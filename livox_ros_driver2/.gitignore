@@ -1,0 +1,12 @@
+devel/
+build/
+install/
+log/
+.cache/
+Livox-SDK2/lib/
+
+.vscode/
+__pycache__/
+.catkin_workspace
+*.gv
+*.pdf
