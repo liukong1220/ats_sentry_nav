@@ -15,11 +15,13 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
   this->declare_parameter<std::string>("lidar_frame", "");
   this->declare_parameter<std::string>("base_frame", "");
   this->declare_parameter<std::string>("robot_base_frame", "");
+  this->declare_parameter<bool>("publish_tf", true);
 
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("lidar_frame", lidar_frame_);
   this->get_parameter("base_frame", base_frame_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("publish_tf", publish_tf_);
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_buffer_->setUsingDedicatedThread(true);
@@ -67,10 +69,12 @@ void SensorScanGenerationNode::odometryHandler(
   tf_odom_to_chassis_ = tf_odom_to_lidar * tf_lidar_to_chassis;
   has_robot_base_pose_ = true;
 
-  publishTransform(
-    tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
-  publishTransform(
-    tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
+  if (publish_tf_) {
+    publishTransform(
+      tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
+    publishTransform(
+      tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
+  }
   publishOdometry(
     tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
 }

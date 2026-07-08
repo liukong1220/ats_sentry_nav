@@ -56,6 +56,7 @@ private:
     nav_msgs::msg::Path & smoothed_path,
     const nav_msgs::msg::Path & reference_path) const;
   void updatePathOrientations(nav_msgs::msg::Path & path) const;
+  void updateRobotFootprintRadius();
   geometry_msgs::msg::PoseStamped projectTowardReference(
     const geometry_msgs::msg::PoseStamped & current_pose,
     const geometry_msgs::msg::PoseStamped & reference_pose,

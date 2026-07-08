@@ -1,11 +1,3 @@
-ign_sim_pointcloud_tool:
-  ros__parameters:
-    pcd_topic: livox/lidar
-    n_scan: 32
-    horizon_scan: 1875
-    ang_bottom: 7.0
-    ang_res_y: 1.84375  # (7+52) / 32
-
 point_lio:
   ros__parameters:
     use_imu_as_input: False                             # Change to True to use IMU as input of Point-LIO
@@ -96,6 +88,7 @@ sensor_scan_generation:
     lidar_frame: "front_mid360"
     base_frame: "base_footprint"
     robot_base_frame: "gimbal_yaw_odom"
+    publish_tf: false
 
 terrain_analysis:
   ros__parameters:
@@ -220,7 +213,7 @@ small_gicp_relocalization:
     base_frame: "gimbal_yaw_odom"
     robot_base_frame: "gimbal_yaw_odom"
     lidar_frame: "front_mid360"
-    # Gazebo rmuc_2025 默认出生点与 gz_world.yaml 保持一致，避免启动初期 map->odom 仍在原点时
+    # 仿真 rmuc_2025 默认出生点保持一致，避免启动初期 map->odom 仍在原点时
     # 导致全局 costmap 判断机器人越界。
     init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # [x, y, z, roll, pitch, yaw]
     # The prior_pcd_file does not need to be specified since it going to be set by defaults in launch.
@@ -436,6 +429,7 @@ trajectory_optimizer:
     derivative_step: 0.02
     obstacle_safe_cost: 96
     use_esdf_obstacle_cost: true
+    robot_footprint_radius: 0.38       # ESDF 原始点距转为机体边缘 clearance 的 footprint 外接半径。
     obstacle_safe_distance: 0.30
     obstacle_weight: 16.0
     obstacle_refinement_iterations: 3
@@ -461,193 +455,51 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.20
+      xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 6.28
     FollowPath:
-      plugin: "nav2_mppi_controller::MPPIController"
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: false
 
-      # --- Motion model ---
-      motion_model: "Omni"
+      min_vel_x: -0.8
+      min_vel_y: -0.8
+      max_vel_x: 0.8
+      max_vel_y: 0.8
+      max_vel_theta: 1.2
+      min_speed_xy: 0.0
+      max_speed_xy: 0.9
+      min_speed_theta: 0.0
 
-      # --- Optimizer settings ---
-      time_steps: 30                     # Horizon T = 30 steps (1.5s at 20Hz)
-      model_dt: 0.05                     # 1/20 Hz
-      batch_size: 500                    # K = 500 samples (sim)
-      temperature: 0.10                  # Softmax temperature
-      gamma: 0.020                       # Discount factor
-      iteration_count: 1                 # Single MPPI iteration per control cycle
-      shift_control_sequence: true       # Warm-start with shifted prior sequence
-      retry_attempt_limit: 1             # Single fallback on all-collision
+      acc_lim_x: 1.5
+      acc_lim_y: 1.5
+      acc_lim_theta: 2.5
+      decel_lim_x: -1.5
+      decel_lim_y: -1.5
+      decel_lim_theta: -2.5
 
-      # --- Velocity constraints (simulation) ---
-      vx_max: 2.5
-      vx_min: -2.5
-      vy_max: 2.5
-      vy_min: -2.5
-      wz_max: 3.0
-      wz_min: -3.0
+      vx_samples: 11
+      vy_samples: 11
+      vtheta_samples: 13
+      sim_time: 1.2
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.25
+      trans_stopped_velocity: 0.08
+      short_circuit_trajectory_evaluation: true
+      stateful: true
 
-      # --- Sampling standard deviations ---
-      vx_std: 0.30
-      vy_std: 0.22
-      wz_std: 0.22
-
-      # --- Critics ---
-      # critics 是 MPPI 的代价项列表。每条 rollout 会被这些 critic 综合打分，最低代价方向会主导控制输出。
-      # 权重速记：
-      # - `cost_weight` / `repulsion_weight` / `critical_weight` 都是乘到对应代价上的权重。
-      #   所以“权重调大”就是把数值调大，轨迹会更强烈地避开该 critic 惩罚的行为。
-      # - `cost_power` 会改变代价曲线形状，通常保持 1；调权重时优先改 weight，不先改 power。
-      # - `threshold_to_consider` 不是权重，而是距离目标点的生效窗口：
-      #   PathAlign / PathFollow / PathAngle / PreferForward 在进入该距离后关闭；
-      #   Goal / GoalAngle 在进入该距离后开启；Obstacles 的 near_goal_distance 会关闭普通斥力项。
-      # - `offset_from_furthest` 是沿路径参考点的前视偏移，调大通常更积极，但更容易切弯。
-      critics: [
-        "PathAlignCritic",
-        "PathFollowCritic",
-        "PathAngleCritic",
-        "GoalCritic",
-        "GoalAngleCritic",
-        "ObstaclesCritic",
-        "ConstraintCritic",
-        "TwirlingCritic",
-        "VelocityDeadbandCritic"
-      ]
-
-      # --- Per-critic weights ---
-      PathAlignCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `PathAlignCritic.cost_weight`
-        # 惩罚 rollout 偏离局部路径中心线。权重调大=数值调大，会更强制贴线；
-        # 但转角、障碍边缘和终段更容易僵硬、来回修正。
-        cost_weight: 10.0
-        # Parameter `PathAlignCritic.threshold_to_consider`
-        # 距目标小于该值时 PathAlign 关闭，让终段交给 GoalCritic。
-        # 调大=更早放弃强制贴线；调小=更晚才退出，终点附近仍会被路径拉住。
-        threshold_to_consider: 0.8
-        # Parameter `PathAlignCritic.offset_from_furthest`
-        # 从当前 rollout 已到达的最远路径点继续向前偏移多少个 path point 作为对齐范围。
-        # 调大=看得更远、速度感更强，但更容易在弯口 shortcut；调小=更保守。
-        offset_from_furthest: 5
-        # Parameter `PathAlignCritic.trajectory_point_step`
-        # rollout 取样步长，越大越粗略但更省计算。
-        trajectory_point_step: 4
-        # Parameter `PathAlignCritic.max_path_occupancy_ratio`
-        # 当局部路径大量落在高占用区域时，不再强行贴线，避免“为贴线去撞障”。
-        max_path_occupancy_ratio: 0.05
-        # Parameter `PathAlignCritic.use_path_orientations`
-        # 仿真巡逻更关注位置，不强依赖路径姿态，避免局部角度跳变放大抖动。
-        use_path_orientations: false
-      PathFollowCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `PathFollowCritic.cost_weight`
-        # 鼓励轨迹末端追向路径前方的 follow 点，比 PathAlign 更柔和。
-        # 权重调大=数值调大，会更积极沿路径推进；过大可能在转角抄近道。
-        cost_weight: 7.0
-        # Parameter `PathFollowCritic.threshold_to_consider`
-        # 距目标小于该值时 PathFollow 关闭，避免终点附近继续“往前推”。
-        # 调大=更早退出推进项；调小=更接近终点仍保持推进。
-        threshold_to_consider: 1.4
-        # Parameter `PathFollowCritic.offset_from_furthest`
-        # 越大越倾向追逐更远的 follow 点，速度会快，但转角更容易 shortcut。
-        offset_from_furthest: 4
-      PathAngleCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `PathAngleCritic.cost_weight`
-        # 惩罚轨迹朝向与路径前方参考点方向不一致。权重调大=数值调大，
-        # 会更强烈抑制反向试探和横切；过大时转角会发僵。
-        cost_weight: 4.5
-        # Parameter `PathAngleCritic.threshold_to_consider`
-        # 距目标小于该值时 PathAngle 关闭，让终段由 GoalAngle/Twirling 控制。
-        # 调大=更早停止路径方向约束；调小=更靠近终点仍要求沿路径方向。
-        threshold_to_consider: 0.5
-        # Parameter `PathAngleCritic.offset_from_furthest`
-        # 判断朝向一致性时使用的前方路径点偏移；调大更看远方，调小更看近处。
-        offset_from_furthest: 3
-        # Parameter `PathAngleCritic.max_angle_to_furthest`
-        # 越小越严格。太小会拐角发僵，太大则更容易横漂或反向抽动。
-        max_angle_to_furthest: 0.85
-        # Parameter `PathAngleCritic.forward_preference`
-        # 全向底盘仍打开前向偏好，减少先倒一下或横切再修正的采样解。
-        forward_preference: true
-      GoalCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `GoalCritic.cost_weight`
-        # 惩罚 rollout 与最终目标点的距离，是终点收敛核心项。
-        # 权重调大=数值调大，接近目标后更急着贴终点；过大可能提前压过路径项。
-        cost_weight: 7.0
-        # Parameter `GoalCritic.threshold_to_consider`
-        # 距目标小于该值时 GoalCritic 才开启。
-        # 调大=更早进入“贴终点”阶段；调小=更晚才由目标主导。
-        threshold_to_consider: 1.8
-      GoalAngleCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `GoalAngleCritic.cost_weight`
-        # 终点姿态约束权重。权重调大=数值调大，会更重视最终 yaw；
-        # 当前不强约束最终朝向，只保留适中角度代价来减少末端乱摆。
-        cost_weight: 3.0
-        # Parameter `GoalAngleCritic.threshold_to_consider`
-        # 距目标小于该值时 GoalAngleCritic 才开启；调大=更早开始收终点姿态。
-        threshold_to_consider: 0.5
-        symmetric_yaw_tolerance: true
-      ObstaclesCritic:
-        enabled: true
-        consider_footprint: true
-        cost_power: 1
-        # Parameter `ObstaclesCritic.repulsion_weight`
-        # 普通障碍斥力权重。权重调大=数值调大，会更早远离膨胀层；
-        # 过大也更容易被障碍代价场推离路径。
-        repulsion_weight: 1.6
-        # Parameter `ObstaclesCritic.critical_weight`
-        # 碰撞边界/安全余量内的重惩罚。权重调大=数值调大，会更强烈避开近碰撞轨迹；
-        # 通常应明显大于其他路径 critic。
-        critical_weight: 60.0
-        # Parameter `ObstaclesCritic.collision_margin_distance`
-        # 在真实碰撞边界外再留一层安全距离；调大更保守，窄通道更难过。
-        collision_margin_distance: 0.08
-        # Parameter `ObstaclesCritic.near_goal_distance`
-        # 距目标小于该值时关闭普通 repulsion 斥力，只保留碰撞/近碰撞惩罚；
-        # 调大可减少最后贴点被代价场推开，但目标附近真实障碍多时会更冒险。
-        near_goal_distance: 0.35
-        # Parameter `ObstaclesCritic.inflation_radius`
-        # 应与 local costmap inflation layer 保持一致，否则障碍距离语义会错位。
-        inflation_radius: 0.50
-        cost_scaling_factor: 5.0
-      ConstraintCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `ConstraintCritic.cost_weight`
-        # 惩罚违反速度/加速度等运动学约束的轨迹。
-        # 权重调大=数值调大，会更强烈排除越界控制；通常保持中等权重即可。
-        cost_weight: 4.0
-      TwirlingCritic:
-        enabled: true
-        cost_power: 1
-        # Parameter `TwirlingCritic.cost_weight`
-        # 抑制不必要自转。权重调大=数值调大，自转会更少；
-        # 终点附近疯狂打圈时可适度增大。
-        cost_weight: 10.0
-      VelocityDeadbandCritic:
-        enabled: false
-        cost_power: 1
-        # Parameter `VelocityDeadbandCritic.cost_weight`
-        # 惩罚落在 deadband 内的“小但非零”速度。
-        # 权重调大=数值调大，会更不愿输出死区小速度；
-        # 过大可能让低速细调不够柔和。
-        cost_weight: 35.0
-        # Parameter `VelocityDeadbandCritic.deadband_velocities`
-        deadband_velocities: [0.05, 0.05, 0.05]
-
-      # --- Visualization ---
-      visualize: true
-      TrajectoryVisualizer:
-        trajectory_step: 5
-        time_step: 3
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.02
+      PathAlign.scale: 16.0
+      PathAlign.forward_point_distance: 0.12
+      GoalAlign.scale: 12.0
+      GoalAlign.forward_point_distance: 0.12
+      PathDist.scale: 24.0
+      GoalDist.scale: 16.0
+      RotateToGoal.scale: 20.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
 
 
 local_costmap:
@@ -695,6 +547,7 @@ local_costmap:
           obstacle_min_range: 0.35
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /map
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -749,6 +602,7 @@ global_costmap:
           obstacle_min_range: 0.35
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /map
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -777,7 +631,7 @@ planner_server:
     expected_planner_frequency: 10.0
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      plugin: "nav2_smac_planner/SmacPlanner2D"
       tolerance: 0.3                      # 如果无法到达精确位置的规划容差，单位：米
       allow_unknown: true                 # 允许在未知空间中行驶
       downsample_costmap: false           # 是否对地图进行下采样
@@ -786,8 +640,8 @@ planner_server:
       max_on_approach_iterations: 1000    # 一旦在容差范围内，尝试到达目标的最大迭代次数
       max_planning_time: 3.5              # 规划、平滑和上采样的最大时间（秒）。将根据规划后的剩余时间缩放最大平滑和上采样时间。
       cost_travel_multiplier: 2.2         # For 2D: 应用于搜索的代价乘数，以避开高代价区域。
-      motion_model_for_search: "DUBIN"    # For Hybrid Dubin, Redds-Shepp
-      angle_quantization_bins: 64         # For Hybrid nodes: 搜索的角度桶数，对于2D节点必须为1（无角度搜索）
+      motion_model_for_search: "2D"       # For 2D nodes.
+      angle_quantization_bins: 1          # For 2D nodes.
       analytic_expansion_ratio: 3.5       # For Hybrid/Lattice nodes: 在搜索过程中尝试解析扩展的比例，用于最终接近。
       analytic_expansion_max_length: 3.6  # For Hybrid/Lattice nodes: 解析扩展被认为有效的最大长度，以防止不安全的捷径（单位：米）。
       minimum_turning_radius: 0.07        # For Hybrid/Lattice nodes: 路径/车辆的最小转弯半径，单位：米
@@ -867,6 +721,7 @@ smoother_server:
       traversability_unknown_is_obstacle: false
       obstacle_safe_cost: 96
       use_esdf_obstacle_cost: true
+      robot_footprint_radius: 0.38     # 主链 smoother 会自动取 Nav2 footprint；这里作为显式兜底。
       obstacle_safe_distance: 0.30
       obstacle_weight: 16.0
       obstacle_refinement_iterations: 3

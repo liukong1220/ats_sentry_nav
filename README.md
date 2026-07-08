@@ -72,7 +72,6 @@ terrain_analysis_ext
 ```text
 ats_sentry_nav/
 ├── fake_vel_transform/            # 速度坐标系转换与自旋叠加
-├── ign_sim_pointcloud_tool/       # Ignition/Gazebo 点云格式补全
 ├── livox_ros_driver2/             # Livox mid360 驱动
 ├── loam_interface/                # point_lio 输出转换到导航 odom
 ├── ats_nav_bringup/            # 导航 launch、RViz、simulation/reality 参数
@@ -228,4 +227,5 @@ ats_sentry_nav/
 - [../../docs/mppi_parameter_tuning_guide.md](../../docs/mppi_parameter_tuning_guide.md)
 - [../../docs/omni_recovery_smoothing_optimization.md](../../docs/omni_recovery_smoothing_optimization.md)
 - [../../docs/上车测试清单.md](../../docs/上车测试清单.md)
-- [../../docs/gazebo_sim_integration.md](../../docs/gazebo_sim_integration.md)
+- [../../docs/仿真域说明.md](../../docs/仿真域说明.md)
+- [../../docs/nav2_to_3desdf_minco_mpc_optimization_direction.md](../../docs/nav2_to_3desdf_minco_mpc_optimization_direction.md)

@@ -197,6 +197,9 @@ void Nav2BSplineSmoother::configure(
     node.get(), plugin_name_ + ".use_esdf_obstacle_cost",
     rclcpp::ParameterValue(params.use_esdf_obstacle_cost));
   nav2_util::declare_parameter_if_not_declared(
+    node.get(), plugin_name_ + ".robot_footprint_radius",
+    rclcpp::ParameterValue(params.robot_footprint_radius));
+  nav2_util::declare_parameter_if_not_declared(
     node.get(), plugin_name_ + ".obstacle_safe_distance",
     rclcpp::ParameterValue(params.obstacle_safe_distance));
   nav2_util::declare_parameter_if_not_declared(
@@ -372,6 +375,9 @@ void Nav2BSplineSmoother::configure(
     plugin_name_ + ".use_esdf_obstacle_cost",
     params.use_esdf_obstacle_cost);
   node->get_parameter(
+    plugin_name_ + ".robot_footprint_radius",
+    params.robot_footprint_radius);
+  node->get_parameter(
     plugin_name_ + ".obstacle_safe_distance",
     params.obstacle_safe_distance);
   node->get_parameter(
@@ -456,6 +462,7 @@ void Nav2BSplineSmoother::configure(
   footprint_sub_ = footprint_sub;
   logger_ = node->get_logger();
   clock_ = node->get_clock();
+  updateRobotFootprintRadius();
   profile_pub_ =
     node->create_publisher<sp_msgs::msg::TrajectoryProfileMsg>(profile_topic_, 10);
   terrain_cloud_sub_ = node->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -512,6 +519,7 @@ bool Nav2BSplineSmoother::smooth(
   nav_msgs::msg::Path & path,
   const rclcpp::Duration &)
 {
+  updateRobotFootprintRadius();
   const nav_msgs::msg::Path reference_path = path;
   if (costmap_sub_) {
     try {
@@ -866,6 +874,39 @@ bool Nav2BSplineSmoother::getRobotFootprint(nav2_costmap_2d::Footprint & footpri
 
   std_msgs::msg::Header footprint_header;
   return footprint_sub_->getFootprintInRobotFrame(footprint, footprint_header);
+}
+
+void Nav2BSplineSmoother::updateRobotFootprintRadius()
+{
+  nav2_costmap_2d::Footprint footprint;
+  if (!getRobotFootprint(footprint) || footprint.empty()) {
+    return;
+  }
+
+  double footprint_radius = 0.0;
+  for (const auto & point : footprint) {
+    footprint_radius = std::max(
+      footprint_radius,
+      std::hypot(point.x, point.y));
+  }
+  if (footprint_radius <= 0.0) {
+    return;
+  }
+
+  auto params = optimizer_.getParams();
+  const double current_radius = std::max(0.0, params.robot_footprint_radius);
+  const double effective_radius = std::max(current_radius, footprint_radius);
+  if (std::abs(effective_radius - current_radius) <= 1e-4) {
+    return;
+  }
+
+  params.robot_footprint_radius = effective_radius;
+  optimizer_.setParams(params);
+  RCLCPP_INFO_THROTTLE(
+    logger_, *clock_, 5000,
+    "RC-ESDF clearance uses robot edge: raw_distance - footprint_radius %.3f m; required physical gap %.3f m",
+    params.robot_footprint_radius,
+    params.obstacle_safe_distance);
 }
 
 double Nav2BSplineSmoother::sampleFootprintCost(

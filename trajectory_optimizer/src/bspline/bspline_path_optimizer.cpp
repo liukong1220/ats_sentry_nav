@@ -372,11 +372,13 @@ double CubicBSpline2D::clampValue(double value, double min_value, double max_val
 BSplinePathOptimizer::BSplinePathOptimizer(const OptimizerParams & params)
 : params_(params)
 {
+  params_.robot_footprint_radius = std::max(0.0, params_.robot_footprint_radius);
 }
 
 void BSplinePathOptimizer::setParams(const OptimizerParams & params)
 {
   params_ = params;
+  params_.robot_footprint_radius = std::max(0.0, params_.robot_footprint_radius);
 }
 
 const OptimizerParams & BSplinePathOptimizer::getParams() const
@@ -1318,6 +1320,9 @@ bool BSplinePathOptimizer::sampleEsdfDistance(
   }
 
   distance = esdf_provider_->getDistance(point.x, point.y);
+  if (std::isfinite(distance)) {
+    distance -= std::max(0.0, params_.robot_footprint_radius);
+  }
   return std::isfinite(distance);
 }
 

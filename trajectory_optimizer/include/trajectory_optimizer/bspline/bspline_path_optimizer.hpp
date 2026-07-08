@@ -68,6 +68,10 @@ struct OptimizerParams
   int obstacle_refinement_iterations = 3;
   double obstacle_refinement_gain = 0.03;
   bool use_esdf_obstacle_cost = false;
+  // Converts raw ESDF point distance into physical body-edge clearance:
+  // clearance = distance(point, obstacle_surface) - robot_footprint_radius.
+  // Keep obstacle_safe_distance as the required physical gap outside the robot body.
+  double robot_footprint_radius = 0.0;
   double obstacle_safe_distance = 0.30;
   double obstacle_speed_reduction_distance = 0.45;
   double obstacle_speed_min_distance = 0.20;

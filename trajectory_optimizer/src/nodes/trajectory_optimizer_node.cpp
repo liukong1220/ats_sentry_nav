@@ -152,6 +152,7 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
     "obstacle_refinement_iterations", params_.obstacle_refinement_iterations);
   declare_parameter<double>("obstacle_refinement_gain", params_.obstacle_refinement_gain);
   declare_parameter<bool>("use_esdf_obstacle_cost", params_.use_esdf_obstacle_cost);
+  declare_parameter<double>("robot_footprint_radius", params_.robot_footprint_radius);
   declare_parameter<double>("obstacle_safe_distance", params_.obstacle_safe_distance);
   declare_parameter<std::string>("esdf_debug_topic", esdf_debug_topic_);
   declare_parameter<std::string>("esdf_source", esdf_source_);
@@ -231,6 +232,7 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
   get_parameter("obstacle_refinement_iterations", params_.obstacle_refinement_iterations);
   get_parameter("obstacle_refinement_gain", params_.obstacle_refinement_gain);
   get_parameter("use_esdf_obstacle_cost", params_.use_esdf_obstacle_cost);
+  get_parameter("robot_footprint_radius", params_.robot_footprint_radius);
   get_parameter("obstacle_safe_distance", params_.obstacle_safe_distance);
   get_parameter("esdf_debug_topic", esdf_debug_topic_);
   get_parameter("esdf_source", esdf_source_);
@@ -527,8 +529,11 @@ void TrajectoryOptimizerNode::publishEsdfDebugMarkers(const nav_msgs::msg::Path 
   std::size_t danger_count = 0;
   std::size_t gradient_count = 0;
   for (const auto & pose : path.poses) {
-    const double distance = active_esdf_provider_->getDistance(
+    double distance = active_esdf_provider_->getDistance(
       pose.pose.position.x, pose.pose.position.y);
+    if (std::isfinite(distance)) {
+      distance -= std::max(0.0, params_.robot_footprint_radius);
+    }
     const Eigen::Vector2d gradient = active_esdf_provider_->getGradient(
       pose.pose.position.x, pose.pose.position.y);
     const double gradient_norm = gradient.norm();

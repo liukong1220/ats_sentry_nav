@@ -38,14 +38,13 @@ This project is based on the [NAV2 Navigation Framework](https://github.com/ros-
 
     The Livox mid360 is mounted at an incline on the chassis.
 
-    Note: In the simulation environment, the point cloud pattern is actually of the Velodyne-style mechanical scan. Additionally, the simulator's output point cloud lacks some fields, preventing point_lio from estimating the state correctly. Thus, the simulator’s output point cloud is processed by [ign_sim_pointcloud_tool](./ign_sim_pointcloud_tool/) to add the `time` field.
+    Current full simulation work is based on MuJoCo. Historical Ignition/Gazebo point cloud conversion is no longer part of the active simulation path.
 
 - File Structure
 
     ```txt
     .
     ├── fake_vel_transform                  # Virtual velocity reference frame to handle gimbal scanning mode, see sub-repository README
-    ├── ign_sim_pointcloud_tool             # Simulator point cloud processing tool
     ├── livox_ros_driver2                   # Livox driver
     ├── loam_interface                      # Point_lio and other odometry interfaces
     ├── ats_teleop_twist_joy                 # Gamepad control
@@ -90,7 +89,7 @@ docker run -it --rm --name ats_sentry_nav \
 
 - Ubuntu 22.04
 - ROS: [Humble](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
-- Simulation package（Option）：[rmu_gazebo_simulator](https://github.com/SMBU-PolarBear-Robotics-Team/rmu_gazebo_simulator)
+- Simulation packages: `ats_mujoco_sim` for full dynamics/sensor validation and `nav2_loopback_sim` for fast navigation or behavior-tree tests.
 - Install [small_icp](https://github.com/koide3/small_gicp):
 
     ```bash
@@ -139,39 +138,13 @@ You can start the project with the following commands. Use the `Nav2 Goal` plugi
 
 #### 2.3.1 Simulation
 
-Single Robot:
-
-Navigation mode：
+Full simulation uses MuJoCo:
 
 ```bash
-ros2 launch ats_nav_bringup rm_navigation_simulation_launch.py \
-world:=rmuc_2025 \
-slam:=False
+ros2 launch ats_mujoco_sim mujoco_navigation.launch.py
 ```
 
-SLAM mode：
-
-```bash
-ros2 launch ats_nav_bringup rm_navigation_simulation_launch.py \
-slam:=True
-```
-
-Save map：`ros2 run nav2_map_server map_saver_cli -f <YOUR_MAP_NAME>  --ros-args -r __ns:=/red_standard_robot1`
-
-Navigation mode:
-
-Multi Robots (Experimental) :
-
-The specified initial pose is currently invalid. TODO: Add transform and initialization for `map` -> `odom`.
-
-```bash
-ros2 launch ats_nav_bringup rm_multi_navigation_simulation_launch.py \
-world:=rmul_2024 \
-robots:=" \
-red_standard_robot1={x: 0.0, y: 0.0, yaw: 0.0}; \
-blue_standard_robot1={x: 5.6, y: 1.4, yaw: 3.14}; \
-"
-```
+Fast behavior-tree or Nav2 loopback testing uses the workspace-level loopback launch files in `ats_sentry_bringup`.
 
 #### 2.3.2 Physical Robot
 
@@ -208,7 +181,7 @@ Launch arguments are largely common to both simulation and physical robot. Howev
 | Available | Argument | Description | Type  | Default |
 |-|-|-|-|-|
 | 🤖 🖥️ | `namespace` | Top-level namespace | string | "red_standard_robot1" |
-| 🤖🖥️ | `use_sim_time` | Use simulation (Gazebo) clock if True | bool | Simulation: True; Reality: False |
+| 🤖🖥️ | `use_sim_time` | Use simulation clock if True | bool | Simulation: True; Reality: False |
 | 🤖 🖥️ | `slam` | Whether run a SLAM. If True, it will disable small_gicp and send static tf (map->odom). Then automatically save the pcd_file in [./point_lio/PCD/](./point_lio/PCD/)| bool | False |
 | 🤖 🖥️ | `world` | In simulation, available options are `rmul_2024` or `rmuc_2024` or `rmul_2025` or `rmuc_2025` | string | "rmuc_2025" |
 |  |  | In reality, the `world` parameter name is the same as the file names of the grid map and prior pointcloud map | string | "" |
@@ -220,7 +193,7 @@ Launch arguments are largely common to both simulation and physical robot. Howev
 | 🤖 🖥️ | `use_composition` | Whether to use composed bringup | bool | True |
 | 🤖 🖥️ | `use_respawn` | Whether to respawn if a node crashes. Applied when composition is disabled. | bool | False |
 | 🤖🖥️ | `use_rviz` | Whether to start RViz | bool | True |
-| 🤖 | `use_robot_state_pub` | Whether to start the robot state publisher <br> 1. In simulation, since the supporting Gazebo simulator already publishes the robot's TF information, there is no need to publish it again. <br> 2. In reality, it is **recommended** to use an independent package to publish the robot's TF information. For example, the serial module [standard_robot_pp_ros2](https://github.com/SMBU-PolarBear-Robotics-Team/standard_robot_pp_ros2) provides `gimbal_yaw_odom` (large yaw), `gimbal_yaw` (small yaw), and `gimbal_pitch` joint states, in which case `use_robot_state_pub` should be set to False. <br> If there is no complete robot system or only the navigation module (this repo) is tested, `use_robot_state_pub` can be set to True. In this case, the navigation module will publish static robot joint pose data to maintain the TF tree. <br> *Note: It is necessary to clone and compile [ats_robot_description](https://github.com/SMBU-PolarBear-Robotics-Team/ats_robot_description.git) additionally* | bool | False |
+| 🤖 | `use_robot_state_pub` | Whether to start the robot state publisher <br> 1. In full MuJoCo simulation, the simulator publishes the robot state and TF information needed by the test chain. <br> 2. In reality, it is **recommended** to use an independent package to publish the robot's TF information. For example, the serial module [standard_robot_pp_ros2](https://github.com/SMBU-PolarBear-Robotics-Team/standard_robot_pp_ros2) provides `gimbal_yaw_odom` (large yaw), `gimbal_yaw` (small yaw), and `gimbal_pitch` joint states, in which case `use_robot_state_pub` should be set to False. <br> If there is no complete robot system or only the navigation module (this repo) is tested, `use_robot_state_pub` can be set to True. In this case, the navigation module will publish static robot joint pose data to maintain the TF tree. <br> *Note: It is necessary to clone and compile [ats_robot_description](https://github.com/SMBU-PolarBear-Robotics-Team/ats_robot_description.git) additionally* | bool | False |
 
 > [!TIP]
 > For more details about this project and the deployment guide for the physical robot, please visit the [Wiki](https://github.com/SMBU-PolarBear-Robotics-Team/ats_sentry_nav/wiki).

@@ -667,8 +667,7 @@ int main(int argc, char **argv) {
       // publish points with elevation
       sensor_msgs::msg::PointCloud2 terrainCloud2;
       pcl::toROSMsg(*terrainCloudElev, terrainCloud2);
-      terrainCloud2.header.stamp =
-          rclcpp::Time(static_cast<uint64_t>(laserCloudTime * 1e9));
+      terrainCloud2.header.stamp = nh->get_clock()->now();
       terrainCloud2.header.frame_id = "odom";
       pubLaserCloud->publish(terrainCloud2);
     }

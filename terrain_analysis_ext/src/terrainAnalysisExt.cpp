@@ -322,6 +322,14 @@ nav_msgs::msg::OccupancyGrid makePlanarGridMessage(const rclcpp::Time &stamp) {
   return grid;
 }
 
+std::size_t planarIndexToOccupancyGridIndex(int planar_ind) {
+  const int ind_x = planar_ind / planarVoxelWidth;
+  const int ind_y = planar_ind % planarVoxelWidth;
+  return static_cast<std::size_t>(ind_y) *
+             static_cast<std::size_t>(planarVoxelWidth) +
+         static_cast<std::size_t>(ind_x);
+}
+
 void publishScalarGrid(
     const rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr &publisher,
     const rclcpp::Time &stamp, const float *values, double scale_limit) {
@@ -335,7 +343,7 @@ void publishScalarGrid(
     if (!has_points) {
       continue;
     }
-    grid.data[static_cast<std::size_t>(i)] =
+    grid.data[planarIndexToOccupancyGridIndex(i)] =
         normalizedToOccupancy(static_cast<double>(values[i]) / scale_limit);
   }
 
@@ -365,10 +373,11 @@ void publishTraversabilityGrid(
                1e-6);
 
   for (int i = 0; i < kPlanarVoxelNum; ++i) {
+    const std::size_t grid_ind = planarIndexToOccupancyGridIndex(i);
     const bool has_points = planarVoxelPointCount[i] >= traversabilityMinPointCount;
     const bool is_connected = !checkTerrainConn || planarVoxelConn[i] == 2;
     if (!has_points) {
-      grid.data[static_cast<std::size_t>(i)] =
+      grid.data[grid_ind] =
           traversabilityUnknownAsOccupied ? 100 : -1;
       continue;
     }
@@ -415,8 +424,7 @@ void publishTraversabilityGrid(
       combined_score = 1.0;
     }
 
-    grid.data[static_cast<std::size_t>(i)] =
-        normalizedToOccupancy(combined_score);
+    grid.data[grid_ind] = normalizedToOccupancy(combined_score);
   }
 
   publisher->publish(grid);
@@ -975,8 +983,7 @@ int main(int argc, char **argv) {
       // publish points with elevation
       sensor_msgs::msg::PointCloud2 terrainCloud2;
       pcl::toROSMsg(*terrainCloudElev, terrainCloud2);
-      terrainCloud2.header.stamp =
-          rclcpp::Time(static_cast<uint64_t>(laserCloudTime * 1e9));
+      terrainCloud2.header.stamp = nh->get_clock()->now();
       terrainCloud2.header.frame_id = "odom";
       pubTerrainCloud->publish(terrainCloud2);
       publishTraversabilityGrid(pubTraversabilityGrid,
