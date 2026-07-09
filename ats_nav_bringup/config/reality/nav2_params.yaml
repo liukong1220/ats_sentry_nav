@@ -123,7 +123,7 @@ terrain_analysis:
     noDataObstacle: False               # treat no data as obstacle
     noDataBlockSkipNum: 0
     minBlockPointNum: 8
-    vehicleHeight: 0.55                 # 允许 30~40cm 级障碍在起伏地面上仍能完整进入近场障碍层。
+    vehicleHeight: 0.23                 # 实车总高约 23cm；高于车体的近场点按障碍候选处理。
     voxelPointUpdateThre: 100
     voxelTimeUpdateThre: 1.0
     minRelZ: -0.75                       # min_rel_z 以及 max_rel_z 限制了有效点云点的Z值范围，用于对天花板和地板进行处理
@@ -138,7 +138,7 @@ terrain_analysis_ext:
     clearingDis: 20.0                    # 触发 clearing 时清空的半径范围。
     useSorting: true                     # true 用分位数估计地面；false 用最小值估计地面。
     quantileZ: 0.2                       # 地面分位数；越小越贴近“最低地面”，越大越抗离群低点。
-    vehicleHeight: 1.0                   # 高于地面的可接受点高度上限，超出后会被视为非地面障碍候选。
+    vehicleHeight: 0.23                  # 实车总高约 23cm；远场地形/障碍高度语义与真实车体一致。
     voxelPointUpdateThre: 100            # 单个 terrain voxel 累积多少点后触发更新。
     voxelTimeUpdateThre: 2.0             # 即使点数不够，超过该时间也强制刷新 terrain voxel。
     lowerBoundZ: -1.5                    # 相对车体允许的最低点云高度窗口。
@@ -452,7 +452,7 @@ trajectory_optimizer:
     # J_obs 参数：cost 超过 48 就开始推离障碍，权重比之前更强。
     obstacle_safe_cost: 48
     use_esdf_obstacle_cost: true
-    robot_footprint_radius: 0.38       # ESDF 原始点距转为机体边缘 clearance 的 footprint 外接半径。
+    robot_footprint_radius: 0.40       # 0.60x0.50m 矩形底盘外接半径约 0.391m，向上取 0.40m。
     obstacle_safe_distance: 0.30
     obstacle_weight: 40.0
     obstacle_refinement_iterations: 3
@@ -649,14 +649,14 @@ controller_server:
         critical_weight: 60.0
         # Parameter `ObstaclesCritic.collision_margin_distance`
         # 在真实碰撞边界外再留一层安全距离；调大更保守，窄通道更难过。
-        collision_margin_distance: 0.08
+        collision_margin_distance: 0.10
         # Parameter `ObstaclesCritic.near_goal_distance`
         # 距目标小于该值时关闭普通 repulsion 斥力，只保留碰撞/近碰撞惩罚；
         # 调大可减少最后贴点被代价场推开，但目标附近真实障碍多时会更冒险。
         near_goal_distance: 0.35
         # Parameter `ObstaclesCritic.inflation_radius`
         # 官方文档明确要求：这里应与 costmap inflation layer 保持一致。
-        inflation_radius: 0.50
+        inflation_radius: 0.60
         cost_scaling_factor: 5.0
       ConstraintCritic:
         enabled: true
@@ -704,7 +704,7 @@ local_costmap:
       width: 5
       height: 5
       resolution: 0.05
-      footprint: "[[0.25, 0.25], [0.25, -0.25], [-0.25, -0.25], [-0.25, 0.25]]"
+      footprint: "[[0.30, 0.25], [0.30, -0.25], [-0.30, -0.25], [-0.30, 0.25]]"
       footprint_padding: 0.02
       plugins: ["static_layer", "intensity_voxel_layer", "inflation_layer"]
       intensity_voxel_layer:
@@ -719,7 +719,7 @@ local_costmap:
         unknown_threshold: 5
         self_filter_use_footprint: true
         self_filter_padding: 0.03
-        self_filter_radius: 0.32
+        self_filter_radius: 0.40
         z_resolution: 0.05
         z_voxels: 16
         min_obstacle_height: 0.0
@@ -743,7 +743,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
-        inflation_radius: 0.50
+        inflation_radius: 0.60
       always_send_full_costmap: False
 
 global_costmap:
@@ -754,7 +754,7 @@ global_costmap:
       publish_frequency: 2.0
       global_frame: map
       robot_base_frame: gimbal_yaw_fake
-      footprint: "[[0.25, 0.25], [0.25, -0.25], [-0.25, -0.25], [-0.25, 0.25]]"
+      footprint: "[[0.30, 0.25], [0.30, -0.25], [-0.30, -0.25], [-0.30, 0.25]]"
       footprint_padding: 0.02
       resolution: 0.05
       track_unknown_space: true
@@ -771,7 +771,7 @@ global_costmap:
         unknown_threshold: 5
         self_filter_use_footprint: true
         self_filter_padding: 0.03
-        self_filter_radius: 0.32
+        self_filter_radius: 0.40
         z_resolution: 0.05
         z_voxels: 16
         min_obstacle_height: 0.0
@@ -796,7 +796,7 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         # 全局层保守于局部层，用来把全局路由尽量拉回通道中心。
         cost_scaling_factor: 6.0
-        inflation_radius: 0.55
+        inflation_radius: 0.65
       always_send_full_costmap: False
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
@@ -820,7 +820,7 @@ planner_server:
     expected_planner_frequency: 10.0
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      plugin: "nav2_smac_planner/SmacPlanner2D"
       tolerance: 0.3                      # 如果无法到达精确位置的规划容差，单位：米
       allow_unknown: true                 # 允许在未知空间中行驶
       downsample_costmap: false           # 是否对地图进行下采样
@@ -828,22 +828,23 @@ planner_server:
       max_iterations: 1000000             # 搜索的最大总迭代次数（如果无法到达），设置为-1以禁用
       max_on_approach_iterations: 1000    # 一旦在容差范围内，尝试到达目标的最大迭代次数
       max_planning_time: 3.5              # 规划、平滑和上采样的最大时间（秒）。将根据规划后的剩余时间缩放最大平滑和上采样时间。
-      cost_travel_multiplier: 2.2         # For 2D: 官方说明数值越大越会贴近通道中心。保持旧实车基线，避免为远离代价区过度绕路。
-      motion_model_for_search: "DUBIN"    # For Hybrid Dubin, Redds-Shepp
-      angle_quantization_bins: 64         # For Hybrid nodes: 搜索的角度桶数，对于2D节点必须为1（无角度搜索）
+      cost_travel_multiplier: 1.25        # For 2D: 数值越大越贴通道中心，也越可能为了躲膨胀层绕远。全向底盘适当降低，减少不必要远路。
+      motion_model_for_search: "2D"       # 全向底盘用 2D 网格搜索；曲线由 smoother / MPPI 负责，不让全局 planner 像 Dubins 小车一样绕弯。
+      angle_quantization_bins: 1          # SmacPlanner2D 必须为 1；角度/曲线交给 smoother 与 MPPI 处理。
       analytic_expansion_ratio: 3.5       # For Hybrid/Lattice nodes: 在搜索过程中尝试解析扩展的比例，用于最终接近。
       analytic_expansion_max_length: 3.6  # For Hybrid/Lattice nodes: 解析扩展被认为有效的最大长度，以防止不安全的捷径（单位：米）。这应该与最小转弯半径成比例，不应小于最小半径的4-5倍。
       minimum_turning_radius: 0.07        # For Hybrid/Lattice nodes: 全向底盘不应被建模成 0.6m 大转弯半径车辆，否则会明显绕远。
-      retrospective_penalty: 0.07        # For Hybrid/Lattice nodes: 优先考虑路径上较晚的机动而不是较早的机动。节省搜索时间，因为较早的节点不会被扩展，直到有必要。必须 >= 0.0且 <= 1.0
+      retrospective_penalty: 0.02        # Hybrid/Lattice 参数；若回退 Hybrid，降低过度延迟扩展导致的绕远。
       reverse_penalty: 1.0                # For Reeds-Shepp model: 应用于倒车的惩罚，必须 >= 1
       change_penalty: 0.0                 # For Hybrid nodes: 应用于改变方向的惩罚，必须 >= 0
-      non_straight_penalty: 1.20          # For Hybrid nodes: 应用于非直线运动的惩罚，必须 >= 1
-      cost_penalty: 2.3                   # For Hybrid nodes: 保持旧实车基线，降低因高代价惩罚导致的绕远。
+      non_straight_penalty: 1.08          # Hybrid 参数；若回退 Hybrid，减轻曲线段绕远。
+      cost_penalty: 1.7                   # Hybrid 参数；若回退 Hybrid，减轻高代价过度绕行。
       rotation_penalty: 5.0               # For Lattice node: 仅在使用包含原地旋转原语的最小控制集时应用于纯原地旋转命令的惩罚。除非严格必要用于避开障碍物，否则应始终设置足够高的权重，以避免此操作，否则可能会在路径中频繁出现不连续的情况，要求机器人原地旋转以节省路径距离。
       lookup_table_size: 20.0             # For Hybrid nodes: 缓存的dubin/reeds-sheep距离窗口的大小，单位：米。
       cache_obstacle_heuristic: True      # For Hybrid nodes: 在同一目标位置的后续重新规划之间缓存障碍物地图动态规划距离扩展启发式。如果代价地图基本静态，则显著加快重新规划性能（40倍）。
       allow_reverse_expansion: False      # For Lattice node: 是否在前向原语或反向扩展状态格子图中扩展，将使每一步的分支因子加倍。
-      smooth_path: True                   # For Lattice/Hybrid nodes: 使用旧实车基线的 Smac 内置平滑，再由 B 样条做受限二次平滑和速度剖面。
+      use_final_approach_orientation: false
+      smooth_path: True                   # 2D 路径先做轻量平滑，再由 B 样条做受限二次平滑和速度剖面。
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
@@ -913,7 +914,7 @@ smoother_server:
       # cost 超过 96 的点会被回拉；profile 会在回拉后重新计算并发给 governor。
       obstacle_safe_cost: 96
       use_esdf_obstacle_cost: true
-      robot_footprint_radius: 0.38     # 主链 smoother 会自动取 Nav2 footprint；这里作为显式兜底。
+      robot_footprint_radius: 0.40     # 主链 smoother 会自动取 Nav2 footprint；这里作为 0.60x0.50m 矩形底盘兜底。
       obstacle_safe_distance: 0.30
       obstacle_weight: 16.0
       obstacle_refinement_iterations: 3
