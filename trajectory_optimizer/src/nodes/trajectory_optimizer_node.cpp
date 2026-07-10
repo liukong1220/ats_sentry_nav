@@ -3,6 +3,7 @@
 #include "trajectory_optimizer/nodes/trajectory_optimizer_node.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -100,6 +101,31 @@ bool hasSubscribers(const std::shared_ptr<PublisherT> & publisher)
          publisher->get_intra_process_subscription_count() > 0);
 }
 
+bool pathsMateriallyDifferent(
+  const nav_msgs::msg::Path & lhs,
+  const nav_msgs::msg::Path & rhs,
+  double threshold)
+{
+  if (lhs.header.frame_id != rhs.header.frame_id || lhs.poses.size() != rhs.poses.size()) {
+    return true;
+  }
+  if (lhs.poses.empty()) {
+    return false;
+  }
+
+  const std::size_t last = lhs.poses.size() - 1;
+  constexpr std::size_t kSamples = 16;
+  for (std::size_t sample = 0; sample < kSamples; ++sample) {
+    const std::size_t index = (last * sample) / (kSamples - 1);
+    const auto & a = lhs.poses[index].pose.position;
+    const auto & b = rhs.poses[index].pose.position;
+    if (std::hypot(a.x - b.x, a.y - b.y) > threshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & options)
@@ -109,6 +135,11 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
   declare_parameter<std::string>("output_path_topic", "smoothed_path");
   declare_parameter<std::string>("output_profile_topic", "trajectory_profile_visual");
   declare_parameter<std::string>("costmap_topic", "global_costmap/costmap_raw");
+  declare_parameter<bool>("local_elastic_enabled", local_elastic_enabled_);
+  declare_parameter<bool>("local_elastic_require_esdf", local_elastic_require_esdf_);
+  declare_parameter<double>("local_elastic_update_rate_hz", local_elastic_update_rate_hz_);
+  declare_parameter<double>(
+    "local_elastic_position_change_threshold", local_elastic_position_change_threshold_);
   declare_parameter<double>("control_point_spacing", params_.control_point_spacing);
   declare_parameter<double>("output_path_spacing", params_.output_path_spacing);
   declare_parameter<double>("min_input_point_spacing", params_.min_input_point_spacing);
@@ -190,6 +221,11 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
   get_parameter("output_path_topic", output_path_topic_);
   get_parameter("output_profile_topic", output_profile_topic_);
   get_parameter("costmap_topic", costmap_topic_);
+  get_parameter("local_elastic_enabled", local_elastic_enabled_);
+  get_parameter("local_elastic_require_esdf", local_elastic_require_esdf_);
+  get_parameter("local_elastic_update_rate_hz", local_elastic_update_rate_hz_);
+  get_parameter(
+    "local_elastic_position_change_threshold", local_elastic_position_change_threshold_);
   get_parameter("control_point_spacing", params_.control_point_spacing);
   get_parameter("output_path_spacing", params_.output_path_spacing);
   get_parameter("min_input_point_spacing", params_.min_input_point_spacing);
@@ -273,7 +309,8 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
   traversability_esdf_provider_->setSlopeGridMaxDegrees(traversability_slope_max_degrees_);
   optimizer_.clearEsdfProvider();
 
-  smoothed_path_pub_ = create_publisher<nav_msgs::msg::Path>(output_path_topic_, 10);
+  smoothed_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+    output_path_topic_, rclcpp::QoS(1).reliable().transient_local());
   profile_pub_ =
     create_publisher<sp_msgs::msg::TrajectoryProfileMsg>(output_profile_topic_, 10);
   esdf_marker_pub_ =
@@ -309,64 +346,47 @@ TrajectoryOptimizerNode::TrajectoryOptimizerNode(const rclcpp::NodeOptions & opt
       &TrajectoryOptimizerNode::traversabilitySlopeCallback,
       this, std::placeholders::_1));
 
+  local_elastic_update_rate_hz_ = std::max(0.1, local_elastic_update_rate_hz_);
+  local_elastic_position_change_threshold_ = std::max(
+    0.001, local_elastic_position_change_threshold_);
+  if (local_elastic_enabled_) {
+    const auto period = std::chrono::duration<double>(1.0 / local_elastic_update_rate_hz_);
+    local_elastic_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+      std::bind(&TrajectoryOptimizerNode::localElasticTimerCallback, this));
+  }
+
   RCLCPP_INFO(
     get_logger(),
-    "Trajectory optimizer active: %s -> %s, esdf_source=%s terrain_topic=%s traversability_topic=%s slope_topic=%s",
-    input_path_topic_.c_str(), output_path_topic_.c_str(), esdf_source_.c_str(),
+    "Trajectory optimizer active: %s -> %s, local_elastic=%s@%.1fHz esdf_source=%s terrain_topic=%s traversability_topic=%s slope_topic=%s",
+    input_path_topic_.c_str(), output_path_topic_.c_str(),
+    local_elastic_enabled_ ? "enabled" : "disabled", local_elastic_update_rate_hz_,
+    esdf_source_.c_str(),
     terrain_pointcloud_topic_.c_str(), traversability_grid_topic_.c_str(),
     traversability_slope_topic_.c_str());
 }
 
 void TrajectoryOptimizerNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
 {
-  const bool publish_smoothed_path = hasSubscribers(smoothed_path_pub_);
-  const bool publish_profile = hasSubscribers(profile_pub_);
-  const bool publish_esdf_debug = hasSubscribers(esdf_marker_pub_);
-  if (!publish_smoothed_path && !publish_profile && !publish_esdf_debug) {
+  if (!msg || msg->poses.size() < 2) {
     return;
   }
 
-  if (!costmap_sub_) {
-    costmap_sub_ =
-      std::make_shared<nav2_costmap_2d::CostmapSubscriber>(shared_from_this(), costmap_topic_);
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    latest_reference_path_ = msg;
+    local_elastic_pending_ = true;
   }
-  if (costmap_sub_) {
-    try {
-      const auto costmap = costmap_sub_->getCostmap();
-      optimizer_.setObstacleCostmap(costmap);
-      if (params_.use_esdf_obstacle_cost && fake_esdf_provider_ && esdf_source_ == "costmap") {
-        fake_esdf_provider_->updateCostmap(costmap, params_.obstacle_safe_cost, true);
-        active_esdf_provider_ = fake_esdf_provider_;
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 5000,
-          "Fake ESDF active in trajectory_optimizer_node: d_safe=%.3f cost_threshold=%d",
-          params_.obstacle_safe_distance, static_cast<int>(params_.obstacle_safe_cost));
-      }
-    } catch (const std::exception & ex) {
-      optimizer_.clearObstacleCostmap();
-      active_esdf_provider_.reset();
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Costmap unavailable for visual trajectory optimizer, using geometry-only path: %s",
-        ex.what());
-    }
-  }
-  refreshEsdfProvider();
-  const auto result = optimizer_.optimizeDetailed(*msg);
-  if (publish_smoothed_path) {
-    smoothed_path_pub_->publish(result.path);
-  }
-  if (publish_profile) {
-    profile_pub_->publish(toProfileMsg(msg->header, "trajectory_optimizer_node", result.profile));
-  }
-  if (publish_esdf_debug) {
-    publishEsdfDebugMarkers(result.path);
+
+  if (!local_elastic_enabled_) {
+    runLocalElasticOptimization();
   }
 }
 
 void TrajectoryOptimizerNode::terrainPointCloudCallback(
   const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   if (!terrain_esdf_provider_) {
     return;
   }
@@ -379,42 +399,151 @@ void TrajectoryOptimizerNode::terrainPointCloudCallback(
   if (esdf_source_ == "terrain_pointcloud") {
     active_esdf_provider_ = terrain_esdf_provider_;
     refreshEsdfProvider();
+    std::lock_guard<std::mutex> data_lock(data_mutex_);
+    local_elastic_pending_ = true;
   }
 }
 
 void TrajectoryOptimizerNode::traversabilityGridCallback(
   const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   traversability_grid_msg_ = msg;
   updateTraversabilityEsdf();
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  local_elastic_pending_ = true;
 }
 
 void TrajectoryOptimizerNode::traversabilityHeightDiffCallback(
   const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   traversability_height_diff_msg_ = msg;
   updateTraversabilityEsdf();
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  local_elastic_pending_ = true;
 }
 
 void TrajectoryOptimizerNode::traversabilityOccupancyRatioCallback(
   const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   traversability_occupancy_ratio_msg_ = msg;
   updateTraversabilityEsdf();
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  local_elastic_pending_ = true;
 }
 
 void TrajectoryOptimizerNode::traversabilityGroundConfidenceCallback(
   const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   traversability_ground_confidence_msg_ = msg;
   updateTraversabilityEsdf();
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  local_elastic_pending_ = true;
 }
 
 void TrajectoryOptimizerNode::traversabilitySlopeCallback(
   const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(optimizer_mutex_);
   traversability_slope_msg_ = msg;
   updateTraversabilityEsdf();
+  std::lock_guard<std::mutex> data_lock(data_mutex_);
+  local_elastic_pending_ = true;
+}
+
+void TrajectoryOptimizerNode::localElasticTimerCallback()
+{
+  runLocalElasticOptimization();
+}
+
+void TrajectoryOptimizerNode::runLocalElasticOptimization()
+{
+  nav_msgs::msg::Path reference_path;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (!latest_reference_path_ || !local_elastic_pending_) {
+      return;
+    }
+    reference_path = *latest_reference_path_;
+    local_elastic_pending_ = false;
+  }
+
+  const bool publish_smoothed_path = hasSubscribers(smoothed_path_pub_);
+  const bool publish_profile = hasSubscribers(profile_pub_);
+  const bool publish_esdf_debug = hasSubscribers(esdf_marker_pub_);
+  if (!publish_smoothed_path && !publish_profile && !publish_esdf_debug) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    local_elastic_pending_ = true;
+    return;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> optimizer_lock(optimizer_mutex_);
+  if (!costmap_sub_) {
+    costmap_sub_ =
+      std::make_shared<nav2_costmap_2d::CostmapSubscriber>(shared_from_this(), costmap_topic_);
+  }
+  if (costmap_sub_) {
+    try {
+      const auto costmap = costmap_sub_->getCostmap();
+      optimizer_.setObstacleCostmap(costmap);
+      if (params_.use_esdf_obstacle_cost && fake_esdf_provider_ && esdf_source_ == "costmap") {
+        fake_esdf_provider_->updateCostmap(costmap, params_.obstacle_safe_cost, true);
+        active_esdf_provider_ = fake_esdf_provider_;
+      }
+    } catch (const std::exception & ex) {
+      optimizer_.clearObstacleCostmap();
+      if (esdf_source_ == "costmap") {
+        active_esdf_provider_.reset();
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Costmap unavailable for local elastic optimization: %s", ex.what());
+    }
+  }
+  refreshEsdfProvider();
+  if (local_elastic_require_esdf_ &&
+    (!active_esdf_provider_ || !active_esdf_provider_->available()))
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "RC-ESDF unavailable; retaining stable global path until a local field is ready.");
+    return;
+  }
+
+  auto result = optimizer_.optimizeDetailed(reference_path);
+  result.path.header.stamp = now();
+  for (auto & pose : result.path.poses) {
+    pose.header = result.path.header;
+  }
+
+  bool publish_path = false;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    publish_path = pathsMateriallyDifferent(
+      result.path, last_published_path_, local_elastic_position_change_threshold_);
+    if (publish_path) {
+      last_published_path_ = result.path;
+    }
+  }
+  if (publish_smoothed_path && publish_path) {
+    smoothed_path_pub_->publish(result.path);
+  }
+  if (publish_profile) {
+    profile_pub_->publish(toProfileMsg(result.path.header, "local_elastic_rc_esdf", result.profile));
+  }
+  if (publish_esdf_debug) {
+    publishEsdfDebugMarkers(result.path);
+  }
+
+  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 2000,
+    "Local elastic optimization: points=%zu published=%s elapsed=%.3fs",
+    result.path.poses.size(), publish_path ? "true" : "false", elapsed.count());
 }
 
 void TrajectoryOptimizerNode::updateTraversabilityEsdf()

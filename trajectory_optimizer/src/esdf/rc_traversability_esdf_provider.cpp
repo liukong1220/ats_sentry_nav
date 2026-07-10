@@ -134,6 +134,7 @@ void RcTraversabilityEsdfProvider::updateGrid(
 
   std::vector<uint8_t> obstacle_mask(cell_count, 0);
   std::vector<uint8_t> free_mask(cell_count, 0);
+  std::vector<uint8_t> known_free_mask(cell_count, 0);
   const int safe_threshold = std::max(0, std::min(100, obstacle_value_threshold));
   const int lethal_threshold =
     std::max(safe_threshold, std::min(100, lethal_value_threshold));
@@ -165,11 +166,37 @@ void RcTraversabilityEsdfProvider::updateGrid(
         obstacle_mask[idx] = 1;
       } else {
         free_mask[idx] = 1;
+        if (!is_unknown) {
+          known_free_mask[idx] = 1;
+        }
       }
     }
   }
 
-  if (std::none_of(obstacle_mask.begin(), obstacle_mask.end(), [](uint8_t v) { return v != 0; })) {
+  const bool has_obstacles = std::any_of(
+    obstacle_mask.begin(), obstacle_mask.end(), [](uint8_t value) { return value != 0; });
+  if (!has_obstacles) {
+    const bool has_known_free = std::any_of(
+      known_free_mask.begin(), known_free_mask.end(), [](uint8_t value) { return value != 0; });
+    if (!has_known_free) {
+      // An all-unknown local grid is not evidence of free space. Keep the provider
+      // unavailable so callers fall back to the stable global path or their own
+      // conservative safety policy.
+      return;
+    }
+
+    // A known-free local snapshot can legitimately contain no obstacle samples.
+    // Keep RC-ESDF queryable in that case: every cell has large positive clearance
+    // and a zero gradient, so the elastic optimizer preserves its guide instead of
+    // treating a clear corridor as an ESDF failure.
+    const double clear_distance = std::hypot(
+      static_cast<double>(width_) * resolution_,
+      static_cast<double>(height_) * resolution_);
+    distance_field_.assign(cell_count, clear_distance);
+    distance_to_obstacle_field_ = distance_field_;
+    distance_to_free_field_.assign(cell_count, 0.0);
+    smoothed_distance_field_ = distance_field_;
+    available_ = true;
     return;
   }
 

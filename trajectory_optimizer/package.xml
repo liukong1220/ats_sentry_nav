@@ -23,6 +23,9 @@
   <depend>nav2_core</depend>
   <depend>nav2_util</depend>
   <depend>nav2_costmap_2d</depend>
+  <depend>nav2_behavior_tree</depend>
+  <depend>nav2_msgs</depend>
+  <depend>behaviortree_cpp_v3</depend>
   <depend>sp_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>

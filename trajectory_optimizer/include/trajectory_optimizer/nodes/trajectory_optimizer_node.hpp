@@ -3,6 +3,7 @@
 #ifndef TRAJECTORY_OPTIMIZER__TRAJECTORY_OPTIMIZER_NODE_HPP_
 #define TRAJECTORY_OPTIMIZER__TRAJECTORY_OPTIMIZER_NODE_HPP_
 
+#include <mutex>
 #include <string>
 
 #include "nav2_costmap_2d/costmap_subscriber.hpp"
@@ -36,6 +37,8 @@ private:
   void publishEsdfDebugMarkers(const nav_msgs::msg::Path & path);
   void refreshEsdfProvider();
   void updateTraversabilityEsdf();
+  void localElasticTimerCallback();
+  void runLocalElasticOptimization();
 
   BSplinePathOptimizer optimizer_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
@@ -67,6 +70,10 @@ private:
   std::string traversability_occupancy_ratio_topic_{"traversability_occupancy_ratio_grid"};
   std::string traversability_ground_confidence_topic_{"traversability_ground_confidence_grid"};
   std::string traversability_slope_topic_{"traversability_slope_grid"};
+  bool local_elastic_enabled_{true};
+  bool local_elastic_require_esdf_{true};
+  double local_elastic_update_rate_hz_{5.0};
+  double local_elastic_position_change_threshold_{0.02};
   double terrain_esdf_resolution_{0.05};
   double terrain_esdf_padding_{0.60};
   double terrain_esdf_inflation_radius_{0.08};
@@ -78,6 +85,12 @@ private:
   int traversability_obstacle_value_threshold_{50};
   int traversability_lethal_value_threshold_{90};
   bool traversability_unknown_is_obstacle_{false};
+  rclcpp::TimerBase::SharedPtr local_elastic_timer_;
+  std::mutex data_mutex_;
+  std::mutex optimizer_mutex_;
+  nav_msgs::msg::Path::SharedPtr latest_reference_path_;
+  nav_msgs::msg::Path last_published_path_;
+  bool local_elastic_pending_{false};
   nav_msgs::msg::OccupancyGrid::SharedPtr traversability_grid_msg_;
   nav_msgs::msg::OccupancyGrid::SharedPtr traversability_height_diff_msg_;
   nav_msgs::msg::OccupancyGrid::SharedPtr traversability_occupancy_ratio_msg_;

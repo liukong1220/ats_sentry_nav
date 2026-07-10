@@ -21,10 +21,21 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/nodes/trajectory_optimizer_node.cpp
 )
 
+ament_auto_add_library(trajectory_optimizer_follow_elastic_path_bt_node SHARED
+  src/bt/follow_elastic_path_action.cpp
+)
+
 target_include_directories(${PROJECT_NAME} PUBLIC
   include
   ${EIGEN3_INCLUDE_DIR}
 )
+
+target_include_directories(trajectory_optimizer_follow_elastic_path_bt_node PUBLIC
+  include
+)
+
+target_compile_definitions(
+  trajectory_optimizer_follow_elastic_path_bt_node PRIVATE BT_PLUGIN_EXPORT)
 
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN trajectory_optimizer::TrajectoryOptimizerNode

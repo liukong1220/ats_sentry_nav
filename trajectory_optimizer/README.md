@@ -3,6 +3,19 @@
 This package is the current Nav2-compatible B-spline smoothing and RC-ESDF
 transition layer.
 
+## Current V1 Test Chain
+
+The current transition test chain keeps a stable Nav2 global reference and
+publishes `local_elastic_path` only when the RC-ESDF optimization changes it
+materially. `FollowElasticPath` updates the controller action from that topic
+with age, goal-compatibility, and update-rate checks. If RC-ESDF is unavailable,
+the controller remains on the stable global reference path.
+
+Global replanning is handled by the Nav2 BT only when the goal changes or
+`IsPathValid` fails. Recovery still uses the existing
+`ats_nav2_behaviors/BackUpFreeSpace` behavior server plugin; this package does
+not replace it with the upstream backup implementation.
+
 Directory layout:
 
 1. `include/trajectory_optimizer/bspline`, `src/bspline`

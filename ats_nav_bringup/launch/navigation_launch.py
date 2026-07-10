@@ -100,8 +100,8 @@ def generate_launch_description():
 
     declare_launch_trajectory_optimizer_cmd = DeclareLaunchArgument(
         "launch_trajectory_optimizer",
-        default_value="False",
-        description="Whether to start non-critical trajectory visualization optimizer node",
+        default_value="True",
+        description="Whether to start the RC-ESDF local elastic path optimizer",
     )
 
     declare_launch_chassis_vel_transform_cmd = DeclareLaunchArgument(

@@ -5,37 +5,44 @@
     <RecoveryNode name="NavigateRecovery"
                   number_of_retries="10">
       <PipelineSequence name="NavigateWithReplanning">
-        <RateController hz="1.2">
-          <Sequence name="PlanAndSmoothPath">
-            <RecoveryNode name="ComputePathThroughPoses"
-                          number_of_retries="1">
-              <ReactiveSequence>
-                <RemovePassedGoals input_goals="{goals}"
-                                   output_goals="{goals}"
-                                   radius="0.3"/>
-                <ComputePathThroughPoses goals="{goals}"
-                                         path="{path_raw}"
-                                         planner_id="GridBased"/>
+        <RateController hz="2.0">
+          <RecoveryNode name="PlanAndSmoothOnTopologyChange"
+                        number_of_retries="1">
+            <Fallback>
+              <ReactiveSequence name="KeepStableGlobalReference">
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
               </ReactiveSequence>
-              <ClearEntireCostmap name="ClearGlobalCostmap-Context"
-                                  service_name="global_costmap/clear_entirely_global_costmap"/>
-            </RecoveryNode>
-            <RecoveryNode name="SmoothPath"
-                          number_of_retries="1">
-              <SmoothPath unsmoothed_path="{path_raw}"
-                          smoothed_path="{path}"
-                          smoother_id="bspline_smoother"
-                          max_smoothing_duration="0.15"
-                          check_for_collisions="false"/>
-              <ClearEntireCostmap name="ClearGlobalCostmap-PostSmooth"
-                                  service_name="global_costmap/clear_entirely_global_costmap"/>
-            </RecoveryNode>
-          </Sequence>
+              <Sequence name="ComputeStableGlobalReference">
+                <ReactiveSequence>
+                  <RemovePassedGoals input_goals="{goals}"
+                                     output_goals="{goals}"
+                                     radius="0.3"/>
+                  <ComputePathThroughPoses goals="{goals}"
+                                           path="{path_raw}"
+                                           planner_id="GridBased"/>
+                </ReactiveSequence>
+                <SmoothPath unsmoothed_path="{path_raw}"
+                            smoothed_path="{path}"
+                            smoother_id="bspline_smoother"
+                            max_smoothing_duration="0.15"
+                            check_for_collisions="false"/>
+              </Sequence>
+            </Fallback>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context"
+                                service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
         </RateController>
         <RecoveryNode name="FollowPath"
                       number_of_retries="10">
-          <FollowPath path="{path}"
-                      controller_id="FollowPath"/>
+          <FollowElasticPath path="{path}"
+                             controller_id="FollowPath"
+                             elastic_path_topic="local_elastic_path"
+                             elastic_path_timeout_s="0.8"
+                             elastic_update_min_period_s="0.2"
+                             goal_match_distance="0.25"/>
           <ClearEntireCostmap name="ClearLocalCostmap-Context"
                               service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
