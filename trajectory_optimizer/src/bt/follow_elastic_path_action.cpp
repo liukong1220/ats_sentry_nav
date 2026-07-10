@@ -7,6 +7,7 @@
 #include <functional>
 #include <utility>
 
+#include "behaviortree_cpp_v3/action_node.h"
 #include "behaviortree_cpp_v3/bt_factory.h"
 
 namespace trajectory_optimizer
@@ -22,6 +23,99 @@ double pointDistance(
   return std::hypot(lhs.x - rhs.x, lhs.y - rhs.y);
 }
 
+double poseYaw(const geometry_msgs::msg::Pose & pose)
+{
+  const auto & q = pose.orientation;
+  return std::atan2(
+    2.0 * (q.w * q.z + q.x * q.y),
+    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+double shortestAngularDistance(double from, double to)
+{
+  return std::atan2(std::sin(to - from), std::cos(to - from));
+}
+
+// PipelineSequence can tick its follower while planning is still RUNNING. This
+// action holds that branch until the planner has produced a usable reference.
+class WaitForValidPath : public BT::ActionNodeBase
+{
+public:
+  WaitForValidPath(const std::string & name, const BT::NodeConfiguration & config)
+  : BT::ActionNodeBase(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {BT::InputPort<nav_msgs::msg::Path>("path", "Path to validate")};
+  }
+
+  BT::NodeStatus tick() override
+  {
+    return pathReady() ? BT::NodeStatus::SUCCESS : BT::NodeStatus::RUNNING;
+  }
+
+  void halt() override
+  {
+    setStatus(BT::NodeStatus::IDLE);
+  }
+
+private:
+  bool pathReady()
+  {
+    nav_msgs::msg::Path path;
+    return getInput("path", path) && path.poses.size() >= 2;
+  }
+};
+
+// Keep the global guide stable during normal tracking. Costmap noise is handled
+// by the local elastic layer; replacing the reference here repeatedly preempts
+// FollowPath and resets the controller's progress checker.
+class HasValidPath : public BT::ConditionNode
+{
+public:
+  HasValidPath(const std::string & name, const BT::NodeConfiguration & config)
+  : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {BT::InputPort<nav_msgs::msg::Path>("path", "Path to validate")};
+  }
+
+  BT::NodeStatus tick() override
+  {
+    nav_msgs::msg::Path path;
+    return getInput("path", path) && path.poses.size() >= 2 ?
+           BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+  }
+};
+
+// A recovery is an anomaly event. Clearing only the blackboard reference makes
+// the next planning tick create a new global guide without ever issuing an
+// empty FollowPath goal to controller_server.
+class ClearPath : public BT::SyncActionNode
+{
+public:
+  ClearPath(const std::string & name, const BT::NodeConfiguration & config)
+  : BT::SyncActionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {BT::OutputPort<nav_msgs::msg::Path>("path", "Path to clear")};
+  }
+
+  BT::NodeStatus tick() override
+  {
+    setOutput("path", nav_msgs::msg::Path {});
+    return BT::NodeStatus::SUCCESS;
+  }
+};
+
 }  // namespace
 
 FollowElasticPathAction::FollowElasticPathAction(
@@ -33,10 +127,12 @@ FollowElasticPathAction::FollowElasticPathAction(
   getInput("elastic_path_timeout_s", elastic_path_timeout_s_);
   getInput("elastic_update_min_period_s", elastic_update_min_period_s_);
   getInput("goal_match_distance", goal_match_distance_);
+  getInput("heading_change_threshold_rad", heading_change_threshold_rad_);
 
   elastic_path_timeout_s_ = std::max(0.05, elastic_path_timeout_s_);
   elastic_update_min_period_s_ = std::max(0.0, elastic_update_min_period_s_);
   goal_match_distance_ = std::max(0.01, goal_match_distance_);
+  heading_change_threshold_rad_ = std::max(0.01, heading_change_threshold_rad_);
 
   elastic_path_sub_ = node_->create_subscription<nav_msgs::msg::Path>(
     elastic_path_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -45,7 +141,18 @@ FollowElasticPathAction::FollowElasticPathAction(
 
 void FollowElasticPathAction::on_tick()
 {
-  getInput("path", latest_global_reference_);
+  nav_msgs::msg::Path global_reference;
+  if (!getInput("path", global_reference) || global_reference.poses.size() < 2) {
+    // BtActionNode would otherwise send an empty goal during the initial
+    // PipelineSequence tick, causing controller_server to abort FollowPath.
+    should_send_goal_ = false;
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "Waiting for a stable global reference path before sending FollowPath.");
+    return;
+  }
+
+  latest_global_reference_ = std::move(global_reference);
   getInput("controller_id", goal_.controller_id);
   getInput("goal_checker_id", goal_.goal_checker_id);
   goal_.path = latest_global_reference_;
@@ -55,8 +162,18 @@ void FollowElasticPathAction::on_tick()
 void FollowElasticPathAction::on_wait_for_result(
   std::shared_ptr<const nav2_msgs::action::FollowPath::Feedback>)
 {
+  // A FollowPath update is only valid when its action goal still has a path.
+  // Keep the last stable reference as the hard fallback through planner and
+  // smoother blackboard transitions.
+  if (!ensureUsableGoalPath()) {
+    goal_updated_ = false;
+    return;
+  }
+
   nav_msgs::msg::Path global_reference;
-  if (getInput("path", global_reference) && globalReferenceChanged(global_reference)) {
+  if (getInput("path", global_reference) && global_reference.poses.size() >= 2 &&
+    globalReferenceChanged(global_reference))
+  {
     latest_global_reference_ = global_reference;
     goal_.path = latest_global_reference_;
     applied_revision_ = 0;
@@ -119,9 +236,28 @@ bool FollowElasticPathAction::applyLatestElasticPath()
   return true;
 }
 
+bool FollowElasticPathAction::ensureUsableGoalPath()
+{
+  if (goal_.path.poses.size() >= 2) {
+    return true;
+  }
+  if (latest_global_reference_.poses.size() < 2) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "Suppressing FollowPath update because no valid reference path is available.");
+    return false;
+  }
+
+  goal_.path = latest_global_reference_;
+  RCLCPP_WARN_THROTTLE(
+    node_->get_logger(), *node_->get_clock(), 2000,
+    "Restored the stable global reference before a FollowPath update.");
+  return true;
+}
+
 bool FollowElasticPathAction::pathMatchesCurrentGoal(const nav_msgs::msg::Path & candidate) const
 {
-  if (candidate.poses.size() < 2 || latest_global_reference_.poses.empty()) {
+  if (candidate.poses.size() < 2 || latest_global_reference_.poses.size() < 2) {
     return false;
   }
   if (!candidate.header.frame_id.empty() && !latest_global_reference_.header.frame_id.empty() &&
@@ -137,13 +273,15 @@ bool FollowElasticPathAction::pathMatchesCurrentGoal(const nav_msgs::msg::Path &
 
 bool FollowElasticPathAction::globalReferenceChanged(const nav_msgs::msg::Path & candidate) const
 {
-  return pathsMateriallyDifferent(candidate, latest_global_reference_, 0.01);
+  return pathsMateriallyDifferent(
+    candidate, latest_global_reference_, 0.01, heading_change_threshold_rad_);
 }
 
 bool FollowElasticPathAction::pathsMateriallyDifferent(
   const nav_msgs::msg::Path & lhs,
   const nav_msgs::msg::Path & rhs,
-  double threshold)
+  double position_threshold,
+  double heading_threshold_rad)
 {
   if (lhs.header.frame_id != rhs.header.frame_id || lhs.poses.size() != rhs.poses.size()) {
     return true;
@@ -156,7 +294,15 @@ bool FollowElasticPathAction::pathsMateriallyDifferent(
   constexpr std::size_t kSamples = 16;
   for (std::size_t sample = 0; sample < kSamples; ++sample) {
     const std::size_t index = (last * sample) / (kSamples - 1);
-    if (pointDistance(lhs.poses[index].pose.position, rhs.poses[index].pose.position) > threshold) {
+    if (pointDistance(
+        lhs.poses[index].pose.position,
+        rhs.poses[index].pose.position) > position_threshold)
+    {
+      return true;
+    }
+    if (std::abs(shortestAngularDistance(
+        poseYaw(lhs.poses[index].pose), poseYaw(rhs.poses[index].pose))) > heading_threshold_rad)
+    {
       return true;
     }
   }
@@ -167,5 +313,8 @@ bool FollowElasticPathAction::pathsMateriallyDifferent(
 
 BT_REGISTER_NODES(factory)
 {
+  factory.registerNodeType<trajectory_optimizer::WaitForValidPath>("WaitForValidPath");
+  factory.registerNodeType<trajectory_optimizer::HasValidPath>("HasValidPath");
+  factory.registerNodeType<trajectory_optimizer::ClearPath>("ClearPath");
   factory.registerNodeType<trajectory_optimizer::FollowElasticPathAction>("FollowElasticPath");
 }

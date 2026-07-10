@@ -13,7 +13,7 @@
                 <Inverter>
                   <GlobalUpdatedGoal/>
                 </Inverter>
-                <IsPathValid path="{path}"/>
+                <HasValidPath path="{path}"/>
               </ReactiveSequence>
               <Sequence name="ComputeStableGlobalReference">
                 <ComputePathToPose goal="{goal}"
@@ -30,30 +30,36 @@
                                 service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
         </RateController>
-        <RecoveryNode name="FollowPath"
-                      number_of_retries="10">
-          <FollowElasticPath path="{path}"
-                             controller_id="FollowPath"
-                             elastic_path_topic="local_elastic_path"
-                             elastic_path_timeout_s="0.8"
-                             elastic_update_min_period_s="0.2"
-                             goal_match_distance="0.25"/>
-          <ClearEntireCostmap name="ClearLocalCostmap-Context"
-                              service_name="local_costmap/clear_entirely_local_costmap"/>
-        </RecoveryNode>
+        <ReactiveSequence name="WaitForStablePathThenFollow">
+          <WaitForValidPath path="{path}"/>
+          <RecoveryNode name="FollowPath"
+                        number_of_retries="10">
+            <FollowElasticPath path="{path}"
+                               controller_id="FollowPath"
+                               elastic_path_topic="local_elastic_path"
+                               elastic_path_timeout_s="0.8"
+                               elastic_update_min_period_s="0.2"
+                               goal_match_distance="0.25"
+                               heading_change_threshold_rad="0.10"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context"
+                                service_name="local_costmap/clear_entirely_local_costmap"/>
+          </RecoveryNode>
+        </ReactiveSequence>
       </PipelineSequence>
       <ReactiveFallback name="RecoveryFallback">
-        <GoalUpdated/>
-        <RoundRobin name="RecoveryActions">
-          <Sequence name="ClearingActions">
-            <ClearEntireCostmap name="ClearLocalCostmap-Subtree"
-                                service_name="local_costmap/clear_entirely_local_costmap"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree"
-                                service_name="global_costmap/clear_entirely_global_costmap"/>
-          </Sequence>
-          <BackUp backup_dist="0.45"
-                  backup_speed="0.25"/>
-        </RoundRobin>
+        <Sequence name="ReplanAfterNavigationAnomaly">
+          <ClearPath path="{path}"/>
+          <RoundRobin name="RecoveryActions">
+            <Sequence name="ClearingActions">
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree"
+                                  service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree"
+                                  service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <BackUp backup_dist="0.45"
+                    backup_speed="0.25"/>
+          </RoundRobin>
+        </Sequence>
       </ReactiveFallback>
     </RecoveryNode>
   </BehaviorTree>

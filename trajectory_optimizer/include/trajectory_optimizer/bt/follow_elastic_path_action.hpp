@@ -45,24 +45,30 @@ public:
           "elastic_update_min_period_s", 0.2, "Minimum controller path update period"),
         BT::InputPort<double>(
           "goal_match_distance", 0.25, "Maximum local/global goal endpoint mismatch"),
+        BT::InputPort<double>(
+          "heading_change_threshold_rad", 0.10,
+          "Minimum orientation change that updates the controller path"),
       });
   }
 
 private:
   void elasticPathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   bool applyLatestElasticPath();
+  bool ensureUsableGoalPath();
   bool pathMatchesCurrentGoal(const nav_msgs::msg::Path & candidate) const;
   bool globalReferenceChanged(const nav_msgs::msg::Path & candidate) const;
   static bool pathsMateriallyDifferent(
     const nav_msgs::msg::Path & lhs,
     const nav_msgs::msg::Path & rhs,
-    double threshold);
+    double position_threshold,
+    double heading_threshold_rad);
 
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr elastic_path_sub_;
   std::string elastic_path_topic_{"local_elastic_path"};
   double elastic_path_timeout_s_{0.8};
   double elastic_update_min_period_s_{0.2};
   double goal_match_distance_{0.25};
+  double heading_change_threshold_rad_{0.10};
   std::mutex elastic_path_mutex_;
   nav_msgs::msg::Path latest_elastic_path_;
   nav_msgs::msg::Path latest_global_reference_;

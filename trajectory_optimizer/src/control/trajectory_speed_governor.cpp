@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "std_msgs/msg/color_rgba.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -35,6 +36,18 @@ std_msgs::msg::ColorRGBA colorFromSpeedRatio(double ratio)
     0.88f);
 }
 
+double yawFromQuaternion(const geometry_msgs::msg::Quaternion & orientation)
+{
+  return std::atan2(
+    2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+    1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z));
+}
+
+double shortestAngularDistance(double from, double to)
+{
+  return std::atan2(std::sin(to - from), std::cos(to - from));
+}
+
 template<typename PublisherT>
 bool hasSubscribers(const std::shared_ptr<PublisherT> & publisher)
 {
@@ -63,6 +76,24 @@ TrajectorySpeedGovernor::TrajectorySpeedGovernor(const rclcpp::NodeOptions & opt
   declare_parameter<double>("speed_scale_filter_gain", speed_scale_filter_gain_);
   declare_parameter<double>("speed_scale_rise_rate", speed_scale_rise_rate_);
   declare_parameter<double>("speed_scale_fall_rate", speed_scale_fall_rate_);
+  declare_parameter<bool>("heading_guard_enabled", heading_guard_enabled_);
+  declare_parameter<std::string>("heading_guard_path_topic", heading_guard_path_topic_);
+  declare_parameter<std::string>(
+    "heading_guard_traversability_grid_topic", heading_guard_traversability_grid_topic_);
+  declare_parameter<std::string>("heading_guard_base_frame", heading_guard_base_frame_);
+  declare_parameter<int>(
+    "heading_guard_obstacle_value_threshold", heading_guard_obstacle_value_threshold_);
+  declare_parameter<int>(
+    "heading_guard_lethal_value_threshold", heading_guard_lethal_value_threshold_);
+  declare_parameter<bool>("heading_guard_unknown_is_obstacle", heading_guard_unknown_is_obstacle_);
+  declare_parameter<double>("heading_guard_enter_clearance_m", heading_guard_enter_clearance_m_);
+  declare_parameter<double>("heading_guard_exit_clearance_m", heading_guard_exit_clearance_m_);
+  declare_parameter<double>("heading_guard_footprint_length_m", heading_guard_footprint_length_m_);
+  declare_parameter<double>("heading_guard_footprint_width_m", heading_guard_footprint_width_m_);
+  declare_parameter<double>("heading_guard_lateral_speed_limit", heading_guard_lateral_speed_limit_);
+  declare_parameter<double>("heading_guard_stop_error_rad", heading_guard_stop_error_rad_);
+  declare_parameter<double>("heading_guard_yaw_kp", heading_guard_yaw_kp_);
+  declare_parameter<double>("heading_guard_max_angular_speed", heading_guard_max_angular_speed_);
 
   get_parameter("profile_topic", profile_topic_);
   get_parameter("input_cmd_vel_topic", input_cmd_vel_topic_);
@@ -78,6 +109,33 @@ TrajectorySpeedGovernor::TrajectorySpeedGovernor(const rclcpp::NodeOptions & opt
   get_parameter("speed_scale_filter_gain", speed_scale_filter_gain_);
   get_parameter("speed_scale_rise_rate", speed_scale_rise_rate_);
   get_parameter("speed_scale_fall_rate", speed_scale_fall_rate_);
+  get_parameter("heading_guard_enabled", heading_guard_enabled_);
+  get_parameter("heading_guard_path_topic", heading_guard_path_topic_);
+  get_parameter(
+    "heading_guard_traversability_grid_topic", heading_guard_traversability_grid_topic_);
+  get_parameter("heading_guard_base_frame", heading_guard_base_frame_);
+  get_parameter(
+    "heading_guard_obstacle_value_threshold", heading_guard_obstacle_value_threshold_);
+  get_parameter("heading_guard_lethal_value_threshold", heading_guard_lethal_value_threshold_);
+  get_parameter("heading_guard_unknown_is_obstacle", heading_guard_unknown_is_obstacle_);
+  get_parameter("heading_guard_enter_clearance_m", heading_guard_enter_clearance_m_);
+  get_parameter("heading_guard_exit_clearance_m", heading_guard_exit_clearance_m_);
+  get_parameter("heading_guard_footprint_length_m", heading_guard_footprint_length_m_);
+  get_parameter("heading_guard_footprint_width_m", heading_guard_footprint_width_m_);
+  get_parameter("heading_guard_lateral_speed_limit", heading_guard_lateral_speed_limit_);
+  get_parameter("heading_guard_stop_error_rad", heading_guard_stop_error_rad_);
+  get_parameter("heading_guard_yaw_kp", heading_guard_yaw_kp_);
+  get_parameter("heading_guard_max_angular_speed", heading_guard_max_angular_speed_);
+
+  heading_guard_enter_clearance_m_ = std::max(0.0, heading_guard_enter_clearance_m_);
+  heading_guard_exit_clearance_m_ = std::max(
+    heading_guard_enter_clearance_m_, heading_guard_exit_clearance_m_);
+  heading_guard_footprint_length_m_ = std::max(0.01, heading_guard_footprint_length_m_);
+  heading_guard_footprint_width_m_ = std::max(0.01, heading_guard_footprint_width_m_);
+  heading_guard_lateral_speed_limit_ = std::max(0.0, heading_guard_lateral_speed_limit_);
+  heading_guard_stop_error_rad_ = std::max(0.01, heading_guard_stop_error_rad_);
+  heading_guard_yaw_kp_ = std::max(0.0, heading_guard_yaw_kp_);
+  heading_guard_max_angular_speed_ = std::max(0.0, heading_guard_max_angular_speed_);
 
   profile_sub_ = create_subscription<sp_msgs::msg::TrajectoryProfileMsg>(
     profile_topic_, 10,
@@ -88,6 +146,19 @@ TrajectorySpeedGovernor::TrajectorySpeedGovernor(const rclcpp::NodeOptions & opt
   governed_cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(output_cmd_vel_topic_, 10);
   marker_pub_ =
     create_publisher<visualization_msgs::msg::MarkerArray>(marker_topic_, 10);
+  if (heading_guard_enabled_) {
+    heading_guard_esdf_ = std::make_shared<RcTraversabilityEsdfProvider>();
+    heading_guard_esdf_->configureRollingWindow(true, 0.0, 0.0);
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    heading_path_sub_ = create_subscription<nav_msgs::msg::Path>(
+      heading_guard_path_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&TrajectorySpeedGovernor::headingPathCallback, this, std::placeholders::_1));
+    heading_traversability_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      heading_guard_traversability_grid_topic_, 10,
+      std::bind(
+        &TrajectorySpeedGovernor::headingTraversabilityCallback, this, std::placeholders::_1));
+  }
   timer_ = create_wall_timer(
     std::chrono::milliseconds(50),
     std::bind(&TrajectorySpeedGovernor::publishGovernedCmd, this));
@@ -163,6 +234,32 @@ void TrajectorySpeedGovernor::cmdVelCallback(
   has_cmd_vel_ = true;
 }
 
+void TrajectorySpeedGovernor::headingPathCallback(const nav_msgs::msg::Path::SharedPtr msg)
+{
+  if (!msg || msg->poses.size() < 2 || msg->header.frame_id.empty()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(heading_guard_mutex_);
+  latest_heading_path_ = *msg;
+}
+
+void TrajectorySpeedGovernor::headingTraversabilityCallback(
+  const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+{
+  if (!msg || msg->header.frame_id.empty() || !heading_guard_esdf_) {
+    return;
+  }
+
+  heading_guard_esdf_->updateGrid(
+    *msg,
+    heading_guard_obstacle_value_threshold_,
+    heading_guard_unknown_is_obstacle_,
+    heading_guard_lethal_value_threshold_);
+  std::lock_guard<std::mutex> lock(heading_guard_mutex_);
+  heading_guard_grid_frame_ = msg->header.frame_id;
+}
+
 void TrajectorySpeedGovernor::publishGovernedCmd()
 {
   if (!has_cmd_vel_) {
@@ -205,7 +302,126 @@ void TrajectorySpeedGovernor::publishGovernedCmd()
     }
   }
 
+  applyNarrowCorridorHeadingGuard(governed);
+
   governed_cmd_pub_->publish(governed);
+}
+
+void TrajectorySpeedGovernor::applyNarrowCorridorHeadingGuard(
+  geometry_msgs::msg::Twist & governed)
+{
+  if (!heading_guard_enabled_ || !heading_guard_esdf_ || !tf_buffer_) {
+    return;
+  }
+
+  nav_msgs::msg::Path path;
+  std::string grid_frame;
+  bool previously_narrow = false;
+  {
+    std::lock_guard<std::mutex> lock(heading_guard_mutex_);
+    path = latest_heading_path_;
+    grid_frame = heading_guard_grid_frame_;
+    previously_narrow = narrow_corridor_active_;
+  }
+  if (path.poses.size() < 2 || path.header.frame_id.empty() || grid_frame.empty()) {
+    return;
+  }
+
+  try {
+    const auto base_in_path = tf_buffer_->lookupTransform(
+      path.header.frame_id, heading_guard_base_frame_, tf2::TimePointZero);
+    const auto base_in_grid = tf_buffer_->lookupTransform(
+      grid_frame, heading_guard_base_frame_, tf2::TimePointZero);
+
+    const double half_length = heading_guard_footprint_length_m_ * 0.5;
+    const double half_width = heading_guard_footprint_width_m_ * 0.5;
+    const std::vector<Eigen::Vector2d> footprint_samples {
+      {0.0, 0.0},
+      {half_length, half_width},
+      {half_length, -half_width},
+      {-half_length, half_width},
+      {-half_length, -half_width},
+    };
+    const Eigen::Vector2d base_position(
+      base_in_grid.transform.translation.x, base_in_grid.transform.translation.y);
+    const double base_yaw_in_grid = yawFromQuaternion(base_in_grid.transform.rotation);
+    const double footprint_clearance = heading_guard_esdf_->getFootprintClearance(
+      base_position, base_yaw_in_grid, footprint_samples);
+
+    bool narrow = previously_narrow;
+    if (std::isfinite(footprint_clearance)) {
+      narrow = previously_narrow ?
+        footprint_clearance < heading_guard_exit_clearance_m_ :
+        footprint_clearance <= heading_guard_enter_clearance_m_;
+    }
+    {
+      std::lock_guard<std::mutex> lock(heading_guard_mutex_);
+      narrow_corridor_active_ = narrow;
+    }
+    if (!narrow) {
+      return;
+    }
+
+    const double robot_x = base_in_path.transform.translation.x;
+    const double robot_y = base_in_path.transform.translation.y;
+    std::size_t closest_index = 0;
+    double closest_distance_squared = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < path.poses.size(); ++i) {
+      const auto & point = path.poses[i].pose.position;
+      const double dx = point.x - robot_x;
+      const double dy = point.y - robot_y;
+      const double distance_squared = dx * dx + dy * dy;
+      if (distance_squared < closest_distance_squared) {
+        closest_distance_squared = distance_squared;
+        closest_index = i;
+      }
+    }
+
+    std::size_t next_index = std::min(closest_index + 1, path.poses.size() - 1);
+    std::size_t previous_index = closest_index;
+    if (next_index == closest_index && closest_index > 0) {
+      previous_index = closest_index - 1;
+    }
+    const auto & start = path.poses[previous_index].pose.position;
+    const auto & end = path.poses[next_index].pose.position;
+    const double tangent_x = end.x - start.x;
+    const double tangent_y = end.y - start.y;
+    if (std::hypot(tangent_x, tangent_y) < 1e-3) {
+      return;
+    }
+
+    const double desired_yaw = std::atan2(tangent_y, tangent_x);
+    const double current_yaw = yawFromQuaternion(base_in_path.transform.rotation);
+    const double heading_error = shortestAngularDistance(current_yaw, desired_yaw);
+    const double abs_heading_error = std::abs(heading_error);
+    const double alignment_scale = std::max(
+      0.0, 1.0 - abs_heading_error / heading_guard_stop_error_rad_);
+
+    // A narrow corridor permits only body-forward motion. The controller still
+    // chooses its global trajectory; this layer enforces the chassis envelope.
+    governed.linear.x = std::max(0.0, governed.linear.x) * alignment_scale;
+    governed.linear.y = std::max(
+      -heading_guard_lateral_speed_limit_,
+      std::min(heading_guard_lateral_speed_limit_, governed.linear.y));
+    if (abs_heading_error >= heading_guard_stop_error_rad_) {
+      governed.linear.x = 0.0;
+      governed.linear.y = 0.0;
+    }
+    const double corrected_angular_speed =
+      governed.angular.z + heading_guard_yaw_kp_ * heading_error;
+    governed.angular.z = std::max(
+      -heading_guard_max_angular_speed_,
+      std::min(heading_guard_max_angular_speed_, corrected_angular_speed));
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Narrow-corridor heading guard: clearance=%.3fm yaw_error=%.3frad forward_scale=%.2f",
+      footprint_clearance, heading_error, alignment_scale);
+  } catch (const tf2::TransformException & ex) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Narrow-corridor heading guard is waiting for TF: %s", ex.what());
+  }
 }
 
 void TrajectorySpeedGovernor::publishProfileMarkers(

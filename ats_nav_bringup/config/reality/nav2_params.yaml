@@ -477,8 +477,10 @@ controller_server:
     controller_plugins: ["FollowPath"]
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.25
-      movement_time_allowance: 6.0
+      # Allow strict body-forward alignment to complete before declaring the
+      # vehicle stalled; genuine failures still enter the custom recovery path.
+      required_movement_radius: 0.15
+      movement_time_allowance: 15.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -1052,6 +1054,23 @@ trajectory_speed_governor:
     speed_scale_filter_gain: 0.22
     speed_scale_rise_rate: 4.0
     speed_scale_fall_rate: 1.8
+    # 四驱四转底盘在开阔区域保持全向；只有完整足迹的 RC-ESDF 净空不足时，
+    # 才收束为车头朝路径切线的前向穿越，避免窄通道横移/倒车擦碰。
+    heading_guard_enabled: true
+    heading_guard_path_topic: "local_elastic_path"
+    heading_guard_traversability_grid_topic: "traversability_grid"
+    heading_guard_base_frame: "gimbal_yaw_odom"
+    heading_guard_obstacle_value_threshold: 50
+    heading_guard_lethal_value_threshold: 90
+    heading_guard_unknown_is_obstacle: false
+    heading_guard_enter_clearance_m: 0.20
+    heading_guard_exit_clearance_m: 0.30
+    heading_guard_footprint_length_m: 0.60
+    heading_guard_footprint_width_m: 0.50
+    heading_guard_lateral_speed_limit: 0.0
+    heading_guard_stop_error_rad: 0.22
+    heading_guard_yaw_kp: 2.5
+    heading_guard_max_angular_speed: 1.50
 
 velocity_smoother:
   ros__parameters:
