@@ -823,8 +823,8 @@ behavior_server:
     # params for ats_nav2_behaviors/BackUpFreeSpace
     service_name: "global_costmap/get_costmap"
     max_radius: 2.0
-    # 仿真里也保持与实车一致的膨胀层过滤逻辑，避免恢复动作贴着高 cost 边界乱试探。
-    max_allowed_cost: 96
+    # 恢复动作允许从膨胀层向外退出，但仍拒绝 253/254 障碍栅格。
+    max_allowed_cost: 252
     # 以下参数语义与 reality 配置一致，便于仿真和实车联调同一套恢复行为。
     search_half_span_deg: 140.0
     search_angle_increment_deg: 10.0

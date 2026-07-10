@@ -5,13 +5,6 @@
     <RecoveryNode name="NavigateRecovery"
                   number_of_retries="10">
       <PipelineSequence name="NavigateWithReplanning">
-        <Inverter>
-          <IsStuckInInflation costmap_topic="local_costmap/costmap_raw"
-                              odom_topic="odometry"
-                              inflation_cost_threshold="128"
-                              movement_radius="0.06"
-                              stuck_time_s="3.0"/>
-        </Inverter>
         <RateController hz="2.0">
           <RecoveryNode name="PlanAndSmoothOnTopologyChange"
                         number_of_retries="1">
@@ -38,6 +31,15 @@
           </RecoveryNode>
         </RateController>
         <ReactiveSequence name="WaitForStablePathThenFollow">
+          <Inverter>
+            <IsStuckInInflation costmap_topic="local_costmap/costmap_raw"
+                                odom_topic="odometry"
+                                inflation_cost_threshold="128"
+                                footprint_radius="0.42"
+                                movement_radius="0.10"
+                                rotation_progress_rad="0.18"
+                                stuck_time_s="3.0"/>
+          </Inverter>
           <WaitForValidPath path="{path}"/>
           <FollowElasticPath path="{path}"
                              controller_id="FollowPath"

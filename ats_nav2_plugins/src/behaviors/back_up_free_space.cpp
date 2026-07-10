@@ -32,11 +32,26 @@ const char * planSourceName(ats_nav2_behaviors::BackUpFreeSpace::PlanSource sour
 {
   switch (source) {
     case ats_nav2_behaviors::BackUpFreeSpace::PlanSource::CORRIDOR_PRIMARY:
-      return "corridor";
+      return "走廊搜索";
     case ats_nav2_behaviors::BackUpFreeSpace::PlanSource::CENTROID_FALLBACK:
-      return "centroid_fallback";
+      return "自由空间重心";
     default:
-      return "unknown";
+      return "未知";
+  }
+}
+
+const char * executionStateName(
+  ats_nav2_behaviors::BackUpFreeSpace::RecoveryExecutionState state)
+{
+  switch (state) {
+    case ats_nav2_behaviors::BackUpFreeSpace::RecoveryExecutionState::PLANNING:
+      return "规划中";
+    case ats_nav2_behaviors::BackUpFreeSpace::RecoveryExecutionState::EXECUTING:
+      return "执行中";
+    case ats_nav2_behaviors::BackUpFreeSpace::RecoveryExecutionState::BLOCKED:
+      return "前方受阻";
+    default:
+      return "未知";
   }
 }
 
@@ -174,7 +189,7 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
 {
   if (!nav2_util::getCurrentPose(
         initial_pose_, *tf_, global_frame_, robot_base_frame_, transform_tolerance_)) {
-    RCLCPP_ERROR(logger_, "Initial robot pose is not available.");
+    RCLCPP_ERROR(logger_, "[自研Backup] 无法获取机器人初始位姿，脱困终止。");
     return nav2_behaviors::Status::FAILED;
   }
 
@@ -187,6 +202,11 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
   command_speed_abs_ = std::fabs(command->speed);
   command_x_ = command->target.x;
   command_time_allowance_ = command->time_allowance;
+  RCLCPP_WARN(
+    logger_,
+    "[自研Backup] 收到脱困请求：目标距离=%.2f 米，最大速度=%.2f 米/秒，"
+    "允许时间=%.1f 秒；开始搜索可通行区域。",
+    command_distance_abs_, command_speed_abs_, command_time_allowance_.seconds());
   end_time_ = clock_->now() + command_time_allowance_;
   plan_start_pose_ = initial_pose_;
   completed_distance_before_plan_ = 0.0;
@@ -209,14 +229,14 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
     {
       RCLCPP_WARN(
         logger_,
-        "No smooth omni recovery trajectory found within %.2fm around the robot.",
+        "[自研Backup] 脱困规划失败：机器人周围 %.2f 米内没有满足完整车体宽度的通道。",
         command_distance_abs_);
       return nav2_behaviors::Status::FAILED;
     }
     active_plan_source_ = PlanSource::CENTROID_FALLBACK;
     RCLCPP_WARN(
       logger_,
-      "Fallback to centroid-based recovery heading %.2fdeg.",
+      "[自研Backup] 主走廊搜索失败，切换自由空间重心方向：%.1f 度。",
       active_plan_.heading * 180.0 / M_PI);
   } else {
     active_plan_source_ = PlanSource::CORRIDOR_PRIMARY;
@@ -233,7 +253,8 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
   }
   RCLCPP_WARN(
     logger_,
-    "Start omni recovery: source=%s distance=%.2f heading=%.2fdeg score=%.2f avg_cost=%.2f",
+    "[自研Backup] 脱困轨迹已生成，开始执行：来源=%s，距离=%.2f 米，"
+    "地图方向=%.1f 度，评分=%.2f，平均代价=%.2f。",
     planSourceName(active_plan_source_),
     active_plan_.distance, active_plan_.heading * 180.0 / M_PI, active_plan_.score,
     active_plan_average_cost_);
@@ -248,15 +269,14 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
     stopRobot();
     RCLCPP_WARN(
       logger_,
-      "Exceeded time allowance before reaching the "
-      "DriveOnHeading goal - Exiting DriveOnHeading");
+      "[自研Backup] 脱困执行超时，未在允许时间内到达自由区域。");
     return nav2_behaviors::Status::FAILED;
   }
 
   geometry_msgs::msg::PoseStamped current_pose;
   if (!nav2_util::getCurrentPose(
         current_pose, *tf_, global_frame_, robot_base_frame_, transform_tolerance_)) {
-      RCLCPP_ERROR(logger_, "Current robot pose is not available.");
+      RCLCPP_ERROR(logger_, "[自研Backup] 执行期间无法获取机器人位姿，脱困终止。");
       return nav2_behaviors::Status::FAILED;
   }
 
@@ -275,8 +295,16 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
 
   if (remaining_distance <= goal_tolerance_) {
     stopRobot();
+    RCLCPP_WARN(
+      logger_, "[自研Backup] 脱困成功：累计移动 %.2f 米，车辆已到达选定自由区域。",
+      total_distance_traveled);
     return nav2_behaviors::Status::SUCCEEDED;
   }
+
+  RCLCPP_WARN_THROTTLE(
+    logger_, *clock_, 1000,
+    "[自研Backup] 正在执行：状态=%s，已移动=%.2f 米，剩余=%.2f 米。",
+    executionStateName(execution_state_), total_distance_traveled, remaining_distance);
 
   // 关键优化 1：
   // 不再采用“移动一个很小步长后立刻判一次”的离散方式，
@@ -325,8 +353,8 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
   if (!trajectory_prefix_safe) {
     RCLCPP_WARN_THROTTLE(
       logger_, *clock_, 1000,
-      "Recovery prefix unsafe: safe=%.3fm required=%.3fm predicted=%.3fm "
-      "predicted_required=%.3fm rate=%.3fm/s remaining=%.3fm.",
+      "[自研Backup] 当前恢复方向受阻：安全前缀=%.3f 米，要求=%.3f 米，"
+      "预测前缀=%.3f 米，预测要求=%.3f 米，变化率=%.3f 米/秒，剩余=%.3f 米。",
       safe_prefix_distance, required_prefix, predicted_safe_prefix,
       predicted_required_prefix, estimated_prefix_rate_, remaining_distance);
   }
@@ -346,7 +374,7 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
     execution_state_ = RecoveryExecutionState::BLOCKED;
     RCLCPP_WARN(
       logger_,
-      "Recovery trajectory blocked for %d consecutive cycles, enter BLOCKED state.",
+      "[自研Backup] 恢复轨迹连续 %d 个周期受阻，停车并准备重新搜索自由区域。",
       blocked_cycles_);
   } else if (
     execution_state_ == RecoveryExecutionState::BLOCKED &&
@@ -355,7 +383,7 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
     execution_state_ = RecoveryExecutionState::EXECUTING;
     RCLCPP_INFO(
       logger_,
-      "Recovery trajectory stayed clear for %d cycles, exit BLOCKED state.",
+      "[自研Backup] 恢复轨迹已连续 %d 个周期恢复畅通，继续执行。",
       clear_cycles_);
   }
 
@@ -379,11 +407,11 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
       last_replan_time_ = now;
       RCLCPP_WARN(
         logger_,
-        "Recovery replan failed %d/%d times.",
+        "[自研Backup] 第 %d/%d 次重新搜索自由区域失败。",
         failed_replan_attempts_, max_replan_attempts_);
       if (failed_replan_attempts_ >= max_replan_attempts_) {
         stopRobot();
-        RCLCPP_WARN(logger_, "Recovery failed after repeated replanning attempts.");
+        RCLCPP_WARN(logger_, "[自研Backup] 连续重新规划失败，脱困动作终止。");
         return nav2_behaviors::Status::FAILED;
       }
     }
@@ -412,16 +440,16 @@ bool BackUpFreeSpace::fetchCostmap(nav2_msgs::msg::Costmap & costmap)
   // 这样每次 onRun / replan 都能基于最新障碍状态重新做局部规划。
   while (!costmap_client_->wait_for_service(std::chrono::seconds(1))) {
     if (!rclcpp::ok()) {
-      RCLCPP_ERROR(logger_, "Interrupted while waiting for the costmap service.");
+      RCLCPP_ERROR(logger_, "[自研Backup] 等待代价地图服务时被中断。");
       return false;
     }
-    RCLCPP_WARN(logger_, "Recovery costmap service not available, waiting again...");
+    RCLCPP_WARN(logger_, "[自研Backup] 代价地图服务暂不可用，继续等待。");
   }
 
   auto request = std::make_shared<nav2_msgs::srv::GetCostmap::Request>();
   auto result = costmap_client_->async_send_request(request);
   if (result.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
-    RCLCPP_ERROR(logger_, "Timeout while waiting for recovery costmap response.");
+    RCLCPP_ERROR(logger_, "[自研Backup] 获取代价地图超时，无法规划脱困方向。");
     return false;
   }
 
@@ -875,9 +903,10 @@ bool BackUpFreeSpace::replanFromCurrentPose(
   previous_plan_heading_ = active_plan_.heading;
   has_previous_plan_heading_ = true;
   last_replan_time_ = clock_->now();
-  RCLCPP_INFO(
+  RCLCPP_WARN(
     logger_,
-    "Recovery replanned: source=%s remaining_total=%.2f released_segment=%.2f heading=%.2fdeg score=%.2f avg_cost=%.2f",
+    "[自研Backup] 已重新找到脱困方向：来源=%s，剩余总距离=%.2f 米，"
+    "本段放行=%.2f 米，地图方向=%.1f 度，评分=%.2f，平均代价=%.2f。",
     planSourceName(active_plan_source_),
     remaining_total_distance, active_plan_.distance,
     active_plan_.heading * 180.0 / M_PI, active_plan_.score, active_plan_average_cost_);
