@@ -573,8 +573,8 @@ controller_server:
         # Parameter `PathAlignCritic.cost_weight`
         # 惩罚 rollout 偏离局部路径中心线。权重调大=数值调大，会更强制贴线；
         # 但转角、障碍边缘和终段更容易僵硬、来回修正。
-        # 全向底盘提高中心线权重，优先消除横向偏差。
-        cost_weight: 20.0
+        # 这里回调到更柔和的基线，减少角点处被旧路径强拉扯。
+        cost_weight: 10.0
         # Parameter `PathAlignCritic.threshold_to_consider`
         # 距目标小于该值时 PathAlign 关闭，让终段交给 GoalCritic。
         # 调大=更早放弃强制贴线；调小=更晚才退出，终点附近仍会被路径拉住。
@@ -582,7 +582,7 @@ controller_server:
         # Parameter `PathAlignCritic.offset_from_furthest`
         # 从当前 rollout 已到达的最远路径点继续向前偏移多少个 path point 作为对齐范围。
         # 调大=看得更远、速度感更强，但更容易在弯口 shortcut；调小=更保守。
-        offset_from_furthest: 3
+        offset_from_furthest: 5
         trajectory_point_step: 4
         max_path_occupancy_ratio: 0.05
         use_path_orientations: false
@@ -592,14 +592,14 @@ controller_server:
         # Parameter `PathFollowCritic.cost_weight`
         # 鼓励轨迹末端追向路径前方的 follow 点，比 PathAlign 更柔和。
         # 权重调大=数值调大，会更积极沿路径推进；过大可能在转角抄近道。
-        cost_weight: 12.0
+        cost_weight: 7.0
         # Parameter `PathFollowCritic.threshold_to_consider`
         # 距目标小于该值时 PathFollow 关闭，避免终点附近继续“往前推”。
         # 调大=更早退出推进项；调小=更接近终点仍保持推进。
         threshold_to_consider: 1.4
         # Parameter `PathFollowCritic.offset_from_furthest`
         # 越大越倾向追逐更远的 follow 点，速度会快，但转角更容易 shortcut。
-        offset_from_furthest: 3
+        offset_from_furthest: 4
       PathAngleCritic:
         enabled: true
         cost_power: 1
@@ -617,9 +617,8 @@ controller_server:
         # Parameter `PathAngleCritic.max_angle_to_furthest`
         # 越小越严格。太小会拐角发僵，太大则更容易横漂或反向抽动。
         max_angle_to_furthest: 0.85
-        # 开阔区允许 Omni MPPI 用横向速度回到中心线；窄通道由 RC-ESDF
-        # heading guard 单独禁止横移和倒车，并强制车头沿通道方向。
-        forward_preference: false
+        # fake gimbal yaw 需要稳定的前向参考，避免巡航时路径朝向被反向采样打散。
+        forward_preference: true
       GoalCritic:
         enabled: true
         cost_power: 1
@@ -982,8 +981,8 @@ behavior_server:
     far_sample_step: 0.08
     # 近采样和远采样的切换距离。
     layered_sampling_split_distance: 0.40
-    # 覆盖 0.60 x 0.50m 车体与 0.02m 足迹 padding，禁止中心线假通道。
-    corridor_half_width: 0.32
+    # 恢复轨迹走廊半宽，等价于给底盘留出的横向安全裕量。调大后更保守。
+    corridor_half_width: 0.18
     # 近距离走廊横向采样间距。越小越严谨，越大越省算力。
     corridor_lateral_step: 0.06
     # 远距离走廊横向采样可适当更稀疏，进一步减少计算量。

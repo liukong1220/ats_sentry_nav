@@ -5,14 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
-#include <mutex>
-#include <optional>
 #include <utility>
 
 #include "behaviortree_cpp_v3/action_node.h"
 #include "behaviortree_cpp_v3/bt_factory.h"
-#include "nav2_msgs/msg/costmap.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 
 namespace trajectory_optimizer
 {
@@ -118,159 +114,6 @@ public:
     setOutput("path", nav_msgs::msg::Path {});
     return BT::NodeStatus::SUCCESS;
   }
-};
-
-// An inflated cell alone is not a recovery event: following a safe path often
-// crosses the inflation halo. It becomes an anomaly only when the robot stays
-// in that halo without making measurable translational progress.
-class IsStuckInInflation : public BT::ConditionNode
-{
-public:
-  IsStuckInInflation(const std::string & name, const BT::NodeConfiguration & config)
-  : BT::ConditionNode(name, config)
-  {
-    getInput("costmap_topic", costmap_topic_);
-    getInput("odom_topic", odom_topic_);
-    getInput("inflation_cost_threshold", inflation_cost_threshold_);
-    getInput("movement_radius", movement_radius_);
-    getInput("stuck_time_s", stuck_time_s_);
-
-    inflation_cost_threshold_ = std::clamp(inflation_cost_threshold_, 1, 252);
-    movement_radius_ = std::max(0.01, movement_radius_);
-    stuck_time_s_ = std::max(0.1, stuck_time_s_);
-
-    auto node = config.blackboard->template get<rclcpp::Node::SharedPtr>("node");
-    costmap_sub_ = node->create_subscription<nav2_msgs::msg::Costmap>(
-      costmap_topic_, rclcpp::QoS(1).reliable(),
-      std::bind(&IsStuckInInflation::costmapCallback, this, std::placeholders::_1));
-    odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
-      odom_topic_, rclcpp::QoS(10),
-      std::bind(&IsStuckInInflation::odomCallback, this, std::placeholders::_1));
-    clock_ = node->get_clock();
-    logger_ = node->get_logger();
-  }
-
-  static BT::PortsList providedPorts()
-  {
-    return {
-      BT::InputPort<std::string>("costmap_topic", "local_costmap/costmap_raw"),
-      BT::InputPort<std::string>("odom_topic", "odometry"),
-      BT::InputPort<int>("inflation_cost_threshold", 128, "Minimum inflation cost"),
-      BT::InputPort<double>("movement_radius", 0.06, "Minimum progress distance"),
-      BT::InputPort<double>("stuck_time_s", 3.0, "Stall detection duration"),
-    };
-  }
-
-  BT::NodeStatus tick() override
-  {
-    nav2_msgs::msg::Costmap costmap;
-    nav_msgs::msg::Odometry odom;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!latest_costmap_ || !latest_odom_) {
-        return BT::NodeStatus::FAILURE;
-      }
-      costmap = *latest_costmap_;
-      odom = *latest_odom_;
-    }
-
-    const auto & metadata = costmap.metadata;
-    if (metadata.resolution <= 0.0 || metadata.size_x == 0 || metadata.size_y == 0 ||
-      costmap.data.empty() ||
-      (!costmap.header.frame_id.empty() && !odom.header.frame_id.empty() &&
-      costmap.header.frame_id != odom.header.frame_id))
-    {
-      reset();
-      return BT::NodeStatus::FAILURE;
-    }
-
-    const double x = odom.pose.pose.position.x;
-    const double y = odom.pose.pose.position.y;
-    const int map_x = static_cast<int>(std::floor(
-      (x - metadata.origin.position.x) / metadata.resolution));
-    const int map_y = static_cast<int>(std::floor(
-      (y - metadata.origin.position.y) / metadata.resolution));
-    if (map_x < 0 || map_y < 0 || map_x >= static_cast<int>(metadata.size_x) ||
-      map_y >= static_cast<int>(metadata.size_y))
-    {
-      reset();
-      return BT::NodeStatus::FAILURE;
-    }
-
-    const auto index = static_cast<std::size_t>(map_y) * metadata.size_x +
-      static_cast<std::size_t>(map_x);
-    if (index >= costmap.data.size()) {
-      reset();
-      return BT::NodeStatus::FAILURE;
-    }
-
-    const int cost = static_cast<unsigned char>(costmap.data[index]);
-    if (cost < inflation_cost_threshold_ || cost >= 253) {
-      reset();
-      return BT::NodeStatus::FAILURE;
-    }
-
-    const auto now = clock_->now();
-    if (!inflation_anchor_) {
-      inflation_anchor_ = geometry_msgs::msg::Point {};
-      inflation_anchor_->x = x;
-      inflation_anchor_->y = y;
-      anchor_time_ = now;
-      return BT::NodeStatus::FAILURE;
-    }
-
-    const double moved = std::hypot(
-      x - inflation_anchor_->x, y - inflation_anchor_->y);
-    if (moved >= movement_radius_) {
-      inflation_anchor_->x = x;
-      inflation_anchor_->y = y;
-      anchor_time_ = now;
-      return BT::NodeStatus::FAILURE;
-    }
-
-    if ((now - anchor_time_).seconds() < stuck_time_s_) {
-      return BT::NodeStatus::FAILURE;
-    }
-
-    RCLCPP_WARN_THROTTLE(
-      logger_, *clock_, 1000,
-      "Inflation-stall detected: center_cost=%d moved=%.3fm in %.2fs; request omni backup.",
-      cost, moved, (now - anchor_time_).seconds());
-    return BT::NodeStatus::SUCCESS;
-  }
-
-private:
-  void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_costmap_ = msg;
-  }
-
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_odom_ = msg;
-  }
-
-  void reset()
-  {
-    inflation_anchor_.reset();
-  }
-
-  std::string costmap_topic_{"local_costmap/costmap_raw"};
-  std::string odom_topic_{"odometry"};
-  int inflation_cost_threshold_{128};
-  double movement_radius_{0.06};
-  double stuck_time_s_{3.0};
-  std::mutex mutex_;
-  rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  nav2_msgs::msg::Costmap::SharedPtr latest_costmap_;
-  nav_msgs::msg::Odometry::SharedPtr latest_odom_;
-  std::optional<geometry_msgs::msg::Point> inflation_anchor_;
-  rclcpp::Time anchor_time_{0, 0, RCL_ROS_TIME};
-  rclcpp::Clock::SharedPtr clock_;
-  rclcpp::Logger logger_{rclcpp::get_logger("IsStuckInInflation")};
 };
 
 }  // namespace
@@ -473,6 +316,5 @@ BT_REGISTER_NODES(factory)
   factory.registerNodeType<trajectory_optimizer::WaitForValidPath>("WaitForValidPath");
   factory.registerNodeType<trajectory_optimizer::HasValidPath>("HasValidPath");
   factory.registerNodeType<trajectory_optimizer::ClearPath>("ClearPath");
-  factory.registerNodeType<trajectory_optimizer::IsStuckInInflation>("IsStuckInInflation");
   factory.registerNodeType<trajectory_optimizer::FollowElasticPathAction>("FollowElasticPath");
 }

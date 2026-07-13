@@ -107,12 +107,6 @@ protected:
   bool evaluateCandidateTrajectory(
     const nav2_msgs::msg::Costmap & costmap, const geometry_msgs::msg::Pose2D & pose,
     double heading, double target_distance, EscapePlan & candidate) const;
-  // Uses exactly the same cost / corridor semantics for planning and execution.
-  // Mixing the global planning snapshot with Nav2's separate local collision checker
-  // can otherwise reject the selected escape trajectory immediately in an inflation halo.
-  bool isCorridorCrossSectionSafe(
-    const nav2_msgs::msg::Costmap & costmap, double x, double y, double heading,
-    double lateral_step) const;
   // 采样局部 costmap 指定位置的代价值。
   // 返回空表示超出地图范围，这类候选方向会直接判为不可用。
   std::optional<unsigned char> sampleCost(
@@ -123,17 +117,15 @@ protected:
   // 这是第二阶段“动态障碍简单速度预测”的观测量基础。
   double computeSafePrefixDistance(
     const geometry_msgs::msg::Pose2D & pose, double remaining_distance) const;
-  // 执行前缀检测使用的有效纵向采样步长。
-  double computePrefixSampleStep() const;
-  // 把连续前视距离转换为离散采样能够实际证明安全的距离。
-  double computeRequiredSafePrefixDistance(double remaining_distance) const;
+  // 执行阶段对当前恢复轨迹的前缀做连续前视检测。
+  // 这一步用于判断“当前轨迹前方一小段是否仍可走”，而不是只看眼前一个离散点。
+  bool isTrajectoryPrefixSafe(const geometry_msgs::msg::Pose2D & pose, double remaining_distance);
   // 计算机器人当前已经沿当前恢复主方向走了多远。
   // 这里使用对恢复方向的投影距离，而不是简单欧式距离，避免全向侧移时进度判断失真。
   double computeSegmentProgress(const geometry_msgs::msg::Pose2D & pose) const;
   // 根据剩余距离构造期望速度。
   // 会结合制动距离自动减速，避免冲过恢复终点。
-  geometry_msgs::msg::Twist buildDesiredCommand(
-    double remaining_distance, double robot_yaw) const;
+  geometry_msgs::msg::Twist buildDesiredCommand(double remaining_distance) const;
   // 对期望速度做一阶低通和平移加减速限幅。
   // 这是保护舵轮电机、降低底盘高频抖动的关键环节。
   geometry_msgs::msg::Twist smoothCommand(
@@ -153,8 +145,6 @@ protected:
   geometry_msgs::msg::Twist filtered_cmd_;
   geometry_msgs::msg::PoseStamped plan_start_pose_;
   EscapePlan active_plan_;
-  nav2_msgs::msg::Costmap active_costmap_;
-  bool has_active_costmap_ = false;
   RecoveryExecutionState execution_state_ = RecoveryExecutionState::PLANNING;
   std::optional<rclcpp::Time> last_cycle_time_;
   std::optional<rclcpp::Time> last_replan_time_;

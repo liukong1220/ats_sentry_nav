@@ -223,8 +223,6 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
   }
 
   active_plan_average_cost_ = computePlanAverageCost(costmap, active_plan_);
-  active_costmap_ = costmap;
-  has_active_costmap_ = true;
   previous_plan_heading_ = active_plan_.heading;
   has_previous_plan_heading_ = true;
   execution_state_ = RecoveryExecutionState::EXECUTING;
@@ -283,9 +281,7 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
   // 而是对当前恢复轨迹前向一段 lookahead 做批量采样检测。
   // 这样既能更早发现动态遮挡，也能避免每拍都因为单个采样点抖动而切状态。
   const double safe_prefix_distance = computeSafePrefixDistance(current_pose_2d, remaining_distance);
-  const double required_prefix = computeRequiredSafePrefixDistance(remaining_distance);
-  constexpr double kDistanceEpsilon = 1e-6;
-  bool trajectory_prefix_safe = safe_prefix_distance + kDistanceEpsilon >= required_prefix;
+  bool trajectory_prefix_safe = safe_prefix_distance >= std::min(monitor_lookahead_distance_, remaining_distance);
 
   // 第二阶段优化：
   // 不只看“当前这一拍前方还能不能走”，还估计这个安全前缀是否在快速缩短。
@@ -301,34 +297,18 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
   }
   last_safe_prefix_distance_ = safe_prefix_distance;
 
-  const double predicted_safe_prefix = std::max(
-    0.0, safe_prefix_distance +
-    estimated_prefix_rate_ * std::max(0.0, prediction_horizon_s_));
-  const double predicted_required_prefix = std::max(
-    0.0, required_prefix - std::max(0.0, predictive_block_margin_));
-  // When the goal is inside the lookahead window, the safe prefix naturally
-  // shrinks with remaining distance. Do not interpret that expected shrinkage
-  // as an obstacle approaching the robot.
-  const bool has_full_prediction_window =
-    remaining_distance + kDistanceEpsilon >= monitor_lookahead_distance_;
-  if (dynamic_obstacle_prediction_enabled_ && has_full_prediction_window) {
-    if (predicted_safe_prefix + kDistanceEpsilon < predicted_required_prefix) {
+  if (dynamic_obstacle_prediction_enabled_) {
+    const double predicted_safe_prefix =
+      safe_prefix_distance + estimated_prefix_rate_ * std::max(0.0, prediction_horizon_s_);
+    const double required_prefix =
+      std::min(monitor_lookahead_distance_, remaining_distance) - predictive_block_margin_;
+    if (predicted_safe_prefix < required_prefix) {
       trajectory_prefix_safe = false;
       RCLCPP_DEBUG_THROTTLE(
         logger_, *clock_, 1000,
         "Predictive recovery block: current_prefix=%.2f predicted_prefix=%.2f prefix_rate=%.2f required_prefix=%.2f",
-        safe_prefix_distance, predicted_safe_prefix, estimated_prefix_rate_,
-        predicted_required_prefix);
+        safe_prefix_distance, predicted_safe_prefix, estimated_prefix_rate_, required_prefix);
     }
-  }
-
-  if (!trajectory_prefix_safe) {
-    RCLCPP_WARN_THROTTLE(
-      logger_, *clock_, 1000,
-      "Recovery prefix unsafe: safe=%.3fm required=%.3fm predicted=%.3fm "
-      "predicted_required=%.3fm rate=%.3fm/s remaining=%.3fm.",
-      safe_prefix_distance, required_prefix, predicted_safe_prefix,
-      predicted_required_prefix, estimated_prefix_rate_, remaining_distance);
   }
 
   if (trajectory_prefix_safe) {
@@ -391,7 +371,7 @@ nav2_behaviors::Status BackUpFreeSpace::onCycleUpdate()
 
   geometry_msgs::msg::Twist desired_cmd;
   if (execution_state_ == RecoveryExecutionState::EXECUTING) {
-    desired_cmd = buildDesiredCommand(remaining_distance, current_pose_2d.theta);
+    desired_cmd = buildDesiredCommand(remaining_distance);
   } else {
     desired_cmd = geometry_msgs::msg::Twist {};
   }
@@ -573,20 +553,24 @@ bool BackUpFreeSpace::evaluateCandidateTrajectory(
     center_point.y = pose.y + s * std::sin(heading);
     center_point.z = 0.0;
 
-    const bool current_ring_safe = isCorridorCrossSectionSafe(
-      costmap, center_point.x, center_point.y, heading, lateral_step);
-    if (current_ring_safe) {
-      for (
-        double offset = -corridor_half_width_; offset <= corridor_half_width_ + 1e-6;
-        offset += lateral_step)
-      {
-        const double sample_x = center_point.x + nx * offset;
-        const double sample_y = center_point.y + ny * offset;
-        const auto cost = sampleCost(costmap, sample_x, sample_y);
-        // The previous cross-section validation guarantees this is present and allowed.
-        accumulated_cost += static_cast<double>(*cost);
-        sampled_cells++;
+    bool current_ring_safe = true;
+    for (
+      double offset = -corridor_half_width_; offset <= corridor_half_width_ + 1e-6;
+      offset += lateral_step)
+    {
+      const double sample_x = center_point.x + nx * offset;
+      const double sample_y = center_point.y + ny * offset;
+      const auto cost = sampleCost(costmap, sample_x, sample_y);
+      if (!cost.has_value()) {
+        current_ring_safe = false;
+        break;
       }
+      if (*cost >= kInscribedObstacleCost || static_cast<int>(*cost) > max_allowed_cost_) {
+        current_ring_safe = false;
+        break;
+      }
+      accumulated_cost += static_cast<double>(*cost);
+      sampled_cells++;
     }
 
     if (!current_ring_safe) {
@@ -620,26 +604,6 @@ bool BackUpFreeSpace::evaluateCandidateTrajectory(
   const double heading_stickiness =
     has_previous_plan_heading_ ? std::abs(normalizeAngle(heading - previous_plan_heading_)) : 0.0;
   candidate.score = average_cost + rear_bias * 8.0 + heading_stickiness * heading_stickiness_weight_;
-  return true;
-}
-
-bool BackUpFreeSpace::isCorridorCrossSectionSafe(
-  const nav2_msgs::msg::Costmap & costmap, double x, double y, double heading,
-  double lateral_step) const
-{
-  const double nx = -std::sin(heading);
-  const double ny = std::cos(heading);
-  for (
-    double offset = -corridor_half_width_; offset <= corridor_half_width_ + 1e-6;
-    offset += lateral_step)
-  {
-    const auto cost = sampleCost(costmap, x + nx * offset, y + ny * offset);
-    if (!cost.has_value() || *cost >= kInscribedObstacleCost ||
-      static_cast<int>(*cost) > max_allowed_cost_)
-    {
-      return false;
-    }
-  }
   return true;
 }
 
@@ -689,53 +653,41 @@ double BackUpFreeSpace::computePlanAverageCost(
   return sampled_points > 0 ? accumulated_cost / static_cast<double>(sampled_points) : 0.0;
 }
 
+bool BackUpFreeSpace::isTrajectoryPrefixSafe(
+  const geometry_msgs::msg::Pose2D & pose, double remaining_distance)
+{
+  const double safe_prefix_distance = computeSafePrefixDistance(pose, remaining_distance);
+  return safe_prefix_distance >= std::min(monitor_lookahead_distance_, remaining_distance);
+}
+
 double BackUpFreeSpace::computeSafePrefixDistance(
   const geometry_msgs::msg::Pose2D & pose, double remaining_distance) const
 {
-  if (!active_plan_.valid || !has_active_costmap_) {
+  if (!active_plan_.valid) {
     return 0.0;
   }
 
   const double check_distance = std::min(monitor_lookahead_distance_, remaining_distance);
-  const double step = computePrefixSampleStep();
-  const double lateral_step = std::max(
-    corridor_lateral_step_, static_cast<double>(active_costmap_.metadata.resolution));
+  const double step = std::max(near_sample_step_ > 0.0 ? near_sample_step_ : trajectory_sample_step_, 0.03);
+  bool fetch_data = true;
   double safe_prefix_distance = 0.0;
 
-  // Reuse the same global snapshot and corridor threshold that selected the
-  // plan. The base DriveOnHeading collision checker consumes a different local
-  // costmap and would reject a valid global escape plan when the robot starts
-  // inside its own inflation halo.
+  // 这里只监控“当前轨迹前方一小段距离”的安全性，而不是整条剩余路径都重新扫一遍。
+  // 原因：
+  // 1. 对动态障碍，当前最重要的是眼前一小段是否还能继续走
+  // 2. 这能把检测做成一个连续的 lookahead 过程，减少旧版那种“走一点停一下”的离散感
   for (double s = step; s <= check_distance + 1e-6; s += step) {
-    const double sample_x = pose.x + s * std::cos(active_plan_.heading);
-    const double sample_y = pose.y + s * std::sin(active_plan_.heading);
-    if (!isCorridorCrossSectionSafe(
-        active_costmap_, sample_x, sample_y, active_plan_.heading, lateral_step))
-    {
+    geometry_msgs::msg::Pose2D sample_pose = pose;
+    sample_pose.x += s * std::cos(active_plan_.heading);
+    sample_pose.y += s * std::sin(active_plan_.heading);
+    if (!collision_checker_->isCollisionFree(sample_pose, fetch_data)) {
       return safe_prefix_distance;
     }
+    fetch_data = false;
     safe_prefix_distance = s;
   }
 
   return safe_prefix_distance;
-}
-
-double BackUpFreeSpace::computePrefixSampleStep() const
-{
-  const double configured_step =
-    near_sample_step_ > 0.0 ? near_sample_step_ : trajectory_sample_step_;
-  const double resolution = has_active_costmap_ ?
-    static_cast<double>(active_costmap_.metadata.resolution) : 0.0;
-  return std::max({configured_step, resolution, 0.03});
-}
-
-double BackUpFreeSpace::computeRequiredSafePrefixDistance(double remaining_distance) const
-{
-  const double check_distance = std::max(
-    0.0, std::min(monitor_lookahead_distance_, remaining_distance));
-  // The last verified sample can be up to one sampling interval before the
-  // continuous lookahead endpoint. Treat that quantization gap as covered.
-  return std::max(0.0, check_distance - computePrefixSampleStep());
 }
 
 double BackUpFreeSpace::computeSegmentProgress(const geometry_msgs::msg::Pose2D & pose) const
@@ -751,8 +703,7 @@ double BackUpFreeSpace::computeSegmentProgress(const geometry_msgs::msg::Pose2D 
   return std::clamp(projected, 0.0, active_plan_.distance);
 }
 
-geometry_msgs::msg::Twist BackUpFreeSpace::buildDesiredCommand(
-  double remaining_distance, double robot_yaw) const
+geometry_msgs::msg::Twist BackUpFreeSpace::buildDesiredCommand(double remaining_distance) const
 {
   geometry_msgs::msg::Twist desired_cmd;
   if (!active_plan_.valid || remaining_distance <= goal_tolerance_) {
@@ -779,11 +730,8 @@ geometry_msgs::msg::Twist BackUpFreeSpace::buildDesiredCommand(
     target_speed = minimum_speed_xy_;
   }
 
-  // active_plan_.heading is expressed in the global costmap frame, while
-  // geometry_msgs/Twist is interpreted in robot_base_frame.
-  const double base_relative_heading = normalizeAngle(active_plan_.heading - robot_yaw);
-  desired_cmd.linear.x = std::cos(base_relative_heading) * target_speed;
-  desired_cmd.linear.y = std::sin(base_relative_heading) * target_speed;
+  desired_cmd.linear.x = std::cos(active_plan_.heading) * target_speed;
+  desired_cmd.linear.y = std::sin(active_plan_.heading) * target_speed;
   desired_cmd.angular.z = 0.0;
   return desired_cmd;
 }
@@ -825,8 +773,6 @@ void BackUpFreeSpace::resetExecutionState()
 {
   filtered_cmd_ = geometry_msgs::msg::Twist {};
   active_plan_ = EscapePlan();
-  active_costmap_ = nav2_msgs::msg::Costmap {};
-  has_active_costmap_ = false;
   execution_state_ = RecoveryExecutionState::PLANNING;
   last_cycle_time_.reset();
   last_replan_time_.reset();
@@ -867,8 +813,6 @@ bool BackUpFreeSpace::replanFromCurrentPose(
   }
 
   active_plan_ = new_plan;
-  active_costmap_ = costmap;
-  has_active_costmap_ = true;
   active_plan_average_cost_ = computePlanAverageCost(costmap, active_plan_);
   plan_start_pose_ = current_pose;
   completed_distance_before_plan_ = total_distance_traveled;
