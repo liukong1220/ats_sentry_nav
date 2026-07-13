@@ -1,28 +1,26 @@
 # minco_planner
 
-This package is the V1 planner-chain workspace for the move from
-`RC-ESDF-lite + B-spline + MPPI` toward
-`RC-ESDF + A*/JPS + MINCO + independent yaw + footprint safety + local repair`.
+Optional V1 planning pipeline:
 
-Directory layout:
+`traversability_grid -> JPS -> MINCO S3 -> independent yaw -> footprint safety`
 
-1. `include/minco_planner/planning`, `src/planning`
-   Front-end graph search. Current implementation: grid A* over
-   `traversability_grid`.
-2. `include/minco_planner/trajectory`, `src/trajectory`
-   Reference trajectory data structures, temporary time allocation, and
-   independent yaw layer. The current optimizer is a placeholder interface for
-   the later GCOPTER/MINCO backend.
-3. `include/minco_planner/safety`, `src/safety`
-   Footprint safety checking and local collision repair.
-4. `include/minco_planner/debug`, `src/debug`
-   RViz marker generation.
-5. `include/minco_planner/nodes`, `src/nodes`
-   ROS2 node glue code only.
+The default front end is 2D JPS with configurable clearance. A* remains available
+through `search_algorithm: astar` and as an optional JPS failure fallback. The
+translation backend is the non-uniform-time, fifth-order MINCO S3 solver adapted
+from GCOPTER. It publishes timed `nav_msgs/Path` poses and internally retains
+world-frame `vx/vy/ax/ay` for the holonomic controller boundary.
 
-Reference migration targets:
+Swerve-specific rules:
 
-1. MINCO backend: `~/参考/src/DDR-opt/back_end/include/gcopter/minco.hpp`
-2. Footprint SDF collision: `~/参考/src/DDR-opt/utils/plan_env/src/rc_footprint_collision.cpp`
-3. MPC / MuJoCo validation: `~/参考/src/nullspace_mpc`,
-   `~/参考/src/swerve_drive`, `~/参考/src/MuJoCo-LiDAR`
+1. Translation and chassis yaw are independent. `goal_heading` is the default;
+   `hold` and legacy `path_tangent` are available for comparison.
+2. JPS uses `jps_safe_distance`, then the exact oriented rectangular footprint is
+   checked on the sampled MINCO trajectory.
+3. Unsafe trajectories are not published by default.
+4. Local point repair is disabled by default because nearest-cell repair is crude.
+   If enabled, repaired geometry is passed through MINCO again before publication.
+
+The node can consume a direct `goal_pose` or the final pose of Nav2 `/plan`. The
+latter keeps RViz Nav2 GoalTool usable during the transition.
+
+See `THIRD_PARTY_NOTICES.md` for the MINCO license and attribution.

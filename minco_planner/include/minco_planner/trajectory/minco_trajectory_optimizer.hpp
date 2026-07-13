@@ -14,6 +14,10 @@ struct MincoTrajectoryOptimizerParams
   double reference_speed = 1.5;
   double min_segment_time = 0.05;
   double sample_spacing = 0.12;
+  double max_velocity = 2.0;
+  double max_acceleration = 2.5;
+  int max_time_scaling_iterations = 5;
+  double time_scaling_factor = 1.25;
 };
 
 class MincoTrajectoryOptimizer

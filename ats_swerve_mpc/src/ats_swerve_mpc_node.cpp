@@ -1,0 +1,327 @@
+// Copyright 2026
+
+#include "ats_swerve_mpc/ats_swerve_mpc_node.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <limits>
+
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
+namespace ats_swerve_mpc
+{
+
+namespace
+{
+
+Eigen::Vector3d vectorParameter(
+  rclcpp::Node & node,
+  const std::string & name,
+  const Eigen::Vector3d & defaults)
+{
+  const std::vector<double> values = node.declare_parameter<std::vector<double>>(
+    name, {defaults(0), defaults(1), defaults(2)});
+  if (values.size() != 3) {
+    RCLCPP_WARN(node.get_logger(), "Parameter '%s' must contain exactly 3 values.", name.c_str());
+    return defaults;
+  }
+  return Eigen::Vector3d(values[0], values[1], values[2]);
+}
+
+}  // namespace
+
+AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
+: Node("ats_swerve_mpc", options)
+{
+  odom_topic_ = declare_parameter<std::string>("odom_topic", "/localization");
+  trajectory_topic_ =
+    declare_parameter<std::string>("trajectory_topic", "/minco/reference_path");
+  command_topic_ =
+    declare_parameter<std::string>("command_topic", "/cmd_vel_gimbal_yaw_odom");
+  emergency_stop_topic_ =
+    declare_parameter<std::string>("emergency_stop_topic", "/planner/emergency_stop");
+  frame_id_ = declare_parameter<std::string>("frame_id", "odom");
+  control_rate_hz_ = declare_parameter<double>("control_rate_hz", control_rate_hz_);
+  fallback_path_dt_ = declare_parameter<double>("fallback_path_dt", fallback_path_dt_);
+  trajectory_timeout_ = declare_parameter<double>("trajectory_timeout", trajectory_timeout_);
+  goal_position_tolerance_ =
+    declare_parameter<double>("goal_position_tolerance", goal_position_tolerance_);
+  goal_yaw_tolerance_ = declare_parameter<double>("goal_yaw_tolerance", goal_yaw_tolerance_);
+  publish_debug_paths_ = declare_parameter<bool>("publish_debug_paths", publish_debug_paths_);
+  controller_ = std::make_unique<Se2MpcController>(loadConfig());
+
+  odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+    odom_topic_, rclcpp::SensorDataQoS(),
+    std::bind(&AtsSwerveMpcNode::onOdometry, this, std::placeholders::_1));
+  trajectory_sub_ = create_subscription<nav_msgs::msg::Path>(
+    trajectory_topic_, rclcpp::QoS(1).reliable(),
+    std::bind(&AtsSwerveMpcNode::onPath, this, std::placeholders::_1));
+  if (!emergency_stop_topic_.empty()) {
+    emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
+      emergency_stop_topic_, rclcpp::QoS(10),
+      std::bind(&AtsSwerveMpcNode::onEmergencyStop, this, std::placeholders::_1));
+  }
+  command_pub_ = create_publisher<geometry_msgs::msg::Twist>(command_topic_, rclcpp::QoS(10));
+  predicted_path_pub_ = create_publisher<nav_msgs::msg::Path>("~/predicted_path", rclcpp::QoS(1));
+  horizon_path_pub_ = create_publisher<nav_msgs::msg::Path>("~/reference_horizon", rclcpp::QoS(1));
+  control_timer_ = create_wall_timer(
+    std::chrono::duration<double>(1.0 / std::max(1.0, control_rate_hz_)),
+    std::bind(&AtsSwerveMpcNode::onControlTimer, this));
+  RCLCPP_INFO(
+    get_logger(),
+    "ATS swerve MPC ready: odom='%s' trajectory='%s' command='%s' horizon=%d dt=%.3f",
+    odom_topic_.c_str(), trajectory_topic_.c_str(), command_topic_.c_str(),
+    controller_->config().horizon, controller_->config().dt);
+}
+
+Se2MpcConfig AtsSwerveMpcNode::loadConfig()
+{
+  Se2MpcConfig config;
+  config.horizon = declare_parameter<int>("horizon", config.horizon);
+  config.dt = declare_parameter<double>("dt", config.dt);
+  config.state_weight = vectorParameter(*this, "state_weight", config.state_weight);
+  config.control_weight = vectorParameter(*this, "control_weight", config.control_weight);
+  config.control_delta_weight =
+    vectorParameter(*this, "control_delta_weight", config.control_delta_weight);
+  config.terminal_weight = vectorParameter(*this, "terminal_weight", config.terminal_weight);
+  config.max_vx = declare_parameter<double>("max_vx", config.max_vx);
+  config.max_vy = declare_parameter<double>("max_vy", config.max_vy);
+  config.max_wz = declare_parameter<double>("max_wz", config.max_wz);
+  config.max_ax = declare_parameter<double>("max_ax", config.max_ax);
+  config.max_ay = declare_parameter<double>("max_ay", config.max_ay);
+  config.max_awz = declare_parameter<double>("max_awz", config.max_awz);
+  config.max_iterations = declare_parameter<int>("max_iterations", config.max_iterations);
+  config.regularization = declare_parameter<double>("regularization", config.regularization);
+  config.line_search_decay =
+    declare_parameter<double>("line_search_decay", config.line_search_decay);
+  config.min_line_search_step =
+    declare_parameter<double>("min_line_search_step", config.min_line_search_step);
+  config.convergence_tolerance =
+    declare_parameter<double>("convergence_tolerance", config.convergence_tolerance);
+  return config;
+}
+
+void AtsSwerveMpcNode::onOdometry(const nav_msgs::msg::Odometry::SharedPtr message)
+{
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  current_state_(0) = message->pose.pose.position.x;
+  current_state_(1) = message->pose.pose.position.y;
+  current_state_(2) = tf2::getYaw(message->pose.pose.orientation);
+  has_odometry_ = current_state_.allFinite();
+}
+
+void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message)
+{
+  if (message->poses.size() < 2) {
+    RCLCPP_WARN(get_logger(), "Ignoring trajectory with fewer than two poses.");
+    return;
+  }
+  if (!frame_id_.empty() && !message->header.frame_id.empty() &&
+    message->header.frame_id != frame_id_)
+  {
+    RCLCPP_ERROR(
+      get_logger(), "Ignoring trajectory in frame '%s'; MPC frame is '%s'.",
+      message->header.frame_id.c_str(), frame_id_.c_str());
+    return;
+  }
+  std::vector<TimedState> parsed;
+  parsed.reserve(message->poses.size());
+  const double header_time = rclcpp::Time(message->header.stamp).seconds();
+  bool monotonic = true;
+  double previous_time = -std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < message->poses.size(); ++i) {
+    const auto & pose = message->poses[i];
+    double pose_time = rclcpp::Time(pose.header.stamp).seconds();
+    if (pose_time <= 0.0) {
+      pose_time = header_time + fallback_path_dt_ * static_cast<double>(i);
+    }
+    monotonic = monotonic && pose_time > previous_time;
+    TimedState timed;
+    timed.time = pose_time;
+    timed.state << pose.pose.position.x, pose.pose.position.y, tf2::getYaw(pose.pose.orientation);
+    if (!timed.state.allFinite()) {
+      return;
+    }
+    parsed.push_back(timed);
+    previous_time = pose_time;
+  }
+  if (!monotonic) {
+    const double start_time = header_time > 0.0 ? header_time : now().seconds();
+    for (std::size_t i = 0; i < parsed.size(); ++i) {
+      parsed[i].time = start_time + fallback_path_dt_ * static_cast<double>(i);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    trajectory_ = std::move(parsed);
+    trajectory_frame_ = message->header.frame_id.empty() ? frame_id_ : message->header.frame_id;
+  }
+  controller_->reset();
+  last_control_.setZero();
+}
+
+void AtsSwerveMpcNode::onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message)
+{
+  emergency_stop_.store(message->data);
+  if (message->data) {
+    controller_->reset();
+    last_control_.setZero();
+    publishCommand(last_control_);
+  }
+}
+
+bool AtsSwerveMpcNode::sampleReference(double time, Se2Reference & reference) const
+{
+  std::lock_guard<std::mutex> lock(trajectory_mutex_);
+  if (trajectory_.empty()) {
+    return false;
+  }
+  if (time >= trajectory_.back().time) {
+    reference.state = trajectory_.back().state;
+    reference.control.setZero();
+    return true;
+  }
+  std::size_t upper = 1;
+  while (upper < trajectory_.size() && trajectory_[upper].time < time) {
+    ++upper;
+  }
+  upper = std::min(upper, trajectory_.size() - 1);
+  const TimedState & first = trajectory_[upper - 1];
+  const TimedState & second = trajectory_[upper];
+  const double duration = std::max(1e-6, second.time - first.time);
+  const double ratio = std::clamp((time - first.time) / duration, 0.0, 1.0);
+  reference.state.head<2>() =
+    first.state.head<2>() + ratio * (second.state.head<2>() - first.state.head<2>());
+  reference.state(2) = interpolateAngle(first.state(2), second.state(2), ratio);
+  const Eigen::Vector2d world_velocity =
+    (second.state.head<2>() - first.state.head<2>()) / duration;
+  const double cosine = std::cos(reference.state(2));
+  const double sine = std::sin(reference.state(2));
+  reference.control(0) = cosine * world_velocity.x() + sine * world_velocity.y();
+  reference.control(1) = -sine * world_velocity.x() + cosine * world_velocity.y();
+  reference.control(2) = normalizeAngle(second.state(2) - first.state(2)) / duration;
+  return true;
+}
+
+std::vector<Se2Reference> AtsSwerveMpcNode::buildHorizon(double start_time) const
+{
+  std::vector<Se2Reference> references;
+  references.reserve(static_cast<std::size_t>(controller_->config().horizon + 1));
+  for (int step = 0; step <= controller_->config().horizon; ++step) {
+    Se2Reference reference;
+    if (!sampleReference(start_time + step * controller_->config().dt, reference)) {
+      return {};
+    }
+    references.push_back(reference);
+  }
+  return references;
+}
+
+void AtsSwerveMpcNode::onControlTimer()
+{
+  State current;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!has_odometry_) {
+      return;
+    }
+    current = current_state_;
+  }
+  if (emergency_stop_.load()) {
+    publishCommand(Control::Zero());
+    return;
+  }
+  double final_time = 0.0;
+  State goal = State::Zero();
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (trajectory_.empty()) {
+      return;
+    }
+    final_time = trajectory_.back().time;
+    goal = trajectory_.back().state;
+  }
+  const double current_time = now().seconds();
+  const double goal_position_error = (goal.head<2>() - current.head<2>()).norm();
+  const double goal_yaw_error = std::abs(normalizeAngle(goal(2) - current(2)));
+  if ((goal_position_error <= goal_position_tolerance_ && goal_yaw_error <= goal_yaw_tolerance_) ||
+    current_time > final_time + trajectory_timeout_)
+  {
+    last_control_.setZero();
+    publishCommand(last_control_);
+    controller_->reset();
+    return;
+  }
+
+  const auto references = buildHorizon(current_time);
+  if (references.size() < static_cast<std::size_t>(controller_->config().horizon + 1)) {
+    last_control_.setZero();
+    publishCommand(last_control_);
+    return;
+  }
+  const Se2MpcResult result = controller_->solve(current, references, last_control_);
+  if (!result.success || result.controls.empty()) {
+    last_control_.setZero();
+    publishCommand(last_control_);
+    controller_->reset();
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "SE2 MPC solve failed.");
+    return;
+  }
+  last_control_ = result.controls.front();
+  publishCommand(last_control_);
+  if (publish_debug_paths_) {
+    publishPath(result.states, predicted_path_pub_);
+    std::vector<State> reference_states;
+    reference_states.reserve(references.size());
+    for (const auto & reference : references) {
+      reference_states.push_back(reference.state);
+    }
+    publishPath(reference_states, horizon_path_pub_);
+  }
+  RCLCPP_DEBUG(
+    get_logger(), "MPC vx=%.3f vy=%.3f wz=%.3f cost=%.3f solve=%.2fms",
+    last_control_(0), last_control_(1), last_control_(2), result.cost, result.solve_time_ms);
+}
+
+void AtsSwerveMpcNode::publishCommand(const Control & command)
+{
+  geometry_msgs::msg::Twist message;
+  message.linear.x = command(0);
+  message.linear.y = command(1);
+  message.angular.z = command(2);
+  command_pub_->publish(message);
+}
+
+void AtsSwerveMpcNode::publishPath(
+  const std::vector<State> & states,
+  const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr & publisher) const
+{
+  nav_msgs::msg::Path path;
+  path.header.stamp = now();
+  path.header.frame_id = trajectory_frame_.empty() ? frame_id_ : trajectory_frame_;
+  path.poses.reserve(states.size());
+  for (const auto & state : states) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = state(0);
+    pose.pose.position.y = state(1);
+    pose.pose.orientation.z = std::sin(0.5 * state(2));
+    pose.pose.orientation.w = std::cos(0.5 * state(2));
+    path.poses.push_back(pose);
+  }
+  publisher->publish(path);
+}
+
+double AtsSwerveMpcNode::normalizeAngle(double angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+double AtsSwerveMpcNode::interpolateAngle(double from, double to, double ratio)
+{
+  return normalizeAngle(from + ratio * normalizeAngle(to - from));
+}
+
+}  // namespace ats_swerve_mpc

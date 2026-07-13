@@ -1,0 +1,36 @@
+ats_swerve_mpc:
+  ros__parameters:
+    use_sim_time: true
+    odom_topic: /localization
+    trajectory_topic: /minco/reference_path
+    command_topic: /cmd_vel_mpc
+    emergency_stop_topic: /planner/emergency_stop
+    frame_id: odom
+    control_rate_hz: 20.0
+    fallback_path_dt: 0.1
+    trajectory_timeout: 0.5
+    goal_position_tolerance: 0.08
+    goal_yaw_tolerance: 0.15
+    publish_debug_paths: true
+
+    horizon: 20
+    dt: 0.1
+    max_iterations: 6
+    regularization: 1.0e-5
+    line_search_decay: 0.5
+    min_line_search_step: 0.05
+    convergence_tolerance: 1.0e-3
+
+    # State [x, y, yaw], body control [vx, vy, wz].
+    state_weight: [18.0, 18.0, 4.0]
+    terminal_weight: [28.0, 28.0, 8.0]
+    control_weight: [0.12, 0.12, 0.08]
+    control_delta_weight: [0.7, 0.7, 0.25]
+
+    # Initial safe simulation limits. Calibrate against steering and drive feedback.
+    max_vx: 1.5
+    max_vy: 1.5
+    max_wz: 2.0
+    max_ax: 2.0
+    max_ay: 2.0
+    max_awz: 3.0

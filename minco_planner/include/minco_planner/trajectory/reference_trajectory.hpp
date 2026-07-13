@@ -18,6 +18,10 @@ struct ReferencePoint
   double y = 0.0;
   double yaw = 0.0;
   double v = 0.0;
+  double vx = 0.0;
+  double vy = 0.0;
+  double ax = 0.0;
+  double ay = 0.0;
   double yaw_rate = 0.0;
   double clearance = 0.0;
   double slope = 0.0;

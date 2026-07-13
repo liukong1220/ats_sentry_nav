@@ -1,30 +1,21 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>minco_planner</name>
+  <name>ats_swerve_mpc</name>
   <version>0.1.0</version>
-  <description>V1 planner skeleton for RC-ESDF driven A*/MINCO/yaw/footprint trajectory planning.</description>
+  <description>SE2 MPC trajectory tracker for the ATS four-wheel independent-steering chassis.</description>
   <maintainer email="lihanchen2004@163.com">Lihan Chen</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_auto</buildtool_depend>
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
-
-  <depend>rclcpp</depend>
-  <depend>rclcpp_components</depend>
-  <depend>std_msgs</depend>
-  <depend>nav_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>visualization_msgs</depend>
-  <depend>tf2</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
   <depend>eigen</depend>
-
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
-  <test_depend>ament_cmake_clang_format</test_depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
   <test_depend>ament_cmake_gtest</test_depend>
 
   <export>

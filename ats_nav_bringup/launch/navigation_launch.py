@@ -24,6 +24,7 @@ def generate_launch_description():
     container_name_full = (namespace, "/", container_name)
     use_respawn = LaunchConfiguration("use_respawn")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
+    launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     log_level = LaunchConfiguration("log_level")
 
@@ -102,6 +103,12 @@ def generate_launch_description():
         "launch_trajectory_optimizer",
         default_value="True",
         description="Whether to start the RC-ESDF local elastic path optimizer",
+    )
+
+    declare_launch_fake_vel_transform_cmd = DeclareLaunchArgument(
+        "launch_fake_vel_transform",
+        default_value="True",
+        description="Whether to start the Nav2 command frame adapter",
     )
 
     declare_launch_chassis_vel_transform_cmd = DeclareLaunchArgument(
@@ -200,6 +207,7 @@ def generate_launch_description():
                 package="fake_vel_transform",
                 executable="fake_vel_transform_node",
                 name="fake_vel_transform",
+                condition=IfCondition(launch_fake_vel_transform),
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
@@ -340,12 +348,6 @@ def generate_launch_description():
                 parameters=[configured_params],
             ),
             ComposableNode(
-                package="fake_vel_transform",
-                plugin="fake_vel_transform::FakeVelTransform",
-                name="fake_vel_transform",
-                parameters=[configured_params],
-            ),
-            ComposableNode(
                 package="trajectory_optimizer",
                 plugin="trajectory_optimizer::TrajectorySpeedGovernor",
                 name="trajectory_speed_governor",
@@ -431,6 +433,21 @@ def generate_launch_description():
         ],
     )
 
+    load_fake_vel_transform_node = LoadComposableNodes(
+        condition=IfCondition(
+            PythonExpression([use_composition, " and ", launch_fake_vel_transform])
+        ),
+        target_container=container_name_full,
+        composable_node_descriptions=[
+            ComposableNode(
+                package="fake_vel_transform",
+                plugin="fake_vel_transform::FakeVelTransform",
+                name="fake_vel_transform",
+                parameters=[configured_params],
+            ),
+        ],
+    )
+
     # Create the launch description and populate
     ld = LaunchDescription()
 
@@ -447,6 +464,7 @@ def generate_launch_description():
     ld.add_action(declare_container_name_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
+    ld.add_action(declare_launch_fake_vel_transform_cmd)
     ld.add_action(declare_launch_chassis_vel_transform_cmd)
     ld.add_action(declare_log_level_cmd)
     # Add the actions to launch all of the navigation nodes
@@ -457,5 +475,6 @@ def generate_launch_description():
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)
     ld.add_action(load_trajectory_optimizer_node)
+    ld.add_action(load_fake_vel_transform_node)
 
     return ld

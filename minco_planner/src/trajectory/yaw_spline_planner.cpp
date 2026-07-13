@@ -18,11 +18,69 @@ void YawSplinePlanner::setParams(const YawSplinePlannerParams & params)
   params_ = params;
 }
 
-void YawSplinePlanner::apply(ReferenceTrajectory & trajectory, double initial_yaw) const
+void YawSplinePlanner::apply(
+  ReferenceTrajectory & trajectory,
+  double initial_yaw,
+  double goal_yaw) const
 {
   if (trajectory.points.empty()) {
     return;
   }
+  if (params_.mode == "path_tangent") {
+    applyPathTangent(trajectory, initial_yaw);
+    return;
+  }
+  if (params_.mode == "hold") {
+    for (auto & point : trajectory.points) {
+      point.yaw = normalizeAngle(initial_yaw);
+      point.yaw_rate = 0.0;
+    }
+    return;
+  }
+  applyGoalHeading(trajectory, initial_yaw, goal_yaw);
+}
+
+void YawSplinePlanner::applyGoalHeading(
+  ReferenceTrajectory & trajectory,
+  double initial_yaw,
+  double goal_yaw) const
+{
+  const double start = normalizeAngle(initial_yaw);
+  const double delta = shortestAngularDistance(start, goal_yaw);
+  double available_duration = std::max(1e-3, trajectory.totalTime());
+  const double rate_limited_duration = params_.yaw_rate_limit > 1e-6 ?
+    1.875 * std::abs(delta) / params_.yaw_rate_limit : available_duration;
+  if (rate_limited_duration > available_duration && trajectory.totalTime() > 1e-6) {
+    const double time_scale = rate_limited_duration / available_duration;
+    for (auto & point : trajectory.points) {
+      point.t *= time_scale;
+      point.vx /= time_scale;
+      point.vy /= time_scale;
+      point.v /= time_scale;
+      point.ax /= time_scale * time_scale;
+      point.ay /= time_scale * time_scale;
+    }
+    available_duration = rate_limited_duration;
+  }
+  const double duration = std::max(1e-3, std::min(available_duration, rate_limited_duration));
+
+  for (auto & point : trajectory.points) {
+    const double u = std::max(0.0, std::min(1.0, point.t / duration));
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double u4 = u3 * u;
+    const double u5 = u4 * u;
+    const double blend = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+    const double blend_rate = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+    point.yaw = normalizeAngle(start + delta * blend);
+    point.yaw_rate = delta * blend_rate;
+  }
+}
+
+void YawSplinePlanner::applyPathTangent(
+  ReferenceTrajectory & trajectory,
+  double initial_yaw) const
+{
 
   double previous_yaw = normalizeAngle(initial_yaw);
   double previous_t = trajectory.points.front().t;
