@@ -2,7 +2,7 @@
 
 Optional V1 planning pipeline:
 
-`traversability_grid -> JPS -> MINCO S3 -> independent yaw -> footprint safety`
+`traversability_grid -> RC-ESDF -> JPS -> MINCO S3 -> clearance-aware yaw -> footprint safety`
 
 The default front end is 2D JPS with configurable clearance. A* remains available
 through `search_algorithm: astar` and as an optional JPS failure fallback. The
@@ -12,8 +12,10 @@ world-frame `vx/vy/ax/ay` for the holonomic controller boundary.
 
 Swerve-specific rules:
 
-1. Translation and chassis yaw are independent. `goal_heading` is the default;
-   `hold` and legacy `path_tangent` are available for comparison.
+1. Translation and chassis yaw remain independent in open space. The default
+   `clearance_aware` mode uses RC-ESDF point clearance with enter/exit hysteresis,
+   and selects the closer forward or reverse path tangent only in narrow space.
+   `goal_heading`, `hold`, and legacy `path_tangent` remain available for comparison.
 2. JPS uses `jps_safe_distance`, then the exact oriented rectangular footprint is
    checked on the sampled MINCO trajectory.
 3. Unsafe trajectories are not published by default.

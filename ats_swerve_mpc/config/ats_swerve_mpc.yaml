@@ -13,6 +13,14 @@ ats_swerve_mpc:
     goal_yaw_tolerance: 0.15
     publish_debug_paths: true
 
+    # Project the measured pose onto MINCO instead of chasing wall-clock stamps.
+    projection_backward_window: 0.20
+    projection_forward_window: 2.00
+    cross_track_slowdown_start: 0.15
+    cross_track_slowdown_end: 0.60
+    min_reference_progress_scale: 0.25
+    command_latency_compensation: 0.01
+
     horizon: 20
     dt: 0.1
     max_iterations: 6

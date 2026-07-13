@@ -7,18 +7,19 @@
 #include <string>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "minco_planner/safety/footprint_safety_checker.hpp"
+#include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/planning/grid_jps.hpp"
+#include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/safety/local_collision_repair.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
-#include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/trajectory/yaw_spline_planner.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 
 namespace minco_planner
@@ -35,9 +36,9 @@ private:
   void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
   bool lookupStartPose(geometry_msgs::msg::PoseStamped & start) const;
   bool transformGoalToGrid(
-    const geometry_msgs::msg::PoseStamped & input,
-    geometry_msgs::msg::PoseStamped & output) const;
+    const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const;
   nav_msgs::msg::Path toPath(const ReferenceTrajectory & trajectory) const;
+  void annotateClearance(ReferenceTrajectory & trajectory) const;
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
@@ -51,6 +52,8 @@ private:
   std::string search_algorithm_ = "jps";
   bool astar_fallback_ = true;
   bool publish_unsafe_trajectory_ = false;
+  int obstacle_value_threshold_ = 50;
+  bool unknown_is_obstacle_ = false;
 
   GridAstar astar_;
   GridJps jps_;
@@ -61,6 +64,7 @@ private:
   PlannerDebugVisualizer visualizer_;
 
   nav_msgs::msg::OccupancyGrid::SharedPtr latest_grid_;
+  std::shared_ptr<trajectory_optimizer::RcTraversabilityEsdfProvider> clearance_esdf_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "rclcpp_components/register_node_macro.hpp"
 #include "tf2/utils.h"
@@ -14,6 +15,7 @@ namespace minco_planner
 
 MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
 : Node("minco_planner", options),
+  clearance_esdf_(std::make_shared<trajectory_optimizer::RcTraversabilityEsdfProvider>()),
   tf_buffer_(std::make_shared<tf2_ros::Buffer>(get_clock())),
   tf_listener_(std::make_shared<tf2_ros::TransformListener>(*tf_buffer_))
 {
@@ -31,17 +33,14 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       std::bind(&MincoPlannerNode::onGlobalPlan, this, std::placeholders::_1));
   }
   raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
-  reference_path_pub_ = create_publisher<nav_msgs::msg::Path>(
-    reference_path_topic_, rclcpp::QoS(1));
-  marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-    debug_marker_topic_, rclcpp::QoS(1));
+  reference_path_pub_ =
+    create_publisher<nav_msgs::msg::Path>(reference_path_topic_, rclcpp::QoS(1));
+  marker_pub_ =
+    create_publisher<visualization_msgs::msg::MarkerArray>(debug_marker_topic_, rclcpp::QoS(1));
 
   RCLCPP_INFO(
-    get_logger(),
-    "minco_planner ready: grid='%s' goal='%s' raw='%s' reference='%s'",
-    grid_topic_.c_str(),
-    goal_topic_.c_str(),
-    raw_path_topic_.c_str(),
+    get_logger(), "minco_planner ready: grid='%s' goal='%s' raw='%s' reference='%s'",
+    grid_topic_.c_str(), goal_topic_.c_str(), raw_path_topic_.c_str(),
     reference_path_topic_.c_str());
 }
 
@@ -80,6 +79,8 @@ void MincoPlannerNode::declareAndLoadParams()
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
   declare_parameter<double>("yaw_rate_limit", yaw_params.yaw_rate_limit);
+  declare_parameter<double>("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
+  declare_parameter<double>("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
 
   FootprintSafetyParams footprint_params;
   declare_parameter<double>("footprint_length", footprint_params.length);
@@ -102,8 +103,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("search_algorithm", search_algorithm_);
   get_parameter("astar_fallback", astar_fallback_);
   get_parameter("publish_unsafe_trajectory", publish_unsafe_trajectory_);
-  get_parameter("obstacle_value_threshold", astar_params.obstacle_value_threshold);
-  get_parameter("unknown_is_obstacle", astar_params.unknown_is_obstacle);
+  get_parameter("obstacle_value_threshold", obstacle_value_threshold_);
+  get_parameter("unknown_is_obstacle", unknown_is_obstacle_);
+  astar_params.obstacle_value_threshold = obstacle_value_threshold_;
+  astar_params.unknown_is_obstacle = unknown_is_obstacle_;
   get_parameter("allow_diagonal", astar_params.allow_diagonal);
   get_parameter("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
   get_parameter("jps_safe_distance", jps_params.safe_distance);
@@ -116,6 +119,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("time_scaling_factor", optimizer_params.time_scaling_factor);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
+  get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
+  get_parameter("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
   get_parameter("footprint_length", footprint_params.length);
   get_parameter("footprint_width", footprint_params.width);
   get_parameter("footprint_safety_margin", footprint_params.safety_margin);
@@ -140,6 +145,7 @@ void MincoPlannerNode::declareAndLoadParams()
 void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
   latest_grid_ = msg;
+  clearance_esdf_->updateGrid(*msg, obstacle_value_threshold_, unknown_is_obstacle_);
 }
 
 void MincoPlannerNode::onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg)
@@ -165,8 +171,8 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
 
   geometry_msgs::msg::PoseStamped goal = *msg;
   if (goal.header.frame_id.empty()) {
-    goal.header.frame_id = latest_grid_->header.frame_id.empty() ? global_frame_ :
-      latest_grid_->header.frame_id;
+    goal.header.frame_id =
+      latest_grid_->header.frame_id.empty() ? global_frame_ : latest_grid_->header.frame_id;
   }
   geometry_msgs::msg::PoseStamped goal_in_grid;
   if (!transformGoalToGrid(goal, goal_in_grid)) {
@@ -188,8 +194,8 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   }
   if (!search_result.success) {
     RCLCPP_WARN(
-      get_logger(), "%s failed: %s expanded=%d",
-      search_algorithm_.c_str(), search_result.reason.c_str(), search_result.expanded_nodes);
+      get_logger(), "%s failed: %s expanded=%d", search_algorithm_.c_str(),
+      search_result.reason.c_str(), search_result.expanded_nodes);
     return;
   }
 
@@ -197,11 +203,13 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
+  annotateClearance(reference);
   yaw_planner_.apply(reference, start_yaw, goal_yaw);
   FootprintSafetyResult safety = safety_checker_.check(reference, *latest_grid_);
   if (!safety.safe && collision_repair_.repair(reference, safety, *latest_grid_)) {
     reference = optimizer_.optimize(toPath(reference));
     reference.header.stamp = now();
+    annotateClearance(reference);
     yaw_planner_.apply(reference, start_yaw, goal_yaw);
     safety = safety_checker_.check(reference, *latest_grid_);
   }
@@ -219,23 +227,26 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   RCLCPP_INFO(
     get_logger(),
     "planned raw_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu expanded=%d",
-    search_result.path.poses.size(),
-    reference.points.size(),
-    reference.totalLength(),
-    reference.totalTime(),
-    safety.collisions.size(),
-    search_result.expanded_nodes);
+    search_result.path.poses.size(), reference.points.size(), reference.totalLength(),
+    reference.totalTime(), safety.collisions.size(), search_result.expanded_nodes);
+}
+
+void MincoPlannerNode::annotateClearance(ReferenceTrajectory & trajectory) const
+{
+  const bool available = clearance_esdf_ && clearance_esdf_->available();
+  for (auto & point : trajectory.points) {
+    point.clearance = available ? clearance_esdf_->getDistance(point.x, point.y)
+                                : std::numeric_limits<double>::quiet_NaN();
+  }
 }
 
 bool MincoPlannerNode::lookupStartPose(geometry_msgs::msg::PoseStamped & start) const
 {
   try {
     const auto transform = tf_buffer_->lookupTransform(
-      latest_grid_ && !latest_grid_->header.frame_id.empty() ? latest_grid_->header.frame_id :
-      global_frame_,
-      robot_frame_,
-      tf2::TimePointZero,
-      tf2::durationFromSec(0.1));
+      latest_grid_ && !latest_grid_->header.frame_id.empty() ? latest_grid_->header.frame_id
+                                                             : global_frame_,
+      robot_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
     start.header = transform.header;
     start.pose.position.x = transform.transform.translation.x;
     start.pose.position.y = transform.transform.translation.y;
@@ -243,18 +254,19 @@ bool MincoPlannerNode::lookupStartPose(geometry_msgs::msg::PoseStamped & start) 
     start.pose.orientation = transform.transform.rotation;
     return true;
   } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN(get_logger(), "TF lookup %s -> %s failed: %s",
-      global_frame_.c_str(), robot_frame_.c_str(), ex.what());
+    RCLCPP_WARN(
+      get_logger(), "TF lookup %s -> %s failed: %s", global_frame_.c_str(), robot_frame_.c_str(),
+      ex.what());
     return false;
   }
 }
 
 bool MincoPlannerNode::transformGoalToGrid(
-  const geometry_msgs::msg::PoseStamped & input,
-  geometry_msgs::msg::PoseStamped & output) const
+  const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const
 {
-  const std::string target_frame = latest_grid_ && !latest_grid_->header.frame_id.empty() ?
-    latest_grid_->header.frame_id : global_frame_;
+  const std::string target_frame = latest_grid_ && !latest_grid_->header.frame_id.empty()
+                                     ? latest_grid_->header.frame_id
+                                     : global_frame_;
   if (input.header.frame_id.empty() || input.header.frame_id == target_frame) {
     output = input;
     output.header.frame_id = target_frame;
@@ -284,8 +296,7 @@ nav_msgs::msg::Path MincoPlannerNode::toPath(const ReferenceTrajectory & traject
     const rclcpp::Time point_stamp =
       rclcpp::Time(trajectory.header.stamp) + rclcpp::Duration::from_seconds(point.t);
     pose.header.stamp.sec = static_cast<int32_t>(point_stamp.nanoseconds() / 1000000000LL);
-    pose.header.stamp.nanosec =
-      static_cast<uint32_t>(point_stamp.nanoseconds() % 1000000000LL);
+    pose.header.stamp.nanosec = static_cast<uint32_t>(point_stamp.nanoseconds() % 1000000000LL);
     pose.pose.position.x = point.x;
     pose.pose.position.y = point.y;
     pose.pose.position.z = 0.0;

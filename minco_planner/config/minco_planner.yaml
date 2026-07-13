@@ -28,10 +28,13 @@ minco_planner:
     max_time_scaling_iterations: 5
     time_scaling_factor: 1.25
 
-    # Swerve/omnidirectional chassis: heading is independent from path tangent.
-    # Compatibility modes: goal_heading, hold, path_tangent.
-    yaw_mode: goal_heading
+    # Swerve chassis keeps independent yaw in open space and aligns to the
+    # nearest forward/reverse path tangent only where RC-ESDF reports a corridor.
+    # Compatibility modes: goal_heading, hold, path_tangent, clearance_aware.
+    yaw_mode: clearance_aware
     yaw_rate_limit: 2.5
+    narrow_clearance_enter: 0.55
+    narrow_clearance_exit: 0.70
 
     footprint_length: 0.70
     footprint_width: 0.55

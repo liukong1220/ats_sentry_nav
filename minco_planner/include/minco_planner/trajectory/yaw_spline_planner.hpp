@@ -14,6 +14,8 @@ struct YawSplinePlannerParams
 {
   std::string mode = "goal_heading";
   double yaw_rate_limit = 2.5;
+  double narrow_clearance_enter = 0.55;
+  double narrow_clearance_exit = 0.70;
 };
 
 class YawSplinePlanner
@@ -28,6 +30,8 @@ private:
   void applyGoalHeading(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const;
   void applyPathTangent(ReferenceTrajectory & trajectory, double initial_yaw) const;
+  void applyClearanceAware(
+    ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const;
   static double normalizeAngle(double angle);
   static double shortestAngularDistance(double from, double to);
 

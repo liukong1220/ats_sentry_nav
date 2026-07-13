@@ -21,6 +21,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 add_library(${PROJECT_NAME}_lib
   src/ats_swerve_mpc_node.cpp
   src/se2_mpc_controller.cpp
+  src/trajectory_tracker.cpp
 )
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -47,6 +48,9 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_se2_mpc_controller test/test_se2_mpc_controller.cpp)
   target_link_libraries(test_se2_mpc_controller ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
+  target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)
 endif()
 
 ament_export_include_directories(include)
