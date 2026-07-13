@@ -5,7 +5,9 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
+#include <Eigen/Core>
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/planning/grid_astar.hpp"
@@ -39,6 +41,7 @@ private:
     const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const;
   nav_msgs::msg::Path toPath(const ReferenceTrajectory & trajectory) const;
   void annotateClearance(ReferenceTrajectory & trajectory) const;
+  std::vector<Eigen::Vector2d> footprintSamples() const;
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
@@ -54,6 +57,9 @@ private:
   bool publish_unsafe_trajectory_ = false;
   int obstacle_value_threshold_ = 50;
   bool unknown_is_obstacle_ = false;
+  double footprint_length_ = 0.70;
+  double footprint_width_ = 0.55;
+  double footprint_safety_margin_ = 0.05;
 
   GridAstar astar_;
   GridJps jps_;

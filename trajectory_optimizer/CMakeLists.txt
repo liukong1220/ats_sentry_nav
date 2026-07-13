@@ -17,7 +17,9 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/esdf/fake_costmap_esdf_provider.cpp
   src/esdf/terrain_pointcloud_esdf_provider.cpp
   src/esdf/rc_traversability_esdf_provider.cpp
+  src/esdf/static_map_fusion.cpp
   src/nav2/nav2_bspline_smoother.cpp
+  src/nodes/rc_esdf_map_node.cpp
   src/nodes/trajectory_optimizer_node.cpp
 )
 
@@ -47,6 +49,11 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTABLE trajectory_speed_governor_node
 )
 
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN trajectory_optimizer::RcEsdfMapNode
+  EXECUTABLE rc_esdf_map_node
+)
+
 pluginlib_export_plugin_description_file(nav2_core trajectory_optimizer_plugins.xml)
 install(FILES trajectory_optimizer_plugins.xml
   DESTINATION share/${PROJECT_NAME}
@@ -55,11 +62,15 @@ install(FILES trajectory_optimizer_plugins.xml
 if(BUILD_TESTING)
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE
     ament_cmake_uncrustify
     ament_cmake_flake8
   )
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_rc_esdf_map test/test_rc_esdf_map.cpp)
+  target_link_libraries(test_rc_esdf_map ${PROJECT_NAME})
 endif()
 
 ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

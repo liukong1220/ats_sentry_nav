@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "minco_planner/planning/grid_jps.hpp"
+#include "trajectory_optimizer/esdf/static_map_fusion.hpp"
 
 namespace
 {
@@ -59,6 +60,33 @@ TEST(GridJps, AppliesConfiguredSafeDistance)
   params.safe_distance = 0.21;
   minco_planner::GridJps planner(params);
   const auto result = planner.plan(makeGrid(), poseAt(0.25, 0.25), poseAt(2.75, 1.75));
+  EXPECT_FALSE(result.success);
+}
+
+TEST(GridJps, RejectsAPathBlockedByStaticMapAfterFusion)
+{
+  auto local_grid = makeGrid();
+  local_grid.header.frame_id = "odom";
+  local_grid.data.assign(local_grid.info.width * local_grid.info.height, 0);
+  auto static_map = local_grid;
+  static_map.header.frame_id = "map";
+  for (unsigned int y = 0; y < static_map.info.height; ++y) {
+    static_map.data[y * static_map.info.width + 14U] = 100;
+  }
+  geometry_msgs::msg::TransformStamped map_from_odom;
+  map_from_odom.header.frame_id = "map";
+  map_from_odom.child_frame_id = "odom";
+  map_from_odom.transform.rotation.w = 1.0;
+
+  nav_msgs::msg::OccupancyGrid planning_grid;
+  ASSERT_TRUE(trajectory_optimizer::StaticMapFusion::buildPlanningGrid(
+    local_grid, static_map, map_from_odom, trajectory_optimizer::StaticMapFusionParams {},
+    planning_grid));
+  EXPECT_EQ(planning_grid.data[10U * planning_grid.info.width + 14U], 100);
+
+  minco_planner::GridJps planner;
+  const auto result = planner.plan(
+    planning_grid, poseAt(0.25, 0.25), poseAt(2.75, 1.75));
   EXPECT_FALSE(result.success);
 }
 

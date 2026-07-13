@@ -3,7 +3,9 @@
 #ifndef TRAJECTORY_OPTIMIZER__ESDF__RC_TRAVERSABILITY_ESDF_PROVIDER_HPP_
 #define TRAJECTORY_OPTIMIZER__ESDF__RC_TRAVERSABILITY_ESDF_PROVIDER_HPP_
 
+#include <cstdint>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <Eigen/Core>
@@ -55,6 +57,10 @@ public:
   bool isInsideLocalWindow(double x, double y) const override;
   bool query(double x, double y, EsdfQueryResult & result) const override;
 
+  // Copies the raw signed field in row-major OccupancyGrid order. This is used
+  // only for inspection and transport; runtime queries keep using interpolation.
+  bool copySignedDistanceField(std::vector<double> & field) const;
+
   // Debug / integration helpers for later modules.
   RollingWindowBounds getRollingWindowBounds() const;
 
@@ -103,6 +109,8 @@ private:
   double resolution_ = 0.0;
   double origin_x_ = 0.0;
   double origin_y_ = 0.0;
+  std::string frame_id_;
+  int64_t stamp_nanoseconds_ = 0;
   bool available_ = false;
   // Rolling-window policy is independent from map transport:
   // a full grid may be received, but callers can still be restricted to a local envelope.

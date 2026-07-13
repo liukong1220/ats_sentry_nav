@@ -216,6 +216,16 @@ def generate_launch_description():
             ),
             Node(
                 package="trajectory_optimizer",
+                executable="rc_esdf_map_node",
+                name="rc_esdf_map",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[configured_params],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            Node(
+                package="trajectory_optimizer",
                 executable="trajectory_optimizer_node",
                 name="trajectory_optimizer",
                 condition=IfCondition(launch_trajectory_optimizer),
@@ -351,6 +361,12 @@ def generate_launch_description():
                 package="trajectory_optimizer",
                 plugin="trajectory_optimizer::TrajectorySpeedGovernor",
                 name="trajectory_speed_governor",
+                parameters=[configured_params],
+            ),
+            ComposableNode(
+                package="trajectory_optimizer",
+                plugin="trajectory_optimizer::RcEsdfMapNode",
+                name="rc_esdf_map",
                 parameters=[configured_params],
             ),
             ComposableNode(

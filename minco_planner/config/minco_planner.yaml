@@ -1,6 +1,7 @@
 minco_planner:
   ros__parameters:
-    grid_topic: traversability_grid
+    # rc_esdf_map fuses static /map walls with local terrain semantics in odom.
+    grid_topic: /rc_esdf/planning_grid
     goal_topic: goal_pose
     global_plan_topic: /plan
     raw_path_topic: minco/raw_path
@@ -11,7 +12,7 @@ minco_planner:
 
     # Same obstacle convention as the current traversability / RC-ESDF bridge.
     obstacle_value_threshold: 50
-    unknown_is_obstacle: false
+    unknown_is_obstacle: true
     allow_diagonal: true
     search_algorithm: jps
     astar_fallback: true

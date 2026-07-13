@@ -124,6 +124,9 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("footprint_length", footprint_params.length);
   get_parameter("footprint_width", footprint_params.width);
   get_parameter("footprint_safety_margin", footprint_params.safety_margin);
+  footprint_length_ = footprint_params.length;
+  footprint_width_ = footprint_params.width;
+  footprint_safety_margin_ = footprint_params.safety_margin;
   get_parameter("local_repair_enabled", repair_params.enabled);
   get_parameter("local_repair_max_iterations", repair_params.max_iterations);
   get_parameter("local_repair_search_radius", repair_params.search_radius);
@@ -203,14 +206,14 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
-  annotateClearance(reference);
   yaw_planner_.apply(reference, start_yaw, goal_yaw);
+  annotateClearance(reference);
   FootprintSafetyResult safety = safety_checker_.check(reference, *latest_grid_);
   if (!safety.safe && collision_repair_.repair(reference, safety, *latest_grid_)) {
     reference = optimizer_.optimize(toPath(reference));
     reference.header.stamp = now();
-    annotateClearance(reference);
     yaw_planner_.apply(reference, start_yaw, goal_yaw);
+    annotateClearance(reference);
     safety = safety_checker_.check(reference, *latest_grid_);
   }
 
@@ -234,10 +237,32 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
 void MincoPlannerNode::annotateClearance(ReferenceTrajectory & trajectory) const
 {
   const bool available = clearance_esdf_ && clearance_esdf_->available();
+  const std::vector<Eigen::Vector2d> samples = footprintSamples();
   for (auto & point : trajectory.points) {
-    point.clearance = available ? clearance_esdf_->getDistance(point.x, point.y)
-                                : std::numeric_limits<double>::quiet_NaN();
+    point.clearance = available ? clearance_esdf_->getFootprintClearance(
+      Eigen::Vector2d(point.x, point.y), point.yaw, samples) :
+      std::numeric_limits<double>::quiet_NaN();
   }
+}
+
+std::vector<Eigen::Vector2d> MincoPlannerNode::footprintSamples() const
+{
+  const double half_length = 0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_;
+  const double half_width = 0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_;
+  const double resolution = latest_grid_ ?
+    std::max(0.02, static_cast<double>(latest_grid_->info.resolution)) : 0.05;
+  const int samples_x = std::max(2, static_cast<int>(std::ceil((2.0 * half_length) / resolution)));
+  const int samples_y = std::max(2, static_cast<int>(std::ceil((2.0 * half_width) / resolution)));
+  std::vector<Eigen::Vector2d> samples;
+  samples.reserve(static_cast<std::size_t>((samples_x + 1) * (samples_y + 1)));
+  for (int ix = 0; ix <= samples_x; ++ix) {
+    const double x = -half_length + 2.0 * half_length * ix / static_cast<double>(samples_x);
+    for (int iy = 0; iy <= samples_y; ++iy) {
+      const double y = -half_width + 2.0 * half_width * iy / static_cast<double>(samples_y);
+      samples.emplace_back(x, y);
+    }
+  }
+  return samples;
 }
 
 bool MincoPlannerNode::lookupStartPose(geometry_msgs::msg::PoseStamped & start) const
