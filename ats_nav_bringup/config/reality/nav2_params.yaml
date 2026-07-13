@@ -968,8 +968,8 @@ behavior_server:
     # params for ats_nav2_behaviors/BackUpFreeSpace
     service_name: "global_costmap/get_costmap"
     max_radius: 1.6
-    # 恢复动作允许从膨胀层向外退出，但仍拒绝 253/254 障碍栅格。
-    max_allowed_cost: 252
+    # 高于该 cost 的膨胀区不再被当作“可脱困方向”，防止恢复动作继续贴墙试探。
+    max_allowed_cost: 96
     # 以车尾为中心的搜索半角。增大后更愿意尝试斜后退/侧后退，更适合全向舵轮。
     search_half_span_deg: 120.0
     # 候选方向角分辨率。越小搜索越细致，但每次恢复规划计算量略增。
