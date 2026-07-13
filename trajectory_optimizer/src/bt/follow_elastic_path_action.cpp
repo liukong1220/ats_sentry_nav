@@ -5,10 +5,15 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <utility>
 
 #include "behaviortree_cpp_v3/action_node.h"
 #include "behaviortree_cpp_v3/bt_factory.h"
+#include "nav2_msgs/msg/costmap.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "rclcpp/executors/single_threaded_executor.hpp"
 
 namespace trajectory_optimizer
 {
@@ -114,6 +119,227 @@ public:
     setOutput("path", nav_msgs::msg::Path {});
     return BT::NodeStatus::SUCCESS;
   }
+};
+
+// Trigger recovery only when the complete footprint remains in inflated or
+// obstacle cells without meaningful net translation or heading progress.
+class IsStuckInInflation : public BT::ConditionNode
+{
+public:
+  IsStuckInInflation(const std::string & name, const BT::NodeConfiguration & config)
+  : BT::ConditionNode(name, config)
+  {
+    getInput("costmap_topic", costmap_topic_);
+    getInput("odom_topic", odom_topic_);
+    getInput("inflation_cost_threshold", inflation_cost_threshold_);
+    getInput("footprint_radius", footprint_radius_);
+    getInput("movement_radius", movement_radius_);
+    getInput("rotation_progress_rad", rotation_progress_rad_);
+    getInput("stuck_time_s", stuck_time_s_);
+
+    inflation_cost_threshold_ = std::clamp(inflation_cost_threshold_, 1, 254);
+    footprint_radius_ = std::max(0.05, footprint_radius_);
+    movement_radius_ = std::max(0.01, movement_radius_);
+    rotation_progress_rad_ = std::max(0.01, rotation_progress_rad_);
+    stuck_time_s_ = std::max(0.1, stuck_time_s_);
+
+    auto node = config.blackboard->template get<rclcpp::Node::SharedPtr>("node");
+    callback_group_ = node->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    rclcpp::SubscriptionOptions subscription_options;
+    subscription_options.callback_group = callback_group_;
+    costmap_sub_ = node->create_subscription<nav2_msgs::msg::Costmap>(
+      costmap_topic_, rclcpp::QoS(1).reliable(),
+      std::bind(&IsStuckInInflation::costmapCallback, this, std::placeholders::_1),
+      subscription_options);
+    odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+      odom_topic_, rclcpp::QoS(10),
+      std::bind(&IsStuckInInflation::odomCallback, this, std::placeholders::_1),
+      subscription_options);
+    callback_group_executor_.add_callback_group(
+      callback_group_, node->get_node_base_interface());
+    clock_ = node->get_clock();
+    logger_ = node->get_logger();
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {
+      BT::InputPort<std::string>("costmap_topic", "local_costmap/costmap_raw"),
+      BT::InputPort<std::string>("odom_topic", "odometry"),
+      BT::InputPort<int>("inflation_cost_threshold", 128, "Minimum inflation cost"),
+      BT::InputPort<double>("footprint_radius", 0.42, "Cost sampling radius"),
+      BT::InputPort<double>("movement_radius", 0.10, "Minimum net translation"),
+      BT::InputPort<double>("rotation_progress_rad", 0.18, "Minimum net rotation"),
+      BT::InputPort<double>("stuck_time_s", 3.0, "Stall detection duration"),
+    };
+  }
+
+  BT::NodeStatus tick() override
+  {
+    callback_group_executor_.spin_some();
+
+    nav2_msgs::msg::Costmap::SharedPtr costmap_msg;
+    nav_msgs::msg::Odometry::SharedPtr odom_msg;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!latest_costmap_ || !latest_odom_) {
+        return BT::NodeStatus::FAILURE;
+      }
+      costmap_msg = latest_costmap_;
+      odom_msg = latest_odom_;
+    }
+    const auto & costmap = *costmap_msg;
+    const auto & odom = *odom_msg;
+
+    const auto & metadata = costmap.metadata;
+    if (metadata.resolution <= 0.0 || metadata.size_x == 0 || metadata.size_y == 0 ||
+      costmap.data.empty() ||
+      (!costmap.header.frame_id.empty() && !odom.header.frame_id.empty() &&
+      costmap.header.frame_id != odom.header.frame_id))
+    {
+      reset();
+      return BT::NodeStatus::FAILURE;
+    }
+
+    const double x = odom.pose.pose.position.x;
+    const double y = odom.pose.pose.position.y;
+    const int map_x = static_cast<int>(std::floor(
+      (x - metadata.origin.position.x) / metadata.resolution));
+    const int map_y = static_cast<int>(std::floor(
+      (y - metadata.origin.position.y) / metadata.resolution));
+    if (map_x < 0 || map_y < 0 || map_x >= static_cast<int>(metadata.size_x) ||
+      map_y >= static_cast<int>(metadata.size_y))
+    {
+      reset();
+      return BT::NodeStatus::FAILURE;
+    }
+
+    const int radius_cells = std::max(
+      1, static_cast<int>(std::ceil(footprint_radius_ / metadata.resolution)));
+    int max_cost = 0;
+    int inflation_cells = 0;
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+      const int sample_y = map_y + dy;
+      if (sample_y < 0 || sample_y >= static_cast<int>(metadata.size_y)) {
+        continue;
+      }
+      for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+        const int sample_x = map_x + dx;
+        if (sample_x < 0 || sample_x >= static_cast<int>(metadata.size_x)) {
+          continue;
+        }
+        const double cell_x = metadata.origin.position.x +
+          (static_cast<double>(sample_x) + 0.5) * metadata.resolution;
+        const double cell_y = metadata.origin.position.y +
+          (static_cast<double>(sample_y) + 0.5) * metadata.resolution;
+        if (std::hypot(cell_x - x, cell_y - y) > footprint_radius_) {
+          continue;
+        }
+        const auto index = static_cast<std::size_t>(sample_y) * metadata.size_x +
+          static_cast<std::size_t>(sample_x);
+        if (index >= costmap.data.size()) {
+          continue;
+        }
+        const int cost = static_cast<unsigned char>(costmap.data[index]);
+        if (cost == 255) {
+          continue;
+        }
+        max_cost = std::max(max_cost, cost);
+        if (cost >= inflation_cost_threshold_) {
+          ++inflation_cells;
+        }
+      }
+    }
+
+    if (inflation_cells == 0) {
+      reset();
+      return BT::NodeStatus::FAILURE;
+    }
+
+    const auto now = clock_->now();
+    const double yaw = poseYaw(odom.pose.pose);
+    if (!inflation_anchor_) {
+      inflation_anchor_ = geometry_msgs::msg::Point {};
+      inflation_anchor_->x = x;
+      inflation_anchor_->y = y;
+      inflation_anchor_yaw_ = yaw;
+      anchor_time_ = now;
+      RCLCPP_WARN(
+        logger_,
+        "[脱困监测] 车体进入膨胀/障碍区域，开始 %.1f 秒卡滞计时："
+        "足迹最大代价=%d，高代价栅格=%d。",
+        stuck_time_s_, max_cost, inflation_cells);
+      return BT::NodeStatus::FAILURE;
+    }
+
+    const double moved = std::hypot(
+      x - inflation_anchor_->x, y - inflation_anchor_->y);
+    const double rotated = std::abs(shortestAngularDistance(*inflation_anchor_yaw_, yaw));
+    const double elapsed = (now - anchor_time_).seconds();
+    if (elapsed < stuck_time_s_) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000,
+        "[脱困监测] 正在计时：%.1f/%.1f 秒，净移动=%.3f 米，净转角=%.1f 度，"
+        "足迹最大代价=%d。",
+        elapsed, stuck_time_s_, moved, rotated * 180.0 / M_PI, max_cost);
+      return BT::NodeStatus::FAILURE;
+    }
+
+    if (moved >= movement_radius_ || rotated >= rotation_progress_rad_) {
+      inflation_anchor_->x = x;
+      inflation_anchor_->y = y;
+      inflation_anchor_yaw_ = yaw;
+      anchor_time_ = now;
+      return BT::NodeStatus::FAILURE;
+    }
+
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "[脱困触发] 车辆在膨胀/障碍区域卡滞 %.1f 秒：净移动=%.3f 米，"
+      "净转角=%.1f 度，足迹最大代价=%d；立即请求自研 Backup。",
+      elapsed, moved, rotated * 180.0 / M_PI, max_cost);
+    return BT::NodeStatus::SUCCESS;
+  }
+
+private:
+  void costmapCallback(const nav2_msgs::msg::Costmap::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_costmap_ = msg;
+  }
+
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_odom_ = msg;
+  }
+
+  void reset()
+  {
+    inflation_anchor_.reset();
+    inflation_anchor_yaw_.reset();
+  }
+
+  std::string costmap_topic_{"local_costmap/costmap_raw"};
+  std::string odom_topic_{"odometry"};
+  int inflation_cost_threshold_{128};
+  double footprint_radius_{0.42};
+  double movement_radius_{0.10};
+  double rotation_progress_rad_{0.18};
+  double stuck_time_s_{3.0};
+  std::mutex mutex_;
+  rclcpp::CallbackGroup::SharedPtr callback_group_;
+  rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
+  rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  nav2_msgs::msg::Costmap::SharedPtr latest_costmap_;
+  nav_msgs::msg::Odometry::SharedPtr latest_odom_;
+  std::optional<geometry_msgs::msg::Point> inflation_anchor_;
+  std::optional<double> inflation_anchor_yaw_;
+  rclcpp::Time anchor_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Logger logger_{rclcpp::get_logger("IsStuckInInflation")};
 };
 
 }  // namespace
@@ -316,5 +542,6 @@ BT_REGISTER_NODES(factory)
   factory.registerNodeType<trajectory_optimizer::WaitForValidPath>("WaitForValidPath");
   factory.registerNodeType<trajectory_optimizer::HasValidPath>("HasValidPath");
   factory.registerNodeType<trajectory_optimizer::ClearPath>("ClearPath");
+  factory.registerNodeType<trajectory_optimizer::IsStuckInInflation>("IsStuckInInflation");
   factory.registerNodeType<trajectory_optimizer::FollowElasticPathAction>("FollowElasticPath");
 }

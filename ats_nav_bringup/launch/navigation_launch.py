@@ -267,6 +267,9 @@ def generate_launch_description():
                 respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=["--ros-args", "--log-level", log_level],
+                remappings=[
+                    ("cmd_vel", "cmd_vel_nav2_result"),  # recovery output
+                ],
             ),
             Node(
                 package="nav2_bt_navigator",
