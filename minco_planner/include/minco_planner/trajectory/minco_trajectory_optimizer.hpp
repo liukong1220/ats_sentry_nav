@@ -33,6 +33,15 @@ struct MincoTrajectoryOptimizerParams
   double esdf_obstacle_control_point_spacing = 0.30;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
+
+  // A second ESDF pass uses a yaw reference and the same rectangular samples as
+  // the final footprint gate. It changes translation only; yaw remains independent.
+  bool esdf_footprint_optimization_enabled = true;
+  double esdf_footprint_clearance = 0.10;
+  double esdf_footprint_sample_spacing = 0.10;
+  double footprint_length = 0.70;
+  double footprint_width = 0.55;
+  double footprint_safety_margin = 0.05;
 };
 
 class MincoTrajectoryOptimizer
@@ -43,9 +52,11 @@ public:
 
   void setParams(const MincoTrajectoryOptimizerParams & params);
   bool esdfObstacleOptimizationEnabled() const;
+  bool esdfFootprintOptimizationEnabled() const;
   ReferenceTrajectory optimize(
     const nav_msgs::msg::Path & raw_path,
-    const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf = nullptr) const;
+    const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf = nullptr,
+    const ReferenceTrajectory * footprint_orientation = nullptr) const;
 
 private:
   MincoTrajectoryOptimizerParams params_;

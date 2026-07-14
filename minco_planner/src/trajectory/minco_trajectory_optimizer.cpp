@@ -8,6 +8,7 @@
 
 #include <Eigen/Core>
 
+#include "minco_planner/safety/footprint_samples.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
 #include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
 
@@ -109,19 +110,88 @@ Point limitNorm(const Point & value, double maximum_norm)
   return value;
 }
 
+double normalizeAngle(double angle)
+{
+  while (angle > M_PI) {
+    angle -= 2.0 * M_PI;
+  }
+  while (angle < -M_PI) {
+    angle += 2.0 * M_PI;
+  }
+  return angle;
+}
+
+double interpolateReferenceYaw(const ReferenceTrajectory & reference, double progress)
+{
+  if (reference.points.empty()) {
+    return 0.0;
+  }
+  if (reference.points.size() == 1U || reference.totalTime() <= 1e-6) {
+    return reference.points.front().yaw;
+  }
+
+  const double target_time = std::max(0.0, std::min(1.0, progress)) * reference.totalTime();
+  const auto upper = std::lower_bound(
+    reference.points.begin(), reference.points.end(), target_time,
+    [](const ReferencePoint & point, double time) {return point.t < time;});
+  if (upper == reference.points.begin()) {
+    return upper->yaw;
+  }
+  if (upper == reference.points.end()) {
+    return reference.points.back().yaw;
+  }
+
+  const ReferencePoint & before = *(upper - 1);
+  const double duration = std::max(1e-6, upper->t - before.t);
+  const double alpha = std::max(0.0, std::min(1.0, (target_time - before.t) / duration));
+  return normalizeAngle(before.yaw + alpha * normalizeAngle(upper->yaw - before.yaw));
+}
+
+bool queryFootprintEsdf(
+  const trajectory_optimizer::RcTraversabilityEsdfProvider & esdf,
+  const Point & position,
+  double yaw,
+  const std::vector<Point> & samples,
+  trajectory_optimizer::EsdfQueryResult & result)
+{
+  result = trajectory_optimizer::EsdfQueryResult {};
+  const double cos_yaw = std::cos(yaw);
+  const double sin_yaw = std::sin(yaw);
+  bool found = false;
+  for (const Point & sample : samples) {
+    trajectory_optimizer::EsdfQueryResult query;
+    const Point world = position + Point(
+      cos_yaw * sample.x() - sin_yaw * sample.y(),
+      sin_yaw * sample.x() + cos_yaw * sample.y());
+    if (!esdf.query(world.x(), world.y(), query) || !std::isfinite(query.distance)) {
+      continue;
+    }
+    if (!found || query.distance < result.distance) {
+      result = query;
+      found = true;
+    }
+  }
+  return found;
+}
+
 std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf)
+  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
+  const ReferenceTrajectory * footprint_orientation)
 {
   if (!params.esdf_obstacle_optimization_enabled || !esdf || !esdf->available()) {
     return input_waypoints;
   }
 
+  const bool footprint_aware = params.esdf_footprint_optimization_enabled &&
+    footprint_orientation && !footprint_orientation->empty();
   const double minimum_clearance = std::max(0.0, params.esdf_obstacle_clearance);
+  const double footprint_clearance = std::max(0.0, params.esdf_footprint_clearance);
   const double maximum_step = std::max(0.0, params.esdf_obstacle_max_step);
   const double maximum_deviation = std::max(0.0, params.esdf_obstacle_max_deviation);
-  if (input_waypoints.size() < 2 || minimum_clearance <= 0.0 || maximum_step <= 0.0) {
+  const double required_clearance = footprint_aware ? footprint_clearance : minimum_clearance;
+  if (input_waypoints.size() < 2 || required_clearance <= 0.0 || maximum_step <= 0.0) {
     return input_waypoints;
   }
 
@@ -130,6 +200,10 @@ std::vector<Point> refineWaypointsWithEsdf(
   std::vector<Point> waypoints = original_waypoints;
   const double reference_speed = std::max(0.05, params.reference_speed);
   const double sample_dt = std::max(0.02, params.sample_spacing * 0.5) / reference_speed;
+  const std::vector<Point> footprint_samples = footprint_aware ?
+    makeRectangularFootprintSamples(
+    params.footprint_length, params.footprint_width, params.footprint_safety_margin,
+    params.esdf_footprint_sample_spacing) : std::vector<Point> {};
 
   for (int iteration = 0; iteration < std::max(0, params.esdf_obstacle_max_iterations);
     ++iteration)
@@ -140,6 +214,8 @@ std::vector<Point> refineWaypointsWithEsdf(
     if (!solveMinco(waypoints, durations, minco)) {
       break;
     }
+    const double total_duration = std::max(1e-6, durations.sum());
+    double elapsed_duration = 0.0;
 
     std::vector<Point> corrections(waypoints.size(), Point::Zero());
     std::vector<double> weights(waypoints.size(), 0.0);
@@ -151,14 +227,20 @@ std::vector<Point> refineWaypointsWithEsdf(
         const double fraction = static_cast<double>(step) / steps;
         const MincoSample sample = minco.sample(piece, duration * fraction);
         trajectory_optimizer::EsdfQueryResult query;
-        if (!esdf->query(sample.position.x(), sample.position.y(), query) ||
-          query.distance >= minimum_clearance || query.gradient.squaredNorm() < 1e-10)
+        const bool query_ok = footprint_aware ? queryFootprintEsdf(
+          *esdf, sample.position,
+          interpolateReferenceYaw(*footprint_orientation,
+          (elapsed_duration + duration * fraction) / total_duration),
+          footprint_samples, query) :
+          esdf->query(sample.position.x(), sample.position.y(), query);
+        if (!query_ok || query.distance >= required_clearance ||
+          query.gradient.squaredNorm() < 1e-10)
         {
           continue;
         }
 
         const Point correction = query.gradient.normalized() * std::min(
-          maximum_step, 0.5 * (minimum_clearance - query.distance));
+          maximum_step, 0.5 * (required_clearance - query.distance));
         const std::size_t start_index = static_cast<std::size_t>(piece);
         const std::size_t end_index = start_index + 1U;
         corrections[start_index] += (1.0 - fraction) * correction;
@@ -167,6 +249,7 @@ std::vector<Point> refineWaypointsWithEsdf(
         weights[end_index] += fraction;
         needs_correction = true;
       }
+      elapsed_duration += duration;
     }
     if (!needs_correction) {
       break;
@@ -232,9 +315,15 @@ bool MincoTrajectoryOptimizer::esdfObstacleOptimizationEnabled() const
   return params_.esdf_obstacle_optimization_enabled;
 }
 
+bool MincoTrajectoryOptimizer::esdfFootprintOptimizationEnabled() const
+{
+  return params_.esdf_obstacle_optimization_enabled && params_.esdf_footprint_optimization_enabled;
+}
+
 ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const nav_msgs::msg::Path & raw_path,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf) const
+  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
+  const ReferenceTrajectory * footprint_orientation) const
 {
   ReferenceTrajectory trajectory;
   trajectory.header = raw_path.header;
@@ -252,7 +341,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
 
   const double reference_speed = std::max(0.05, params_.reference_speed);
   const double sample_spacing = std::max(0.02, params_.sample_spacing);
-  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf);
+  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation);
   Eigen::VectorXd durations = allocateDurations(
     waypoints, reference_speed, std::max(0.01, params_.min_segment_time));
   MincoS3 minco;

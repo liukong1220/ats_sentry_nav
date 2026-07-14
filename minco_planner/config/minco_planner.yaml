@@ -33,14 +33,18 @@ minco_planner:
     time_scaling_factor: 1.25
 
     # The outer loop refines only MINCO inner points with signed RC-ESDF
-    # gradients, then re-solves S3. It is topology-preserving and independent
-    # of the later yaw-aware rectangular footprint gate.
+    # gradients, then re-solves S3. A second pass uses the yaw reference and
+    # the same rectangular samples as the final footprint gate.
     esdf_obstacle_optimization_enabled: true
     esdf_obstacle_clearance: 0.45
     esdf_obstacle_max_iterations: 6
     esdf_obstacle_control_point_spacing: 0.30
     esdf_obstacle_max_step: 0.10
     esdf_obstacle_max_deviation: 0.50
+    esdf_footprint_optimization_enabled: true
+    # Required gap from the safety-margin-expanded rectangle to an obstacle.
+    esdf_footprint_clearance: 0.10
+    esdf_footprint_sample_spacing: 0.10
 
     # Swerve chassis keeps independent yaw in open space and aligns to the
     # nearest forward/reverse path tangent only where RC-ESDF reports a corridor.

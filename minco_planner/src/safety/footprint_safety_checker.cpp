@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "minco_planner/safety/footprint_samples.hpp"
+
 namespace minco_planner
 {
 
@@ -91,26 +93,19 @@ bool FootprintSafetyChecker::sampleFootprintOccupied(
   double & collision_x,
   double & collision_y) const
 {
-  const double half_length = 0.5 * std::max(0.0, params_.length) + params_.safety_margin;
-  const double half_width = 0.5 * std::max(0.0, params_.width) + params_.safety_margin;
-  const double resolution = std::max(0.02, static_cast<double>(grid.info.resolution));
-  const int samples_x = std::max(2, static_cast<int>(std::ceil((2.0 * half_length) / resolution)));
-  const int samples_y = std::max(2, static_cast<int>(std::ceil((2.0 * half_width) / resolution)));
+  const std::vector<Eigen::Vector2d> samples = makeRectangularFootprintSamples(
+    params_.length, params_.width, params_.safety_margin, grid.info.resolution);
   const double cos_yaw = std::cos(point.yaw);
   const double sin_yaw = std::sin(point.yaw);
 
-  for (int ix = 0; ix <= samples_x; ++ix) {
-    const double bx = -half_length + 2.0 * half_length * ix / static_cast<double>(samples_x);
-    for (int iy = 0; iy <= samples_y; ++iy) {
-      const double by = -half_width + 2.0 * half_width * iy / static_cast<double>(samples_y);
-      const double wx = point.x + cos_yaw * bx - sin_yaw * by;
-      const double wy = point.y + sin_yaw * bx + cos_yaw * by;
-      GridIndex index;
-      if (!worldToGrid(grid, wx, wy, index) || isOccupied(grid, index)) {
-        collision_x = wx;
-        collision_y = wy;
-        return true;
-      }
+  for (const auto & sample : samples) {
+    const double wx = point.x + cos_yaw * sample.x() - sin_yaw * sample.y();
+    const double wy = point.y + sin_yaw * sample.x() + cos_yaw * sample.y();
+    GridIndex index;
+    if (!worldToGrid(grid, wx, wy, index) || isOccupied(grid, index)) {
+      collision_x = wx;
+      collision_y = wy;
+      return true;
     }
   }
   return false;

@@ -85,6 +85,11 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
+  declare_parameter<bool>(
+    "esdf_footprint_optimization_enabled", optimizer_params.esdf_footprint_optimization_enabled);
+  declare_parameter<double>("esdf_footprint_clearance", optimizer_params.esdf_footprint_clearance);
+  declare_parameter<double>(
+    "esdf_footprint_sample_spacing", optimizer_params.esdf_footprint_sample_spacing);
 
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
@@ -135,6 +140,10 @@ void MincoPlannerNode::declareAndLoadParams()
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
+  get_parameter(
+    "esdf_footprint_optimization_enabled", optimizer_params.esdf_footprint_optimization_enabled);
+  get_parameter("esdf_footprint_clearance", optimizer_params.esdf_footprint_clearance);
+  get_parameter("esdf_footprint_sample_spacing", optimizer_params.esdf_footprint_sample_spacing);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
@@ -145,6 +154,9 @@ void MincoPlannerNode::declareAndLoadParams()
   footprint_length_ = footprint_params.length;
   footprint_width_ = footprint_params.width;
   footprint_safety_margin_ = footprint_params.safety_margin;
+  optimizer_params.footprint_length = footprint_length_;
+  optimizer_params.footprint_width = footprint_width_;
+  optimizer_params.footprint_safety_margin = footprint_safety_margin_;
   const double all_yaw_footprint_radius = std::hypot(
     0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_,
     0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_);
@@ -230,13 +242,35 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     return;
   }
 
-  ReferenceTrajectory reference = optimizer_.optimize(search_result.path, clearance_esdf_.get());
-  reference.header.stamp = now();
+  ReferenceTrajectory center_reference = optimizer_.optimize(search_result.path, clearance_esdf_.get());
+  center_reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
-  yaw_planner_.apply(reference, start_yaw, goal_yaw);
-  annotateClearance(reference);
-  FootprintSafetyResult safety = safety_checker_.check(reference, *latest_grid_);
+  yaw_planner_.apply(center_reference, start_yaw, goal_yaw);
+  annotateClearance(center_reference);
+  FootprintSafetyResult center_safety = safety_checker_.check(center_reference, *latest_grid_);
+  ReferenceTrajectory reference = center_reference;
+  FootprintSafetyResult safety = center_safety;
+  if (optimizer_.esdfFootprintOptimizationEnabled()) {
+    ReferenceTrajectory footprint_reference = optimizer_.optimize(
+      search_result.path, clearance_esdf_.get(), &center_reference);
+    if (!footprint_reference.empty()) {
+      footprint_reference.header.stamp = now();
+      yaw_planner_.apply(footprint_reference, start_yaw, goal_yaw);
+      annotateClearance(footprint_reference);
+      FootprintSafetyResult footprint_safety = safety_checker_.check(
+        footprint_reference, *latest_grid_);
+      if (footprint_safety.safe || !center_safety.safe) {
+        reference = std::move(footprint_reference);
+        safety = std::move(footprint_safety);
+      } else {
+        RCLCPP_WARN(
+          get_logger(),
+          "Footprint-aware RC-ESDF candidate had %zu collisions; keeping safe center ESDF candidate.",
+          footprint_safety.collisions.size());
+      }
+    }
+  }
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
     ReferenceTrajectory fallback_reference = optimizer_.optimize(search_result.path);
     fallback_reference.header.stamp = now();
@@ -254,7 +288,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     }
   }
   if (!safety.safe && collision_repair_.repair(reference, safety, *latest_grid_)) {
-    reference = optimizer_.optimize(toPath(reference), clearance_esdf_.get());
+    reference = optimizer_.optimize(toPath(reference), clearance_esdf_.get(), &reference);
     reference.header.stamp = now();
     yaw_planner_.apply(reference, start_yaw, goal_yaw);
     annotateClearance(reference);
