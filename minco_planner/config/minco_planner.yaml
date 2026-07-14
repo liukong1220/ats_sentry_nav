@@ -1,63 +1,93 @@
 minco_planner:
   ros__parameters:
-    # rc_esdf_map fuses static /map walls with local terrain semantics in odom.
+    # RC-ESDF 融合静态墙体与局部地形后的规划栅格；JPS、MINCO 和足迹检查共用它。
     grid_topic: /rc_esdf/planning_grid
+    # 自研模式可直接向此话题发布 PoseStamped 目标。
     goal_topic: goal_pose
+    # Nav2 兼容入口；自研 Nav2-free 模式设为空字符串即可停止订阅 /plan。
     global_plan_topic: /plan
+    # 发布原始 JPS/A* 路径，便于检查离散搜索是否正确。
     raw_path_topic: minco/raw_path
+    # 发布带位置、yaw、速度和加速度的 MINCO 连续参考路径，供 MPC 跟踪。
     reference_path_topic: minco/reference_path
+    # 发布 JPS、MINCO 和足迹碰撞调试 marker。
     debug_marker_topic: minco/debug_markers
+    # 规划栅格和目标最终统一到的全局坐标系。
     global_frame: odom
+    # 从 global_frame 查询当前车体起点位姿时使用的 TF frame。
     robot_frame: gimbal_yaw_odom
 
-    # Same obstacle convention as the current traversability / RC-ESDF bridge.
+    # 栅格值达到此阈值即视为障碍；必须与 RC-ESDF 编码保持一致。
     obstacle_value_threshold: 50
+    # 未知栅格按障碍处理，避免局部地图未观测区域被路径穿过。
     unknown_is_obstacle: true
+    # 是否允许八邻域搜索；true 可产生对角线捷径。
     allow_diagonal: true
+    # 全局离散搜索算法；当前 jps 失败时仍可回退 A*。
     search_algorithm: jps
+    # JPS 无解后是否自动尝试 A*。
     astar_fallback: true
+    # JPS 最大展开节点数；-1 表示不人为限制。
     jps_max_expanded_nodes: -1
-    # 0.57 m is just above the 0.515 m all-yaw radius of the configured
-    # 0.70 x 0.55 m rectangle with its safety margin. At the 0.40 m RC-ESDF
-    # resolution this also rejects occupied diagonal neighbours.
+    # JPS 质心最小净空（m）；0.57 大于当前带安全边界矩形的任意 yaw 外接半径，
+    # 同时会在 0.40 m RC-ESDF 栅格上排除被障碍占据的对角邻居。
     jps_safe_distance: 0.57
+    # false 时最终足迹检查失败的轨迹不会发布给 MPC。
     publish_unsafe_trajectory: false
 
-    # S3 non-uniform-time MINCO translation trajectory limits.
+    # MINCO S3 非均匀时间平移轨迹的名义速度（m/s），也用于采样密度估计。
     reference_speed: 1.5
+    # 单段最短持续时间（s），防止短路径产生数值不稳定的极短时间段。
     min_segment_time: 0.05
+    # 输出参考轨迹相邻采样点的期望间距（m）。
     sample_spacing: 0.12
+    # 平移速度模长上限（m/s）；小于等于 0 表示不限制。
     max_velocity: 2.0
+    # 平移加速度模长上限（m/s^2）；小于等于 0 表示不限制。
     max_acceleration: 2.5
+    # 超出动力学上限时最多整体拉长时间的次数。
     max_time_scaling_iterations: 5
+    # 每次时间重标定的最小放大倍率，大于 1 会降低速度和加速度。
     time_scaling_factor: 1.25
 
-    # The outer loop refines only MINCO inner points with signed RC-ESDF
-    # gradients, then re-solves S3. A second pass uses the yaw reference and
-    # the same rectangular samples as the final footprint gate.
+    # 是否启用基于 RC-ESDF 梯度的 MINCO 内部控制点避障修正。
     esdf_obstacle_optimization_enabled: true
+    # 质心候选所需最小 signed distance（m）；小于该值时沿 ESDF 正梯度外推。
     esdf_obstacle_clearance: 0.45
+    # ESDF 内点修正与重新求解 MINCO 的最大轮数。
     esdf_obstacle_max_iterations: 6
+    # 将原始 JPS 路径加密为可修正控制点的间距（m）。
     esdf_obstacle_control_point_spacing: 0.30
+    # 单次 ESDF 梯度修正的最大位移（m），避免一次跳过狭窄可行区域。
     esdf_obstacle_max_step: 0.10
+    # 内点相对原始 JPS 引导线允许偏离的最大距离（m）。
     esdf_obstacle_max_deviation: 0.50
+    # 是否使用独立 yaw 和矩形足迹采样进行第二阶段内点修正。
     esdf_footprint_optimization_enabled: true
-    # Required gap from the safety-margin-expanded rectangle to an obstacle.
+    # 带安全边界的矩形足迹到障碍的额外最小间隙（m）。
     esdf_footprint_clearance: 0.10
+    # 矩形足迹采样点的间距（m）；越小越保守但查询次数越多。
     esdf_footprint_sample_spacing: 0.10
 
-    # Swerve chassis keeps independent yaw in open space and aligns to the
-    # nearest forward/reverse path tangent only where RC-ESDF reports a corridor.
-    # Compatibility modes: goal_heading, hold, path_tangent, clearance_aware.
+    # 舵轮航向模式：goal_heading=平滑转向目标，hold=始终保持初始朝向，
+    # path_tangent=始终贴路径切线，clearance_aware=开阔区独立 yaw、窄区贴最近正/反向切线。
     yaw_mode: clearance_aware
+    # yaw 角速度上限（rad/s），航向规划会按采样时间限制相邻 yaw 的变化量。
     yaw_rate_limit: 2.5
+    # 净空小于等于该值（m）时进入窄通道航向策略。
     narrow_clearance_enter: 0.55
+    # 已进入窄通道后，净空达到该值（m）以上才退出，形成滞回以防抖动。
     narrow_clearance_exit: 0.70
 
+    # 车体矩形足迹长度（m），对应前后方向的保守尺寸。
     footprint_length: 0.70
+    # 车体矩形足迹宽度（m），对应左右方向的保守尺寸。
     footprint_width: 0.55
+    # 每个矩形边界外额外扩张的安全边界（m）。
     footprint_safety_margin: 0.05
-    # Repaired geometry is reprocessed by MINCO, but nearest-cell repair stays opt-in.
+    # 是否启用局部碰撞修复；修复后仍会重新经过 MINCO 和最终足迹 gate。
     local_repair_enabled: false
+    # 局部修复搜索的最大迭代次数。
     local_repair_max_iterations: 2
+    # 局部修复时可寻找替代栅格点的最大半径（m）。
     local_repair_search_radius: 0.35

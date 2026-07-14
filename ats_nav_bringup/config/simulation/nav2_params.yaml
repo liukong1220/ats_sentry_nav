@@ -373,22 +373,34 @@ bt_navigator:
 
 rc_esdf_map:
   ros__parameters:
+    # MuJoCo 使用 /clock；实车配置中对应参数必须为 false。
     use_sim_time: true
+    # 静态 PGM 墙体来源，用于补足局部 terrain 视野之外的固定障碍。
     static_map_topic: "/map"
+    # terrain_analysis_ext 发布的局部可通行栅格输入。
     traversability_grid_topic: "traversability_grid"
+    # 融合静态墙体与 terrain 后的统一规划栅格，JPS/MINCO 订阅此话题。
     planning_grid_topic: "/rc_esdf/planning_grid"
+    # 仅用于 RViz 的 signed distance 运输编码，不能作为无损数值 ESDF。
     signed_distance_grid_topic: "/rc_esdf/signed_distance_grid"
+    # 扣除保守外接圆后的净空可视化栅格。
     footprint_clearance_grid_topic: "/rc_esdf/footprint_clearance_grid"
+    # 静态地图所属 frame；局部 terrain 会经 TF 变换到此 frame 后融合。
     static_map_frame: "map"
+    # 静态栅格值达到此阈值即视为墙体障碍。
     static_obstacle_value_threshold: 50
+    # 局部可通行栅格值达到此阈值即视为障碍，也作为 ESDF 障碍阈值。
     local_obstacle_value_threshold: 50
-    # Keep terrain semantics at their source resolution, but fuse /map and run
-    # the signed EDT on this finer grid so static walls do not occupy a whole
-    # 0.40 m terrain cell around an otherwise valid rectangular footprint.
+    # terrain 语义仍按源分辨率产生，但融合和 signed EDT 在此更细栅格执行，
+    # 避免静态墙体占满本应允许矩形足迹通过的整块 0.40 m terrain 单元。
     planning_grid_resolution: 0.10
+    # RViz signed distance 编码的正负距离截断范围（m）。
     signed_distance_max_m: 2.0
+    # clearance 可视化使用的保守车体长度（m）。
     footprint_length: 0.60
+    # clearance 可视化使用的保守车体宽度（m）。
     footprint_width: 0.50
+    # clearance 可视化矩形额外扩张的安全边界（m）。
     footprint_safety_margin: 0.02
 
 trajectory_optimizer:
@@ -404,6 +416,7 @@ trajectory_optimizer:
     local_elastic_position_change_threshold: 0.025
     esdf_source: "traversability_grid"
     terrain_pointcloud_topic: "terrain_map_ext"
+    # 使用融合后的规划栅格，避免优化器只看到 terrain 而漏掉静态墙体。
     traversability_grid_topic: "/rc_esdf/planning_grid"
     traversability_slope_topic: "traversability_slope_grid"  # task1: 先把坡度接进 ESDF 语义侧，供后续限速策略复用。
     terrain_esdf_resolution: 0.05
@@ -416,6 +429,7 @@ trajectory_optimizer:
     traversability_slope_max_degrees: 45.0  # 要与 slopeGridMaxDeg 保持一致，否则解码出来的坡度会失真。
     traversability_obstacle_value_threshold: 50
     traversability_lethal_value_threshold: 90
+    # unknown 按障碍处理，局部观测缺失不能被误当作可通行空间。
     traversability_unknown_is_obstacle: true
     control_point_spacing: 0.22
     output_path_spacing: 0.05
@@ -777,6 +791,7 @@ smoother_server:
       profile_topic: "trajectory_profile"
       esdf_source: "traversability_grid"
       terrain_pointcloud_topic: "terrain_map_ext"
+      # 与旁路优化器统一使用 RC-ESDF 融合后的规划栅格。
       traversability_grid_topic: "/rc_esdf/planning_grid"
       traversability_slope_topic: "traversability_slope_grid"  # smoother 与旁路优化器共用同一坡度输入。
       terrain_esdf_resolution: 0.05
@@ -789,6 +804,7 @@ smoother_server:
       traversability_slope_max_degrees: 45.0  # 和 terrain_analysis_ext 发布侧编码上限对应。
       traversability_obstacle_value_threshold: 50
       traversability_lethal_value_threshold: 90
+      # 在 smoother 中同样保守处理 unknown，防止两条路径链语义不一致。
       traversability_unknown_is_obstacle: true
       obstacle_safe_cost: 96
       use_esdf_obstacle_cost: true
@@ -900,10 +916,12 @@ trajectory_speed_governor:
     # 仅当 RC-ESDF 的完整车体足迹净空不足时，才限制全向底盘横移/倒车。
     heading_guard_enabled: true
     heading_guard_path_topic: "local_elastic_path"
+    # heading guard 读取同一融合栅格来判断完整车体净空。
     heading_guard_traversability_grid_topic: "/rc_esdf/planning_grid"
     heading_guard_base_frame: "gimbal_yaw_odom"
     heading_guard_obstacle_value_threshold: 50
     heading_guard_lethal_value_threshold: 90
+    # 未观测区域不允许横移或倒车穿越。
     heading_guard_unknown_is_obstacle: true
     heading_guard_enter_clearance_m: 0.20
     heading_guard_exit_clearance_m: 0.30

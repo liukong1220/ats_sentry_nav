@@ -18,6 +18,7 @@ RcEsdfMapNode::RcEsdfMapNode(const rclcpp::NodeOptions & options)
   tf_buffer_(std::make_shared<tf2_ros::Buffer>(get_clock())),
   tf_listener_(std::make_shared<tf2_ros::TransformListener>(*tf_buffer_))
 {
+  // 这些参数决定静态地图、局部 terrain 与 ESDF 可视化的同一份融合契约。
   declare_parameter<std::string>("static_map_topic", static_map_topic_);
   declare_parameter<std::string>("traversability_grid_topic", traversability_grid_topic_);
   declare_parameter<std::string>("planning_grid_topic", planning_grid_topic_);
@@ -120,6 +121,7 @@ void RcEsdfMapNode::rebuild()
     }
   }
 
+  // 先上采样 terrain，再融合静态墙体，避免粗 terrain 单元把窄通道整块封死。
   const nav_msgs::msg::OccupancyGrid terrain_grid =
     resampleTraversabilityGrid(*traversability_grid_);
   nav_msgs::msg::OccupancyGrid planning_grid;
@@ -132,8 +134,7 @@ void RcEsdfMapNode::rebuild()
   }
 
   planning_grid_pub_->publish(planning_grid);
-  // Unknown cells retain -1 in the published planning grid, but are deliberately
-  // treated as obstacles by the distance field and all path consumers.
+  // 发布栅格仍保留 unknown 的 -1；距离场和所有路径消费者则保守地把它视为障碍。
   esdf_provider_->updateGrid(
     planning_grid, fusion_params_.local_obstacle_value_threshold, true,
     fusion_params_.local_obstacle_value_threshold);
@@ -145,6 +146,7 @@ void RcEsdfMapNode::rebuild()
   }
 
   signed_distance_grid_pub_->publish(encodeDistanceGrid(planning_grid, distance_field, 0.0));
+  // 清晰度图采用任意 yaw 都覆盖的外接圆，仅用于 RViz，最终安全仍由定向矩形 gate 决定。
   const double all_yaw_footprint_radius = 0.5 * std::hypot(footprint_length_, footprint_width_) +
     footprint_safety_margin_;
   footprint_clearance_grid_pub_->publish(
@@ -165,6 +167,7 @@ nav_msgs::msg::OccupancyGrid RcEsdfMapNode::resampleTraversabilityGrid(
     return input;
   }
 
+  // 对每个细栅格中心做最近源单元采样，语义值不在上采样时做平均稀释。
   nav_msgs::msg::OccupancyGrid output = input;
   const double extent_x = static_cast<double>(input.info.width) * input.info.resolution;
   const double extent_y = static_cast<double>(input.info.height) * input.info.resolution;
@@ -207,7 +210,8 @@ nav_msgs::msg::OccupancyGrid RcEsdfMapNode::encodeDistanceGrid(
     if (planning_grid.data[index] < 0 || !std::isfinite(distance_field[index])) {
       continue;
     }
-    const double normalized = std::max(
+  // 0..100 只是一种 RViz 运输编码；运行时优化器始终读取未截断的浮点 signed distance。
+  const double normalized = std::max(
       -1.0, std::min(1.0, (distance_field[index] - clearance_offset) / signed_distance_max_m_));
     encoded.data[index] = static_cast<int8_t>(std::lround(50.0 + 50.0 * normalized));
   }

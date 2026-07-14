@@ -15,7 +15,7 @@ def generate_launch_description():
                 default_value=PathJoinSubstitution(
                     [FindPackageShare("minco_planner"), "config", "minco_planner.yaml"]
                 ),
-                description="Path to minco_planner parameter file.",
+                description="MINCO/JPS/足迹安全参数 YAML 的路径。",
             ),
             Node(
                 package="minco_planner",

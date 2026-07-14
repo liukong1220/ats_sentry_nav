@@ -184,6 +184,7 @@ std::vector<Point> refineWaypointsWithEsdf(
     return input_waypoints;
   }
 
+  // 有 yaw 参考时查询旋转后的矩形采样点；否则保持兼容的质心 ESDF 修正。
   const bool footprint_aware = params.esdf_footprint_optimization_enabled &&
     footprint_orientation && !footprint_orientation->empty();
   const double minimum_clearance = std::max(0.0, params.esdf_obstacle_clearance);
@@ -205,6 +206,7 @@ std::vector<Point> refineWaypointsWithEsdf(
     params.footprint_length, params.footprint_width, params.footprint_safety_margin,
     params.esdf_footprint_sample_spacing) : std::vector<Point> {};
 
+  // 每轮先解出连续 MINCO，再把低净空采样点的梯度分配到相邻内部控制点。
   for (int iteration = 0; iteration < std::max(0, params.esdf_obstacle_max_iterations);
     ++iteration)
   {
@@ -256,6 +258,7 @@ std::vector<Point> refineWaypointsWithEsdf(
     }
 
     bool changed = false;
+    // 首尾点锁定为任务起终点，只允许移动内部点，并限制相对 JPS 引导线的偏离。
     for (std::size_t index = 1; index + 1 < waypoints.size(); ++index) {
       if (weights[index] <= 1e-9) {
         continue;
@@ -349,6 +352,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     return trajectory;
   }
 
+  // 若速度或加速度超限，只整体拉长各段时间，不改变已经通过安全检查的几何形状。
   for (int iteration = 0; iteration < std::max(0, params_.max_time_scaling_iterations);
     ++iteration)
   {

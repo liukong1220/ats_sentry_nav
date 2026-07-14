@@ -39,6 +39,7 @@ void YawSplinePlanner::apply(
 void YawSplinePlanner::applyClearanceAware(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const
 {
+  // 开阔区域先平滑朝向目标；只有窄通道才强制朝向路径，保留舵轮横移能力。
   applyGoalHeading(trajectory, initial_yaw, goal_yaw);
   if (trajectory.points.size() < 2) {
     return;
@@ -61,6 +62,7 @@ void YawSplinePlanner::applyClearanceAware(
   for (std::size_t i = 1; i < trajectory.points.size(); ++i) {
     auto & current = trajectory.points[i];
     if (std::isfinite(current.clearance)) {
+      // 进入和退出使用不同阈值，避免净空在边界附近时航向模式来回切换。
       narrow = narrow ? current.clearance < exit_clearance : current.clearance <= enter_clearance;
     }
 
@@ -75,6 +77,7 @@ void YawSplinePlanner::applyClearanceAware(
       if (std::hypot(tangent_x, tangent_y) > 1e-6) {
         const double forward_yaw = std::atan2(tangent_y, tangent_x);
         const double reverse_yaw = normalizeAngle(forward_yaw + M_PI);
+        // 窄通道可正向或反向对齐，选择与上一时刻转角较小的一侧。
         desired_yaw = std::abs(shortestAngularDistance(previous_yaw, forward_yaw)) <=
                           std::abs(shortestAngularDistance(previous_yaw, reverse_yaw))
                         ? forward_yaw
@@ -82,6 +85,7 @@ void YawSplinePlanner::applyClearanceAware(
       }
     }
 
+    // 最后按 yaw_rate_limit 裁剪，避免参考轨迹要求舵轮瞬时转向。
     const double dt = std::max(1e-3, current.t - previous_t);
     const double max_delta = std::max(0.0, params_.yaw_rate_limit) * dt;
     const double desired_delta = shortestAngularDistance(previous_yaw, desired_yaw);

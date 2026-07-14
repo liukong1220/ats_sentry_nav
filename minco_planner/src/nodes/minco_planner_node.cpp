@@ -27,6 +27,7 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
     goal_topic_, rclcpp::QoS(10),
     std::bind(&MincoPlannerNode::onGoal, this, std::placeholders::_1));
+  // 设为空可彻底断开 Nav2 /plan；此时 goal_topic 仍可独立触发 JPS 与 MINCO。
   if (!global_plan_topic_.empty()) {
     global_plan_sub_ = create_subscription<nav_msgs::msg::Path>(
       global_plan_topic_, rclcpp::QoS(1),
@@ -188,6 +189,7 @@ void MincoPlannerNode::declareAndLoadParams()
 void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
   latest_grid_ = msg;
+  // 每次栅格更新都刷新同一份运行时 ESDF，防止搜索和轨迹优化读取不同地图快照。
   clearance_esdf_->updateGrid(*msg, obstacle_value_threshold_, unknown_is_obstacle_);
 }
 
@@ -196,6 +198,7 @@ void MincoPlannerNode::onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg)
   if (msg->poses.empty()) {
     return;
   }
+  // 兼容 Nav2 时只取全局路径终点；真正的离散搜索仍由本节点在 RC-ESDF 上完成。
   onGoal(std::make_shared<geometry_msgs::msg::PoseStamped>(msg->poses.back()));
 }
 
@@ -224,6 +227,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   }
   goal = goal_in_grid;
 
+  // 起点来自 TF、终点来自 goal_topic，因此此分支不依赖 Smac 的路径几何。
   GridAstarResult search_result;
   if (search_algorithm_ == "jps") {
     search_result = jps_.plan(*latest_grid_, start, goal);
@@ -242,6 +246,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     return;
   }
 
+  // 先生成质心 ESDF 候选，再以独立 yaw 的矩形足迹进行第二阶段内点修正。
   ReferenceTrajectory center_reference = optimizer_.optimize(search_result.path, clearance_esdf_.get());
   center_reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
@@ -272,6 +277,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     }
   }
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
+    // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
     ReferenceTrajectory fallback_reference = optimizer_.optimize(search_result.path);
     fallback_reference.header.stamp = now();
     yaw_planner_.apply(fallback_reference, start_yaw, goal_yaw);
@@ -288,6 +294,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     }
   }
   if (!safety.safe && collision_repair_.repair(reference, safety, *latest_grid_)) {
+    // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
     reference = optimizer_.optimize(toPath(reference), clearance_esdf_.get(), &reference);
     reference.header.stamp = now();
     yaw_planner_.apply(reference, start_yaw, goal_yaw);

@@ -1,44 +1,76 @@
 ats_swerve_mpc:
   ros__parameters:
+    # 是否使用 /clock；MuJoCo 回归为 true，实车应改为 false。
     use_sim_time: true
+    # 当前车体状态来源，必须与参考轨迹处于同一 frame。
     odom_topic: /localization
+    # MINCO 发布的连续参考路径输入。
     trajectory_topic: /minco/reference_path
+    # MPC 唯一速度输出；舵轮模式下由 twist_to_motion_ctrl 转成底盘控制量。
     command_topic: /cmd_vel_mpc
+    # true 时立即清空 warm start 并发布零速度；设为空可关闭该输入。
     emergency_stop_topic: /planner/emergency_stop
+    # MPC 接受的状态与轨迹坐标系。
     frame_id: odom
+    # 控制器计算频率（Hz）。
     control_rate_hz: 20.0
+    # 输入 Path 缺少单点时间戳时，相邻点使用的兜底时间间隔（s）。
     fallback_path_dt: 0.1
+    # 轨迹跟踪超时附加宽限（s），用于容忍通信与执行延迟。
     trajectory_timeout: 0.5
+    # 到达目标的位置误差阈值（m）。
     goal_position_tolerance: 0.08
+    # 到达目标的航向误差阈值（rad）。
     goal_yaw_tolerance: 0.15
+    # 是否发布预测轨迹和参考预测域，供 RViz 与回归脚本检查。
     publish_debug_paths: true
 
-    # Project the measured pose onto MINCO instead of chasing wall-clock stamps.
+    # 从上次进度向后允许重新投影的时间窗口（s），用于吸收小幅定位抖动。
     projection_backward_window: 0.20
+    # 从上次进度向前允许搜索的最大时间窗口（s），防止误投影到远处路径段。
     projection_forward_window: 2.00
+    # 横向误差超过该值（m）后开始减慢参考进度。
     cross_track_slowdown_start: 0.15
+    # 横向误差达到该值（m）时降到最小参考进度倍率。
     cross_track_slowdown_end: 0.60
+    # 偏离路径严重时仍保留的最小参考进度/前馈速度比例，范围为 0 到 1。
     min_reference_progress_scale: 0.25
+    # 预测域起点补偿的命令传输延迟（s）。
     command_latency_compensation: 0.01
 
+    # MPC/iLQR 预测步数；实际预测时长约为 horizon * dt。
     horizon: 20
+    # MPC 离散模型步长（s）。
     dt: 0.1
+    # 每个控制周期允许的 iLQR 最大迭代次数。
     max_iterations: 6
+    # Q_uu 的对角正则化，避免反向递推求解病态矩阵。
     regularization: 1.0e-5
+    # 线搜索每次未下降时的步长缩小倍率。
     line_search_decay: 0.5
+    # 线搜索允许尝试的最小步长；低于它仍无下降则结束本轮迭代。
     min_line_search_step: 0.05
+    # 控制更新的无穷范数小于该值时视为收敛。
     convergence_tolerance: 1.0e-3
 
-    # State [x, y, yaw], body control [vx, vy, wz].
+    # 状态误差权重，对应世界系 [x, y, yaw]。
     state_weight: [18.0, 18.0, 4.0]
+    # 预测末端状态误差权重，通常大于过程权重以保证收敛到目标。
     terminal_weight: [28.0, 28.0, 8.0]
+    # 控制偏离参考的权重，对应车体系 [vx, vy, wz]。
     control_weight: [0.12, 0.12, 0.08]
+    # 相邻控制量变化的权重，用于抑制舵轮速度/角速度突变。
     control_delta_weight: [0.7, 0.7, 0.25]
 
-    # Initial safe simulation limits. Calibrate against steering and drive feedback.
+    # 车体系前后最大速度（m/s）；实车需按轮速能力重新标定。
     max_vx: 1.5
+    # 车体系横移最大速度（m/s）；这是舵轮全向能力，不应设为零。
     max_vy: 1.5
+    # 最大 yaw 角速度（rad/s）。
     max_wz: 2.0
+    # 车体系前后最大加速度（m/s^2）。
     max_ax: 2.0
+    # 车体系横移最大加速度（m/s^2）。
     max_ay: 2.0
+    # 最大 yaw 角加速度（rad/s^2）。
     max_awz: 3.0

@@ -15,8 +15,13 @@ def generate_launch_description():
                 default_value=PathJoinSubstitution(
                     [FindPackageShare("ats_swerve_mpc"), "config", "ats_swerve_mpc.yaml"]
                 ),
+                description="舵轮 SE2 MPC 参数 YAML 的路径。",
             ),
-            DeclareLaunchArgument("use_sim_time", default_value="true"),
+            DeclareLaunchArgument(
+                "use_sim_time",
+                default_value="true",
+                description="是否使用 /clock；MuJoCo 为 true，实车应设为 false。",
+            ),
             Node(
                 package="ats_swerve_mpc",
                 executable="ats_swerve_mpc_node",

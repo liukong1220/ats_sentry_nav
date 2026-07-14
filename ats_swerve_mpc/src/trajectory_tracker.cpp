@@ -50,6 +50,7 @@ TrajectoryProjection TrajectoryTracker::project(const Eigen::Vector2d & position
   }
 
   if (has_progress_) {
+    // 进度只能单调前进且受前向窗口限制，避免定位噪声跳回旧路径或跳到远端路径段。
     projection.time = std::max(last_progress_time_, projection.time);
     projection.time =
       std::min(last_progress_time_ + config_.forward_search_window, projection.time);
@@ -118,6 +119,7 @@ double TrajectoryTracker::progressScale(double cross_track_error) const
   if (cross_track_error >= config_.cross_track_slowdown_end) {
     return config_.min_progress_scale;
   }
+  // 横向偏差越大，越降低参考前馈和预测进度，让底盘先回到路径附近再继续追赶。
   const double ratio = (cross_track_error - config_.cross_track_slowdown_start) /
                        (config_.cross_track_slowdown_end - config_.cross_track_slowdown_start);
   return 1.0 - ratio * (1.0 - config_.min_progress_scale);
@@ -129,6 +131,7 @@ std::vector<Se2Reference> TrajectoryTracker::buildHorizon(
   if (!projection.valid || horizon <= 0 || dt <= 0.0) {
     return {};
   }
+  // 预测域以最近投影点为起点，而不是盲从 ROS 墙钟时间；延迟补偿也随降速同步缩小。
   const double scale = progressScale(projection.cross_track_error);
   const double start_time = projection.time + config_.command_latency_compensation * scale;
   std::vector<Se2Reference> references;
@@ -168,6 +171,7 @@ bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) c
   reference.state(2) = interpolateAngle(first.state(2), second.state(2), ratio);
   const Eigen::Vector2d world_velocity =
     (second.state.head<2>() - first.state.head<2>()) / duration;
+  // MINCO 速度在世界系，MPC 控制量必须转换为当前车体系 [vx, vy, wz]。
   const double cosine = std::cos(reference.state(2));
   const double sine = std::sin(reference.state(2));
   reference.control(0) = cosine * world_velocity.x() + sine * world_velocity.y();

@@ -41,6 +41,7 @@ State Se2MpcController::stateDifference(const State & lhs, const State & rhs)
 
 State Se2MpcController::dynamics(const State & state, const Control & control) const
 {
+  // 状态位于世界系 [x, y, yaw]，而 vx/vy 是车体系控制；此处完成 SE2 坐标变换。
   const double yaw = state(2);
   State next = state;
   next(0) += config_.dt * (control(0) * std::cos(yaw) - control(1) * std::sin(yaw));
@@ -86,6 +87,7 @@ Control Se2MpcController::clampIncrement(
     config_.max_ax * config_.dt,
     config_.max_ay * config_.dt,
     config_.max_awz * config_.dt);
+  // 同时限制速度幅值和每个 dt 内的增量，近似轮速与舵角执行器的加速度边界。
   Control delta = target - previous;
   for (int axis = 0; axis < 3; ++axis) {
     delta(axis) = std::clamp(delta(axis), -max_delta(axis), max_delta(axis));
@@ -141,6 +143,7 @@ void Se2MpcController::initializeControls(
   if (!has_warm_start_ || static_cast<int>(warm_controls_.size()) != config_.horizon) {
     warm_controls_.assign(static_cast<std::size_t>(config_.horizon), Control::Zero());
   } else {
+    // 将上一次控制序列左移一格，减少每个控制周期从零开始求解的时间。
     std::rotate(warm_controls_.begin(), warm_controls_.begin() + 1, warm_controls_.end());
   }
   Control previous = last_control;
@@ -191,6 +194,7 @@ Se2MpcController::BackwardResult Se2MpcController::backwardPass(
     const Matrix3 q_xx = 2.0 * q + a.transpose() * value_hessian * a;
     const Matrix3 q_ux = b.transpose() * value_hessian * a;
     Matrix3 q_uu = 2.0 * (r + rd) + b.transpose() * value_hessian * b;
+    // 正则化 Q_uu，避免在低速或权重极端时反向递推出现奇异求解。
     q_uu += config_.regularization * Matrix3::Identity();
     Eigen::LDLT<Matrix3> factor(q_uu);
     if (factor.info() != Eigen::Success) {
@@ -240,6 +244,7 @@ Se2MpcResult Se2MpcController::solve(
       max_update = std::max(max_update, update.lpNorm<Eigen::Infinity>());
     }
     bool accepted = false;
+    // 线搜索只接受代价下降的候选控制，失败则逐步缩小 iLQR 更新量。
     for (double alpha = 1.0; alpha >= config_.min_line_search_step;
       alpha *= config_.line_search_decay)
     {
