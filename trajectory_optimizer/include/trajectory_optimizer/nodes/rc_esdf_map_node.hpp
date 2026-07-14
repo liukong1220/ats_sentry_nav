@@ -26,6 +26,8 @@ private:
   void onStaticMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   void onTraversabilityGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   void rebuild();
+  nav_msgs::msg::OccupancyGrid resampleTraversabilityGrid(
+    const nav_msgs::msg::OccupancyGrid & input) const;
   nav_msgs::msg::OccupancyGrid encodeDistanceGrid(
     const nav_msgs::msg::OccupancyGrid & planning_grid,
     const std::vector<double> & distance_field,
@@ -38,6 +40,9 @@ private:
   std::string footprint_clearance_grid_topic_ = "rc_esdf/footprint_clearance_grid";
   std::string static_map_frame_ = "map";
   StaticMapFusionParams fusion_params_;
+  // Zero preserves the terrain grid resolution. A finer value lets static walls
+  // retain their geometry without turning every coarse terrain cell into a wall.
+  double planning_grid_resolution_ = 0.0;
   double signed_distance_max_m_ = 2.0;
   double footprint_length_ = 0.60;
   double footprint_width_ = 0.50;

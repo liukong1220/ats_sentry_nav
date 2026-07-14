@@ -9,6 +9,7 @@
 #include <Eigen/Core>
 
 #include "minco_planner/trajectory/minco_s3.hpp"
+#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace minco_planner
 {
@@ -79,6 +80,119 @@ bool solveMinco(
   return minco.solve(head, tail, inner_points, durations);
 }
 
+std::vector<Point> densifyWaypoints(const std::vector<Point> & waypoints, double spacing)
+{
+  if (waypoints.size() <= 1 || spacing <= 1e-6) {
+    return waypoints;
+  }
+
+  std::vector<Point> dense;
+  dense.reserve(waypoints.size());
+  dense.push_back(waypoints.front());
+  for (std::size_t index = 0; index + 1 < waypoints.size(); ++index) {
+    const Point & start = waypoints[index];
+    const Point & end = waypoints[index + 1];
+    const int steps = std::max(1, static_cast<int>(std::ceil((end - start).norm() / spacing)));
+    for (int step = 1; step <= steps; ++step) {
+      dense.push_back(start + (end - start) * static_cast<double>(step) / steps);
+    }
+  }
+  return dense;
+}
+
+Point limitNorm(const Point & value, double maximum_norm)
+{
+  const double norm = value.norm();
+  if (maximum_norm > 0.0 && norm > maximum_norm) {
+    return value * (maximum_norm / norm);
+  }
+  return value;
+}
+
+std::vector<Point> refineWaypointsWithEsdf(
+  const std::vector<Point> & input_waypoints,
+  const MincoTrajectoryOptimizerParams & params,
+  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf)
+{
+  if (!params.esdf_obstacle_optimization_enabled || !esdf || !esdf->available()) {
+    return input_waypoints;
+  }
+
+  const double minimum_clearance = std::max(0.0, params.esdf_obstacle_clearance);
+  const double maximum_step = std::max(0.0, params.esdf_obstacle_max_step);
+  const double maximum_deviation = std::max(0.0, params.esdf_obstacle_max_deviation);
+  if (input_waypoints.size() < 2 || minimum_clearance <= 0.0 || maximum_step <= 0.0) {
+    return input_waypoints;
+  }
+
+  const std::vector<Point> original_waypoints = densifyWaypoints(
+    input_waypoints, std::max(0.05, params.esdf_obstacle_control_point_spacing));
+  std::vector<Point> waypoints = original_waypoints;
+  const double reference_speed = std::max(0.05, params.reference_speed);
+  const double sample_dt = std::max(0.02, params.sample_spacing * 0.5) / reference_speed;
+
+  for (int iteration = 0; iteration < std::max(0, params.esdf_obstacle_max_iterations);
+    ++iteration)
+  {
+    const Eigen::VectorXd durations = allocateDurations(
+      waypoints, reference_speed, std::max(0.01, params.min_segment_time));
+    MincoS3 minco;
+    if (!solveMinco(waypoints, durations, minco)) {
+      break;
+    }
+
+    std::vector<Point> corrections(waypoints.size(), Point::Zero());
+    std::vector<double> weights(waypoints.size(), 0.0);
+    bool needs_correction = false;
+    for (int piece = 0; piece < minco.pieceCount(); ++piece) {
+      const double duration = minco.pieceDuration(piece);
+      const int steps = std::max(2, static_cast<int>(std::ceil(duration / sample_dt)));
+      for (int step = 1; step < steps; ++step) {
+        const double fraction = static_cast<double>(step) / steps;
+        const MincoSample sample = minco.sample(piece, duration * fraction);
+        trajectory_optimizer::EsdfQueryResult query;
+        if (!esdf->query(sample.position.x(), sample.position.y(), query) ||
+          query.distance >= minimum_clearance || query.gradient.squaredNorm() < 1e-10)
+        {
+          continue;
+        }
+
+        const Point correction = query.gradient.normalized() * std::min(
+          maximum_step, 0.5 * (minimum_clearance - query.distance));
+        const std::size_t start_index = static_cast<std::size_t>(piece);
+        const std::size_t end_index = start_index + 1U;
+        corrections[start_index] += (1.0 - fraction) * correction;
+        corrections[end_index] += fraction * correction;
+        weights[start_index] += 1.0 - fraction;
+        weights[end_index] += fraction;
+        needs_correction = true;
+      }
+    }
+    if (!needs_correction) {
+      break;
+    }
+
+    bool changed = false;
+    for (std::size_t index = 1; index + 1 < waypoints.size(); ++index) {
+      if (weights[index] <= 1e-9) {
+        continue;
+      }
+      const Point step = limitNorm(corrections[index] / weights[index], maximum_step);
+      Point candidate = waypoints[index] + step;
+      candidate = original_waypoints[index] + limitNorm(
+        candidate - original_waypoints[index], maximum_deviation);
+      if ((candidate - waypoints[index]).norm() > 1e-6) {
+        waypoints[index] = candidate;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      break;
+    }
+  }
+  return waypoints;
+}
+
 void findDynamicExtrema(
   const MincoS3 & minco,
   double sample_spacing,
@@ -113,11 +227,18 @@ void MincoTrajectoryOptimizer::setParams(const MincoTrajectoryOptimizerParams & 
   params_ = params;
 }
 
-ReferenceTrajectory MincoTrajectoryOptimizer::optimize(const nav_msgs::msg::Path & raw_path) const
+bool MincoTrajectoryOptimizer::esdfObstacleOptimizationEnabled() const
+{
+  return params_.esdf_obstacle_optimization_enabled;
+}
+
+ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
+  const nav_msgs::msg::Path & raw_path,
+  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf) const
 {
   ReferenceTrajectory trajectory;
   trajectory.header = raw_path.header;
-  const std::vector<Point> waypoints = extractWaypoints(raw_path);
+  std::vector<Point> waypoints = extractWaypoints(raw_path);
   if (waypoints.empty()) {
     return trajectory;
   }
@@ -131,6 +252,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(const nav_msgs::msg::Path
 
   const double reference_speed = std::max(0.05, params_.reference_speed);
   const double sample_spacing = std::max(0.02, params_.sample_spacing);
+  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf);
   Eigen::VectorXd durations = allocateDurations(
     waypoints, reference_speed, std::max(0.01, params_.min_segment_time));
   MincoS3 minco;

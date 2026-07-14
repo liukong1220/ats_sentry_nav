@@ -17,7 +17,10 @@ minco_planner:
     search_algorithm: jps
     astar_fallback: true
     jps_max_expanded_nodes: -1
-    jps_safe_distance: 0.30
+    # 0.57 m is just above the 0.515 m all-yaw radius of the configured
+    # 0.70 x 0.55 m rectangle with its safety margin. At the 0.40 m RC-ESDF
+    # resolution this also rejects occupied diagonal neighbours.
+    jps_safe_distance: 0.57
     publish_unsafe_trajectory: false
 
     # S3 non-uniform-time MINCO translation trajectory limits.
@@ -28,6 +31,16 @@ minco_planner:
     max_acceleration: 2.5
     max_time_scaling_iterations: 5
     time_scaling_factor: 1.25
+
+    # The outer loop refines only MINCO inner points with signed RC-ESDF
+    # gradients, then re-solves S3. It is topology-preserving and independent
+    # of the later yaw-aware rectangular footprint gate.
+    esdf_obstacle_optimization_enabled: true
+    esdf_obstacle_clearance: 0.45
+    esdf_obstacle_max_iterations: 6
+    esdf_obstacle_control_point_spacing: 0.30
+    esdf_obstacle_max_step: 0.10
+    esdf_obstacle_max_deviation: 0.50
 
     # Swerve chassis keeps independent yaw in open space and aligns to the
     # nearest forward/reverse path tangent only where RC-ESDF reports a corridor.

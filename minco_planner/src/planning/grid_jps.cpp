@@ -166,16 +166,37 @@ GridAstarResult GridJps::plan(
     return result;
   }
   std::reverse(reversed.begin(), reversed.end());
-  result.path.poses.reserve(reversed.size());
+  result.path.poses.reserve(std::max<std::size_t>(2U, reversed.size()));
   for (const auto & index : reversed) {
     auto pose = gridToPose(grid, index);
     pose.header = result.path.header;
     result.path.poses.push_back(pose);
   }
-  for (std::size_t i = 1; i < reversed.size(); ++i) {
-    result.length += grid.info.resolution * std::hypot(
-      static_cast<double>(reversed[i].x - reversed[i - 1].x),
-      static_cast<double>(reversed[i].y - reversed[i - 1].y));
+
+  // JPS uses the cells only for graph connectivity. Preserve the true poses at
+  // both ends so a coarse RC-ESDF cannot shift the robot or target by half a cell.
+  auto exact_start = start;
+  exact_start.header = result.path.header;
+  auto exact_goal = goal;
+  exact_goal.header = result.path.header;
+  if (result.path.poses.size() == 1U) {
+    result.path.poses.front() = exact_start;
+    if (std::hypot(
+        exact_goal.pose.position.x - exact_start.pose.position.x,
+        exact_goal.pose.position.y - exact_start.pose.position.y) > 1e-6)
+    {
+      result.path.poses.push_back(exact_goal);
+    }
+  } else {
+    result.path.poses.front() = exact_start;
+    result.path.poses.back() = exact_goal;
+  }
+  for (std::size_t i = 1; i < result.path.poses.size(); ++i) {
+    const auto & previous = result.path.poses[i - 1].pose.position;
+    const auto & current = result.path.poses[i].pose.position;
+    result.length += std::hypot(
+      current.x - previous.x,
+      current.y - previous.y);
   }
   result.reason = "ok";
   return result;

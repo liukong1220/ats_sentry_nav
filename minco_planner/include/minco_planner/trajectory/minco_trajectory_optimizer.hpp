@@ -6,6 +6,11 @@
 #include "minco_planner/trajectory/reference_trajectory.hpp"
 #include "nav_msgs/msg/path.hpp"
 
+namespace trajectory_optimizer
+{
+class RcTraversabilityEsdfProvider;
+}
+
 namespace minco_planner
 {
 
@@ -18,6 +23,16 @@ struct MincoTrajectoryOptimizerParams
   double max_acceleration = 2.5;
   int max_time_scaling_iterations = 5;
   double time_scaling_factor = 1.25;
+
+  // Keep MINCO's interpolation from cutting into obstacles between JPS nodes.
+  // The correction moves only inner control points and re-solves MINCO after
+  // each update; endpoints and the JPS route topology remain fixed.
+  bool esdf_obstacle_optimization_enabled = true;
+  double esdf_obstacle_clearance = 0.45;
+  int esdf_obstacle_max_iterations = 6;
+  double esdf_obstacle_control_point_spacing = 0.30;
+  double esdf_obstacle_max_step = 0.10;
+  double esdf_obstacle_max_deviation = 0.50;
 };
 
 class MincoTrajectoryOptimizer
@@ -27,7 +42,10 @@ public:
     MincoTrajectoryOptimizerParams params = MincoTrajectoryOptimizerParams());
 
   void setParams(const MincoTrajectoryOptimizerParams & params);
-  ReferenceTrajectory optimize(const nav_msgs::msg::Path & raw_path) const;
+  bool esdfObstacleOptimizationEnabled() const;
+  ReferenceTrajectory optimize(
+    const nav_msgs::msg::Path & raw_path,
+    const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf = nullptr) const;
 
 private:
   MincoTrajectoryOptimizerParams params_;

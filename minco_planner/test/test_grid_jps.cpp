@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/planning/grid_jps.hpp"
 #include "trajectory_optimizer/esdf/static_map_fusion.hpp"
 
@@ -44,6 +45,34 @@ TEST(GridJps, FindsPathThroughWallOpening)
   ASSERT_GE(result.path.poses.size(), 2U);
   EXPECT_GT(result.length, 0.0);
   EXPECT_LT(result.expanded_nodes, 300);
+}
+
+TEST(GridJps, PreservesContinuousStartAndGoalPoses)
+{
+  const auto start = poseAt(0.21, 0.24);
+  const auto goal = poseAt(2.79, 1.76);
+  minco_planner::GridJps planner;
+  const auto result = planner.plan(makeGrid(), start, goal);
+  ASSERT_TRUE(result.success) << result.reason;
+  ASSERT_GE(result.path.poses.size(), 2U);
+  EXPECT_NEAR(result.path.poses.front().pose.position.x, start.pose.position.x, 1e-9);
+  EXPECT_NEAR(result.path.poses.front().pose.position.y, start.pose.position.y, 1e-9);
+  EXPECT_NEAR(result.path.poses.back().pose.position.x, goal.pose.position.x, 1e-9);
+  EXPECT_NEAR(result.path.poses.back().pose.position.y, goal.pose.position.y, 1e-9);
+}
+
+TEST(GridAstar, PreservesContinuousStartAndGoalPoses)
+{
+  const auto start = poseAt(0.21, 0.24);
+  const auto goal = poseAt(2.79, 1.76);
+  minco_planner::GridAstar planner;
+  const auto result = planner.plan(makeGrid(), start, goal);
+  ASSERT_TRUE(result.success) << result.reason;
+  ASSERT_GE(result.path.poses.size(), 2U);
+  EXPECT_NEAR(result.path.poses.front().pose.position.x, start.pose.position.x, 1e-9);
+  EXPECT_NEAR(result.path.poses.front().pose.position.y, start.pose.position.y, 1e-9);
+  EXPECT_NEAR(result.path.poses.back().pose.position.x, goal.pose.position.x, 1e-9);
+  EXPECT_NEAR(result.path.poses.back().pose.position.y, goal.pose.position.y, 1e-9);
 }
 
 TEST(GridJps, RejectsOccupiedGoal)

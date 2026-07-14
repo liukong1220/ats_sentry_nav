@@ -75,6 +75,16 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<int>(
     "max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   declare_parameter<double>("time_scaling_factor", optimizer_params.time_scaling_factor);
+  declare_parameter<bool>(
+    "esdf_obstacle_optimization_enabled", optimizer_params.esdf_obstacle_optimization_enabled);
+  declare_parameter<double>("esdf_obstacle_clearance", optimizer_params.esdf_obstacle_clearance);
+  declare_parameter<int>(
+    "esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
+  declare_parameter<double>(
+    "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
+  declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
+  declare_parameter<double>(
+    "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
 
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
@@ -117,6 +127,14 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("max_acceleration", optimizer_params.max_acceleration);
   get_parameter("max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   get_parameter("time_scaling_factor", optimizer_params.time_scaling_factor);
+  get_parameter(
+    "esdf_obstacle_optimization_enabled", optimizer_params.esdf_obstacle_optimization_enabled);
+  get_parameter("esdf_obstacle_clearance", optimizer_params.esdf_obstacle_clearance);
+  get_parameter("esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
+  get_parameter(
+    "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
+  get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
+  get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
@@ -127,6 +145,16 @@ void MincoPlannerNode::declareAndLoadParams()
   footprint_length_ = footprint_params.length;
   footprint_width_ = footprint_params.width;
   footprint_safety_margin_ = footprint_params.safety_margin;
+  const double all_yaw_footprint_radius = std::hypot(
+    0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_,
+    0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_);
+  if (jps_params.safe_distance + 1e-6 < all_yaw_footprint_radius) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Raising JPS clearance from %.3f m to rectangular all-yaw footprint radius %.3f m.",
+      jps_params.safe_distance, all_yaw_footprint_radius);
+    jps_params.safe_distance = all_yaw_footprint_radius;
+  }
   get_parameter("local_repair_enabled", repair_params.enabled);
   get_parameter("local_repair_max_iterations", repair_params.max_iterations);
   get_parameter("local_repair_search_radius", repair_params.search_radius);
@@ -202,15 +230,31 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     return;
   }
 
-  ReferenceTrajectory reference = optimizer_.optimize(search_result.path);
+  ReferenceTrajectory reference = optimizer_.optimize(search_result.path, clearance_esdf_.get());
   reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
   yaw_planner_.apply(reference, start_yaw, goal_yaw);
   annotateClearance(reference);
   FootprintSafetyResult safety = safety_checker_.check(reference, *latest_grid_);
+  if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
+    ReferenceTrajectory fallback_reference = optimizer_.optimize(search_result.path);
+    fallback_reference.header.stamp = now();
+    yaw_planner_.apply(fallback_reference, start_yaw, goal_yaw);
+    annotateClearance(fallback_reference);
+    const FootprintSafetyResult fallback_safety = safety_checker_.check(
+      fallback_reference, *latest_grid_);
+    if (fallback_safety.safe) {
+      RCLCPP_WARN(
+        get_logger(),
+        "RC-ESDF outer candidate had %zu footprint collisions; using the safe JPS-MINCO baseline.",
+        safety.collisions.size());
+      reference = std::move(fallback_reference);
+      safety = fallback_safety;
+    }
+  }
   if (!safety.safe && collision_repair_.repair(reference, safety, *latest_grid_)) {
-    reference = optimizer_.optimize(toPath(reference));
+    reference = optimizer_.optimize(toPath(reference), clearance_esdf_.get());
     reference.header.stamp = now();
     yaw_planner_.apply(reference, start_yaw, goal_yaw);
     annotateClearance(reference);
@@ -220,9 +264,12 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   raw_path_pub_->publish(search_result.path);
   marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
   if (!safety.safe && !publish_unsafe_trajectory_) {
+    const CollisionSample & first_collision = safety.collisions.front();
     RCLCPP_ERROR(
-      get_logger(), "Rejecting unsafe MINCO trajectory with %zu footprint collisions.",
-      safety.collisions.size());
+      get_logger(),
+      "Rejecting unsafe MINCO trajectory with %zu footprint collisions; first index=%zu at (%.3f, %.3f).",
+      safety.collisions.size(), first_collision.trajectory_index,
+      first_collision.x, first_collision.y);
     return;
   }
   reference_path_pub_->publish(toPath(reference));

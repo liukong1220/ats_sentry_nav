@@ -29,6 +29,7 @@ RcEsdfMapNode::RcEsdfMapNode(const rclcpp::NodeOptions & options)
     "static_obstacle_value_threshold", fusion_params_.static_obstacle_value_threshold);
   declare_parameter<int>(
     "local_obstacle_value_threshold", fusion_params_.local_obstacle_value_threshold);
+  declare_parameter<double>("planning_grid_resolution", planning_grid_resolution_);
   declare_parameter<double>("signed_distance_max_m", signed_distance_max_m_);
   declare_parameter<double>("footprint_length", footprint_length_);
   declare_parameter<double>("footprint_width", footprint_width_);
@@ -44,11 +45,13 @@ RcEsdfMapNode::RcEsdfMapNode(const rclcpp::NodeOptions & options)
     "static_obstacle_value_threshold", fusion_params_.static_obstacle_value_threshold);
   get_parameter(
     "local_obstacle_value_threshold", fusion_params_.local_obstacle_value_threshold);
+  get_parameter("planning_grid_resolution", planning_grid_resolution_);
   get_parameter("signed_distance_max_m", signed_distance_max_m_);
   get_parameter("footprint_length", footprint_length_);
   get_parameter("footprint_width", footprint_width_);
   get_parameter("footprint_safety_margin", footprint_safety_margin_);
   signed_distance_max_m_ = std::max(signed_distance_max_m_, 1e-3);
+  planning_grid_resolution_ = std::max(0.0, planning_grid_resolution_);
   footprint_length_ = std::max(footprint_length_, 0.0);
   footprint_width_ = std::max(footprint_width_, 0.0);
   footprint_safety_margin_ = std::max(footprint_safety_margin_, 0.0);
@@ -117,9 +120,11 @@ void RcEsdfMapNode::rebuild()
     }
   }
 
+  const nav_msgs::msg::OccupancyGrid terrain_grid =
+    resampleTraversabilityGrid(*traversability_grid_);
   nav_msgs::msg::OccupancyGrid planning_grid;
   if (!StaticMapFusion::buildPlanningGrid(
-      *traversability_grid_, *static_map_, static_from_local, fusion_params_, planning_grid))
+      terrain_grid, *static_map_, static_from_local, fusion_params_, planning_grid))
   {
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 2000, "RC-ESDF map rejected malformed static or terrain grid.");
@@ -144,6 +149,50 @@ void RcEsdfMapNode::rebuild()
     footprint_safety_margin_;
   footprint_clearance_grid_pub_->publish(
     encodeDistanceGrid(planning_grid, distance_field, all_yaw_footprint_radius));
+}
+
+nav_msgs::msg::OccupancyGrid RcEsdfMapNode::resampleTraversabilityGrid(
+  const nav_msgs::msg::OccupancyGrid & input) const
+{
+  const std::size_t input_size =
+    static_cast<std::size_t>(input.info.width) * input.info.height;
+  if (input.info.resolution <= 0.0F || input.data.size() < input_size) {
+    return input;
+  }
+  if (planning_grid_resolution_ <= 0.0 ||
+    planning_grid_resolution_ >= input.info.resolution - 1e-6)
+  {
+    return input;
+  }
+
+  nav_msgs::msg::OccupancyGrid output = input;
+  const double extent_x = static_cast<double>(input.info.width) * input.info.resolution;
+  const double extent_y = static_cast<double>(input.info.height) * input.info.resolution;
+  output.info.resolution = planning_grid_resolution_;
+  output.info.width = static_cast<uint32_t>(std::ceil(extent_x / planning_grid_resolution_));
+  output.info.height = static_cast<uint32_t>(std::ceil(extent_y / planning_grid_resolution_));
+  output.data.assign(
+    static_cast<std::size_t>(output.info.width) * output.info.height, -1);
+
+  for (uint32_t y = 0; y < output.info.height; ++y) {
+    for (uint32_t x = 0; x < output.info.width; ++x) {
+      const double local_x = (static_cast<double>(x) + 0.5) * output.info.resolution;
+      const double local_y = (static_cast<double>(y) + 0.5) * output.info.resolution;
+      const int source_x = static_cast<int>(std::floor(local_x / input.info.resolution));
+      const int source_y = static_cast<int>(std::floor(local_y / input.info.resolution));
+      if (source_x < 0 || source_y < 0 ||
+        source_x >= static_cast<int>(input.info.width) ||
+        source_y >= static_cast<int>(input.info.height))
+      {
+        continue;
+      }
+      const std::size_t source_index =
+        static_cast<std::size_t>(source_y) * input.info.width + source_x;
+      const std::size_t output_index = static_cast<std::size_t>(y) * output.info.width + x;
+      output.data[output_index] = input.data[source_index];
+    }
+  }
+  return output;
 }
 
 nav_msgs::msg::OccupancyGrid RcEsdfMapNode::encodeDistanceGrid(

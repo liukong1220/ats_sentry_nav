@@ -396,6 +396,7 @@ rc_esdf_map:
     static_map_frame: "map"
     static_obstacle_value_threshold: 50
     local_obstacle_value_threshold: 50
+    planning_grid_resolution: 0.10
     signed_distance_max_m: 2.0
     footprint_length: 0.60
     footprint_width: 0.50

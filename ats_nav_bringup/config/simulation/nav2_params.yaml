@@ -382,6 +382,10 @@ rc_esdf_map:
     static_map_frame: "map"
     static_obstacle_value_threshold: 50
     local_obstacle_value_threshold: 50
+    # Keep terrain semantics at their source resolution, but fuse /map and run
+    # the signed EDT on this finer grid so static walls do not occupy a whole
+    # 0.40 m terrain cell around an otherwise valid rectangular footprint.
+    planning_grid_resolution: 0.10
     signed_distance_max_m: 2.0
     footprint_length: 0.60
     footprint_width: 0.50

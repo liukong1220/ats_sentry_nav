@@ -172,11 +172,31 @@ GridAstarResult GridAstar::plan(
   }
   std::reverse(reversed.begin(), reversed.end());
 
-  result.path.poses.reserve(reversed.size());
+  result.path.poses.reserve(std::max<std::size_t>(2U, reversed.size()));
   for (const auto & index : reversed) {
     auto pose = gridToPose(grid, index);
     pose.header = result.path.header;
     result.path.poses.push_back(pose);
+  }
+
+  // Search runs on cell indices, but MINCO and the footprint checker must start
+  // and end at the requested continuous poses. Returning cell centres here can
+  // displace a 0.4 m RC-ESDF path by 0.2 m before any trajectory is generated.
+  auto exact_start = start;
+  exact_start.header = result.path.header;
+  auto exact_goal = goal;
+  exact_goal.header = result.path.header;
+  if (result.path.poses.size() == 1U) {
+    result.path.poses.front() = exact_start;
+    if (std::hypot(
+        exact_goal.pose.position.x - exact_start.pose.position.x,
+        exact_goal.pose.position.y - exact_start.pose.position.y) > 1e-6)
+    {
+      result.path.poses.push_back(exact_goal);
+    }
+  } else {
+    result.path.poses.front() = exact_start;
+    result.path.poses.back() = exact_goal;
   }
 
   for (std::size_t i = 1; i < result.path.poses.size(); ++i) {
