@@ -1,0 +1,37 @@
+ats_rog_map_adapter:
+  ros__parameters:
+    use_sim_time: true
+    projection_service: /rog_map/get_ground_projection
+    projection_rate_hz: 2.0
+    projection_request_timeout_sec: 2.0
+    projection_snapshot_timeout_sec: 2.0
+    # Terrain/slope and the ROGMap projection must describe the same sensor-time neighborhood.
+    input_sync_tolerance_sec: 1.0
+    # At 0.10 m voxels, start at z=0.15 m so flat-ground hits centered at z=-0.05 m
+    # do not enter the ground-planning projection. Terrain layers retain low-step semantics.
+    projection_min_height: 0.10
+    projection_max_height: 0.80
+    planning_resolution: 0.10
+
+    static_map_topic: /map
+    traversability_grid_topic: /traversability_grid
+    traversability_slope_grid_topic: /traversability_slope_grid
+    planning_grid_topic: /rc_esdf/planning_grid
+    signed_distance_grid_topic: /rc_esdf/signed_distance_grid
+    footprint_clearance_grid_topic: /rc_esdf/footprint_clearance_grid
+    ready_topic: /rog_map_adapter/ready
+    generation_topic: /rog_map_adapter/generation
+
+    static_obstacle_value_threshold: 50
+    terrain_obstacle_value_threshold: 50
+    slope_grid_max_degrees: 45.0
+    slope_obstacle_degrees: 28.0
+    unknown_is_obstacle: true
+    input_timeout_sec: 2.0
+    signed_distance_max_m: 2.0
+    footprint_length: 0.70
+    footprint_width: 0.55
+    footprint_safety_margin: 0.05
+    robot_frame: gimbal_yaw_odom
+    # Disabled in P2: a yaw-free circle would clear unknown outside the rectangular footprint.
+    robot_unknown_clear_radius: 0.0
