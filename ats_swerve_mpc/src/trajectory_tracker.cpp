@@ -33,6 +33,12 @@ void TrajectoryTracker::setTrajectory(std::vector<TimedState> trajectory)
   resetProgress();
 }
 
+void TrajectoryTracker::clear()
+{
+  trajectory_.clear();
+  resetProgress();
+}
+
 void TrajectoryTracker::resetProgress()
 {
   has_progress_ = false;

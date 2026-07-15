@@ -42,6 +42,7 @@ public:
 
   void setConfig(const TrajectoryTrackerConfig & config);
   void setTrajectory(std::vector<TimedState> trajectory);
+  void clear();
   void resetProgress();
 
   bool empty() const { return trajectory_.empty(); }

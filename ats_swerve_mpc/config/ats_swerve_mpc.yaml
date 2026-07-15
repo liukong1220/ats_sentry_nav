@@ -10,6 +10,8 @@ ats_swerve_mpc:
     command_topic: /cmd_vel_mpc
     # true 时立即清空 warm start 并发布零速度；设为空可关闭该输入。
     emergency_stop_topic: /planner/emergency_stop
+    # 急停 heartbeat 的 steady-clock 租约；超时后清空旧 reference 并持续发布零速度。
+    emergency_stop_timeout: 0.5
     # MPC 接受的状态与轨迹坐标系。
     frame_id: odom
     # 控制器计算频率（Hz）。

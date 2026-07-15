@@ -51,6 +51,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_emergency_stop_watchdog test/test_emergency_stop_watchdog.cpp)
+  target_link_libraries(test_emergency_stop_watchdog ${PROJECT_NAME}_lib)
 endif()
 
 ament_export_include_directories(include)

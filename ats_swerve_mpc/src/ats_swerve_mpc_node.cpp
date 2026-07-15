@@ -42,6 +42,9 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
   control_rate_hz_ = declare_parameter<double>("control_rate_hz", control_rate_hz_);
   fallback_path_dt_ = declare_parameter<double>("fallback_path_dt", fallback_path_dt_);
   trajectory_timeout_ = declare_parameter<double>("trajectory_timeout", trajectory_timeout_);
+  emergency_stop_timeout_ = std::max(
+    0.1, declare_parameter<double>("emergency_stop_timeout", emergency_stop_timeout_));
+  emergency_stop_watchdog_.setTimeout(emergency_stop_timeout_);
   goal_position_tolerance_ =
     declare_parameter<double>("goal_position_tolerance", goal_position_tolerance_);
   goal_yaw_tolerance_ = declare_parameter<double>("goal_yaw_tolerance", goal_yaw_tolerance_);
@@ -57,8 +60,12 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
     std::bind(&AtsSwerveMpcNode::onPath, this, std::placeholders::_1));
   if (!emergency_stop_topic_.empty()) {
     emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
-      emergency_stop_topic_, rclcpp::QoS(10),
+      emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local(),
       std::bind(&AtsSwerveMpcNode::onEmergencyStop, this, std::placeholders::_1));
+  } else {
+    emergency_stop_watchdog_enabled_ = false;
+    fail_stop_engaged_.store(false);
+    RCLCPP_WARN(get_logger(), "Emergency-stop input is explicitly disabled.");
   }
   command_pub_ = create_publisher<geometry_msgs::msg::Twist>(command_topic_, rclcpp::QoS(10));
   predicted_path_pub_ = create_publisher<nav_msgs::msg::Path>("~/predicted_path", rclcpp::QoS(1));
@@ -66,6 +73,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
   control_timer_ = create_wall_timer(
     std::chrono::duration<double>(1.0 / std::max(1.0, control_rate_hz_)),
     std::bind(&AtsSwerveMpcNode::onControlTimer, this));
+  publishCommand(Control::Zero());
   RCLCPP_INFO(
     get_logger(), "ATS swerve MPC ready: odom='%s' trajectory='%s' command='%s' horizon=%d dt=%.3f",
     odom_topic_.c_str(), trajectory_topic_.c_str(), command_topic_.c_str(),
@@ -169,6 +177,14 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message)
   }
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    const bool missing_stamp =
+      message->header.stamp.sec == 0 && message->header.stamp.nanosec == 0;
+    if (last_stop_stamp_.nanoseconds() > 0 &&
+      (missing_stamp || rclcpp::Time(message->header.stamp) <= last_stop_stamp_))
+    {
+      RCLCPP_WARN(get_logger(), "Ignoring a trajectory older than the latest emergency stop.");
+      return;
+    }
     trajectory_tracker_.setTrajectory(std::move(parsed));
     trajectory_frame_ = message->header.frame_id.empty() ? frame_id_ : message->header.frame_id;
     const double maximum_tracking_duration =
@@ -183,16 +199,28 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message)
 
 void AtsSwerveMpcNode::onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message)
 {
-  emergency_stop_.store(message->data);
+  const bool first_signal = !emergency_stop_signal_received_.exchange(true);
+  emergency_stop_watchdog_.update(message->data);
+  if (first_signal) {
+    fail_stop_engaged_.store(false);
+    engageFailStop();
+  }
   if (message->data) {
-    controller_->reset();
-    last_control_.setZero();
-    publishCommand(last_control_);
+    engageFailStop();
+  } else {
+    fail_stop_engaged_.store(false);
   }
 }
 
 void AtsSwerveMpcNode::onControlTimer()
 {
+  if (
+    emergency_stop_watchdog_enabled_ &&
+    (emergency_stop_watchdog_.stopRequired() || fail_stop_engaged_.load()))
+  {
+    engageFailStop();
+    return;
+  }
   State current;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -200,10 +228,6 @@ void AtsSwerveMpcNode::onControlTimer()
       return;
     }
     current = current_state_;
-  }
-  if (emergency_stop_.load()) {
-    publishCommand(Control::Zero());
-    return;
   }
   State goal = State::Zero();
   TrajectoryProjection projection;
@@ -262,6 +286,21 @@ void AtsSwerveMpcNode::onControlTimer()
     last_control_(0), last_control_(1), last_control_(2), projection.cross_track_error,
     trajectory_tracker_.progressScale(projection.cross_track_error), result.cost,
     result.solve_time_ms);
+}
+
+void AtsSwerveMpcNode::engageFailStop()
+{
+  const bool was_engaged = fail_stop_engaged_.exchange(true);
+  if (!was_engaged) {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    trajectory_tracker_.clear();
+    trajectory_frame_.clear();
+    trajectory_deadline_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_stop_stamp_ = now();
+    controller_->reset();
+  }
+  last_control_.setZero();
+  publishCommand(last_control_);
 }
 
 void AtsSwerveMpcNode::publishCommand(const Control & command)

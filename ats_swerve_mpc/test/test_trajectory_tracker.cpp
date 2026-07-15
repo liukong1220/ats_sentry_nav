@@ -75,4 +75,14 @@ TEST(TrajectoryTracker, SlowsHorizonProgressForCrossTrackError)
   EXPECT_NEAR(horizon[1].control(0), 0.60, 1e-9);
 }
 
+TEST(TrajectoryTracker, ClearDropsStoppedTrajectoryAndProgress)
+{
+  ats_swerve_mpc::TrajectoryTracker tracker;
+  tracker.setTrajectory(straightTrajectory());
+  ASSERT_TRUE(tracker.project(Eigen::Vector2d(0.5, 0.0)).valid);
+  tracker.clear();
+  EXPECT_TRUE(tracker.empty());
+  EXPECT_FALSE(tracker.project(Eigen::Vector2d(0.5, 0.0)).valid);
+}
+
 }  // namespace
