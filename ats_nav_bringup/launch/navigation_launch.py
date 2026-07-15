@@ -4,8 +4,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode, ParameterFile
 from nav2_common.launch import RewrittenYaml
@@ -19,6 +19,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
     params_file = LaunchConfiguration("params_file")
+    use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
     use_composition = LaunchConfiguration("use_composition")
     container_name = LaunchConfiguration("container_name")
     container_name_full = (namespace, "/", container_name)
@@ -26,7 +27,15 @@ def generate_launch_description():
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
+    nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
+    fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
+    chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
     log_level = LaunchConfiguration("log_level")
+
+    any_velocity_transform = PythonExpression([
+        "'", launch_fake_vel_transform, "'.lower() == 'true' or '",
+        launch_chassis_vel_transform, "'.lower() == 'true'",
+    ])
 
     lifecycle_nodes = [
         "controller_server",
@@ -75,6 +84,12 @@ def generate_launch_description():
         description="Full path to the ROS2 parameters file to use for all launched nodes",
     )
 
+    declare_use_robot_state_pub_cmd = DeclareLaunchArgument(
+        "use_robot_state_pub",
+        default_value="False",
+        description="Whether robot_state_publisher owns fixed robot-link transforms",
+    )
+
     declare_autostart_cmd = DeclareLaunchArgument(
         "autostart",
         default_value="true",
@@ -117,6 +132,30 @@ def generate_launch_description():
         description="Whether to start sentry chassis velocity transform node",
     )
 
+    declare_nav_cmd_vel_topic_cmd = DeclareLaunchArgument(
+        "nav_cmd_vel_topic",
+        default_value=IfElseSubstitution(
+            any_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
+        ),
+        description="Nav2 velocity output selected for the enabled transform chain",
+    )
+
+    declare_fake_vel_output_topic_cmd = DeclareLaunchArgument(
+        "fake_vel_output_topic",
+        default_value=IfElseSubstitution(
+            launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"
+        ),
+        description="Fake-yaw adapter output topic",
+    )
+
+    declare_chassis_vel_input_topic_cmd = DeclareLaunchArgument(
+        "chassis_vel_input_topic",
+        default_value=IfElseSubstitution(
+            launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", "cmd_vel_nav2_result"
+        ),
+        description="Chassis-frame adapter input topic",
+    )
+
     declare_log_level_cmd = DeclareLaunchArgument(
         "log_level", default_value="info", description="log level"
     )
@@ -147,6 +186,7 @@ def generate_launch_description():
         package="tf2_ros",
         executable="static_transform_publisher",
         name="static_transform_publisher_base_footprint_to_base_link",
+        condition=UnlessCondition(use_robot_state_pub),
         output="screen",
         arguments=[
             "--x",
@@ -168,6 +208,20 @@ def generate_launch_description():
         ],
     )
 
+    static_tf_fake_yaw_compat_cmd = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_transform_publisher_fake_yaw_compat",
+        condition=UnlessCondition(launch_fake_vel_transform),
+        output="screen",
+        arguments=[
+            "--frame-id",
+            "gimbal_yaw_odom",
+            "--child-frame-id",
+            "gimbal_yaw_fake",
+        ],
+    )
+
     start_chassis_vel_transform_cmd = Node(
         package="sentry_chassis_vel_transform",
         executable="chassis_vel_transform_node",
@@ -176,12 +230,15 @@ def generate_launch_description():
         output="screen",
         respawn=use_respawn,
         respawn_delay=2.0,
-        parameters=[configured_params],
+        parameters=[
+            configured_params,
+            {"input_cmd_vel_topic": chassis_vel_input_topic},
+        ],
         arguments=["--ros-args", "--log-level", log_level],
     )
 
     load_nodes = GroupAction(
-        condition=IfCondition(PythonExpression(["not ", use_composition])),
+        condition=UnlessCondition(use_composition),
         actions=[
             Node(
                 package="loam_interface",
@@ -211,7 +268,13 @@ def generate_launch_description():
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
-                parameters=[configured_params],
+                parameters=[
+                    configured_params,
+                    {
+                        "input_cmd_vel_topic": nav_cmd_vel_topic,
+                        "output_cmd_vel_topic": fake_vel_output_topic,
+                    },
+                ],
                 arguments=["--ros-args", "--log-level", log_level],
             ),
             Node(
@@ -286,7 +349,7 @@ def generate_launch_description():
                 parameters=[configured_params],
                 arguments=["--ros-args", "--log-level", log_level],
                 remappings=[
-                    ("cmd_vel", "cmd_vel_nav2_result"),  # recovery output
+                    ("cmd_vel", nav_cmd_vel_topic),  # recovery output
                 ],
             ),
             Node(
@@ -299,7 +362,7 @@ def generate_launch_description():
                 parameters=[configured_params],
                 arguments=["--ros-args", "--log-level", log_level],
                 remappings=[
-                    ("cmd_vel", "cmd_vel_nav2_result"),  # remap output
+                    ("cmd_vel", nav_cmd_vel_topic),  # remap output
                 ],
             ),
             Node(
@@ -323,7 +386,7 @@ def generate_launch_description():
                 arguments=["--ros-args", "--log-level", log_level],
                 remappings=[
                     ("cmd_vel", "cmd_vel_controller_governed"),  # remap input
-                    ("cmd_vel_smoothed", "cmd_vel_nav2_result"),  # remap output
+                    ("cmd_vel_smoothed", nav_cmd_vel_topic),  # remap output
                 ],
             ),
             Node(
@@ -394,7 +457,7 @@ def generate_launch_description():
                 name="behavior_server",
                 parameters=[configured_params],
                 remappings=[
-                    ("cmd_vel", "cmd_vel_nav2_result"),  # remap output
+                    ("cmd_vel", nav_cmd_vel_topic),  # remap output
                 ],
             ),
             ComposableNode(
@@ -416,7 +479,7 @@ def generate_launch_description():
                 parameters=[configured_params],
                 remappings=[
                     ("cmd_vel", "cmd_vel_controller_governed"),  # remap input
-                    ("cmd_vel_smoothed", "cmd_vel_nav2_result"),  # remap output
+                    ("cmd_vel_smoothed", nav_cmd_vel_topic),  # remap output
                 ],
             ),
             ComposableNode(
@@ -436,7 +499,10 @@ def generate_launch_description():
 
     load_trajectory_optimizer_node = LoadComposableNodes(
         condition=IfCondition(
-            PythonExpression([use_composition, " and ", launch_trajectory_optimizer])
+            PythonExpression([
+                "'", use_composition, "'.lower() == 'true' and '",
+                launch_trajectory_optimizer, "'.lower() == 'true'",
+            ])
         ),
         target_container=container_name_full,
         composable_node_descriptions=[
@@ -451,7 +517,10 @@ def generate_launch_description():
 
     load_fake_vel_transform_node = LoadComposableNodes(
         condition=IfCondition(
-            PythonExpression([use_composition, " and ", launch_fake_vel_transform])
+            PythonExpression([
+                "'", use_composition, "'.lower() == 'true' and '",
+                launch_fake_vel_transform, "'.lower() == 'true'",
+            ])
         ),
         target_container=container_name_full,
         composable_node_descriptions=[
@@ -459,7 +528,13 @@ def generate_launch_description():
                 package="fake_vel_transform",
                 plugin="fake_vel_transform::FakeVelTransform",
                 name="fake_vel_transform",
-                parameters=[configured_params],
+                parameters=[
+                    configured_params,
+                    {
+                        "input_cmd_vel_topic": nav_cmd_vel_topic,
+                        "output_cmd_vel_topic": fake_vel_output_topic,
+                    },
+                ],
             ),
         ],
     )
@@ -475,6 +550,7 @@ def generate_launch_description():
     ld.add_action(declare_namespace_cmd)
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_params_file_cmd)
+    ld.add_action(declare_use_robot_state_pub_cmd)
     ld.add_action(declare_autostart_cmd)
     ld.add_action(declare_use_composition_cmd)
     ld.add_action(declare_container_name_cmd)
@@ -482,11 +558,15 @@ def generate_launch_description():
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
     ld.add_action(declare_launch_fake_vel_transform_cmd)
     ld.add_action(declare_launch_chassis_vel_transform_cmd)
+    ld.add_action(declare_nav_cmd_vel_topic_cmd)
+    ld.add_action(declare_fake_vel_output_topic_cmd)
+    ld.add_action(declare_chassis_vel_input_topic_cmd)
     ld.add_action(declare_log_level_cmd)
     # Add the actions to launch all of the navigation nodes
     ld.add_action(start_terrain_analysis_cmd)
     ld.add_action(start_terrain_analysis_ext_cmd)
     ld.add_action(static_tf_base_footprint_to_base_link_cmd)
+    ld.add_action(static_tf_fake_yaw_compat_cmd)
     ld.add_action(start_chassis_vel_transform_cmd)
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)

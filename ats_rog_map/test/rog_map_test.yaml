@@ -1,0 +1,40 @@
+rog_map:
+  esdf:
+    enable: true
+    resolution: 0.10
+    local_update_box: [4.0, 4.0, 1.0]
+    update_interval_updates: 1
+  map_sliding:
+    enable: true
+    threshold: 0.5
+  fix_map_origin: [0.0, 0.0, 0.0]
+  ros_callback:
+    enable: false
+  visualization:
+    enable: false
+  resolution: 0.10
+  inflation_resolution: 0.10
+  inflation_step: 1
+  map_size: [6.0, 6.0, 1.0]
+  point_filt_num: 1
+  raycasting:
+    enable: true
+    batch_update_size: 1
+    unk_thresh: 0.70
+    p_hit: 0.70
+    p_miss: 0.30
+    p_min: 0.12
+    p_max: 0.97
+    p_occ: 0.80
+    p_free: 0.30
+    ray_range: [0.10, 5.0]
+    local_update_box: [4.0, 4.0, 1.0]
+    stale_decay:
+      enable: true
+      soft_ttl_updates: 2
+      hard_ttl_updates: 3
+      decay_log_odds_step: 0.25
+      sweep_interval_updates: 1
+      local_update_box_only: true
+  virtual_ground_height: -0.40
+  virtual_ceil_height: 0.60

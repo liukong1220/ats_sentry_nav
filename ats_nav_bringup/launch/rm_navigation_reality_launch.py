@@ -10,7 +10,12 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch.substitutions import (
+    IfElseSubstitution,
+    LaunchConfiguration,
+    PythonExpression,
+    TextSubstitution,
+)
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 from nav2_common.launch import RewrittenYaml
@@ -53,8 +58,17 @@ def generate_launch_description():
     launch_joy_teleop = LaunchConfiguration("launch_joy_teleop")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
+    launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
+    nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
+    fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
+    chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
     log_level = LaunchConfiguration("log_level")
+
+    any_velocity_transform = PythonExpression([
+        "'", launch_fake_vel_transform, "'.lower() == 'true' or '",
+        launch_chassis_vel_transform, "'.lower() == 'true'",
+    ])
 
     # Declare the launch arguments
     declare_namespace_cmd = DeclareLaunchArgument(
@@ -169,11 +183,38 @@ def generate_launch_description():
 
     declare_launch_chassis_vel_transform_cmd = DeclareLaunchArgument(
         "launch_chassis_vel_transform",
-        default_value="False",
-        description=(
-            "Whether to start sentry chassis velocity transform node. Keep false "
-            "when ats_sentry_bringup/bringup.launch.py already starts it."
+        default_value="True",
+        description="Keep the gimbal-yaw to chassis command transform enabled.",
+    )
+
+    declare_launch_fake_vel_transform_cmd = DeclareLaunchArgument(
+        "launch_fake_vel_transform",
+        default_value="True",
+        description="Whether to start the fake-yaw command frame adapter.",
+    )
+
+    declare_nav_cmd_vel_topic_cmd = DeclareLaunchArgument(
+        "nav_cmd_vel_topic",
+        default_value=IfElseSubstitution(
+            any_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
         ),
+        description="Nav2 velocity output selected for the enabled transform chain",
+    )
+
+    declare_fake_vel_output_topic_cmd = DeclareLaunchArgument(
+        "fake_vel_output_topic",
+        default_value=IfElseSubstitution(
+            launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"
+        ),
+        description="Fake-yaw adapter output topic",
+    )
+
+    declare_chassis_vel_input_topic_cmd = DeclareLaunchArgument(
+        "chassis_vel_input_topic",
+        default_value=IfElseSubstitution(
+            launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", "cmd_vel_nav2_result"
+        ),
+        description="Chassis-frame adapter input topic",
     )
 
     declare_log_level_cmd = DeclareLaunchArgument(
@@ -240,9 +281,14 @@ def generate_launch_description():
             "autostart": autostart,
             "use_composition": use_composition,
             "use_respawn": use_respawn,
+            "use_robot_state_pub": use_robot_state_pub,
             "launch_trajectory_optimizer": launch_trajectory_optimizer,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
+            "launch_fake_vel_transform": launch_fake_vel_transform,
             "launch_chassis_vel_transform": launch_chassis_vel_transform,
+            "nav_cmd_vel_topic": nav_cmd_vel_topic,
+            "fake_vel_output_topic": fake_vel_output_topic,
+            "chassis_vel_input_topic": chassis_vel_input_topic,
             "log_level": log_level,
         }.items(),
     )
@@ -277,6 +323,10 @@ def generate_launch_description():
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
     ld.add_action(declare_launch_small_gicp_relocalization_cmd)
     ld.add_action(declare_launch_chassis_vel_transform_cmd)
+    ld.add_action(declare_launch_fake_vel_transform_cmd)
+    ld.add_action(declare_nav_cmd_vel_topic_cmd)
+    ld.add_action(declare_fake_vel_output_topic_cmd)
+    ld.add_action(declare_chassis_vel_input_topic_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
     ld.add_action(sanitize_ld_library_path)
