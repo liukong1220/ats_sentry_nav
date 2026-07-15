@@ -3,6 +3,8 @@
 #ifndef MINCO_PLANNER__REFERENCE_TRAJECTORY_HPP_
 #define MINCO_PLANNER__REFERENCE_TRAJECTORY_HPP_
 
+#include <cmath>
+#include <limits>
 #include <vector>
 
 #include "std_msgs/msg/header.hpp"
@@ -35,6 +37,28 @@ struct ReferenceTrajectory
   bool empty() const
   {
     return points.empty();
+  }
+
+  bool valid() const
+  {
+    if (points.size() < 2) {
+      return false;
+    }
+    double previous_time = -std::numeric_limits<double>::infinity();
+    double previous_length = -std::numeric_limits<double>::infinity();
+    for (const auto & point : points) {
+      if (!std::isfinite(point.t) || !std::isfinite(point.s) || !std::isfinite(point.x) ||
+        !std::isfinite(point.y) || !std::isfinite(point.yaw) || !std::isfinite(point.v) ||
+        !std::isfinite(point.vx) || !std::isfinite(point.vy) || !std::isfinite(point.ax) ||
+        !std::isfinite(point.ay) || !std::isfinite(point.yaw_rate) ||
+        point.t <= previous_time || point.s < previous_length)
+      {
+        return false;
+      }
+      previous_time = point.t;
+      previous_length = point.s;
+    }
+    return points.back().t > points.front().t;
   }
 
   double totalLength() const

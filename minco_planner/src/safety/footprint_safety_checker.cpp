@@ -25,7 +25,8 @@ FootprintSafetyResult FootprintSafetyChecker::check(
   const nav_msgs::msg::OccupancyGrid & grid) const
 {
   FootprintSafetyResult result;
-  if (trajectory.points.empty() || grid.data.empty()) {
+  if (!trajectory.valid() || grid.data.empty()) {
+    result.safe = false;
     return result;
   }
 

@@ -3,13 +3,17 @@
 #ifndef MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 #define MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 
+#include <chrono>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <Eigen/Core>
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
+#include "minco_planner/nodes/planning_map_snapshot.hpp"
 #include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/planning/grid_jps.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"
@@ -19,6 +23,7 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
@@ -34,14 +39,28 @@ public:
 
 private:
   void onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+  void onMapReady(const std_msgs::msg::Bool::SharedPtr msg);
+  void onMapReadyWatchdog();
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
-  bool lookupStartPose(geometry_msgs::msg::PoseStamped & start) const;
+  bool lookupStartPose(
+    const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
   bool transformGoalToGrid(
+    const nav_msgs::msg::OccupancyGrid & grid,
     const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const;
+  bool transformPathToGlobal(
+    const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output) const;
   nav_msgs::msg::Path toPath(const ReferenceTrajectory & trajectory) const;
-  void annotateClearance(ReferenceTrajectory & trajectory) const;
-  std::vector<Eigen::Vector2d> footprintSamples() const;
+  void annotateClearance(
+    ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
+  std::vector<Eigen::Vector2d> footprintSamples(
+    const nav_msgs::msg::OccupancyGrid & grid) const;
+  void setPlanSafe(bool safe);
+  bool publishReferenceIfCurrent(
+    const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
+    std::uint64_t map_health_epoch,
+    const nav_msgs::msg::Path & reference_path);
+  void publishEmergencyStop(bool stop);
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
@@ -50,16 +69,20 @@ private:
   std::string raw_path_topic_ = "minco/raw_path";
   std::string reference_path_topic_ = "minco/reference_path";
   std::string debug_marker_topic_ = "minco/debug_markers";
+  std::string map_ready_topic_;
+  std::string emergency_stop_topic_ = "/planner/emergency_stop";
   std::string global_frame_ = "map";
   std::string robot_frame_ = "base_link";
   std::string search_algorithm_ = "jps";
   bool astar_fallback_ = true;
   bool publish_unsafe_trajectory_ = false;
   int obstacle_value_threshold_ = 50;
-  bool unknown_is_obstacle_ = false;
+  bool unknown_is_obstacle_ = true;
   double footprint_length_ = 0.70;
   double footprint_width_ = 0.55;
   double footprint_safety_margin_ = 0.05;
+  double map_ready_timeout_sec_ = 3.0;
+  double emergency_stop_heartbeat_period_sec_ = 0.1;
 
   GridAstar astar_;
   GridJps jps_;
@@ -69,15 +92,26 @@ private:
   LocalCollisionRepair collision_repair_;
   PlannerDebugVisualizer visualizer_;
 
-  nav_msgs::msg::OccupancyGrid::SharedPtr latest_grid_;
-  std::shared_ptr<trajectory_optimizer::RcTraversabilityEsdfProvider> clearance_esdf_;
+  std::mutex map_mutex_;
+  std::shared_ptr<const PlanningMapSnapshot> latest_map_snapshot_;
+  std::uint64_t next_map_generation_{0};
+  std::uint64_t map_health_epoch_{0};
+  PlannerSafetyState safety_state_;
+  std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_plan_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
+  rclcpp::TimerBase::SharedPtr safety_watchdog_timer_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raw_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+
+  rclcpp::CallbackGroup::SharedPtr planning_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr map_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr health_callback_group_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

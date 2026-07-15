@@ -14,6 +14,7 @@ find_package(Eigen3 REQUIRED)
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/debug/planner_debug_visualizer.cpp
   src/nodes/minco_planner_node.cpp
+  src/nodes/planning_map_snapshot.cpp
   src/planning/grid_astar.cpp
   src/planning/grid_jps.cpp
   src/safety/footprint_safety_checker.cpp
@@ -28,6 +29,7 @@ target_link_libraries(${PROJECT_NAME} Eigen3::Eigen)
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN minco_planner::MincoPlannerNode
   EXECUTABLE ${PROJECT_NAME}_node
+  EXECUTOR MultiThreadedExecutor
 )
 
 install(DIRECTORY config launch
@@ -57,6 +59,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_yaw_spline_planner test/test_yaw_spline_planner.cpp)
   target_link_libraries(test_yaw_spline_planner ${PROJECT_NAME})
+
+  ament_add_gtest(test_planning_map_snapshot test/test_planning_map_snapshot.cpp)
+  target_link_libraries(test_planning_map_snapshot ${PROJECT_NAME})
+
+  ament_add_gtest(test_reference_path_timing test/test_reference_path_timing.cpp)
+  target_link_libraries(test_reference_path_timing ${PROJECT_NAME})
 endif()
 
 ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

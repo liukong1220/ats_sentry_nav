@@ -12,6 +12,13 @@ minco_planner:
     reference_path_topic: minco/reference_path
     # 发布 JPS、MINCO 和足迹碰撞调试 marker。
     debug_marker_topic: minco/debug_markers
+    # P2 ROGMap 模式由 launch 覆盖为 /rog_map_adapter/ready；空值保持 RC-ESDF 回归兼容。
+    map_ready_topic: ""
+    emergency_stop_topic: /planner/emergency_stop
+    # ROGMap adapter heartbeat lease; timeout always invalidates the previous trajectory.
+    map_ready_timeout_sec: 3.0
+    # 急停状态 heartbeat 周期；必须显著小于 MPC 的 emergency_stop_timeout。
+    emergency_stop_heartbeat_period_sec: 0.1
     # 规划栅格和目标最终统一到的全局坐标系。
     global_frame: odom
     # 从 global_frame 查询当前车体起点位姿时使用的 TF frame。
