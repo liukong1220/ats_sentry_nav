@@ -1,0 +1,16 @@
+# Absolute Z obstacle height band in the ROGMap frame.
+float32 min_height
+float32 max_height
+# Requested XY resolution. The server never samples finer than the occupancy map.
+float32 resolution
+---
+# 0 free, 100 raw occupied, -1 unknown. Downstream owns metric clearance/inflation.
+nav_msgs/OccupancyGrid occupancy_grid
+uint64 generation
+bool ready
+bool stale
+# Row-major, metric signed distance. Positive is free, negative is occupied, NaN is unknown.
+float32[] signed_distance
+# Row-major gradient in occupancy_grid.header.frame_id. Unknown cells are NaN.
+float32[] gradient_x
+float32[] gradient_y
