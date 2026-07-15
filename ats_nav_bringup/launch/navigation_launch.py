@@ -25,6 +25,7 @@ def generate_launch_description():
     container_name_full = (namespace, "/", container_name)
     use_respawn = LaunchConfiguration("use_respawn")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
+    planning_grid_owner = LaunchConfiguration("planning_grid_owner")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
@@ -118,6 +119,13 @@ def generate_launch_description():
         "launch_trajectory_optimizer",
         default_value="True",
         description="Whether to start the RC-ESDF local elastic path optimizer",
+    )
+
+    declare_planning_grid_owner_cmd = DeclareLaunchArgument(
+        "planning_grid_owner",
+        default_value="rc_esdf",
+        choices=["rc_esdf", "rog_map"],
+        description="Single /rc_esdf/planning_grid owner: rc_esdf or rog_map",
     )
 
     declare_launch_fake_vel_transform_cmd = DeclareLaunchArgument(
@@ -281,6 +289,11 @@ def generate_launch_description():
                 package="trajectory_optimizer",
                 executable="rc_esdf_map_node",
                 name="rc_esdf_map",
+                condition=IfCondition(
+                    PythonExpression([
+                        "'", planning_grid_owner, "'.lower() == 'rc_esdf'"
+                    ])
+                ),
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
@@ -427,12 +440,6 @@ def generate_launch_description():
                 parameters=[configured_params],
             ),
             ComposableNode(
-                package="trajectory_optimizer",
-                plugin="trajectory_optimizer::RcEsdfMapNode",
-                name="rc_esdf_map",
-                parameters=[configured_params],
-            ),
-            ComposableNode(
                 package="nav2_controller",
                 plugin="nav2_controller::ControllerServer",
                 name="controller_server",
@@ -515,6 +522,24 @@ def generate_launch_description():
         ],
     )
 
+    load_rc_esdf_map_node = LoadComposableNodes(
+        condition=IfCondition(
+            PythonExpression([
+                "'", use_composition, "'.lower() == 'true' and '",
+                planning_grid_owner, "'.lower() == 'rc_esdf'",
+            ])
+        ),
+        target_container=container_name_full,
+        composable_node_descriptions=[
+            ComposableNode(
+                package="trajectory_optimizer",
+                plugin="trajectory_optimizer::RcEsdfMapNode",
+                name="rc_esdf_map",
+                parameters=[configured_params],
+            ),
+        ],
+    )
+
     load_fake_vel_transform_node = LoadComposableNodes(
         condition=IfCondition(
             PythonExpression([
@@ -556,6 +581,7 @@ def generate_launch_description():
     ld.add_action(declare_container_name_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
+    ld.add_action(declare_planning_grid_owner_cmd)
     ld.add_action(declare_launch_fake_vel_transform_cmd)
     ld.add_action(declare_launch_chassis_vel_transform_cmd)
     ld.add_action(declare_nav_cmd_vel_topic_cmd)
@@ -571,6 +597,7 @@ def generate_launch_description():
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)
     ld.add_action(load_trajectory_optimizer_node)
+    ld.add_action(load_rc_esdf_map_node)
     ld.add_action(load_fake_vel_transform_node)
 
     return ld
