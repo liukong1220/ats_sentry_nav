@@ -1,0 +1,45 @@
+rog_map:
+  esdf:
+    enable: true
+    resolution: 0.10
+    local_update_box: [8.0, 8.0, 1.0]
+    # P2 numeric snapshots require occupancy and 3D ESDF to share one update generation.
+    update_interval_updates: 1
+  map_sliding:
+    enable: true
+    threshold: 1.0
+  fix_map_origin: [0.0, 0.0, 0.5]
+  frontier_extraction_en: false
+  ros_callback:
+    enable: false
+  visualization:
+    enable: false
+  resolution: 0.10
+  inflation_resolution: 0.10
+  inflation_step: 2
+  unk_inflation_en: false
+  map_size: [10.0, 10.0, 1.0]
+  point_filt_num: 1
+  raycasting:
+    enable: true
+    batch_update_size: 1
+    unk_thresh: 0.70
+    p_hit: 0.70
+    p_miss: 0.30
+    p_min: 0.12
+    p_max: 0.97
+    # P2 planning requires repeated evidence before a voxel enters occupancy and 3D ESDF.
+    p_occ: 0.80
+    p_free: 0.30
+    ray_range: [0.30, 10.0]
+    local_update_box: [8.0, 8.0, 1.0]
+    clear_clipped_endpoint: true
+    stale_decay:
+      enable: true
+      soft_ttl_updates: 30
+      hard_ttl_updates: 90
+      decay_log_odds_step: 0.25
+      sweep_interval_updates: 1
+      local_update_box_only: true
+  virtual_ground_height: -0.50
+  virtual_ceil_height: 1.00

@@ -10,6 +10,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(ats_rog_map_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -50,7 +51,7 @@ ament_target_dependencies(${PROJECT_NAME}_core PUBLIC
 
 add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
 target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core)
-ament_target_dependencies(ats_rog_map_node ament_index_cpp)
+ament_target_dependencies(ats_rog_map_node ament_index_cpp ats_rog_map_interfaces)
 
 install(TARGETS ${PROJECT_NAME}_core ats_rog_map_node
   ARCHIVE DESTINATION lib
@@ -76,6 +77,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_split_robot_sensor_pose test/test_split_robot_sensor_pose.cpp)
   target_link_libraries(test_split_robot_sensor_pose ${PROJECT_NAME}_core)
   target_compile_definitions(test_split_robot_sensor_pose PRIVATE
+    ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
+
+  ament_add_gtest(test_rog_map_engine_snapshot test/test_rog_map_engine_snapshot.cpp)
+  target_link_libraries(test_rog_map_engine_snapshot ${PROJECT_NAME}_core)
+  target_compile_definitions(test_rog_map_engine_snapshot PRIVATE
     ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
 endif()
 

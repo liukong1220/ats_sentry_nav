@@ -14,6 +14,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("sensor_frame", default_value="front_mid360"),
         DeclareLaunchArgument("odom_topic", default_value="/localization"),
         DeclareLaunchArgument("cloud_topic", default_value="/registered_scan"),
+        DeclareLaunchArgument("self_filter_radius", default_value="0.45"),
         DeclareLaunchArgument(
             "map_config_file",
             default_value=PathJoinSubstitution([
@@ -32,6 +33,7 @@ def generate_launch_description() -> LaunchDescription:
                 "sensor_frame": LaunchConfiguration("sensor_frame"),
                 "odom_topic": LaunchConfiguration("odom_topic"),
                 "cloud_topic": LaunchConfiguration("cloud_topic"),
+                "self_filter_radius": LaunchConfiguration("self_filter_radius"),
                 "map_config_file": LaunchConfiguration("map_config_file"),
             }],
         ),
