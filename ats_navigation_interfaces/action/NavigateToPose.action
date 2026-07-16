@@ -1,0 +1,29 @@
+# 目标必须能够变换到目标管理器的 planning_frame；timeout 小于等于零时使用服务端默认值。
+geometry_msgs/PoseStamped goal_pose
+builtin_interfaces/Duration timeout
+---
+uint8 RESULT_SUCCEEDED=0
+uint8 RESULT_CANCELED=1
+uint8 RESULT_PREEMPTED=2
+uint8 RESULT_TIMEOUT=3
+uint8 RESULT_MAP_UNREADY=4
+uint8 RESULT_PLANNING_FAILED=5
+uint8 RESULT_TF_FAILED=6
+uint8 RESULT_INTERNAL_ERROR=7
+uint8 result_code
+string message
+geometry_msgs/PoseStamped final_pose
+float64 final_distance
+---
+uint8 STATE_ACCEPTED=0
+uint8 STATE_WAITING_FOR_MAP=1
+uint8 STATE_PLANNING=2
+uint8 STATE_TRACKING=3
+uint8 STATE_CANCELING=4
+uint8 STATE_STOPPED=5
+uint8 state
+uint64 goal_id
+geometry_msgs/PoseStamped current_pose
+float64 distance_remaining
+float64 elapsed_sec
+string status
