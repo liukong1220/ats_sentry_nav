@@ -95,6 +95,53 @@ void YawSplinePlanner::applyClearanceAware(
     previous_yaw = current.yaw;
     previous_t = current.t;
   }
+  // 窄通道可能延续到最终位置。此时保留通道内的切线 yaw，再追加原地、
+  // 限速的目标朝向过渡，避免 Navigate action 在位置到达后永久 tracking。
+  appendTerminalGoalYawTransition(trajectory, goal_yaw);
+}
+
+void YawSplinePlanner::appendTerminalGoalYawTransition(
+  ReferenceTrajectory & trajectory, double goal_yaw) const
+{
+  if (trajectory.points.empty()) {
+    return;
+  }
+  const ReferencePoint terminal = trajectory.points.back();
+  const double delta = shortestAngularDistance(terminal.yaw, goal_yaw);
+  if (std::abs(delta) <= 1e-8) {
+    trajectory.points.back().yaw = normalizeAngle(goal_yaw);
+    trajectory.points.back().yaw_rate = 0.0;
+    return;
+  }
+
+  const double yaw_rate_limit = std::max(1e-3, params_.yaw_rate_limit);
+  const double duration = 1.875 * std::abs(delta) / yaw_rate_limit;
+  const double sample_period = std::max(0.01, params_.terminal_yaw_sample_period);
+  const int sample_count = std::max(
+    2, static_cast<int>(std::ceil(duration / sample_period)));
+
+  trajectory.points.reserve(trajectory.points.size() + static_cast<std::size_t>(sample_count));
+  for (int index = 1; index <= sample_count; ++index) {
+    const double u = static_cast<double>(index) / static_cast<double>(sample_count);
+    const double u2 = u * u;
+    const double u3 = u2 * u;
+    const double u4 = u3 * u;
+    const double u5 = u4 * u;
+    const double blend = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+    const double blend_rate = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+
+    ReferencePoint point = terminal;
+    point.t = terminal.t + duration * u;
+    point.s = terminal.s;
+    point.v = 0.0;
+    point.vx = 0.0;
+    point.vy = 0.0;
+    point.ax = 0.0;
+    point.ay = 0.0;
+    point.yaw = normalizeAngle(terminal.yaw + delta * blend);
+    point.yaw_rate = delta * blend_rate;
+    trajectory.points.push_back(point);
+  }
 }
 
 void YawSplinePlanner::applyGoalHeading(

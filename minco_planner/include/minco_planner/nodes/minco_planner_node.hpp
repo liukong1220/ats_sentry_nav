@@ -11,6 +11,9 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include "ats_navigation_interfaces/msg/planner_goal.hpp"
+#include "ats_navigation_interfaces/msg/planner_status.hpp"
+#include "builtin_interfaces/msg/time.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/nodes/planning_map_snapshot.hpp"
@@ -42,7 +45,10 @@ private:
   void onMapReady(const std_msgs::msg::Bool::SharedPtr msg);
   void onMapReadyWatchdog();
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+  void onPlannerGoal(const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg);
   void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
+  void planGoal(
+    const geometry_msgs::msg::PoseStamped & goal, std::uint64_t goal_id, bool report_status);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
   bool transformGoalToGrid(
@@ -59,15 +65,24 @@ private:
   bool publishReferenceIfCurrent(
     const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
     std::uint64_t map_health_epoch,
-    const nav_msgs::msg::Path & reference_path);
+    const nav_msgs::msg::Path & reference_path,
+    std::uint64_t goal_id,
+    bool report_status);
   void publishEmergencyStop(bool stop);
+  void publishPlannerStatus(
+    std::uint64_t goal_id, std::uint64_t map_generation, std::uint8_t state,
+    const std::string & reason,
+    const builtin_interfaces::msg::Time & reference_stamp = builtin_interfaces::msg::Time());
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
   std::string goal_topic_ = "goal_pose";
   std::string global_plan_topic_ = "/plan";
+  std::string goal_request_topic_;
+  std::string planner_status_topic_;
   std::string raw_path_topic_ = "minco/raw_path";
   std::string reference_path_topic_ = "minco/reference_path";
+  std::string candidate_reference_path_topic_;
   std::string debug_marker_topic_ = "minco/debug_markers";
   std::string map_ready_topic_;
   std::string emergency_stop_topic_ = "/planner/emergency_stop";
@@ -76,6 +91,7 @@ private:
   std::string search_algorithm_ = "jps";
   bool astar_fallback_ = true;
   bool publish_unsafe_trajectory_ = false;
+  bool planner_manages_emergency_stop_ = true;
   int obstacle_value_threshold_ = 50;
   bool unknown_is_obstacle_ = true;
   double footprint_length_ = 0.70;
@@ -101,13 +117,16 @@ private:
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerGoal>::SharedPtr goal_request_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_plan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::TimerBase::SharedPtr safety_watchdog_timer_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raw_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr candidate_reference_path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr planner_status_pub_;
 
   rclcpp::CallbackGroup::SharedPtr planning_callback_group_;
   rclcpp::CallbackGroup::SharedPtr map_callback_group_;

@@ -6,15 +6,23 @@ minco_planner:
     goal_topic: goal_pose
     # Nav2 兼容入口；自研 Nav2-free 模式设为空字符串即可停止订阅 /plan。
     global_plan_topic: /plan
+    # P3 由 ats_goal_manager 发布带单调 goal_id 的请求；空值保持 P2 直接 /goal_pose 兼容。
+    goal_request_topic: ""
+    # P3 规划结果使用结构化状态回传，不能由可视化路径推断成功或失败。
+    planner_status_topic: ""
     # 发布原始 JPS/A* 路径，便于检查离散搜索是否正确。
     raw_path_topic: minco/raw_path
     # 发布带位置、yaw、速度和加速度的 MINCO 连续参考路径，供 MPC 跟踪。
     reference_path_topic: minco/reference_path
+    # P3 候选 reference 只交给目标管理器复核和重定时；P2 保持空值并直接发布正式 reference。
+    candidate_reference_path_topic: ""
     # 发布 JPS、MINCO 和足迹碰撞调试 marker。
     debug_marker_topic: minco/debug_markers
     # P2 ROGMap 模式由 launch 覆盖为 /rog_map_adapter/ready；空值保持 RC-ESDF 回归兼容。
     map_ready_topic: ""
     emergency_stop_topic: /planner/emergency_stop
+    # true 为 P2 兼容模式。P3 设为 false 后 /planner/emergency_stop 只有目标管理器一个发布者。
+    planner_manages_emergency_stop: true
     # ROGMap adapter heartbeat lease; timeout always invalidates the previous trajectory.
     map_ready_timeout_sec: 3.0
     # 急停状态 heartbeat 周期；必须显著小于 MPC 的 emergency_stop_timeout。
@@ -85,6 +93,8 @@ minco_planner:
     narrow_clearance_enter: 0.55
     # 已进入窄通道后，净空达到该值（m）以上才退出，形成滞回以防抖动。
     narrow_clearance_exit: 0.70
+    # 窄通道延续到终点时，追加零平移 yaw 过渡的最长采样间隔（s）；每个点仍过足迹 gate。
+    terminal_yaw_sample_period: 0.10
 
     # 车体矩形足迹长度（m），对应前后方向的保守尺寸。
     footprint_length: 0.70

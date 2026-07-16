@@ -110,3 +110,35 @@ TEST(YawSplinePlanner, ClearanceAwareSelectsReverseTangentWhenCloser)
   EXPECT_NEAR(std::abs(trajectory.points[1].yaw), M_PI, 1e-9);
   EXPECT_NEAR(std::abs(trajectory.points[2].yaw), M_PI, 1e-9);
 }
+
+TEST(YawSplinePlanner, ClearanceAwareRestoresGoalHeadingAfterNarrowTerminalSegment)
+{
+  minco_planner::ReferenceTrajectory trajectory;
+  for (int i = 0; i < 3; ++i) {
+    minco_planner::ReferencePoint point;
+    point.t = 0.4 * static_cast<double>(i);
+    point.s = 0.5 * static_cast<double>(i);
+    point.x = 0.5 * static_cast<double>(i);
+    point.clearance = 0.2;
+    trajectory.points.push_back(point);
+  }
+  minco_planner::YawSplinePlannerParams params;
+  params.mode = "clearance_aware";
+  params.yaw_rate_limit = 2.5;
+  params.terminal_yaw_sample_period = 0.1;
+  minco_planner::YawSplinePlanner planner(params);
+
+  planner.apply(trajectory, 0.0, M_PI_2);
+
+  ASSERT_GT(trajectory.points.size(), 3U);
+  EXPECT_NEAR(trajectory.points[2].yaw, 0.0, 1e-9);
+  EXPECT_NEAR(trajectory.points.back().yaw, M_PI_2, 1e-8);
+  EXPECT_NEAR(trajectory.points.back().yaw_rate, 0.0, 1e-8);
+  for (std::size_t i = 3; i < trajectory.points.size(); ++i) {
+    EXPECT_NEAR(trajectory.points[i].x, 1.0, 1e-9);
+    EXPECT_NEAR(trajectory.points[i].y, 0.0, 1e-9);
+    EXPECT_NEAR(trajectory.points[i].v, 0.0, 1e-9);
+    EXPECT_LE(std::abs(trajectory.points[i].yaw_rate), params.yaw_rate_limit + 1e-9);
+  }
+  EXPECT_TRUE(trajectory.valid());
+}

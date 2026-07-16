@@ -34,9 +34,16 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
     grid_topic_, rclcpp::QoS(1).reliable(),
     std::bind(&MincoPlannerNode::onGrid, this, std::placeholders::_1), map_options);
-  goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-    goal_topic_, rclcpp::QoS(10),
-    std::bind(&MincoPlannerNode::onGoal, this, std::placeholders::_1), planning_options);
+  if (!goal_topic_.empty()) {
+    goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      goal_topic_, rclcpp::QoS(10),
+      std::bind(&MincoPlannerNode::onGoal, this, std::placeholders::_1), planning_options);
+  }
+  if (!goal_request_topic_.empty()) {
+    goal_request_sub_ = create_subscription<ats_navigation_interfaces::msg::PlannerGoal>(
+      goal_request_topic_, rclcpp::QoS(10).reliable(),
+      std::bind(&MincoPlannerNode::onPlannerGoal, this, std::placeholders::_1), planning_options);
+  }
   // 设为空可彻底断开 Nav2 /plan；此时 goal_topic 仍可独立触发 JPS 与 MINCO。
   if (!global_plan_topic_.empty()) {
     global_plan_sub_ = create_subscription<nav_msgs::msg::Path>(
@@ -44,13 +51,24 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       std::bind(&MincoPlannerNode::onGlobalPlan, this, std::placeholders::_1), planning_options);
   }
   raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
-  reference_path_pub_ =
-    create_publisher<nav_msgs::msg::Path>(reference_path_topic_, rclcpp::QoS(1));
+  if (planner_manages_emergency_stop_) {
+    reference_path_pub_ =
+      create_publisher<nav_msgs::msg::Path>(reference_path_topic_, rclcpp::QoS(1));
+  }
+  if (!candidate_reference_path_topic_.empty()) {
+    candidate_reference_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+      candidate_reference_path_topic_, rclcpp::QoS(1).reliable());
+  }
   marker_pub_ =
     create_publisher<visualization_msgs::msg::MarkerArray>(debug_marker_topic_, rclcpp::QoS(1));
-  emergency_stop_pub_ =
-    create_publisher<std_msgs::msg::Bool>(
-    emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
+  if (planner_manages_emergency_stop_) {
+    emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
+      emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
+  }
+  if (!planner_status_topic_.empty()) {
+    planner_status_pub_ = create_publisher<ats_navigation_interfaces::msg::PlannerStatus>(
+      planner_status_topic_, rclcpp::QoS(10).reliable());
+  }
   safety_state_.map_ready = map_ready_topic_.empty();
   if (!map_ready_topic_.empty()) {
     map_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
@@ -63,8 +81,8 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   publishEmergencyStop(true);
 
   RCLCPP_INFO(
-    get_logger(), "minco_planner ready: grid='%s' goal='%s' raw='%s' reference='%s'",
-    grid_topic_.c_str(), goal_topic_.c_str(), raw_path_topic_.c_str(),
+    get_logger(), "minco_planner ready: grid='%s' goal='%s' request='%s' raw='%s' reference='%s'",
+    grid_topic_.c_str(), goal_topic_.c_str(), goal_request_topic_.c_str(), raw_path_topic_.c_str(),
     reference_path_topic_.c_str());
 }
 
@@ -73,8 +91,11 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("grid_topic", grid_topic_);
   declare_parameter<std::string>("goal_topic", goal_topic_);
   declare_parameter<std::string>("global_plan_topic", global_plan_topic_);
+  declare_parameter<std::string>("goal_request_topic", goal_request_topic_);
+  declare_parameter<std::string>("planner_status_topic", planner_status_topic_);
   declare_parameter<std::string>("raw_path_topic", raw_path_topic_);
   declare_parameter<std::string>("reference_path_topic", reference_path_topic_);
+  declare_parameter<std::string>("candidate_reference_path_topic", candidate_reference_path_topic_);
   declare_parameter<std::string>("debug_marker_topic", debug_marker_topic_);
   declare_parameter<std::string>("map_ready_topic", map_ready_topic_);
   declare_parameter<std::string>("emergency_stop_topic", emergency_stop_topic_);
@@ -86,6 +107,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("search_algorithm", search_algorithm_);
   declare_parameter<bool>("astar_fallback", astar_fallback_);
   declare_parameter<bool>("publish_unsafe_trajectory", publish_unsafe_trajectory_);
+  declare_parameter<bool>("planner_manages_emergency_stop", planner_manages_emergency_stop_);
 
   GridAstarParams astar_params;
   declare_parameter<int>("obstacle_value_threshold", astar_params.obstacle_value_threshold);
@@ -125,6 +147,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("yaw_rate_limit", yaw_params.yaw_rate_limit);
   declare_parameter<double>("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
   declare_parameter<double>("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
+  declare_parameter<double>(
+    "terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
 
   FootprintSafetyParams footprint_params;
   declare_parameter<double>("footprint_length", footprint_params.length);
@@ -139,8 +163,11 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("grid_topic", grid_topic_);
   get_parameter("goal_topic", goal_topic_);
   get_parameter("global_plan_topic", global_plan_topic_);
+  get_parameter("goal_request_topic", goal_request_topic_);
+  get_parameter("planner_status_topic", planner_status_topic_);
   get_parameter("raw_path_topic", raw_path_topic_);
   get_parameter("reference_path_topic", reference_path_topic_);
+  get_parameter("candidate_reference_path_topic", candidate_reference_path_topic_);
   get_parameter("debug_marker_topic", debug_marker_topic_);
   get_parameter("map_ready_topic", map_ready_topic_);
   get_parameter("emergency_stop_topic", emergency_stop_topic_);
@@ -154,6 +181,7 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("search_algorithm", search_algorithm_);
   get_parameter("astar_fallback", astar_fallback_);
   get_parameter("publish_unsafe_trajectory", publish_unsafe_trajectory_);
+  get_parameter("planner_manages_emergency_stop", planner_manages_emergency_stop_);
   get_parameter("obstacle_value_threshold", obstacle_value_threshold_);
   get_parameter("unknown_is_obstacle", unknown_is_obstacle_);
   astar_params.obstacle_value_threshold = obstacle_value_threshold_;
@@ -184,6 +212,7 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
   get_parameter("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
+  get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   get_parameter("footprint_length", footprint_params.length);
   get_parameter("footprint_width", footprint_params.width);
   get_parameter("footprint_safety_margin", footprint_params.safety_margin);
@@ -308,7 +337,36 @@ void MincoPlannerNode::onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg)
 
 void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
+  // P2/P3 过渡兼容入口：P2 保持直接 PoseStamped，不携带任务生命周期编号。
+  planGoal(*msg, 0, false);
+}
+
+void MincoPlannerNode::onPlannerGoal(
+  const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg)
+{
+  if (msg->goal_id == 0) {
+    publishPlannerStatus(
+      0, 0, ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
+      "planner goal_id must be non-zero");
+    return;
+  }
+  publishPlannerStatus(
+    msg->goal_id, 0, ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED,
+    "MINCO accepted ATS goal request");
+  planGoal(msg->goal_pose, msg->goal_id, true);
+}
+
+void MincoPlannerNode::planGoal(
+  const geometry_msgs::msg::PoseStamped & input_goal, std::uint64_t goal_id, bool report_status)
+{
   setPlanSafe(false);
+  const auto fail = [this, goal_id, report_status](const std::string & reason, std::uint64_t generation) {
+      setPlanSafe(false);
+      if (report_status) {
+        publishPlannerStatus(
+          goal_id, generation, ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED, reason);
+      }
+    };
   std::shared_ptr<const PlanningMapSnapshot> map_snapshot;
   std::uint64_t map_health_epoch = 0;
   bool map_ready = false;
@@ -320,6 +378,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   }
   if (!map_ready || !map_snapshot) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "No traversability grid received yet.");
+    fail("planning grid unavailable or map heartbeat stale", 0);
     return;
   }
   const auto & planning_grid = map_snapshot->grid;
@@ -328,10 +387,11 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   geometry_msgs::msg::PoseStamped start;
   if (!lookupStartPose(planning_grid, start)) {
     RCLCPP_WARN(get_logger(), "Cannot plan because start pose lookup failed.");
+    fail("start pose TF lookup failed", map_snapshot->generation);
     return;
   }
 
-  geometry_msgs::msg::PoseStamped goal = *msg;
+  geometry_msgs::msg::PoseStamped goal = input_goal;
   if (goal.header.frame_id.empty()) {
     goal.header.frame_id =
       planning_grid.header.frame_id.empty() ? global_frame_ : planning_grid.header.frame_id;
@@ -339,6 +399,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   geometry_msgs::msg::PoseStamped goal_in_grid;
   if (!transformGoalToGrid(planning_grid, goal, goal_in_grid)) {
     RCLCPP_WARN(get_logger(), "Cannot plan because goal transform failed.");
+    fail("goal TF transform failed", map_snapshot->generation);
     return;
   }
   goal = goal_in_grid;
@@ -359,6 +420,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     RCLCPP_WARN(
       get_logger(), "%s failed: %s expanded=%d", search_algorithm_.c_str(),
       search_result.reason.c_str(), search_result.expanded_nodes);
+    fail(search_algorithm_ + " failed: " + search_result.reason, map_snapshot->generation);
     return;
   }
 
@@ -366,6 +428,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   ReferenceTrajectory center_reference = optimizer_.optimize(search_result.path, clearance_esdf.get());
   if (!center_reference.valid()) {
     RCLCPP_ERROR(get_logger(), "MINCO returned an invalid center trajectory.");
+    fail("MINCO returned an invalid center trajectory", map_snapshot->generation);
     return;
   }
   center_reference.header.stamp = now();
@@ -420,6 +483,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
     reference = optimizer_.optimize(toPath(reference), clearance_esdf.get(), &reference);
     if (!reference.valid()) {
       RCLCPP_ERROR(get_logger(), "Local collision repair produced an invalid MINCO trajectory.");
+      fail("local collision repair produced an invalid MINCO trajectory", map_snapshot->generation);
       return;
     }
     reference.header.stamp = now();
@@ -432,6 +496,7 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
   marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
   if (!reference.valid()) {
     RCLCPP_ERROR(get_logger(), "Rejecting an invalid MINCO reference trajectory.");
+    fail("final MINCO reference is invalid", map_snapshot->generation);
     return;
   }
   if (!safety.safe && !publish_unsafe_trajectory_) {
@@ -445,18 +510,23 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
         safety.collisions.size(), first_collision.trajectory_index,
         first_collision.x, first_collision.y);
     }
+    fail("final footprint safety gate rejected trajectory", map_snapshot->generation);
     return;
   }
   nav_msgs::msg::Path control_reference;
   if (!transformPathToGlobal(toPath(reference), control_reference)) {
     RCLCPP_ERROR(
       get_logger(), "Cannot publish MINCO reference because the control-frame transform failed.");
+    fail("reference control-frame TF transform failed", map_snapshot->generation);
     return;
   }
-  if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch, control_reference)) {
+  if (!publishReferenceIfCurrent(
+      map_snapshot, map_health_epoch, control_reference, goal_id, report_status)) {
     RCLCPP_WARN(
       get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
       static_cast<unsigned long long>(map_snapshot->generation));
+    fail("planning snapshot changed or map heartbeat became stale before reference commit",
+      map_snapshot->generation);
     return;
   }
 
@@ -582,9 +652,30 @@ bool MincoPlannerNode::transformPathToGlobal(
 
 void MincoPlannerNode::publishEmergencyStop(bool stop)
 {
+  if (!planner_manages_emergency_stop_ || !emergency_stop_pub_) {
+    return;
+  }
   std_msgs::msg::Bool message;
   message.data = stop;
   emergency_stop_pub_->publish(message);
+}
+
+void MincoPlannerNode::publishPlannerStatus(
+  std::uint64_t goal_id, std::uint64_t map_generation, std::uint8_t state,
+  const std::string & reason, const builtin_interfaces::msg::Time & reference_stamp)
+{
+  if (!planner_status_pub_) {
+    return;
+  }
+  ats_navigation_interfaces::msg::PlannerStatus status;
+  status.header.stamp = now();
+  status.header.frame_id = global_frame_;
+  status.goal_id = goal_id;
+  status.map_generation = map_generation;
+  status.state = state;
+  status.reference_stamp = reference_stamp;
+  status.reason = reason;
+  planner_status_pub_->publish(status);
 }
 
 void MincoPlannerNode::setPlanSafe(bool safe)
@@ -599,9 +690,12 @@ void MincoPlannerNode::setPlanSafe(bool safe)
 bool MincoPlannerNode::publishReferenceIfCurrent(
   const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
   std::uint64_t map_health_epoch,
-  const nav_msgs::msg::Path & reference_path)
+  const nav_msgs::msg::Path & reference_path,
+  std::uint64_t goal_id,
+  bool report_status)
 {
   bool publish = false;
+  nav_msgs::msg::Path candidate_reference;
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
     const bool heartbeat_fresh = map_ready_topic_.empty() || steadyHeartbeatLeaseValid(
@@ -619,11 +713,31 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
       nav_msgs::msg::Path committed_reference = reference_path;
       rebasePathTimestamps(committed_reference, now());
       safety_state_.plan_safe = true;
-      publishEmergencyStop(false);
-      reference_path_pub_->publish(committed_reference);
+      if (planner_manages_emergency_stop_) {
+        // P2 保留同一互斥区内的先解除急停、再发布正式 reference 契约。
+        publishEmergencyStop(false);
+        reference_path_pub_->publish(committed_reference);
+      } else {
+        // P3 不让规划器越权发布正式 reference；目标管理器会再次核对 heartbeat 后提交。
+        candidate_reference = std::move(committed_reference);
+      }
     } else {
       safety_state_.plan_safe = false;
       publishEmergencyStop(true);
+    }
+  }
+  if (publish && !planner_manages_emergency_stop_) {
+    if (!candidate_reference_path_pub_) {
+      RCLCPP_ERROR(get_logger(), "P3 planner has no candidate reference publisher.");
+      return false;
+    }
+    candidate_reference_path_pub_->publish(candidate_reference);
+    if (report_status) {
+      publishPlannerStatus(
+        goal_id, snapshot->generation,
+        ats_navigation_interfaces::msg::PlannerStatus::STATE_REFERENCE_READY,
+        "MINCO candidate passed snapshot and footprint gate",
+        candidate_reference.header.stamp);
     }
   }
   return publish;
