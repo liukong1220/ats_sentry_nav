@@ -1,0 +1,22 @@
+ats_goal_manager:
+  ros__parameters:
+    # 外部最小目标入口；RViz 的 SetGoal 和调试工具均通过它进入同一状态机。
+    input_goal_topic: /goal_pose
+    # 只供 MINCO 使用的带单调 goal_id 请求，避免旧规划结果在抢占后重新授权运动。
+    planner_goal_topic: /ats_goal_manager/planner_goal
+    planner_status_topic: /minco/planning_status
+    candidate_reference_topic: /minco/reference_path_candidate
+    reference_path_topic: /minco/reference_path
+    emergency_stop_topic: /planner/emergency_stop
+    map_ready_topic: /rog_map_adapter/ready
+    odom_topic: /localization
+    action_name: /ats_navigate_to_pose
+    planning_frame: odom
+    # 该租约使用 steady clock，不能由仿真时钟跳变或旧 DDS 样本续命。
+    map_ready_timeout_sec: 3.0
+    emergency_stop_heartbeat_period_sec: 0.1
+    # 未就绪时 topic/action 目标最多等待该时间，期间始终急停。
+    map_wait_timeout_sec: 5.0
+    default_goal_timeout_sec: 120.0
+    goal_position_tolerance: 0.08
+    goal_yaw_tolerance: 0.15
