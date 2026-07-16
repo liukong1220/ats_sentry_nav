@@ -21,17 +21,21 @@ void Se2MpcController::setConfig(const Se2MpcConfig & config)
   reset();
 }
 
+//清空上一次优化的控制序列
 void Se2MpcController::reset()
 {
   warm_controls_.clear();
   has_warm_start_ = false;
 }
 
+//将任意角度归一到 (-π, π]，避免角度跳变
 double Se2MpcController::normalizeAngle(double angle)
 {
   return std::atan2(std::sin(angle), std::cos(angle));
 }
 
+
+//计算SE(2) 状态（x, y, yaw）的差，角度差值归一化到 (-π, π]
 State Se2MpcController::stateDifference(const State & lhs, const State & rhs)
 {
   State difference = lhs - rhs;
@@ -39,6 +43,7 @@ State Se2MpcController::stateDifference(const State & lhs, const State & rhs)
   return difference;
 }
 
+//将 SE(2) 状态（x, y, yaw）与控制（vx, vy, wz）应用于离散时间动力学模型，计算下一状态
 State Se2MpcController::dynamics(const State & state, const Control & control) const
 {
   // 状态位于世界系 [x, y, yaw]，而 vx/vy 是车体系控制；此处完成 SE2 坐标变换。
@@ -50,6 +55,7 @@ State Se2MpcController::dynamics(const State & state, const Control & control) c
   return next;
 }
 
+//计算离散时间动力学模型的雅可比矩阵，分别对状态和控制求偏导
 void Se2MpcController::jacobians(
   const State & state,
   const Control & control,
@@ -70,6 +76,7 @@ void Se2MpcController::jacobians(
   control_jacobian(2, 2) = config_.dt;
 }
 
+//将控制输入限制在最大速度和加速度范围内，避免过快或过大控制指令
 Control Se2MpcController::clampControl(const Control & control) const
 {
   Control clamped = control;
@@ -79,6 +86,7 @@ Control Se2MpcController::clampControl(const Control & control) const
   return clamped;
 }
 
+//将控制增量限制在最大加速度范围内，避免每个 dt 内的速度变化过大
 Control Se2MpcController::clampIncrement(
   const Control & target,
   const Control & previous) const
@@ -95,6 +103,7 @@ Control Se2MpcController::clampIncrement(
   return clampControl(previous + delta);
 }
 
+//根据初始状态和控制序列，沿离散时间动力学模型前向滚动计算状态序列
 std::vector<State> Se2MpcController::rollout(
   const State & initial,
   const std::vector<Control> & controls) const
@@ -108,6 +117,7 @@ std::vector<State> Se2MpcController::rollout(
   return states;
 }
 
+//计算给定状态序列、控制序列和参考轨迹的总代价，包括状态误差、控制误差、控制增量误差和终端状态误差
 double Se2MpcController::cost(
   const std::vector<State> & states,
   const std::vector<Control> & controls,
@@ -136,6 +146,7 @@ double Se2MpcController::cost(
   return total + final_error.dot(terminal * final_error);
 }
 
+//根据当前状态、参考轨迹和上一次控制量，调用 iLQR 算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
 void Se2MpcController::initializeControls(
   const std::vector<Se2Reference> & references,
   const Control & last_control)
@@ -158,6 +169,7 @@ void Se2MpcController::initializeControls(
   has_warm_start_ = true;
 }
 
+//反向传播:根据当前状态、参考轨迹和上一次控制量，调用 iLQR 算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
 Se2MpcController::BackwardResult Se2MpcController::backwardPass(
   const std::vector<State> & states,
   const std::vector<Control> & controls,
@@ -217,6 +229,7 @@ Se2MpcController::BackwardResult Se2MpcController::backwardPass(
   return result;
 }
 
+//主求解:根据当前状态、参考轨迹和上一次控制量，调用 iLQR 算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
 Se2MpcResult Se2MpcController::solve(
   const State & current_state,
   const std::vector<Se2Reference> & references,

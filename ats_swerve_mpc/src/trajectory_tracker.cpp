@@ -7,14 +7,29 @@
 #include <limits>
 #include <utility>
 
+/*
+轨迹输入
+    │
+    ▼
+寻找机器人当前对应轨迹位置(Project)
+    │
+    ▼
+限制轨迹进度(Progress)
+    │
+    ▼
+生成MPC预测参考(buildHorizon)
+*/
+
 namespace ats_swerve_mpc
 {
 
+//轨迹跟踪器类的构造函数,参数声明与加载
 TrajectoryTracker::TrajectoryTracker(const TrajectoryTrackerConfig & config) : config_(config)
 {
   setConfig(config);
 }
 
+//设置轨迹跟踪器参数，包括前向/后向搜索窗口、横向误差减速区间、最小进度缩放和控制延迟补偿
 void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
 {
   config_ = config;
@@ -27,29 +42,49 @@ void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
   config_.command_latency_compensation = std::max(0.0, config_.command_latency_compensation);
 }
 
+//通过移动语义高效接管路径点，然后重置进，丢弃旧投影信息。
 void TrajectoryTracker::setTrajectory(std::vector<TimedState> trajectory)
 {
   trajectory_ = std::move(trajectory);
   resetProgress();
 }
 
+//清空轨迹并重置进度
 void TrajectoryTracker::clear()
 {
   trajectory_.clear();
   resetProgress();
 }
 
+//将投影状态标记为未初始化，进度时间归零
 void TrajectoryTracker::resetProgress()
 {
   has_progress_ = false;
   last_progress_time_ = 0.0;
 }
 
+//根据给定位置，沿轨迹寻找最近投影点，并返回投影结果，包括投影时间、横向误差和轨迹段索引
 TrajectoryProjection TrajectoryTracker::project(const Eigen::Vector2d & position)
 {
-  TrajectoryProjection projection = nearestProjection(position, has_progress_);
+  return projectImpl(position, 0.0, false);
+}
+
+//根据给定状态，沿轨迹寻找最近投影点，并返回投影结果，包括投影时间、横向误差和轨迹段索引
+TrajectoryProjection TrajectoryTracker::project(const State & state)
+{
+  if (!state.allFinite()) {
+    return {};
+  }
+  return projectImpl(state.head<2>(), state(2), true);
+}
+
+//根据给定位置和航向，沿轨迹寻找最近投影点，并返回投影结果，包括投影时间、横向误差和轨迹段索引，使得投影点沿轨迹平滑推进，具有抗噪能力
+TrajectoryProjection TrajectoryTracker::projectImpl(
+  const Eigen::Vector2d & position, double yaw, bool use_yaw)
+{
+  TrajectoryProjection projection = nearestProjection(position, yaw, use_yaw, has_progress_);
   if (!projection.valid && has_progress_) {
-    projection = nearestProjection(position, false);
+    projection = nearestProjection(position, yaw, use_yaw, false);
   }
   if (!projection.valid) {
     return projection;
@@ -67,8 +102,9 @@ TrajectoryProjection TrajectoryTracker::project(const Eigen::Vector2d & position
   return projection;
 }
 
+//在给定位置和航向的情况下，沿轨迹寻找最近投影点的实现函数
 TrajectoryProjection TrajectoryTracker::nearestProjection(
-  const Eigen::Vector2d & position, bool restrict_progress) const
+  const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress) const
 {
   TrajectoryProjection best;
   if (trajectory_.size() < 2 || !position.allFinite()) {
@@ -82,6 +118,7 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
                                 ? last_progress_time_ + config_.forward_search_window
                                 : std::numeric_limits<double>::infinity();
   double best_distance_squared = std::numeric_limits<double>::infinity();
+  double best_yaw_error = std::numeric_limits<double>::infinity();
 
   for (std::size_t i = 0; i + 1 < trajectory_.size(); ++i) {
     const TimedState & first = trajectory_[i];
@@ -95,6 +132,14 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
     double ratio = length_squared > 1e-12
                      ? std::clamp((position - start).dot(delta) / length_squared, 0.0, 1.0)
                      : 0.0;
+    if (length_squared <= 1e-12 && use_yaw) {
+      // 原地转向段没有可用的二维位置进度，必须用当前 yaw 才能推进末端 reference。
+      const double yaw_delta = normalizeAngle(second.state(2) - first.state(2));
+      if (std::abs(yaw_delta) > 1e-9) {
+        ratio = std::clamp(
+          normalizeAngle(yaw - first.state(2)) / yaw_delta, 0.0, 1.0);
+      }
+    }
     const double segment_duration = std::max(1e-9, second.time - first.time);
     const double minimum_ratio =
       std::clamp((minimum_time - first.time) / segment_duration, 0.0, 1.0);
@@ -104,7 +149,14 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
     const Eigen::Vector2d projected = start + ratio * delta;
     const double distance_squared = (position - projected).squaredNorm();
     const double projected_time = first.time + ratio * (second.time - first.time);
-    if (distance_squared >= best_distance_squared) {
+    double yaw_error = 0.0;
+    if (use_yaw) {
+      yaw_error = std::abs(normalizeAngle(
+        yaw - interpolateAngle(first.state(2), second.state(2), ratio)));
+    }
+    const bool farther = distance_squared > best_distance_squared + 1e-12;
+    const bool equal_distance = std::abs(distance_squared - best_distance_squared) <= 1e-12;
+    if (farther || (equal_distance && yaw_error >= best_yaw_error)) {
       continue;
     }
     best.valid = true;
@@ -112,10 +164,12 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
     best.cross_track_error = std::sqrt(distance_squared);
     best.segment_index = i;
     best_distance_squared = distance_squared;
+    best_yaw_error = yaw_error;
   }
   return best;
 }
 
+//根据横向误差计算进度缩放因子，横向误差越大，进度缩放越小，让底盘先回到路径附近再继续追赶
 double TrajectoryTracker::progressScale(double cross_track_error) const
 {
   if (
@@ -131,6 +185,7 @@ double TrajectoryTracker::progressScale(double cross_track_error) const
   return 1.0 - ratio * (1.0 - config_.min_progress_scale);
 }
 
+//构建预测参考序列：根据给定时间沿轨迹采样参考状态和控制量，返回采样结果，包括状态和控制量
 std::vector<Se2Reference> TrajectoryTracker::buildHorizon(
   const TrajectoryProjection & projection, int horizon, double dt) const
 {
@@ -153,6 +208,7 @@ std::vector<Se2Reference> TrajectoryTracker::buildHorizon(
   return references;
 }
 
+//单点采样：根据给定时间沿轨迹采样参考状态和控制量，返回采样结果，包括状态和控制量
 bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) const
 {
   if (trajectory_.empty()) {
@@ -186,11 +242,13 @@ bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) c
   return true;
 }
 
+//将角度归一化到 [-π, π] 范围内，避免角度跳变问题
 double TrajectoryTracker::normalizeAngle(double angle)
 {
   return std::atan2(std::sin(angle), std::cos(angle));
 }
 
+//在给定起始角度和目标角度的情况下，沿最短路径插值计算中间角度，避免角度跳变
 double TrajectoryTracker::interpolateAngle(double from, double to, double ratio)
 {
   return normalizeAngle(from + ratio * normalizeAngle(to - from));

@@ -51,13 +51,16 @@ public:
   double finalTime() const { return trajectory_.back().time; }
   double minimumProgressScale() const { return config_.min_progress_scale; }
   TrajectoryProjection project(const Eigen::Vector2d & position);
+  TrajectoryProjection project(const State & state);
   double progressScale(double cross_track_error) const;
   std::vector<Se2Reference> buildHorizon(
     const TrajectoryProjection & projection, int horizon, double dt) const;
 
 private:
+  TrajectoryProjection projectImpl(
+    const Eigen::Vector2d & position, double yaw, bool use_yaw);
   TrajectoryProjection nearestProjection(
-    const Eigen::Vector2d & position, bool restrict_progress) const;
+    const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress) const;
   bool sampleReference(double time, Se2Reference & reference) const;
   static double normalizeAngle(double angle);
   static double interpolateAngle(double from, double to, double ratio);

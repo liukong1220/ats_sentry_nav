@@ -18,6 +18,9 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
 
+
+/*节点通过 ROS 2 话题接收 里程计 和 参考轨迹，利用 MPC 求解最优速度指令（vx, vy, ω）
+并发布到控制话题。系统包含了轨迹时间有效性、目标收敛检测、紧急停止信号处理、诊断信息发布等*/
 namespace ats_swerve_mpc
 {
 

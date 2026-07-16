@@ -85,4 +85,28 @@ TEST(TrajectoryTracker, ClearDropsStoppedTrajectoryAndProgress)
   EXPECT_FALSE(tracker.project(Eigen::Vector2d(0.5, 0.0)).valid);
 }
 
+TEST(TrajectoryTracker, UsesYawToAdvanceAnInPlaceTerminalRotation)
+{
+  std::vector<ats_swerve_mpc::TimedState> trajectory(4);
+  trajectory[0].time = 10.0;
+  trajectory[0].state << 0.0, 0.0, 0.0;
+  trajectory[1].time = 11.0;
+  trajectory[1].state << 1.0, 0.0, 0.0;
+  trajectory[2].time = 12.0;
+  trajectory[2].state << 1.0, 0.0, M_PI_2;
+  trajectory[3].time = 13.0;
+  trajectory[3].state << 1.0, 0.0, M_PI;
+
+  ats_swerve_mpc::TrajectoryTracker tracker;
+  tracker.setTrajectory(trajectory);
+  ats_swerve_mpc::State state;
+  state << 1.0, 0.0, 0.75 * M_PI;
+
+  const auto projection = tracker.project(state);
+
+  ASSERT_TRUE(projection.valid);
+  EXPECT_EQ(projection.segment_index, 2U);
+  EXPECT_NEAR(projection.time, 12.5, 1e-9);
+}
+
 }  // namespace

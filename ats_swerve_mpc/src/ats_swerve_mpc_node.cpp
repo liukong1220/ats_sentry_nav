@@ -15,7 +15,7 @@ namespace ats_swerve_mpc
 
 namespace
 {
-
+// 匿名辅助函数：加载三维向量参数
 Eigen::Vector3d vectorParameter(
   rclcpp::Node & node, const std::string & name, const Eigen::Vector3d & defaults)
 {
@@ -30,6 +30,7 @@ Eigen::Vector3d vectorParameter(
 
 }  // namespace
 
+// 节点类的构造函数,参数声明与加载
 AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
 : Node("ats_swerve_mpc", options)
 {
@@ -80,6 +81,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions & options)
     controller_->config().horizon, controller_->config().dt);
 }
 
+// 加载 MPC 控制器参数
 Se2MpcConfig AtsSwerveMpcNode::loadConfig()
 {
   Se2MpcConfig config;
@@ -107,6 +109,8 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig()
   return config;
 }
 
+
+// 加载轨迹跟踪器参数
 TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig()
 {
   TrajectoryTrackerConfig config;
@@ -125,6 +129,7 @@ TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig()
   return config;
 }
 
+//里程计更新
 void AtsSwerveMpcNode::onOdometry(const nav_msgs::msg::Odometry::SharedPtr message)
 {
   std::lock_guard<std::mutex> lock(state_mutex_);
@@ -134,6 +139,7 @@ void AtsSwerveMpcNode::onOdometry(const nav_msgs::msg::Odometry::SharedPtr messa
   has_odometry_ = current_state_.allFinite();
 }
 
+//接收全局轨迹,并进行时间戳处理，存储到轨迹跟踪器中
 void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message)
 {
   if (message->poses.size() < 2) {
@@ -197,6 +203,7 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message)
   last_control_.setZero();
 }
 
+//紧急停止信号处理,当接收到紧急停止信号时，节点会立即停止控制器，并清除当前轨迹，确保机器人处于安全状态。
 void AtsSwerveMpcNode::onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message)
 {
   const bool first_signal = !emergency_stop_signal_received_.exchange(true);
@@ -212,15 +219,17 @@ void AtsSwerveMpcNode::onEmergencyStop(const std_msgs::msg::Bool::SharedPtr mess
   }
 }
 
+//核心控制循环
 void AtsSwerveMpcNode::onControlTimer()
 {
-  if (
-    emergency_stop_watchdog_enabled_ &&
-    (emergency_stop_watchdog_.stopRequired() || fail_stop_engaged_.load()))
+  // 1. 紧急停止检查
+  if (emergency_stop_watchdog_enabled_ &&
+      (emergency_stop_watchdog_.stopRequired() || fail_stop_engaged_.load()))
   {
     engageFailStop();
     return;
   }
+  // 2. 获取当前状态
   State current;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -229,6 +238,7 @@ void AtsSwerveMpcNode::onControlTimer()
     }
     current = current_state_;
   }
+  // 3. 获取目标、投影、参考序列
   State goal = State::Zero();
   TrajectoryProjection projection;
   std::vector<Se2Reference> references;
@@ -239,27 +249,28 @@ void AtsSwerveMpcNode::onControlTimer()
       return;
     }
     goal = trajectory_tracker_.goal();
-    projection = trajectory_tracker_.project(current.head<2>());
+    projection = trajectory_tracker_.project(current);
     references = trajectory_tracker_.buildHorizon(
       projection, controller_->config().horizon, controller_->config().dt);
     trajectory_expired = trajectory_deadline_.nanoseconds() > 0 && now() > trajectory_deadline_;
   }
+  // 4. 判断是否达到目标或轨迹过期
   const double goal_position_error = (goal.head<2>() - current.head<2>()).norm();
   const double goal_yaw_error = std::abs(normalizeAngle(goal(2) - current(2)));
-  if (
-    (goal_position_error <= goal_position_tolerance_ && goal_yaw_error <= goal_yaw_tolerance_) ||
-    trajectory_expired) {
+  if ((goal_position_error <= goal_position_tolerance_ && goal_yaw_error <= goal_yaw_tolerance_) ||
+      trajectory_expired) {
     last_control_.setZero();
     publishCommand(last_control_);
     controller_->reset();
     return;
   }
-
+  // 5. 检查参考序列长度
   if (references.size() < static_cast<std::size_t>(controller_->config().horizon + 1)) {
     last_control_.setZero();
     publishCommand(last_control_);
     return;
   }
+  // 6. 调用 MPC 求解
   const Se2MpcResult result = controller_->solve(current, references, last_control_);
   if (!result.success || result.controls.empty()) {
     last_control_.setZero();
@@ -268,8 +279,10 @@ void AtsSwerveMpcNode::onControlTimer()
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "SE2 MPC solve failed.");
     return;
   }
+  // 7. 应用第一个控制量并发布
   last_control_ = result.controls.front();
   publishCommand(last_control_);
+  // 8. 发布调试路径
   if (publish_debug_paths_) {
     publishPath(result.states, predicted_path_pub_);
     std::vector<State> reference_states;
@@ -288,6 +301,7 @@ void AtsSwerveMpcNode::onControlTimer()
     result.solve_time_ms);
 }
 
+//执行紧急停止
 void AtsSwerveMpcNode::engageFailStop()
 {
   const bool was_engaged = fail_stop_engaged_.exchange(true);
@@ -303,6 +317,7 @@ void AtsSwerveMpcNode::engageFailStop()
   publishCommand(last_control_);
 }
 
+// 发布控制指令到 ROS 话题
 void AtsSwerveMpcNode::publishCommand(const Control & command)
 {
   geometry_msgs::msg::Twist message;
