@@ -78,6 +78,8 @@ public:
     robot_frame_ = declare_parameter<std::string>("robot_frame", "gimbal_yaw_odom");
     robot_unknown_clear_radius_ = std::max(
       0.0, declare_parameter<double>("robot_unknown_clear_radius", 0.0));
+    // 仅用于隔离仿真故障注入；默认关闭，不能改变正式融合的 unknown 真值表。
+    declare_parameter<bool>("test_force_all_unknown", false);
 
     static_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       static_map_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -270,6 +272,13 @@ private:
     const std::size_t ego_unknown_cleared = GroundProjectionFusion::clearUnknownCircle(
       fusion, static_from_robot.transform.translation.x, static_from_robot.transform.translation.y,
       robot_unknown_clear_radius_);
+    if (get_parameter("test_force_all_unknown").as_bool()) {
+      // 保持 adapter 对规划栅格的唯一所有权，主动输出 all-unknown blocked grid，
+      // 用于验证目标管理、MPC 与底盘对真实 unknown 规划快照的失效安全链。
+      last_blocking_grid_ = fusion.planning_grid;
+      publishUnavailable("P3 test injected all-unknown planning grid");
+      return;
+    }
     if (fusion.known_free_cells == 0) {
       publishUnavailable("ROGMap terrain fusion produced no known-free cells");
       return;
