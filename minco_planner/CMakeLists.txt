@@ -65,6 +65,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_reference_path_timing test/test_reference_path_timing.cpp)
   target_link_libraries(test_reference_path_timing ${PROJECT_NAME})
+
+  ament_add_gtest(test_footprint_swept_safety test/test_footprint_swept_safety.cpp)
+  target_link_libraries(test_footprint_swept_safety ${PROJECT_NAME})
 endif()
 
 ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

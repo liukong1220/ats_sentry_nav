@@ -27,6 +27,9 @@ minco_planner:
     map_ready_timeout_sec: 3.0
     # 急停状态 heartbeat 周期；必须显著小于 MPC 的 emergency_stop_timeout。
     emergency_stop_heartbeat_period_sec: 0.1
+    # Recheck the remaining executed reference against the latest immutable map snapshot.
+    runtime_safety_recheck_hz: 10.0
+    runtime_safety_horizon_sec: 1.0
     # 规划栅格和目标最终统一到的全局坐标系。
     global_frame: odom
     # 从 global_frame 查询当前车体起点位姿时使用的 TF frame。
@@ -102,6 +105,8 @@ minco_planner:
     footprint_width: 0.55
     # 每个矩形边界外额外扩张的安全边界（m）。
     footprint_safety_margin: 0.05
+    # No swept sample may move the farthest footprint corner by more than half a grid cell.
+    swept_max_corner_step_cells: 0.5
     # 是否启用局部碰撞修复；修复后仍会重新经过 MINCO 和最终足迹 gate。
     local_repair_enabled: false
     # 局部修复搜索的最大迭代次数。

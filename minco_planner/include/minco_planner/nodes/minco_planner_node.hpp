@@ -49,6 +49,7 @@ private:
   void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
   void planGoal(const geometry_msgs::msg::PoseStamped &goal,
                 std::uint64_t goal_id, std::uint64_t localization_epoch,
+                std::uint64_t map_publication_sequence,
                 bool report_status);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
@@ -66,13 +67,17 @@ private:
   bool publishReferenceIfCurrent(
       const std::shared_ptr<const PlanningMapSnapshot> &snapshot,
       std::uint64_t map_health_epoch, const nav_msgs::msg::Path &reference_path,
+      const ReferenceTrajectory &safety_reference,
       std::uint64_t goal_id, std::uint64_t localization_epoch,
+      std::uint64_t map_publication_sequence,
       bool report_status);
+  void onRuntimeSafetyRecheck();
   void publishEmergencyStop(bool stop);
   void
   publishPlannerStatus(std::uint64_t goal_id, std::uint64_t localization_epoch,
-                       std::uint64_t map_generation, std::uint8_t state,
-                       const std::string &reason,
+                       std::uint64_t map_generation,
+                       std::uint64_t map_publication_sequence,
+                       std::uint8_t state, std::uint8_t failure_reason,
                        const builtin_interfaces::msg::Time &reference_stamp =
                            builtin_interfaces::msg::Time());
   void declareAndLoadParams();
@@ -101,6 +106,8 @@ private:
   double footprint_safety_margin_ = 0.05;
   double map_ready_timeout_sec_ = 3.0;
   double emergency_stop_heartbeat_period_sec_ = 0.1;
+  double runtime_safety_recheck_hz_ = 10.0;
+  double runtime_safety_horizon_sec_ = 1.0;
 
   GridAstar astar_;
   GridJps jps_;
@@ -116,6 +123,15 @@ private:
   std::uint64_t map_health_epoch_{0};
   PlannerSafetyState safety_state_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
+  struct ActiveSafetyReference
+  {
+    ReferenceTrajectory trajectory;
+    std::uint64_t goal_id{0};
+    std::uint64_t localization_epoch{0};
+    std::uint64_t map_generation{0};
+    std::uint64_t map_publication_sequence{0};
+  };
+  std::optional<ActiveSafetyReference> active_safety_reference_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
@@ -123,6 +139,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_plan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::TimerBase::SharedPtr safety_watchdog_timer_;
+  rclcpp::TimerBase::SharedPtr runtime_safety_recheck_timer_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raw_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr candidate_reference_path_pub_;

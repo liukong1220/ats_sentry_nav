@@ -31,6 +31,7 @@ FootprintSafetyResult FootprintSafetyChecker::check(
   }
 
   for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    ++result.discrete_samples_checked;
     double collision_x = 0.0;
     double collision_y = 0.0;
     if (!sampleFootprintOccupied(trajectory.points[i], grid, collision_x, collision_y)) {
@@ -39,9 +40,41 @@ FootprintSafetyResult FootprintSafetyChecker::check(
     result.safe = false;
     CollisionSample sample;
     sample.trajectory_index = i;
+    sample.segment_index = i;
     sample.x = collision_x;
     sample.y = collision_y;
     result.collisions.push_back(sample);
+  }
+
+  // A reference point check alone can skip a wall between two safe poses.  The
+  // same oriented rectangular rasterization is therefore evaluated at
+  // adaptively subdivided SE(2) poses.  The bound uses actual corner motion,
+  // so pure rotation, lateral translation, and diagonal motion share one rule.
+  for (std::size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
+    const std::size_t subdivisions = sweptSubdivisions(
+      trajectory.points[i], trajectory.points[i + 1], grid);
+    ++result.swept_segments_checked;
+    for (std::size_t step = 1; step < subdivisions; ++step) {
+      const double fraction = static_cast<double>(step) /
+        static_cast<double>(subdivisions);
+      const ReferencePoint point = interpolate(
+        trajectory.points[i], trajectory.points[i + 1], fraction);
+      ++result.swept_samples_checked;
+      double collision_x = 0.0;
+      double collision_y = 0.0;
+      if (!sampleFootprintOccupied(point, grid, collision_x, collision_y)) {
+        continue;
+      }
+      result.safe = false;
+      CollisionSample sample;
+      sample.trajectory_index = i;
+      sample.segment_index = i;
+      sample.segment_fraction = fraction;
+      sample.swept = true;
+      sample.x = collision_x;
+      sample.y = collision_y;
+      result.collisions.push_back(sample);
+    }
   }
   return result;
 }
@@ -55,8 +88,17 @@ bool FootprintSafetyChecker::worldToGrid(
   if (grid.info.resolution <= 0.0) {
     return false;
   }
-  const double gx = (wx - grid.info.origin.position.x) / grid.info.resolution;
-  const double gy = (wy - grid.info.origin.position.y) / grid.info.resolution;
+  const double yaw = std::atan2(
+    2.0 * (grid.info.origin.orientation.w * grid.info.origin.orientation.z +
+      grid.info.origin.orientation.x * grid.info.origin.orientation.y),
+    1.0 - 2.0 * (grid.info.origin.orientation.y * grid.info.origin.orientation.y +
+      grid.info.origin.orientation.z * grid.info.origin.orientation.z));
+  const double dx = wx - grid.info.origin.position.x;
+  const double dy = wy - grid.info.origin.position.y;
+  // OccupancyGrid cells live in the origin pose's local axes.  Rotate the
+  // query into those axes before converting to an index.
+  const double gx = (std::cos(yaw) * dx + std::sin(yaw) * dy) / grid.info.resolution;
+  const double gy = (-std::sin(yaw) * dx + std::cos(yaw) * dy) / grid.info.resolution;
   if (gx < 0.0 || gy < 0.0 ||
     gx >= static_cast<double>(grid.info.width) ||
     gy >= static_cast<double>(grid.info.height))
@@ -110,6 +152,60 @@ bool FootprintSafetyChecker::sampleFootprintOccupied(
     }
   }
   return false;
+}
+
+std::size_t FootprintSafetyChecker::sweptSubdivisions(
+  const ReferencePoint & start, const ReferencePoint & end,
+  const nav_msgs::msg::OccupancyGrid & grid) const
+{
+  const double half_length = 0.5 * std::max(0.0, params_.length) +
+    std::max(0.0, params_.safety_margin);
+  const double half_width = 0.5 * std::max(0.0, params_.width) +
+    std::max(0.0, params_.safety_margin);
+  const std::vector<Eigen::Vector2d> corners = {
+    Eigen::Vector2d(-half_length, -half_width),
+    Eigen::Vector2d(-half_length, half_width),
+    Eigen::Vector2d(half_length, -half_width),
+    Eigen::Vector2d(half_length, half_width)};
+  const double start_cos = std::cos(start.yaw);
+  const double start_sin = std::sin(start.yaw);
+  const double end_cos = std::cos(end.yaw);
+  const double end_sin = std::sin(end.yaw);
+  double maximum_corner_displacement = 0.0;
+  for (const auto & corner : corners) {
+    const Eigen::Vector2d start_corner(
+      start.x + start_cos * corner.x() - start_sin * corner.y(),
+      start.y + start_sin * corner.x() + start_cos * corner.y());
+    const Eigen::Vector2d end_corner(
+      end.x + end_cos * corner.x() - end_sin * corner.y(),
+      end.y + end_sin * corner.x() + end_cos * corner.y());
+    maximum_corner_displacement = std::max(
+      maximum_corner_displacement, (end_corner - start_corner).norm());
+  }
+  const double maximum_step = std::max(
+    1e-6, static_cast<double>(grid.info.resolution) *
+    std::max(1e-3, params_.swept_max_corner_step_cells));
+  return std::max<std::size_t>(
+    1, static_cast<std::size_t>(std::ceil(maximum_corner_displacement / maximum_step)));
+}
+
+ReferencePoint FootprintSafetyChecker::interpolate(
+  const ReferencePoint & start, const ReferencePoint & end, double fraction)
+{
+  const double clamped_fraction = std::max(0.0, std::min(1.0, fraction));
+  ReferencePoint result = start;
+  result.x = start.x + (end.x - start.x) * clamped_fraction;
+  result.y = start.y + (end.y - start.y) * clamped_fraction;
+  result.yaw = normalizeAngle(
+    start.yaw + normalizeAngle(end.yaw - start.yaw) * clamped_fraction);
+  result.t = start.t + (end.t - start.t) * clamped_fraction;
+  result.s = start.s + (end.s - start.s) * clamped_fraction;
+  return result;
+}
+
+double FootprintSafetyChecker::normalizeAngle(double angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
 }
 
 }  // namespace minco_planner

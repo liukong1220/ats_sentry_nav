@@ -53,10 +53,21 @@ bool LocalCollisionRepair::findNearestFreeCell(
   double & repaired_x,
   double & repaired_y) const
 {
+  const double yaw = std::atan2(
+    2.0 * (grid.info.origin.orientation.w * grid.info.origin.orientation.z +
+      grid.info.origin.orientation.x * grid.info.origin.orientation.y),
+    1.0 - 2.0 * (grid.info.origin.orientation.y * grid.info.origin.orientation.y +
+      grid.info.origin.orientation.z * grid.info.origin.orientation.z));
+  const double dx_from_origin = x - grid.info.origin.position.x;
+  const double dy_from_origin = y - grid.info.origin.position.y;
+  const double local_x = std::cos(yaw) * dx_from_origin +
+    std::sin(yaw) * dy_from_origin;
+  const double local_y = -std::sin(yaw) * dx_from_origin +
+    std::cos(yaw) * dy_from_origin;
   const int center_x = static_cast<int>(
-    std::floor((x - grid.info.origin.position.x) / grid.info.resolution));
+    std::floor(local_x / grid.info.resolution));
   const int center_y = static_cast<int>(
-    std::floor((y - grid.info.origin.position.y) / grid.info.resolution));
+    std::floor(local_y / grid.info.resolution));
   const int radius_cells = std::max(
     1, static_cast<int>(std::ceil(params_.search_radius / grid.info.resolution)));
 
@@ -69,10 +80,12 @@ bool LocalCollisionRepair::findNearestFreeCell(
       if (!isFree(grid, mx, my)) {
         continue;
       }
-      const double wx =
-        grid.info.origin.position.x + (static_cast<double>(mx) + 0.5) * grid.info.resolution;
-      const double wy =
-        grid.info.origin.position.y + (static_cast<double>(my) + 0.5) * grid.info.resolution;
+      const double cell_local_x = (static_cast<double>(mx) + 0.5) * grid.info.resolution;
+      const double cell_local_y = (static_cast<double>(my) + 0.5) * grid.info.resolution;
+      const double wx = grid.info.origin.position.x +
+        std::cos(yaw) * cell_local_x - std::sin(yaw) * cell_local_y;
+      const double wy = grid.info.origin.position.y +
+        std::sin(yaw) * cell_local_x + std::cos(yaw) * cell_local_y;
       const double distance_sq = (wx - x) * (wx - x) + (wy - y) * (wy - y);
       if (distance_sq >= best_distance_sq) {
         continue;

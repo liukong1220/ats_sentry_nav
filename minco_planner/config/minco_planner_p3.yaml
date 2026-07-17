@@ -9,3 +9,6 @@ minco_planner:
     candidate_reference_path_topic: /minco/reference_path_candidate
     reference_path_topic: /minco/reference_path
     planner_manages_emergency_stop: false
+    runtime_safety_recheck_hz: 10.0
+    runtime_safety_horizon_sec: 1.0
+    swept_max_corner_step_cells: 0.5
