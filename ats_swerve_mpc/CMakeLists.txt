@@ -11,6 +11,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(ats_navigation_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -29,7 +30,7 @@ target_include_directories(${PROJECT_NAME}_lib PUBLIC
 )
 target_link_libraries(${PROJECT_NAME}_lib Eigen3::Eigen)
 ament_target_dependencies(${PROJECT_NAME}_lib
-  geometry_msgs nav_msgs rclcpp std_msgs tf2 tf2_geometry_msgs
+  ats_navigation_interfaces geometry_msgs nav_msgs rclcpp std_msgs tf2 tf2_geometry_msgs
 )
 
 add_executable(${PROJECT_NAME}_node src/main.cpp)
@@ -54,6 +55,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_emergency_stop_watchdog test/test_emergency_stop_watchdog.cpp)
   target_link_libraries(test_emergency_stop_watchdog ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_mpc_localization_gate test/test_mpc_localization_gate.cpp)
+  target_link_libraries(test_mpc_localization_gate ${PROJECT_NAME}_lib)
 endif()
 
 ament_export_include_directories(include)

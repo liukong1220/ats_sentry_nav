@@ -10,6 +10,10 @@ ats_swerve_mpc:
     command_topic: /cmd_vel_mpc
     # true 时立即清空 warm start 并发布零速度；设为空可关闭该输入。
     emergency_stop_topic: /planner/emergency_stop
+    # 定位健康与 epoch；收到非 TRACKING 或 epoch 跳变时清空 tracker 并双零。
+    localization_status_topic: /localization/status
+    # P4 必须为 true；P3 legacy 由 launch 覆盖为 false，避免依赖不存在的状态源。
+    require_localization_status: true
     # 急停 heartbeat 的 steady-clock 租约；超时后清空旧 reference 并持续发布零速度。
     emergency_stop_timeout: 0.5
     # MPC 接受的状态与轨迹坐标系。
@@ -76,3 +80,21 @@ ats_swerve_mpc:
     max_ay: 2.0
     # 最大 yaw 角加速度（rad/s^2）。
     max_awz: 3.0
+    # 底盘中心到前/后轮心的 x 半轴偏置（m），不是完整轮心距。
+    wheel_base_x: 0.270
+    # 底盘中心到左/右轮心的 y 半轴偏置（m），不是完整轮心距。
+    wheel_base_y: 0.270
+    # 42.5 mm 是包含包胶后的最终滚动半径；rubber_thickness 不再叠加。
+    wheel_radius: 0.0425
+    # 减速比统一定义为电机转速/轮端转速。
+    drive_gear_ratio: 1.0
+    steer_gear_ratio: 1.0
+    motor_max_rpm: 450.0
+    steer_max_rpm: 120.0
+    actuator_redundancy: 1.2
+    # 若显式设置则覆盖物理参数推导值；当前等于 450 rpm / 1.2 的保守轮缘速度。
+    max_wheel_speed: 1.6689711
+    # 逐轮速度向量变化上限（m/s^2）；P4 仿真初值，仍需电机电流与实车阶跃标定。
+    max_wheel_acceleration: 2.0
+    # 逐轮运动中目标舵角变化上限（rad/s）；当前等于 120 rpm / 1.2。
+    max_steer_rate: 10.4719755
