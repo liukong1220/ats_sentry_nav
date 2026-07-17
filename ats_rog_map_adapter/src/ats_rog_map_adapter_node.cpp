@@ -90,6 +90,12 @@ public:
       0.0, declare_parameter<double>("robot_unknown_clear_radius", 0.0));
     // 仅用于隔离仿真故障注入；默认关闭，不能改变正式融合的 unknown 真值表。
     declare_parameter<bool>("test_force_all_unknown", false);
+    // P4 runtime swept-volume injection.  These values are only sampled when
+    // explicitly enabled at runtime and never affect the normal map contract.
+    declare_parameter<bool>("test_inject_dynamic_obstacle", false);
+    declare_parameter<double>("test_dynamic_obstacle_x", 0.0);
+    declare_parameter<double>("test_dynamic_obstacle_y", 0.0);
+    declare_parameter<double>("test_dynamic_obstacle_radius", 0.10);
 
     static_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       static_map_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -358,6 +364,7 @@ private:
       publishUnavailable("ROGMap terrain fusion produced no known-free cells");
       return;
     }
+    const std::size_t injected_cells = injectDynamicObstacleForTest(fusion.planning_grid);
 
     trajectory_optimizer::RcTraversabilityEsdfProvider esdf;
     esdf.updateGrid(
@@ -392,10 +399,66 @@ private:
     publishMapStatus(true, response.generation, "planning snapshot ready");
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu numeric_esdf=%zu",
+      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu injected=%zu numeric_esdf=%zu",
       static_cast<unsigned long long>(response.generation), fusion.known_free_cells,
-      fusion.occupied_cells, fusion.unknown_cells, ego_unknown_cleared,
+      fusion.occupied_cells, fusion.unknown_cells, ego_unknown_cleared, injected_cells,
       numeric_snapshot.signed_distance.size());
+  }
+
+  std::size_t injectDynamicObstacleForTest(nav_msgs::msg::OccupancyGrid & grid)
+  {
+    if (!get_parameter("test_inject_dynamic_obstacle").as_bool() ||
+      grid.info.resolution <= 0.0 || grid.data.empty())
+    {
+      return 0;
+    }
+    const double world_x = get_parameter("test_dynamic_obstacle_x").as_double();
+    const double world_y = get_parameter("test_dynamic_obstacle_y").as_double();
+    const double radius = std::max(
+      0.0, get_parameter("test_dynamic_obstacle_radius").as_double());
+    const double yaw = std::atan2(
+      2.0 * (grid.info.origin.orientation.w * grid.info.origin.orientation.z +
+        grid.info.origin.orientation.x * grid.info.origin.orientation.y),
+      1.0 - 2.0 * (grid.info.origin.orientation.y * grid.info.origin.orientation.y +
+        grid.info.origin.orientation.z * grid.info.origin.orientation.z));
+    const double dx = world_x - grid.info.origin.position.x;
+    const double dy = world_y - grid.info.origin.position.y;
+    const double grid_x =
+      (std::cos(yaw) * dx + std::sin(yaw) * dy) / grid.info.resolution;
+    const double grid_y =
+      (-std::sin(yaw) * dx + std::cos(yaw) * dy) / grid.info.resolution;
+    const int center_x = static_cast<int>(std::floor(grid_x));
+    const int center_y = static_cast<int>(std::floor(grid_y));
+    const double conservative_radius = radius +
+      0.5 * std::sqrt(2.0) * grid.info.resolution;
+    const int radius_cells = std::max(
+      0, static_cast<int>(std::ceil(conservative_radius / grid.info.resolution)));
+    std::size_t injected = 0;
+    for (int y = center_y - radius_cells; y <= center_y + radius_cells; ++y) {
+      for (int x = center_x - radius_cells; x <= center_x + radius_cells; ++x) {
+        if (x < 0 || y < 0 || x >= static_cast<int>(grid.info.width) ||
+          y >= static_cast<int>(grid.info.height))
+        {
+          continue;
+        }
+        const double cell_dx =
+          (static_cast<double>(x) + 0.5 - grid_x) * grid.info.resolution;
+        const double cell_dy =
+          (static_cast<double>(y) + 0.5 - grid_y) * grid.info.resolution;
+        if (cell_dx * cell_dx + cell_dy * cell_dy >
+          conservative_radius * conservative_radius)
+        {
+          continue;
+        }
+        const std::size_t index = static_cast<std::size_t>(y) * grid.info.width + x;
+        if (grid.data[index] < fusion_params_.terrain_obstacle_value_threshold) {
+          ++injected;
+        }
+        grid.data[index] = static_cast<int8_t>(
+          std::max(fusion_params_.terrain_obstacle_value_threshold, 100));
+      }
+    }
+    return injected;
   }
 
   nav_msgs::msg::OccupancyGrid encodeDistanceGrid(
