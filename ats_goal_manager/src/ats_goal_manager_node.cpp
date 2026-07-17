@@ -3,6 +3,7 @@
 #include "ats_goal_manager/goal_lifecycle.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,7 @@
 
 #include "ats_navigation_interfaces/action/navigate_to_pose.hpp"
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/planner_goal.hpp"
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
@@ -37,12 +39,37 @@ using NavigateToPose = ats_navigation_interfaces::action::NavigateToPose;
 using GoalHandleNavigateToPose =
     rclcpp_action::ServerGoalHandle<NavigateToPose>;
 using LocalizationStatus = ats_navigation_interfaces::msg::LocalizationStatus;
+using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
 using PlanningMapStatus = ats_navigation_interfaces::msg::PlanningMapStatus;
 using PlannerGoal = ats_navigation_interfaces::msg::PlannerGoal;
 using PlannerStatus = ats_navigation_interfaces::msg::PlannerStatus;
 
-constexpr char kPlanningGridUnavailableReason[] =
-    "planning grid unavailable or map heartbeat stale";
+const char *plannerFailureMessage(std::uint8_t failure_reason) {
+  switch (failure_reason) {
+  case PlannerStatus::FAILURE_INVALID_GOAL:
+    return "planner rejected invalid goal";
+  case PlannerStatus::FAILURE_MAP_UNREADY:
+    return "planning map is unavailable";
+  case PlannerStatus::FAILURE_START_TF:
+  case PlannerStatus::FAILURE_GOAL_TF:
+  case PlannerStatus::FAILURE_REFERENCE_TF:
+    return "planner transform is unavailable";
+  case PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED:
+    return "start or goal is occupied";
+  case PlannerStatus::FAILURE_NO_PATH:
+    return "planner found no path";
+  case PlannerStatus::FAILURE_OPTIMIZER:
+  case PlannerStatus::FAILURE_REPAIR:
+    return "trajectory optimization failed";
+  case PlannerStatus::FAILURE_FOOTPRINT:
+  case PlannerStatus::FAILURE_RUNTIME_UNSAFE:
+    return "trajectory footprint is unsafe";
+  case PlannerStatus::FAILURE_SNAPSHOT_CHANGED:
+    return "planning snapshot changed before commit";
+  default:
+    return "MINCO planning failed";
+  }
+}
 
 bool sameStamp(const builtin_interfaces::msg::Time &left,
                const builtin_interfaces::msg::Time &right) {
@@ -83,6 +110,8 @@ public:
         reference_path_topic_, rclcpp::QoS(1));
     emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
         emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
+    execution_command_pub_ = create_publisher<ExecutionCommand>(
+        execution_command_topic_, rclcpp::QoS(1).reliable().transient_local());
     input_goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         input_goal_topic_, rclcpp::QoS(10),
         std::bind(&AtsGoalManagerNode::onTopicGoal, this,
@@ -127,6 +156,7 @@ public:
     // 上电和任何无任务状态都保持急停，禁止 DDS late joiner 获得旧 reference
     // 后自行运动。
     publishEmergencyStop(true);
+    publishExecutionStop(0, 0, PlannerStatus::FAILURE_NONE, 0, 0);
     RCLCPP_INFO(get_logger(),
                 "ATS goal manager ready: action='%s' topic='%s' planner='%s'",
                 action_name_.c_str(), input_goal_topic_.c_str(),
@@ -159,6 +189,8 @@ private:
         "reference_path_topic", "/minco/reference_path");
     emergency_stop_topic_ = declare_parameter<std::string>(
         "emergency_stop_topic", "/planner/emergency_stop");
+    execution_command_topic_ = declare_parameter<std::string>(
+        "execution_command_topic", "/planner/execution_command");
     map_ready_topic_ = declare_parameter<std::string>("map_ready_topic",
                                                       "/rog_map_adapter/ready");
     map_status_topic_ = declare_parameter<std::string>(
@@ -253,6 +285,7 @@ private:
     std::shared_ptr<GoalHandleNavigateToPose> preempted;
     std::uint64_t id = 0;
     std::uint64_t localization_epoch = 0;
+    std::uint64_t map_publication_sequence = 0;
     bool dispatch_now = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -262,6 +295,7 @@ private:
       }
       candidate_reference_.reset();
       planner_ready_status_.reset();
+      active_execution_command_.reset();
       id = ++next_goal_id_;
       lifecycle_.start(id, mapReadyLocked() && localizationHealthyLocked());
       active_goal_ = ActiveGoal{id,
@@ -274,6 +308,7 @@ private:
                                 std::nullopt,
                                 false};
       localization_epoch = localization_epoch_.value_or(0);
+      map_publication_sequence = map_status_publication_sequence_;
       active_goal_->localization_epoch = localization_epoch;
       if (lifecycle_.state() == GoalLifecycleState::kWaitingForMap) {
         active_goal_->waiting_since = std::chrono::steady_clock::now();
@@ -283,6 +318,9 @@ private:
     }
     // 先停止旧任务；即使旧 MINCO 回调晚到，也会因 goal_id 不匹配而被丢弃。
     publishEmergencyStop(true);
+    publishExecutionStop(
+      id, localization_epoch, PlannerStatus::FAILURE_NONE, 0,
+      map_publication_sequence);
     if (preempted) {
       completeStandaloneAction(preempted,
                                NavigateToPose::Result::RESULT_PREEMPTED,
@@ -309,6 +347,15 @@ private:
     request.header.frame_id = planning_frame_;
     request.goal_id = id;
     request.localization_epoch = localization_epoch;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!active_goal_ || active_goal_->id != id ||
+          active_goal_->localization_epoch != localization_epoch ||
+          !mapReadyLocked() || !localizationHealthyLocked()) {
+        return false;
+      }
+      request.map_publication_sequence = map_status_publication_sequence_;
+    }
     request.goal_pose = target;
     planner_goal_pub_->publish(request);
     return true;
@@ -327,6 +374,7 @@ private:
       const auto previous_waiting_since = active_goal_->waiting_since;
       candidate_reference_.reset();
       planner_ready_status_.reset();
+      active_execution_command_.reset();
       fail_stop_ = true;
       lifecycle_.start(id, false);
       active_goal_->waiting_since = waiting_since.value_or(
@@ -335,6 +383,7 @@ private:
               : std::chrono::steady_clock::now());
     }
     publishEmergencyStop(true);
+    publishExecutionStop(id, 0, PlannerStatus::FAILURE_NONE, 0, 0);
   }
 
   void onPlannerStatus(const PlannerStatus::SharedPtr message) {
@@ -348,9 +397,15 @@ private:
             active_goal_->localization_epoch == message->localization_epoch;
         transient_failure =
             matches &&
-            (message->reason == kPlanningGridUnavailableReason ||
+            (message->failure_reason == PlannerStatus::FAILURE_MAP_UNREADY ||
+             message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
+             message->failure_reason == PlannerStatus::FAILURE_SNAPSHOT_CHANGED ||
+             message->failure_reason == PlannerStatus::FAILURE_START_TF ||
+             message->failure_reason == PlannerStatus::FAILURE_GOAL_TF ||
+             message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF ||
              (active_goal_->recovering &&
-              message->reason.find("start is occupied") != std::string::npos));
+              message->failure_reason ==
+                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED));
         if (transient_failure) {
           active_goal_->recovering = true;
           map_ready_signal_ = false;
@@ -364,8 +419,7 @@ private:
           suspendActiveGoal(message->goal_id);
         } else {
           finishActive(NavigateToPose::Result::RESULT_PLANNING_FAILED,
-                       message->reason.empty() ? "MINCO planning failed"
-                                               : message->reason,
+                       plannerFailureMessage(message->failure_reason),
                        GoalLifecycleState::kFailed);
         }
       }
@@ -414,6 +468,7 @@ private:
       map_status_ready_ = message->ready;
       map_status_localization_epoch_ = message->localization_epoch;
       map_status_generation_ = message->rog_generation;
+      map_status_publication_sequence_ = message->publication_sequence;
       last_map_status_signal_ = std::chrono::steady_clock::now();
       const bool current_epoch =
           !localization_epoch_ ||
@@ -452,6 +507,7 @@ private:
       if (active_goal_ && (!healthy || epoch_changed || !previously_healthy)) {
         candidate_reference_.reset();
         planner_ready_status_.reset();
+        active_execution_command_.reset();
         fail_stop_ = true;
         active_goal_->localization_epoch = message->epoch;
         active_goal_->recovering = true;
@@ -468,7 +524,9 @@ private:
       }
     }
     if (stop_active) {
-      publishEmergencyStop(true);
+        publishEmergencyStop(true);
+        publishExecutionStop(
+          0, message->epoch, PlannerStatus::FAILURE_NONE, 0, 0);
     }
   }
 
@@ -510,6 +568,8 @@ private:
             active_goal_->localization_epoch ||
         (localization_epoch_ &&
          planner_ready_status_->localization_epoch != *localization_epoch_) ||
+        planner_ready_status_->map_publication_sequence !=
+            map_status_publication_sequence_ ||
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
@@ -519,13 +579,25 @@ private:
       return;
     }
 
-    // 仅在当前 map heartbeat、candidate stamp 和 goal_id 同时复核成功后提交。
-    // 保留 MINCO 的相对采样时间，并在同一互斥区严格先解除急停、再发布
-    // reference。
+    // A single execution command is the only MPC authorization.  It packages
+    // the final retimed reference and all version fields in one DDS sample;
+    // the legacy Path/Bool topics below are diagnostics only.
     nav_msgs::msg::Path committed = *candidate_reference_;
     rebasePathTimestamps(committed, now());
+    ExecutionCommand command;
+    command.header = committed.header;
+    command.mode = ExecutionCommand::MODE_EXECUTE;
+    command.goal_id = active_goal_->id;
+    command.localization_epoch = active_goal_->localization_epoch;
+    command.map_generation = planner_ready_status_->map_generation;
+    command.map_publication_sequence =
+      planner_ready_status_->map_publication_sequence;
+    command.failure_reason = PlannerStatus::FAILURE_NONE;
+    command.reference = committed;
     fail_stop_ = false;
     active_goal_->recovering = false;
+    active_execution_command_ = command;
+    publishExecutionCommand(command);
     publishEmergencyStop(false);
     reference_path_pub_->publish(committed);
     candidate_reference_.reset();
@@ -632,9 +704,28 @@ private:
     }
 
     bool stop = true;
+    std::optional<ExecutionCommand> execution_heartbeat;
+    std::uint64_t stop_goal_id = 0;
+    std::uint64_t stop_localization_epoch = 0;
+    std::uint64_t stop_map_generation = 0;
+    std::uint64_t stop_map_publication_sequence = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stop = fail_stop_ || lifecycle_.emergencyStopRequired();
+      if (!stop && active_execution_command_) {
+        execution_heartbeat = active_execution_command_;
+      } else if (active_goal_) {
+        stop_goal_id = active_goal_->id;
+        stop_localization_epoch = active_goal_->localization_epoch;
+        stop_map_publication_sequence = map_status_publication_sequence_;
+      }
+    }
+    if (execution_heartbeat) {
+      publishExecutionCommand(*execution_heartbeat);
+    } else {
+      publishExecutionStop(
+        stop_goal_id, stop_localization_epoch, PlannerStatus::FAILURE_NONE,
+        stop_map_generation, stop_map_publication_sequence);
     }
     publishEmergencyStop(stop);
   }
@@ -677,9 +768,13 @@ private:
       active_goal_.reset();
       candidate_reference_.reset();
       planner_ready_status_.reset();
+      active_execution_command_.reset();
       fail_stop_ = true;
     }
     publishEmergencyStop(true);
+    publishExecutionStop(
+      finished->id, finished->localization_epoch, PlannerStatus::FAILURE_NONE,
+      0, 0);
     if (finished->action_handle) {
       auto result = std::make_shared<NavigateToPose::Result>();
       result->result_code = result_code;
@@ -856,12 +951,35 @@ private:
     emergency_stop_pub_->publish(message);
   }
 
+  void publishExecutionCommand(ExecutionCommand command) {
+    command.command_sequence = ++next_execution_command_sequence_;
+    command.header.stamp = now();
+    execution_command_pub_->publish(command);
+  }
+
+  void publishExecutionStop(
+      std::uint64_t goal_id, std::uint64_t localization_epoch,
+      std::uint8_t failure_reason, std::uint64_t map_generation,
+      std::uint64_t map_publication_sequence) {
+    ExecutionCommand command;
+    command.header.stamp = now();
+    command.header.frame_id = planning_frame_;
+    command.mode = ExecutionCommand::MODE_STOP;
+    command.goal_id = goal_id;
+    command.localization_epoch = localization_epoch;
+    command.map_generation = map_generation;
+    command.map_publication_sequence = map_publication_sequence;
+    command.failure_reason = failure_reason;
+    publishExecutionCommand(std::move(command));
+  }
+
   std::string input_goal_topic_;
   std::string planner_goal_topic_;
   std::string planner_status_topic_;
   std::string candidate_reference_topic_;
   std::string reference_path_topic_;
   std::string emergency_stop_topic_;
+  std::string execution_command_topic_;
   std::string map_ready_topic_;
   std::string map_status_topic_;
   std::string localization_status_topic_;
@@ -885,6 +1003,7 @@ private:
   std::optional<ActiveGoal> active_goal_;
   std::optional<nav_msgs::msg::Path> candidate_reference_;
   std::optional<PlannerStatus> planner_ready_status_;
+  std::optional<ExecutionCommand> active_execution_command_;
   bool map_ready_signal_{false};
   bool map_status_ready_{false};
   bool fail_stop_{true};
@@ -892,6 +1011,8 @@ private:
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;
   std::uint64_t map_status_localization_epoch_{0};
   std::uint64_t map_status_generation_{0};
+  std::uint64_t map_status_publication_sequence_{0};
+  std::atomic<std::uint64_t> next_execution_command_sequence_{0};
   std::optional<std::chrono::steady_clock::time_point>
       last_localization_status_signal_;
   std::optional<std::uint64_t> localization_epoch_;
@@ -903,6 +1024,7 @@ private:
   rclcpp::Publisher<PlannerGoal>::SharedPtr planner_goal_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+  rclcpp::Publisher<ExecutionCommand>::SharedPtr execution_command_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
       input_goal_sub_;
   rclcpp::Subscription<PlannerStatus>::SharedPtr planner_status_sub_;

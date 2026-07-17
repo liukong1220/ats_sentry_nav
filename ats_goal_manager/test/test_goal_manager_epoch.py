@@ -8,6 +8,7 @@ import unittest
 
 from ament_index_python.packages import get_package_prefix
 from ats_navigation_interfaces.msg import LocalizationStatus
+from ats_navigation_interfaces.msg import ExecutionCommand
 from ats_navigation_interfaces.msg import PlannerGoal
 from ats_navigation_interfaces.msg import PlannerStatus
 from ats_navigation_interfaces.msg import PlanningMapStatus
@@ -41,6 +42,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             "candidate_reference_topic": f"{TOPIC_PREFIX}/candidate",
             "reference_path_topic": f"{TOPIC_PREFIX}/reference",
             "emergency_stop_topic": f"{TOPIC_PREFIX}/emergency_stop",
+            "execution_command_topic": f"{TOPIC_PREFIX}/execution_command",
             "map_ready_topic": f"{TOPIC_PREFIX}/map_ready",
             "map_status_topic": f"{TOPIC_PREFIX}/map_status",
             "localization_status_topic": f"{TOPIC_PREFIX}/localization_status",
@@ -97,6 +99,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         cls.planner_goals = []
         cls.references = []
         cls.stop_states = []
+        cls.execution_commands = []
         cls.node.create_subscription(
             PlannerGoal,
             f"{TOPIC_PREFIX}/planner_goal",
@@ -110,6 +113,12 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             Bool,
             f"{TOPIC_PREFIX}/emergency_stop",
             lambda message: cls.stop_states.append(message.data),
+            transient_qos,
+        )
+        cls.node.create_subscription(
+            ExecutionCommand,
+            f"{TOPIC_PREFIX}/execution_command",
+            cls.execution_commands.append,
             transient_qos,
         )
         cls.tf_broadcaster = TransformBroadcaster(cls.node)
@@ -180,7 +189,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         cls.map_status_pub.publish(map_status)
 
     @classmethod
-    def publish_candidate(cls, goal, epoch):
+    def publish_candidate(cls, goal, epoch, publication_sequence=None):
         stamp = cls.node.get_clock().now().to_msg()
         path = Path()
         path.header.stamp = stamp
@@ -197,6 +206,9 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         status.goal_id = goal.goal_id
         status.localization_epoch = epoch
         status.map_generation = epoch
+        status.map_publication_sequence = (
+            epoch if publication_sequence is None else publication_sequence
+        )
         status.state = PlannerStatus.STATE_REFERENCE_READY
         status.reference_stamp = stamp
         cls.candidate_pub.publish(path)
@@ -245,7 +257,8 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         transient_failure.goal_id = first_goal.goal_id
         transient_failure.localization_epoch = first_goal.localization_epoch
         transient_failure.state = PlannerStatus.STATE_FAILED
-        transient_failure.reason = "planning grid unavailable or map heartbeat stale"
+        transient_failure.failure_reason = PlannerStatus.FAILURE_MAP_UNREADY
+        transient_failure.map_publication_sequence = first_goal.map_publication_sequence
         self.planner_status_pub.publish(transient_failure)
         self.assertTrue(
             self.spin_until(
@@ -263,7 +276,12 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         blocked_snapshot_failure.goal_id = retried_goal.goal_id
         blocked_snapshot_failure.localization_epoch = retried_goal.localization_epoch
         blocked_snapshot_failure.state = PlannerStatus.STATE_FAILED
-        blocked_snapshot_failure.reason = "jps failed: start is occupied"
+        blocked_snapshot_failure.failure_reason = (
+            PlannerStatus.FAILURE_START_OR_GOAL_OCCUPIED
+        )
+        blocked_snapshot_failure.map_publication_sequence = (
+            retried_goal.map_publication_sequence
+        )
         self.planner_status_pub.publish(blocked_snapshot_failure)
         self.assertTrue(
             self.spin_until(
@@ -275,9 +293,31 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         self.assertEqual(first_goal.goal_id, retried_goal.goal_id)
         self.assertEqual(first_goal.localization_epoch, retried_goal.localization_epoch)
 
+        # A reference carrying an old adapter publication sequence cannot pass
+        # the final Goal Manager commit, even when goal/epoch/timestamp match.
+        self.publish_candidate(first_goal, 1, publication_sequence=0)
+        self.assertFalse(
+            self.spin_until(
+                lambda: bool(self.references),
+                timeout=0.4,
+                periodic=lambda: self.publish_health(1, 1.0),
+            )
+        )
         self.publish_candidate(first_goal, 1)
         self.assertTrue(self.spin_until(lambda: len(self.references) == 1))
         self.assertTrue(self.spin_until(lambda: False in self.stop_states))
+        self.assertTrue(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_EXECUTE
+                    and command.goal_id == first_goal.goal_id
+                    and command.localization_epoch == 1
+                    and command.map_publication_sequence == 1
+                    and len(command.reference.poses) == 2
+                    for command in self.execution_commands
+                )
+            )
+        )
 
         stop_event_count = len(self.stop_states)
         goal_count = len(self.planner_goals)
@@ -317,6 +357,15 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             self.spin_until(
                 lambda: True in self.stop_states[stop_event_count:],
                 periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_STOP
+                    and command.command_sequence > 0
+                    for command in self.execution_commands
+                )
             )
         )
 

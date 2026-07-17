@@ -36,6 +36,8 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   odom_topic_ = declare_parameter<std::string>("odom_topic", "/localization");
   trajectory_topic_ = declare_parameter<std::string>("trajectory_topic",
                                                      "/minco/reference_path");
+  execution_command_topic_ = declare_parameter<std::string>(
+      "execution_command_topic", "/planner/execution_command");
   command_topic_ = declare_parameter<std::string>("command_topic",
                                                   "/cmd_vel_gimbal_yaw_odom");
   emergency_stop_topic_ = declare_parameter<std::string>(
@@ -55,6 +57,10 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       std::max(0.1, declare_parameter<double>("emergency_stop_timeout",
                                               emergency_stop_timeout_));
   emergency_stop_watchdog_.setTimeout(emergency_stop_timeout_);
+  execution_command_timeout_ = std::max(
+      0.1, declare_parameter<double>("execution_command_timeout",
+                                     execution_command_timeout_));
+  execution_command_enabled_ = !execution_command_topic_.empty();
   goal_position_tolerance_ = declare_parameter<double>(
       "goal_position_tolerance", goal_position_tolerance_);
   goal_yaw_tolerance_ =
@@ -70,6 +76,16 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   trajectory_sub_ = create_subscription<nav_msgs::msg::Path>(
       trajectory_topic_, rclcpp::QoS(1).reliable(),
       std::bind(&AtsSwerveMpcNode::onPath, this, std::placeholders::_1));
+  if (execution_command_enabled_) {
+    execution_command_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::ExecutionCommand>(
+      execution_command_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&AtsSwerveMpcNode::onExecutionCommand, this,
+                std::placeholders::_1));
+    // ExecutionCommand carries its own stop/execute lease.  The legacy Bool
+    // remains a stop-only failsafe and cannot reauthorize a reference.
+    emergency_stop_watchdog_enabled_ = false;
+  }
   if (!emergency_stop_topic_.empty()) {
     emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
         emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -206,32 +222,43 @@ void AtsSwerveMpcNode::onOdometry(
   has_odometry_ = current_state_.allFinite();
 }
 
-//接收全局轨迹,并进行时间戳处理，存储到轨迹跟踪器中
+// Legacy Path remains available for Nav2 comparison only.  P4 execution must
+// arrive as one atomic ExecutionCommand.
 void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
+  if (execution_command_enabled_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Ignoring legacy Path because ExecutionCommand owns MPC authorization.");
+    return;
+  }
+  installPath(*message);
+}
+
+bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
   if (require_localization_status_ && !localization_tracking_.load()) {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "Ignoring trajectory while localization is not TRACKING.");
-    return;
+    return false;
   }
-  if (message->poses.size() < 2) {
+  if (message.poses.size() < 2) {
     RCLCPP_WARN(get_logger(), "Ignoring trajectory with fewer than two poses.");
-    return;
+    return false;
   }
-  if (!frame_id_.empty() && !message->header.frame_id.empty() &&
-      message->header.frame_id != frame_id_) {
+  if (!frame_id_.empty() && !message.header.frame_id.empty() &&
+      message.header.frame_id != frame_id_) {
     RCLCPP_ERROR(get_logger(),
                  "Ignoring trajectory in frame '%s'; MPC frame is '%s'.",
-                 message->header.frame_id.c_str(), frame_id_.c_str());
-    return;
+                 message.header.frame_id.c_str(), frame_id_.c_str());
+    return false;
   }
   std::vector<TimedState> parsed;
-  parsed.reserve(message->poses.size());
-  const double header_time = rclcpp::Time(message->header.stamp).seconds();
+  parsed.reserve(message.poses.size());
+  const double header_time = rclcpp::Time(message.header.stamp).seconds();
   bool monotonic = true;
   double previous_time = -std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i < message->poses.size(); ++i) {
-    const auto &pose = message->poses[i];
+  for (std::size_t i = 0; i < message.poses.size(); ++i) {
+    const auto &pose = message.poses[i];
     double pose_time = rclcpp::Time(pose.header.stamp).seconds();
     if (pose_time <= 0.0) {
       pose_time = header_time + fallback_path_dt_ * static_cast<double>(i);
@@ -242,7 +269,7 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
     timed.state << pose.pose.position.x, pose.pose.position.y,
         tf2::getYaw(pose.pose.orientation);
     if (!timed.state.allFinite()) {
-      return;
+      return false;
     }
     parsed.push_back(timed);
     previous_time = pose_time;
@@ -256,18 +283,18 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     const bool missing_stamp =
-        message->header.stamp.sec == 0 && message->header.stamp.nanosec == 0;
+        message.header.stamp.sec == 0 && message.header.stamp.nanosec == 0;
     if (last_stop_stamp_.nanoseconds() > 0 &&
         (missing_stamp ||
-         rclcpp::Time(message->header.stamp) <= last_stop_stamp_)) {
+         rclcpp::Time(message.header.stamp) <= last_stop_stamp_)) {
       RCLCPP_WARN(
           get_logger(),
           "Ignoring a trajectory older than the latest emergency stop.");
-      return;
+      return false;
     }
     trajectory_tracker_.setTrajectory(std::move(parsed));
     trajectory_frame_ =
-        message->header.frame_id.empty() ? frame_id_ : message->header.frame_id;
+        message.header.frame_id.empty() ? frame_id_ : message.header.frame_id;
     const double maximum_tracking_duration =
         trajectory_tracker_.duration() /
         std::max(1e-3, trajectory_tracker_.minimumProgressScale());
@@ -277,11 +304,73 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
   }
   controller_->reset();
   last_control_.setZero();
+  return true;
+}
+
+void AtsSwerveMpcNode::onExecutionCommand(
+    const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message) {
+  if (!message || message->command_sequence == 0) {
+    engageFailStop();
+    return;
+  }
+  bool install_reference = false;
+  bool stop = message->mode ==
+    ats_navigation_interfaces::msg::ExecutionCommand::MODE_STOP;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (message->command_sequence <= last_execution_command_sequence_) {
+      return;
+    }
+    last_execution_command_sequence_ = message->command_sequence;
+    last_execution_command_signal_ = std::chrono::steady_clock::now();
+    if (stop) {
+      active_execution_command_.reset();
+    } else if (message->mode !=
+        ats_navigation_interfaces::msg::ExecutionCommand::MODE_EXECUTE ||
+      message->goal_id == 0 || message->reference.poses.size() < 2 ||
+      (require_localization_status_ &&
+       (!localization_tracking_.load() || !localization_epoch_ ||
+        *localization_epoch_ != message->localization_epoch))) {
+      stop = true;
+      active_execution_command_.reset();
+    } else {
+      const bool same_reference = active_execution_command_ &&
+        active_execution_command_->goal_id == message->goal_id &&
+        active_execution_command_->localization_epoch == message->localization_epoch &&
+        active_execution_command_->map_generation == message->map_generation &&
+        active_execution_command_->map_publication_sequence ==
+          message->map_publication_sequence &&
+        active_execution_command_->reference.header.stamp.sec ==
+          message->reference.header.stamp.sec &&
+        active_execution_command_->reference.header.stamp.nanosec ==
+          message->reference.header.stamp.nanosec;
+      if (!same_reference) {
+        install_reference = true;
+      }
+      active_execution_command_ = *message;
+    }
+  }
+  if (stop) {
+    engageFailStop();
+    return;
+  }
+  if (install_reference && !installPath(message->reference)) {
+    engageFailStop();
+    return;
+  }
+  fail_stop_engaged_.store(false);
 }
 
 //紧急停止信号处理,当接收到紧急停止信号时，节点会立即停止控制器，并清除当前轨迹，确保机器人处于安全状态。
 void AtsSwerveMpcNode::onEmergencyStop(
     const std_msgs::msg::Bool::SharedPtr message) {
+  if (execution_command_enabled_) {
+    // A legacy false cannot release the structured execution stop state.
+    if (message->data) {
+      engageFailStop();
+    }
+    return;
+  }
   const bool first_signal = !emergency_stop_signal_received_.exchange(true);
   emergency_stop_watchdog_.update(message->data);
   if (first_signal) {
@@ -320,7 +409,21 @@ void AtsSwerveMpcNode::onControlTimer() {
     engageFailStop();
     return;
   }
-  if (emergency_stop_watchdog_enabled_ &&
+  if (execution_command_enabled_) {
+    bool lease_valid = false;
+    {
+      std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      lease_valid = last_execution_command_signal_ &&
+        std::chrono::steady_clock::now() >= *last_execution_command_signal_ &&
+        std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - *last_execution_command_signal_).count() <=
+          execution_command_timeout_;
+    }
+    if (!lease_valid || fail_stop_engaged_.load()) {
+      engageFailStop();
+      return;
+    }
+  } else if (emergency_stop_watchdog_enabled_ &&
       (emergency_stop_watchdog_.stopRequired() || fail_stop_engaged_.load())) {
     engageFailStop();
     return;

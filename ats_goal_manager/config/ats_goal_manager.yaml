@@ -8,6 +8,9 @@ ats_goal_manager:
     candidate_reference_topic: /minco/reference_path_candidate
     reference_path_topic: /minco/reference_path
     emergency_stop_topic: /planner/emergency_stop
+    # The MPC executes only this atomic stop/execute contract.  Path and Bool
+    # topics remain diagnostics and compatibility outputs.
+    execution_command_topic: /planner/execution_command
     map_ready_topic: /rog_map_adapter/ready
     map_status_topic: /rog_map_adapter/status
     localization_status_topic: /localization/status

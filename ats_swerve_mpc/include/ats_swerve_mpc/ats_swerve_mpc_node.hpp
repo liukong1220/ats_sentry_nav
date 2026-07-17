@@ -4,6 +4,7 @@
 #define ATS_SWERVE_MPC__ATS_SWERVE_MPC_NODE_HPP_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
@@ -34,12 +36,15 @@ public:
 private:
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr message);
   void onPath(const nav_msgs::msg::Path::SharedPtr message);
+  void onExecutionCommand(
+      const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message);
   void onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message);
   void onLocalizationStatus(
       const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
           message);
   void onControlTimer();
   void engageFailStop();
+  bool installPath(const nav_msgs::msg::Path & message);
   Se2MpcConfig loadConfig();
   TrajectoryTrackerConfig loadTrackerConfig();
   void publishCommand(const Control &command);
@@ -52,6 +57,7 @@ private:
   TrajectoryTracker trajectory_tracker_;
   std::string odom_topic_;
   std::string trajectory_topic_;
+  std::string execution_command_topic_;
   std::string command_topic_;
   std::string emergency_stop_topic_;
   std::string localization_status_topic_;
@@ -60,6 +66,7 @@ private:
   double fallback_path_dt_ = 0.1;
   double trajectory_timeout_ = 0.5;
   double emergency_stop_timeout_ = 0.5;
+  double execution_command_timeout_ = 0.5;
   double goal_position_tolerance_ = 0.08;
   double goal_yaw_tolerance_ = 0.15;
   bool publish_debug_paths_ = true;
@@ -75,13 +82,20 @@ private:
   Control last_control_ = Control::Zero();
   EmergencyStopWatchdog emergency_stop_watchdog_;
   bool emergency_stop_watchdog_enabled_ = true;
+  bool execution_command_enabled_ = false;
   std::atomic<bool> emergency_stop_signal_received_{false};
   std::atomic<bool> fail_stop_engaged_{true};
   std::atomic<bool> localization_tracking_{false};
   std::optional<std::uint64_t> localization_epoch_;
+  std::optional<std::chrono::steady_clock::time_point> last_execution_command_signal_;
+  std::uint64_t last_execution_command_sequence_{0};
+  std::optional<ats_navigation_interfaces::msg::ExecutionCommand>
+      active_execution_command_;
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr trajectory_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::ExecutionCommand>::SharedPtr
+      execution_command_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
       SharedPtr localization_status_sub_;
