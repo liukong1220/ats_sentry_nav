@@ -38,6 +38,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration("use_respawn")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
+    launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
@@ -149,6 +150,12 @@ def generate_launch_description():
         description="Whether to start small_gicp map->odom relocalization",
     )
 
+    declare_launch_localization_fusion_cmd = DeclareLaunchArgument(
+        "launch_localization_fusion",
+        default_value="True",
+        description="Whether localization_fusion owns map->odom and /localization",
+    )
+
     declare_launch_chassis_vel_transform_cmd = DeclareLaunchArgument(
         "launch_chassis_vel_transform",
         default_value="False",
@@ -233,6 +240,7 @@ def generate_launch_description():
                     "use_respawn": use_respawn,
                     "container_name": "nav2_container",
                     "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
+                    "launch_localization_fusion": launch_localization_fusion,
                     "log_level": log_level,
                 }.items(),
             ),
@@ -281,6 +289,7 @@ def generate_launch_description():
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
     ld.add_action(declare_launch_small_gicp_relocalization_cmd)
+    ld.add_action(declare_launch_localization_fusion_cmd)
     ld.add_action(declare_launch_chassis_vel_transform_cmd)
     ld.add_action(declare_launch_fake_vel_transform_cmd)
     ld.add_action(declare_nav_cmd_vel_topic_cmd)

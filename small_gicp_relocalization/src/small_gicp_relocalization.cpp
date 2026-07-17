@@ -1,6 +1,26 @@
- 
+
+
+// Copyright 2026 Lihan Chen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "small_gicp_relocalization/small_gicp_relocalization.hpp"
+
+#include <Eigen/Eigenvalues>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
 
 #include "pcl/common/transforms.h"
 #include "pcl_conversions/pcl_conversions.h"
@@ -11,6 +31,59 @@
 
 namespace small_gicp_relocalization
 {
+
+namespace
+{
+
+double normalizedRegistrationError(double error, std::size_t inliers)
+{
+  return inliers > 0 && std::isfinite(error) ? error / static_cast<double>(inliers)
+                                             : std::numeric_limits<double>::infinity();
+}
+
+double yawDistance(const Eigen::Isometry3d & lhs, const Eigen::Isometry3d & rhs)
+{
+  const double delta =
+    lhs.rotation().eulerAngles(0, 1, 2).z() - rhs.rotation().eulerAngles(0, 1, 2).z();
+  return std::abs(std::atan2(std::sin(delta), std::cos(delta)));
+}
+
+std::array<double, 36> registrationCovariance(
+  const Eigen::Matrix<double, 6, 6> & information, double error, std::size_t inliers)
+{
+  Eigen::Matrix<double, 6, 6> covariance_rt = Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
+    0.5 * (information + information.transpose()));
+  if (
+    solver.info() == Eigen::Success && solver.eigenvalues().allFinite() &&
+    solver.eigenvectors().allFinite()) {
+    const double degrees_of_freedom = std::max(1.0, 3.0 * static_cast<double>(inliers) - 6.0);
+    const double residual_scale = std::clamp(2.0 * error / degrees_of_freedom, 1e-6, 1e3);
+    Eigen::Matrix<double, 6, 1> variances;
+    for (int index = 0; index < 6; ++index) {
+      variances(index) =
+        std::clamp(residual_scale / std::max(1e-9, solver.eigenvalues()(index)), 1e-6, 1e3);
+    }
+    covariance_rt =
+      solver.eigenvectors() * variances.asDiagonal() * solver.eigenvectors().transpose();
+  } else {
+    covariance_rt.diagonal() << 1.0, 1.0, 1.0, 4.0, 4.0, 4.0;
+  }
+
+  // small_gicp 的李代数顺序是 [rx, ry, rz, x, y, z]，ROS PoseWithCovariance
+  // 使用 [x, y, z, rx, ry, rz]。
+  constexpr std::array<int, 6> kPoseToRegistration{{3, 4, 5, 0, 1, 2}};
+  std::array<double, 36> covariance{};
+  for (int row = 0; row < 6; ++row) {
+    for (int column = 0; column < 6; ++column) {
+      covariance[static_cast<std::size_t>(6 * row + column)] =
+        covariance_rt(kPoseToRegistration[row], kPoseToRegistration[column]);
+    }
+  }
+  return covariance;
+}
+
+}  // namespace
 
 SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptions & options)
 : Node("small_gicp_relocalization", options),
@@ -26,6 +99,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_dist_sq", 1.0);
   this->declare_parameter("max_registration_error", -1.0);
   this->declare_parameter("log_registration_details", true);
+  this->declare_parameter("publish_tf", true);
+  this->declare_parameter("confirmation_count", 2);
+  this->declare_parameter("confirmation_translation_tolerance", 0.15);
+  this->declare_parameter("confirmation_yaw_tolerance", 0.10);
   this->declare_parameter("registration_interval_s", 0.25);
   this->declare_parameter("max_accumulation_age_s", 0.30);
   this->declare_parameter("min_registration_translation_delta", 0.10);
@@ -50,13 +127,19 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_dist_sq", max_dist_sq_);
   this->get_parameter("max_registration_error", max_registration_error_);
   this->get_parameter("log_registration_details", log_registration_details_);
+  this->get_parameter("publish_tf", publish_tf_);
+  this->get_parameter("confirmation_count", confirmation_count_);
+  this->get_parameter("confirmation_translation_tolerance", confirmation_translation_tolerance_);
+  this->get_parameter("confirmation_yaw_tolerance", confirmation_yaw_tolerance_);
+  confirmation_count_ = std::max(1, confirmation_count_);
+  confirmation_translation_tolerance_ = std::max(0.0, confirmation_translation_tolerance_);
+  confirmation_yaw_tolerance_ = std::max(0.0, confirmation_yaw_tolerance_);
   this->get_parameter("registration_interval_s", registration_interval_s_);
   this->get_parameter("max_accumulation_age_s", max_accumulation_age_s_);
   this->get_parameter("min_registration_translation_delta", min_registration_translation_delta_);
   this->get_parameter("min_registration_yaw_delta", min_registration_yaw_delta_);
   this->get_parameter(
-    "initial_pose_force_registration_window_s",
-    initial_pose_force_registration_window_s_);
+    "initial_pose_force_registration_window_s", initial_pose_force_registration_window_s_);
   this->get_parameter("transform_future_offset_s", transform_future_offset_s_);
   this->get_parameter("max_scan_stamp_lag_s", max_scan_stamp_lag_s_);
   this->get_parameter("map_frame", map_frame_);
@@ -108,6 +191,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "initialpose", 10,
     std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1));
+  observation_pub_ =
+    this->create_publisher<ats_navigation_interfaces::msg::RelocalizationObservation>(
+      "relocalization_observation", rclcpp::QoS(10).reliable());
 
   register_timer_ = this->create_wall_timer(
     std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -206,28 +292,86 @@ void SmallGicpRelocalizationNode::performRegistration()
 
   auto result = register_->align(*target_, *source_, *target_tree_, previous_result_t_);
 
+  const double registration_error = normalizedRegistrationError(result.error, result.num_inliers);
   const bool inlier_ok = static_cast<int>(result.num_inliers) >= min_inliers_;
-  const bool error_ok = max_registration_error_ < 0.0 || result.error <= max_registration_error_;
+  const bool error_ok =
+    max_registration_error_ < 0.0 || registration_error <= max_registration_error_;
+  const auto covariance = registrationCovariance(result.H, result.error, result.num_inliers);
 
   if (log_registration_details_) {
     RCLCPP_INFO(
       this->get_logger(),
-      "GICP result: converged=%s iterations=%zu inliers=%zu error=%.6f source_points=%zu downsampled_source=%zu",
-      result.converged ? "true" : "false", result.iterations, result.num_inliers, result.error,
-      accumulated_cloud_->size(), source_->size());
+      "GICP result: converged=%s iterations=%zu inliers=%zu error=%.6f source_points=%zu "
+      "downsampled_source=%zu",
+      result.converged ? "true" : "false", result.iterations, result.num_inliers,
+      registration_error, accumulated_cloud_->size(), source_->size());
   }
 
   if (result.converged && inlier_ok && error_ok) {
-    result_t_ = previous_result_t_ = result.T_target_source;
+    const Eigen::Isometry3d candidate = result.T_target_source;
+    if (confirmation_count_ > 1) {
+      if (confirmationConsistent(candidate)) {
+        ++pending_confirmation_count_;
+      } else {
+        pending_confirmation_transform_ = candidate;
+        pending_confirmation_count_ = 1;
+      }
+      if (pending_confirmation_count_ < confirmation_count_) {
+        const auto odom_to_robot_base = getOdomToRobotBase(last_scan_time_);
+        const Eigen::Isometry3d map_to_robot_base =
+          odom_to_robot_base ? candidate * *odom_to_robot_base : Eigen::Isometry3d::Identity();
+        publishObservation(
+          false,
+          ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_PENDING_CONFIRMATION,
+          "awaiting consistent GICP confirmation", result.num_inliers, registration_error,
+          source_->size(), map_to_robot_base, covariance);
+        accumulated_cloud_->clear();
+        first_accumulated_scan_time_.reset();
+        return;
+      }
+    }
+
+    const auto odom_to_robot_base = getOdomToRobotBase(last_scan_time_);
+    if (!odom_to_robot_base) {
+      publishObservation(
+        false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
+        "odom->robot_base unavailable at observation time", result.num_inliers, registration_error,
+        source_->size(), Eigen::Isometry3d::Identity(), covariance);
+      accumulated_cloud_->clear();
+      first_accumulated_scan_time_.reset();
+      return;
+    }
+
+    result_t_ = previous_result_t_ = candidate;
     if (auto current_robot_base_to_odom = getCurrentRobotBaseToOdom()) {
       last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
     }
+    pending_confirmation_transform_.reset();
+    pending_confirmation_count_ = 0;
+    publishObservation(
+      true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED, "accepted",
+      result.num_inliers, registration_error, source_->size(), result_t_ * *odom_to_robot_base,
+      covariance);
   } else {
     RCLCPP_WARN(
       this->get_logger(),
       "Reject GICP result: converged=%s inliers=%zu/%d error=%.6f max_error=%.6f",
-      result.converged ? "true" : "false", result.num_inliers, min_inliers_, result.error,
+      result.converged ? "true" : "false", result.num_inliers, min_inliers_, registration_error,
       max_registration_error_);
+    std::string reason = "rejected";
+    if (!result.converged) {
+      reason = "not converged";
+    } else if (!inlier_ok) {
+      reason = "insufficient inliers";
+    } else if (!error_ok) {
+      reason = "registration error too large";
+    }
+    pending_confirmation_transform_.reset();
+    pending_confirmation_count_ = 0;
+    publishObservation(
+      false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED, reason,
+      result.num_inliers, registration_error, source_->size(), Eigen::Isometry3d::Identity(),
+      covariance);
   }
 
   accumulated_cloud_->clear();
@@ -236,6 +380,9 @@ void SmallGicpRelocalizationNode::performRegistration()
 
 void SmallGicpRelocalizationNode::publishTransform()
 {
+  if (!publish_tf_) {
+    return;
+  }
   if (result_t_.matrix().isZero()) {
     return;
   }
@@ -252,7 +399,8 @@ void SmallGicpRelocalizationNode::publishTransform()
       tf_stamp = current_time + rclcpp::Duration::from_seconds(transform_future_offset_s_);
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "small_gicp tf stamp falls behind current time by %.3fs, clamping map->odom stamp to now().",
+        "small_gicp tf stamp falls behind current time by %.3fs, clamping map->odom stamp to "
+        "now().",
         lag_s);
     }
   }
@@ -272,6 +420,49 @@ void SmallGicpRelocalizationNode::publishTransform()
   transform_stamped.transform.rotation.w = rotation.w();
 
   tf_broadcaster_->sendTransform(transform_stamped);
+}
+
+void SmallGicpRelocalizationNode::publishObservation(
+  bool accepted, std::uint8_t status, const std::string & message, std::size_t inliers,
+  double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
+  const std::array<double, 36> & covariance)
+{
+  if (!observation_pub_) {
+    return;
+  }
+
+  ats_navigation_interfaces::msg::RelocalizationObservation observation;
+  observation.header.stamp = has_received_scan_ ? last_scan_time_ : now();
+  observation.header.frame_id = map_frame_;
+  observation.child_frame_id = robot_base_frame_;
+  observation.sequence = ++observation_sequence_;
+  observation.accepted = accepted;
+  observation.status = status;
+  observation.inlier_count = static_cast<std::uint32_t>(
+    std::min<std::size_t>(inliers, std::numeric_limits<std::uint32_t>::max()));
+  observation.source_points = static_cast<std::uint32_t>(
+    std::min<std::size_t>(source_points, std::numeric_limits<std::uint32_t>::max()));
+  observation.registration_error = std::isfinite(error) ? error : -1.0;
+  const double inlier_ratio =
+    source_points > 0 ? static_cast<double>(inliers) / static_cast<double>(source_points) : 0.0;
+  const double error_quality =
+    std::isfinite(error) && error >= 0.0 ? std::exp(-std::min(error, 10.0)) : 0.0;
+  observation.quality = accepted ? std::clamp(inlier_ratio * error_quality, 0.0, 1.0) : 0.0;
+  observation.message = message;
+
+  const Eigen::Vector3d translation = map_to_robot_base.translation();
+  const Eigen::Quaterniond rotation(map_to_robot_base.rotation());
+  observation.pose.pose.position.x = translation.x();
+  observation.pose.pose.position.y = translation.y();
+  observation.pose.pose.position.z = translation.z();
+  observation.pose.pose.orientation.x = rotation.x();
+  observation.pose.pose.orientation.y = rotation.y();
+  observation.pose.pose.orientation.z = rotation.z();
+  observation.pose.pose.orientation.w = rotation.w();
+
+  observation.pose.covariance = covariance;
+
+  observation_pub_->publish(observation);
 }
 
 void SmallGicpRelocalizationNode::initialPoseCallback(
@@ -296,6 +487,8 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     Eigen::Isometry3d map_to_odom = map_to_robot_base * robot_base_to_odom;
 
     previous_result_t_ = result_t_ = map_to_odom;
+    pending_confirmation_transform_.reset();
+    pending_confirmation_count_ = 0;
     accumulated_cloud_->clear();
     first_accumulated_scan_time_.reset();
     initial_pose_override_time_ = this->now();
@@ -323,9 +516,13 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
   }
 
   const bool force_after_initial_pose =
-    initial_pose_override_time_ &&
-    (this->now() - *initial_pose_override_time_).seconds() <= initial_pose_force_registration_window_s_;
+    initial_pose_override_time_ && (this->now() - *initial_pose_override_time_).seconds() <=
+                                     initial_pose_force_registration_window_s_;
   if (force_after_initial_pose) {
+    return true;
+  }
+
+  if (pending_confirmation_transform_) {
     return true;
   }
 
@@ -341,9 +538,8 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
 
   const double translation_delta = translationDeltaFromLastTrigger(*current_robot_base_to_odom);
   const double yaw_delta = yawDeltaFromLastTrigger(*current_robot_base_to_odom);
-  return
-    translation_delta >= std::max(0.0, min_registration_translation_delta_) ||
-    yaw_delta >= std::max(0.0, min_registration_yaw_delta_);
+  return translation_delta >= std::max(0.0, min_registration_translation_delta_) ||
+         yaw_delta >= std::max(0.0, min_registration_yaw_delta_);
 }
 
 double SmallGicpRelocalizationNode::accumulatedCloudAgeSeconds() const
@@ -365,15 +561,35 @@ std::optional<Eigen::Isometry3d> SmallGicpRelocalizationNode::getCurrentRobotBas
   }
 }
 
+std::optional<Eigen::Isometry3d> SmallGicpRelocalizationNode::getOdomToRobotBase(
+  const rclcpp::Time & stamp) const
+{
+  try {
+    auto transform = tf_buffer_->lookupTransform(
+      odom_frame_, robot_base_frame_, stamp, rclcpp::Duration::from_seconds(0.1));
+    return tf2::transformToEigen(transform.transform);
+  } catch (const tf2::TransformException &) {
+    return std::nullopt;
+  }
+}
+
+bool SmallGicpRelocalizationNode::confirmationConsistent(const Eigen::Isometry3d & candidate) const
+{
+  return pending_confirmation_transform_ &&
+         (candidate.translation() - pending_confirmation_transform_->translation()).norm() <=
+           confirmation_translation_tolerance_ &&
+         yawDistance(candidate, *pending_confirmation_transform_) <= confirmation_yaw_tolerance_;
+}
+
 double SmallGicpRelocalizationNode::translationDeltaFromLastTrigger(
   const Eigen::Isometry3d & current_robot_base_to_odom) const
 {
   if (!last_registration_robot_base_to_odom_) {
     return 0.0;
   }
-  return (
-    current_robot_base_to_odom.translation() -
-    last_registration_robot_base_to_odom_->translation()).norm();
+  return (current_robot_base_to_odom.translation() -
+          last_registration_robot_base_to_odom_->translation())
+    .norm();
 }
 
 double SmallGicpRelocalizationNode::yawDeltaFromLastTrigger(
@@ -385,7 +601,8 @@ double SmallGicpRelocalizationNode::yawDeltaFromLastTrigger(
   const double current_yaw = current_robot_base_to_odom.rotation().eulerAngles(0, 1, 2).z();
   const double previous_yaw =
     last_registration_robot_base_to_odom_->rotation().eulerAngles(0, 1, 2).z();
-  return std::abs(std::atan2(std::sin(current_yaw - previous_yaw), std::cos(current_yaw - previous_yaw)));
+  return std::abs(
+    std::atan2(std::sin(current_yaw - previous_yaw), std::cos(current_yaw - previous_yaw)));
 }
 
 }  // namespace small_gicp_relocalization

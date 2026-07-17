@@ -1,14 +1,29 @@
- 
+// Copyright 2026 Lihan Chen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #ifndef SMALL_GICP_RELOCALIZATION__SMALL_GICP_RELOCALIZATION_HPP_
 #define SMALL_GICP_RELOCALIZATION__SMALL_GICP_RELOCALIZATION_HPP_
 
+#include <Eigen/Geometry>
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <Eigen/Geometry>
+#include "ats_navigation_interfaces/msg/relocalization_observation.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "pcl/io/pcd_io.h"
 #include "rclcpp/rclcpp.hpp"
@@ -35,15 +50,24 @@ private:
   void loadGlobalMap(const std::string & file_name);
   void performRegistration();
   void publishTransform();
+  void publishObservation(
+    bool accepted, std::uint8_t status, const std::string & message, std::size_t inliers,
+    double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
+    const std::array<double, 36> & covariance);
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
   bool shouldRunRegistration();
   double accumulatedCloudAgeSeconds() const;
   std::optional<Eigen::Isometry3d> getCurrentRobotBaseToOdom() const;
-  double translationDeltaFromLastTrigger(const Eigen::Isometry3d & current_robot_base_to_odom) const;
+  std::optional<Eigen::Isometry3d> getOdomToRobotBase(const rclcpp::Time & stamp) const;
+  bool confirmationConsistent(const Eigen::Isometry3d & candidate) const;
+  double translationDeltaFromLastTrigger(
+    const Eigen::Isometry3d & current_robot_base_to_odom) const;
   double yawDeltaFromLastTrigger(const Eigen::Isometry3d & current_robot_base_to_odom) const;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::RelocalizationObservation>::SharedPtr
+    observation_pub_;
 
   int num_threads_;
   int num_neighbors_;
@@ -54,6 +78,10 @@ private:
   float max_dist_sq_;
   double max_registration_error_;
   bool log_registration_details_;
+  bool publish_tf_;
+  int confirmation_count_;
+  double confirmation_translation_tolerance_;
+  double confirmation_yaw_tolerance_;
   double registration_interval_s_;
   double max_accumulation_age_s_;
   double min_registration_translation_delta_;
@@ -74,6 +102,9 @@ private:
   std::optional<rclcpp::Time> first_accumulated_scan_time_;
   std::optional<rclcpp::Time> initial_pose_override_time_;
   bool has_received_scan_{false};
+  std::uint64_t observation_sequence_{0};
+  int pending_confirmation_count_{0};
+  std::optional<Eigen::Isometry3d> pending_confirmation_transform_;
   Eigen::Isometry3d result_t_;
   Eigen::Isometry3d previous_result_t_;
   std::optional<Eigen::Isometry3d> last_registration_robot_base_to_odom_;

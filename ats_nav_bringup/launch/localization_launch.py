@@ -26,6 +26,7 @@ def generate_launch_description():
     container_name_full = (namespace, "/", container_name)
     use_respawn = LaunchConfiguration("use_respawn")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
+    launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
     log_level = LaunchConfiguration("log_level")
 
     lifecycle_nodes = ["map_server"]
@@ -105,6 +106,12 @@ def generate_launch_description():
         description="Whether to start small_gicp map->odom relocalization",
     )
 
+    declare_launch_localization_fusion_cmd = DeclareLaunchArgument(
+        "launch_localization_fusion",
+        default_value="True",
+        description="Whether localization_fusion owns map->odom and /localization",
+    )
+
     declare_log_level_cmd = DeclareLaunchArgument(
         "log_level", default_value="info", description="log level"
     )
@@ -170,7 +177,30 @@ def generate_launch_description():
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
-                parameters=[configured_params, {"prior_pcd_file": prior_pcd_file}],
+                parameters=[
+                    configured_params,
+                    {
+                        "prior_pcd_file": prior_pcd_file,
+                        "publish_tf": PythonExpression(["not ", launch_localization_fusion]),
+                    },
+                ],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            Node(
+                package="small_gicp_relocalization",
+                executable="localization_fusion_node",
+                name="localization_fusion",
+                condition=IfCondition(
+                    PythonExpression([
+                        launch_small_gicp_relocalization,
+                        " and ",
+                        launch_localization_fusion,
+                    ])
+                ),
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[configured_params],
                 arguments=["--ros-args", "--log-level", log_level],
             ),
             Node(
@@ -215,9 +245,15 @@ def generate_launch_description():
         ],
     )
 
-    load_composable_nodes_with_small_gicp = LoadComposableNodes(
+    load_composable_nodes_with_small_gicp_and_fusion = LoadComposableNodes(
         condition=IfCondition(
-            PythonExpression([use_composition, " and ", launch_small_gicp_relocalization])
+            PythonExpression([
+                use_composition,
+                " and ",
+                launch_small_gicp_relocalization,
+                " and ",
+                launch_localization_fusion,
+            ])
         ),
         target_container=container_name_full,
         composable_node_descriptions=[
@@ -243,7 +279,61 @@ def generate_launch_description():
                 package="small_gicp_relocalization",
                 plugin="small_gicp_relocalization::SmallGicpRelocalizationNode",
                 name="small_gicp_relocalization",
-                parameters=[configured_params, {"prior_pcd_file": prior_pcd_file}],
+                parameters=[
+                    configured_params,
+                    {
+                        "prior_pcd_file": prior_pcd_file,
+                        "publish_tf": PythonExpression(["not ", launch_localization_fusion]),
+                    },
+                ],
+            ),
+            ComposableNode(
+                package="small_gicp_relocalization",
+                plugin="small_gicp_relocalization::LocalizationFusionNode",
+                name="localization_fusion",
+                parameters=[configured_params],
+            ),
+        ],
+    )
+
+    load_composable_nodes_with_small_gicp_only = LoadComposableNodes(
+        condition=IfCondition(
+            PythonExpression([
+                use_composition,
+                " and ",
+                launch_small_gicp_relocalization,
+                " and not ",
+                launch_localization_fusion,
+            ])
+        ),
+        target_container=container_name_full,
+        composable_node_descriptions=[
+            ComposableNode(
+                package="nav2_map_server",
+                plugin="nav2_map_server::MapServer",
+                name="map_server",
+                parameters=[configured_params],
+            ),
+            ComposableNode(
+                package="nav2_lifecycle_manager",
+                plugin="nav2_lifecycle_manager::LifecycleManager",
+                name="lifecycle_manager_localization",
+                parameters=[
+                    {
+                        "use_sim_time": use_sim_time,
+                        "autostart": autostart,
+                        "node_names": lifecycle_nodes,
+                    }
+                ],
+            ),
+            ComposableNode(
+                package="small_gicp_relocalization",
+                plugin="small_gicp_relocalization::SmallGicpRelocalizationNode",
+                name="small_gicp_relocalization",
+                parameters=[
+                    configured_params,
+                    {"prior_pcd_file": prior_pcd_file, "publish_tf": True},
+                ],
             ),
         ],
     )
@@ -266,6 +356,7 @@ def generate_launch_description():
     ld.add_action(declare_container_name_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_launch_small_gicp_relocalization_cmd)
+    ld.add_action(declare_launch_localization_fusion_cmd)
     ld.add_action(declare_log_level_cmd)
 
     # Add the actions to launch all of the localiztion nodes
@@ -273,6 +364,7 @@ def generate_launch_description():
     ld.add_action(static_tf_map_to_odom_cmd)
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)
-    ld.add_action(load_composable_nodes_with_small_gicp)
+    ld.add_action(load_composable_nodes_with_small_gicp_and_fusion)
+    ld.add_action(load_composable_nodes_with_small_gicp_only)
 
     return ld
