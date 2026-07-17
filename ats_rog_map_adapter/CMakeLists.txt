@@ -10,6 +10,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_gtest REQUIRED)
+find_package(ats_navigation_interfaces REQUIRED)
 find_package(ats_rog_map_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -32,7 +33,7 @@ ament_target_dependencies(${PROJECT_NAME}_core
 add_executable(ats_rog_map_adapter_node src/ats_rog_map_adapter_node.cpp)
 target_link_libraries(ats_rog_map_adapter_node ${PROJECT_NAME}_core)
 ament_target_dependencies(ats_rog_map_adapter_node
-  ats_rog_map_interfaces rclcpp std_msgs tf2_ros trajectory_optimizer
+  ats_navigation_interfaces ats_rog_map_interfaces rclcpp std_msgs tf2_ros trajectory_optimizer
 )
 
 install(TARGETS ${PROJECT_NAME}_core ats_rog_map_adapter_node

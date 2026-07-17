@@ -21,6 +21,11 @@ ats_rog_map_adapter:
     footprint_clearance_grid_topic: /rc_esdf/footprint_clearance_grid
     ready_topic: /rog_map_adapter/ready
     generation_topic: /rog_map_adapter/generation
+    map_status_topic: /rog_map_adapter/status
+    localization_status_topic: /localization/status
+    # P3 MuJoCo 无融合节点时保持 false；P4 实机入口由 launch/参数覆盖为 true。
+    require_localization_status: false
+    localization_status_timeout_sec: 1.0
 
     static_obstacle_value_threshold: 50
     terrain_obstacle_value_threshold: 50

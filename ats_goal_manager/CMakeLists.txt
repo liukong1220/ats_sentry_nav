@@ -35,8 +35,14 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+
   ament_add_gtest(test_goal_lifecycle test/test_goal_lifecycle.cpp)
   target_include_directories(test_goal_lifecycle PRIVATE include)
+
+  ament_add_pytest_test(test_goal_manager_epoch test/test_goal_manager_epoch.py
+    TIMEOUT 40
+  )
 endif()
 
 ament_package()

@@ -9,11 +9,19 @@ ats_goal_manager:
     reference_path_topic: /minco/reference_path
     emergency_stop_topic: /planner/emergency_stop
     map_ready_topic: /rog_map_adapter/ready
+    map_status_topic: /rog_map_adapter/status
+    localization_status_topic: /localization/status
     odom_topic: /localization
     action_name: /ats_navigate_to_pose
+    # 全局目标固定在 map；每次规划提交时再按当前 map->odom 转换到 planning_frame。
+    goal_frame: map
     planning_frame: odom
     # 该租约使用 steady clock，不能由仿真时钟跳变或旧 DDS 样本续命。
     map_ready_timeout_sec: 3.0
+    localization_status_timeout_sec: 1.0
+    # MuJoCo P3 直接使用真值 /localization 时保持 false；P4 实机入口覆盖为 true。
+    require_localization_status: false
+    require_map_status: true
     emergency_stop_heartbeat_period_sec: 0.1
     # 未就绪时 topic/action 目标最多等待该时间，期间始终急停。
     map_wait_timeout_sec: 5.0

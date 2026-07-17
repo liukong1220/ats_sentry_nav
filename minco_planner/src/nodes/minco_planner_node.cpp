@@ -338,7 +338,7 @@ void MincoPlannerNode::onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg)
 void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
   // P2/P3 过渡兼容入口：P2 保持直接 PoseStamped，不携带任务生命周期编号。
-  planGoal(*msg, 0, false);
+  planGoal(*msg, 0, 0, false);
 }
 
 void MincoPlannerNode::onPlannerGoal(
@@ -346,27 +346,31 @@ void MincoPlannerNode::onPlannerGoal(
 {
   if (msg->goal_id == 0) {
     publishPlannerStatus(
-      0, 0, ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
-      "planner goal_id must be non-zero");
+        0, msg->localization_epoch, 0,
+        ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
+        "planner goal_id must be non-zero");
     return;
   }
   publishPlannerStatus(
-    msg->goal_id, 0, ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED,
-    "MINCO accepted ATS goal request");
-  planGoal(msg->goal_pose, msg->goal_id, true);
+      msg->goal_id, msg->localization_epoch, 0,
+      ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED,
+      "MINCO accepted ATS goal request");
+  planGoal(msg->goal_pose, msg->goal_id, msg->localization_epoch, true);
 }
 
 void MincoPlannerNode::planGoal(
-  const geometry_msgs::msg::PoseStamped & input_goal, std::uint64_t goal_id, bool report_status)
-{
+    const geometry_msgs::msg::PoseStamped &input_goal, std::uint64_t goal_id,
+    std::uint64_t localization_epoch, bool report_status) {
   setPlanSafe(false);
-  const auto fail = [this, goal_id, report_status](const std::string & reason, std::uint64_t generation) {
-      setPlanSafe(false);
-      if (report_status) {
-        publishPlannerStatus(
-          goal_id, generation, ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED, reason);
-      }
-    };
+  const auto fail = [this, goal_id, localization_epoch, report_status](
+                        const std::string &reason, std::uint64_t generation) {
+    setPlanSafe(false);
+    if (report_status) {
+      publishPlannerStatus(
+          goal_id, localization_epoch, generation,
+          ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED, reason);
+    }
+  };
   std::shared_ptr<const PlanningMapSnapshot> map_snapshot;
   std::uint64_t map_health_epoch = 0;
   bool map_ready = false;
@@ -520,8 +524,9 @@ void MincoPlannerNode::planGoal(
     fail("reference control-frame TF transform failed", map_snapshot->generation);
     return;
   }
-  if (!publishReferenceIfCurrent(
-      map_snapshot, map_health_epoch, control_reference, goal_id, report_status)) {
+  if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch,
+                                 control_reference, goal_id, localization_epoch,
+                                 report_status)) {
     RCLCPP_WARN(
       get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
       static_cast<unsigned long long>(map_snapshot->generation));
@@ -661,9 +666,9 @@ void MincoPlannerNode::publishEmergencyStop(bool stop)
 }
 
 void MincoPlannerNode::publishPlannerStatus(
-  std::uint64_t goal_id, std::uint64_t map_generation, std::uint8_t state,
-  const std::string & reason, const builtin_interfaces::msg::Time & reference_stamp)
-{
+    std::uint64_t goal_id, std::uint64_t localization_epoch,
+    std::uint64_t map_generation, std::uint8_t state, const std::string &reason,
+    const builtin_interfaces::msg::Time &reference_stamp) {
   if (!planner_status_pub_) {
     return;
   }
@@ -671,6 +676,7 @@ void MincoPlannerNode::publishPlannerStatus(
   status.header.stamp = now();
   status.header.frame_id = global_frame_;
   status.goal_id = goal_id;
+  status.localization_epoch = localization_epoch;
   status.map_generation = map_generation;
   status.state = state;
   status.reference_stamp = reference_stamp;
@@ -688,12 +694,10 @@ void MincoPlannerNode::setPlanSafe(bool safe)
 }
 
 bool MincoPlannerNode::publishReferenceIfCurrent(
-  const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
-  std::uint64_t map_health_epoch,
-  const nav_msgs::msg::Path & reference_path,
-  std::uint64_t goal_id,
-  bool report_status)
-{
+    const std::shared_ptr<const PlanningMapSnapshot> &snapshot,
+    std::uint64_t map_health_epoch, const nav_msgs::msg::Path &reference_path,
+    std::uint64_t goal_id, std::uint64_t localization_epoch,
+    bool report_status) {
   bool publish = false;
   nav_msgs::msg::Path candidate_reference;
   {
@@ -734,10 +738,10 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     candidate_reference_path_pub_->publish(candidate_reference);
     if (report_status) {
       publishPlannerStatus(
-        goal_id, snapshot->generation,
-        ats_navigation_interfaces::msg::PlannerStatus::STATE_REFERENCE_READY,
-        "MINCO candidate passed snapshot and footprint gate",
-        candidate_reference.header.stamp);
+          goal_id, localization_epoch, snapshot->generation,
+          ats_navigation_interfaces::msg::PlannerStatus::STATE_REFERENCE_READY,
+          "MINCO candidate passed snapshot and footprint gate",
+          candidate_reference.header.stamp);
     }
   }
   return publish;

@@ -47,8 +47,9 @@ private:
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void onPlannerGoal(const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg);
   void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
-  void planGoal(
-    const geometry_msgs::msg::PoseStamped & goal, std::uint64_t goal_id, bool report_status);
+  void planGoal(const geometry_msgs::msg::PoseStamped &goal,
+                std::uint64_t goal_id, std::uint64_t localization_epoch,
+                bool report_status);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
   bool transformGoalToGrid(
@@ -63,16 +64,17 @@ private:
     const nav_msgs::msg::OccupancyGrid & grid) const;
   void setPlanSafe(bool safe);
   bool publishReferenceIfCurrent(
-    const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
-    std::uint64_t map_health_epoch,
-    const nav_msgs::msg::Path & reference_path,
-    std::uint64_t goal_id,
-    bool report_status);
+      const std::shared_ptr<const PlanningMapSnapshot> &snapshot,
+      std::uint64_t map_health_epoch, const nav_msgs::msg::Path &reference_path,
+      std::uint64_t goal_id, std::uint64_t localization_epoch,
+      bool report_status);
   void publishEmergencyStop(bool stop);
-  void publishPlannerStatus(
-    std::uint64_t goal_id, std::uint64_t map_generation, std::uint8_t state,
-    const std::string & reason,
-    const builtin_interfaces::msg::Time & reference_stamp = builtin_interfaces::msg::Time());
+  void
+  publishPlannerStatus(std::uint64_t goal_id, std::uint64_t localization_epoch,
+                       std::uint64_t map_generation, std::uint8_t state,
+                       const std::string &reason,
+                       const builtin_interfaces::msg::Time &reference_stamp =
+                           builtin_interfaces::msg::Time());
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";

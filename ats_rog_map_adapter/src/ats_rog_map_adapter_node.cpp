@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_status.hpp"
 #include "ats_rog_map_adapter/ground_projection_fusion.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -56,6 +58,14 @@ public:
     ready_topic_ = declare_parameter<std::string>("ready_topic", "/rog_map_adapter/ready");
     generation_topic_ = declare_parameter<std::string>(
       "generation_topic", "/rog_map_adapter/generation");
+    map_status_topic_ = declare_parameter<std::string>(
+        "map_status_topic", "/rog_map_adapter/status");
+    localization_status_topic_ = declare_parameter<std::string>(
+        "localization_status_topic", "/localization/status");
+    require_localization_status_ =
+        declare_parameter<bool>("require_localization_status", false);
+    localization_status_timeout_sec_ = std::max(
+        0.1, declare_parameter<double>("localization_status_timeout_sec", 1.0));
     fusion_params_.static_obstacle_value_threshold = declare_parameter<int>(
       "static_obstacle_value_threshold", 50);
     fusion_params_.terrain_obstacle_value_threshold = declare_parameter<int>(
@@ -99,6 +109,12 @@ public:
         std::lock_guard<std::mutex> lock(input_mutex_);
         slope_grid_ = std::move(msg);
       });
+    localization_status_sub_ =
+        create_subscription<ats_navigation_interfaces::msg::LocalizationStatus>(
+            localization_status_topic_,
+            rclcpp::QoS(1).reliable().transient_local(),
+            std::bind(&AtsRogMapAdapterNode::onLocalizationStatus, this,
+                      std::placeholders::_1));
 
     const auto output_qos = rclcpp::QoS(1).reliable().transient_local();
     planning_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
@@ -109,10 +125,13 @@ public:
       footprint_clearance_grid_topic_, output_qos);
     ready_pub_ = create_publisher<std_msgs::msg::Bool>(ready_topic_, output_qos);
     generation_pub_ = create_publisher<std_msgs::msg::UInt64>(generation_topic_, output_qos);
+    map_status_pub_ =
+        create_publisher<ats_navigation_interfaces::msg::PlanningMapStatus>(
+            map_status_topic_, output_qos);
     projection_client_ = create_client<ats_rog_map_interfaces::srv::GetRogMapProjection>(
       projection_service_);
 
-    publishReady(false);
+    publishMapStatus(false, 0, "waiting for first projection");
     const auto period = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::duration<double>(1.0 / projection_rate_hz_));
     projection_timer_ = create_wall_timer(
@@ -126,6 +145,47 @@ public:
   }
 
 private:
+  void onLocalizationStatus(
+      const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
+          message) {
+    if (!require_localization_status_) {
+      return;
+    }
+    const bool epoch_changed =
+        has_localization_status_ && message->epoch != localization_epoch_;
+    has_localization_status_ = true;
+    localization_epoch_ = message->epoch;
+    localization_state_ = message->state;
+    last_localization_status_signal_ = std::chrono::steady_clock::now();
+    if (epoch_changed || message->state !=
+                             ats_navigation_interfaces::msg::
+                                 LocalizationStatus::STATE_TRACKING) {
+      if (request_pending_) {
+        projection_client_->remove_pending_request(active_request_id_);
+        request_pending_ = false;
+      }
+      ++active_request_epoch_;
+      RogMapEsdfSnapshot invalidated_snapshot;
+      last_numeric_snapshot_ = std::move(invalidated_snapshot);
+      publishUnavailable(
+          epoch_changed
+              ? "localization epoch changed; invalidating planning snapshot"
+              : "localization is not tracking");
+    }
+  }
+
+  bool localizationReady() const {
+    if (!require_localization_status_) {
+      return true;
+    }
+    return has_localization_status_ && last_localization_status_signal_ &&
+           localization_state_ == ats_navigation_interfaces::msg::
+                                      LocalizationStatus::STATE_TRACKING &&
+           std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         *last_localization_status_signal_)
+                   .count() <= localization_status_timeout_sec_;
+  }
+
   bool inputFresh(const nav_msgs::msg::OccupancyGrid & grid) const
   {
     if (input_timeout_sec_ <= 0.0) {
@@ -164,6 +224,11 @@ private:
 
   void requestProjection()
   {
+    if (!localizationReady()) {
+      publishUnavailable(
+          "localization status is missing, stale, or not tracking");
+      return;
+    }
     if (request_pending_) {
       const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - active_request_sent_time_).count();
@@ -184,26 +249,35 @@ private:
     request->max_height = static_cast<float>(projection_max_height_);
     request->resolution = static_cast<float>(planning_resolution_);
     const std::uint64_t epoch = ++next_request_epoch_;
+    const std::uint64_t localization_epoch = localization_epoch_;
     active_request_epoch_ = epoch;
     active_request_sent_time_ = std::chrono::steady_clock::now();
     request_pending_ = true;
     try {
       const auto pending = projection_client_->async_send_request(
-        request,
-        [this, epoch](
-          rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedFuture future)
-        {
-          if (!request_pending_ || epoch != active_request_epoch_) {
-            return;
-          }
-          request_pending_ = false;
-          try {
-            processProjection(*future.get());
-          } catch (const std::exception & exception) {
-            RCLCPP_ERROR(get_logger(), "ROGMap projection response failed: %s", exception.what());
-            publishUnavailable("ROGMap projection response failed");
-          }
-        });
+          request,
+          [this, epoch, localization_epoch](
+              rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::
+                  SharedFuture future) {
+            if (!request_pending_ || epoch != active_request_epoch_) {
+              return;
+            }
+            request_pending_ = false;
+            try {
+              if (!localizationReady() ||
+                  localization_epoch != localization_epoch_) {
+                publishUnavailable(
+                    "discarded projection from an obsolete localization epoch");
+                return;
+              }
+              processProjection(*future.get(), localization_epoch);
+            } catch (const std::exception &exception) {
+              RCLCPP_ERROR(get_logger(),
+                           "ROGMap projection response failed: %s",
+                           exception.what());
+              publishUnavailable("ROGMap projection response failed");
+            }
+          });
       active_request_id_ = pending.request_id;
     } catch (const std::exception & exception) {
       request_pending_ = false;
@@ -213,8 +287,9 @@ private:
   }
 
   void processProjection(
-    const ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response)
-  {
+      const ats_rog_map_interfaces::srv::GetRogMapProjection::Response
+          &response,
+      std::uint64_t localization_epoch) {
     const RogMapEsdfSnapshot numeric_snapshot = RogMapEsdfSnapshot::fromResponse(response);
     if (response.occupancy_grid.info.width > 0 && response.occupancy_grid.info.height > 0 &&
       !response.occupancy_grid.data.empty())
@@ -295,6 +370,11 @@ private:
       return;
     }
 
+    if (!localizationReady() || localization_epoch != localization_epoch_) {
+      publishUnavailable(
+          "localization changed before planning snapshot commit");
+      return;
+    }
     last_numeric_snapshot_ = numeric_snapshot;
     last_blocking_grid_ = fusion.planning_grid;
     planning_grid_pub_->publish(fusion.planning_grid);
@@ -308,7 +388,8 @@ private:
     std_msgs::msg::UInt64 generation;
     generation.data = response.generation;
     generation_pub_->publish(generation);
-    publishReady(true);
+    last_rog_generation_ = response.generation;
+    publishMapStatus(true, response.generation, "planning snapshot ready");
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu numeric_esdf=%zu",
@@ -347,16 +428,26 @@ private:
 
   void publishUnavailable(const char * reason)
   {
-    publishReady(false);
+    publishMapStatus(false, last_rog_generation_, reason);
     publishBlockedGrid(last_blocking_grid_);
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", reason);
   }
 
-  void publishReady(bool ready)
-  {
+  void publishMapStatus(bool ready, std::uint64_t rog_generation,
+                        const std::string &reason) {
     std_msgs::msg::Bool message;
     message.data = ready;
     ready_pub_->publish(message);
+
+    ats_navigation_interfaces::msg::PlanningMapStatus status;
+    status.header.stamp = now();
+    status.header.frame_id = last_blocking_grid_.header.frame_id;
+    status.ready = ready;
+    status.localization_epoch = localization_epoch_;
+    status.rog_generation = rog_generation;
+    status.publication_sequence = ++map_status_sequence_;
+    status.message = reason;
+    map_status_pub_->publish(status);
   }
 
   std::string projection_service_;
@@ -368,6 +459,8 @@ private:
   std::string footprint_clearance_grid_topic_;
   std::string ready_topic_;
   std::string generation_topic_;
+  std::string map_status_topic_;
+  std::string localization_status_topic_;
   std::string robot_frame_;
   double projection_rate_hz_{2.0};
   double projection_request_timeout_sec_{2.0};
@@ -382,6 +475,8 @@ private:
   double footprint_width_{0.55};
   double footprint_safety_margin_{0.05};
   double robot_unknown_clear_radius_{0.0};
+  double localization_status_timeout_sec_{1.0};
+  bool require_localization_status_{false};
   GroundProjectionFusionParams fusion_params_;
 
   tf2_ros::Buffer tf_buffer_;
@@ -396,16 +491,28 @@ private:
   std::int64_t active_request_id_{0};
   std::uint64_t next_request_epoch_{0};
   std::uint64_t active_request_epoch_{0};
+  std::uint64_t localization_epoch_{0};
+  std::uint64_t last_rog_generation_{0};
+  std::uint64_t map_status_sequence_{0};
+  std::uint8_t localization_state_{
+      ats_navigation_interfaces::msg::LocalizationStatus::STATE_UNINITIALIZED};
+  bool has_localization_status_{false};
+  std::optional<std::chrono::steady_clock::time_point>
+      last_localization_status_signal_;
   std::chrono::steady_clock::time_point active_request_sent_time_{};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr static_map_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr traversability_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr slope_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
+      SharedPtr localization_status_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr signed_distance_grid_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr footprint_clearance_grid_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::
+      SharedPtr map_status_pub_;
   rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_client_;
   rclcpp::TimerBase::SharedPtr projection_timer_;
 };

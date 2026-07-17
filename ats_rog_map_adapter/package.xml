@@ -8,6 +8,7 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>ats_navigation_interfaces</depend>
   <depend>ats_rog_map_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
