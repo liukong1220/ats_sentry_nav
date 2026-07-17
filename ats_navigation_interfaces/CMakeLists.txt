@@ -9,8 +9,12 @@ find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavigateToPose.action"
+  "msg/LocalizationStatus.msg"
+  "msg/PlanningMapStatus.msg"
   "msg/PlannerGoal.msg"
   "msg/PlannerStatus.msg"
+  "msg/RelocalizationObservation.msg"
+  "msg/SwerveTelemetry.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 
