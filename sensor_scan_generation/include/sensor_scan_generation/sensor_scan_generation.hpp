@@ -1,4 +1,4 @@
- 
+
 
 #ifndef SENSOR_SCAN_GENERATION__SENSOR_SCAN_GENERATION_HPP_
 #define SENSOR_SCAN_GENERATION__SENSOR_SCAN_GENERATION_HPP_
@@ -30,8 +30,9 @@ private:
     const nav_msgs::msg::Odometry::ConstSharedPtr & odometry,
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr & laserCloud2);
 
-  tf2::Transform getTransform(
-    const std::string & target_frame, const std::string & source_frame, const rclcpp::Time & time);
+  bool lookupTransform(
+    const std::string & target_frame, const std::string & source_frame, const rclcpp::Time & time,
+    tf2::Transform & transform);
 
   void publishTransform(
     const tf2::Transform & transform, const std::string & parent_frame,
