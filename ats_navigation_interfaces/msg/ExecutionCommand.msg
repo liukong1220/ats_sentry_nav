@@ -26,4 +26,14 @@ uint8 FAILURE_REFERENCE_TF=10
 uint8 FAILURE_SNAPSHOT_CHANGED=11
 uint8 FAILURE_RUNTIME_UNSAFE=12
 uint8 failure_reason
+# The yaw authority is part of the execution lease, never a separate Bool.
+uint8 YAW_AUTHORITY_HOLD_SAFE_STOP=0
+uint8 YAW_AUTHORITY_GIMBAL_COMPENSATED=1
+uint8 YAW_AUTHORITY_BODY_YAW_FOLLOW=2
+uint8 yaw_authority
+bool requires_gimbal_lock
+# The exact protected mode request acknowledged for this EXECUTE reference.
+uint64 gimbal_request_sequence
+# Monotonic feedback sequence that Goal Manager validated after that request.
+uint64 gimbal_feedback_sequence
 nav_msgs/Path reference

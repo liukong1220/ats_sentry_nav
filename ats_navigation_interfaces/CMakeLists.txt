@@ -12,11 +12,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavigateToPose.action"
   "msg/LocalizationStatus.msg"
   "msg/ExecutionCommand.msg"
+  "msg/GimbalYawStatus.msg"
   "msg/PlanningMapStatus.msg"
   "msg/PlannerGoal.msg"
   "msg/PlannerStatus.msg"
   "msg/RelocalizationObservation.msg"
   "msg/SwerveTelemetry.msg"
+  "msg/YawAuthorityRequest.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs nav_msgs std_msgs
 )
 

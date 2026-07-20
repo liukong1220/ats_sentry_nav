@@ -24,3 +24,9 @@ uint8 FAILURE_REFERENCE_TF=10
 uint8 FAILURE_SNAPSHOT_CHANGED=11
 uint8 FAILURE_RUNTIME_UNSAFE=12
 uint8 failure_reason
+# Planner-selected yaw policy associated with this candidate reference.
+uint8 YAW_AUTHORITY_HOLD_SAFE_STOP=0
+uint8 YAW_AUTHORITY_GIMBAL_COMPENSATED=1
+uint8 YAW_AUTHORITY_BODY_YAW_FOLLOW=2
+uint8 yaw_authority
+bool requires_gimbal_lock
