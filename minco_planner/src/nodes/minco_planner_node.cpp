@@ -107,6 +107,8 @@ void MincoPlannerNode::declareAndLoadParams()
     "emergency_stop_heartbeat_period_sec", emergency_stop_heartbeat_period_sec_);
   declare_parameter<double>("runtime_safety_recheck_hz", runtime_safety_recheck_hz_);
   declare_parameter<double>("runtime_safety_horizon_sec", runtime_safety_horizon_sec_);
+  declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
+  declare_parameter<bool>("force_body_yaw_follow", force_body_yaw_follow_);
   declare_parameter<std::string>("global_frame", global_frame_);
   declare_parameter<std::string>("robot_frame", robot_frame_);
   declare_parameter<std::string>("search_algorithm", search_algorithm_);
@@ -187,6 +189,9 @@ void MincoPlannerNode::declareAndLoadParams()
   runtime_safety_recheck_hz_ = std::max(0.1, runtime_safety_recheck_hz_);
   get_parameter("runtime_safety_horizon_sec", runtime_safety_horizon_sec_);
   runtime_safety_horizon_sec_ = std::max(0.0, runtime_safety_horizon_sec_);
+  get_parameter("body_yaw_follow_clearance", body_yaw_follow_clearance_);
+  body_yaw_follow_clearance_ = std::max(0.0, body_yaw_follow_clearance_);
+  get_parameter("force_body_yaw_follow", force_body_yaw_follow_);
   get_parameter("global_frame", global_frame_);
   get_parameter("robot_frame", robot_frame_);
   get_parameter("search_algorithm", search_algorithm_);
@@ -633,9 +638,11 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
+  const std::uint8_t yaw_authority = selectYawAuthority(
+    reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
   if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch,
                                  control_reference, reference, goal_id, localization_epoch,
-                                 map_publication_sequence,
+                                 map_publication_sequence, yaw_authority,
                                  report_status)) {
     RCLCPP_WARN(
       get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
@@ -645,12 +652,20 @@ void MincoPlannerNode::planGoal(
     return;
   }
 
+  double minimum_clearance = std::numeric_limits<double>::infinity();
+  for (const auto & point : reference.points) {
+    if (std::isfinite(point.clearance)) {
+      minimum_clearance = std::min(minimum_clearance, point.clearance);
+    }
+  }
   RCLCPP_INFO(
     get_logger(),
-    "planned generation=%llu raw_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu expanded=%d",
+    "planned generation=%llu raw_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
+    "expanded=%d yaw_authority=%u minimum_clearance=%.3f",
     static_cast<unsigned long long>(map_snapshot->generation),
     search_result.path.poses.size(), reference.points.size(), reference.totalLength(),
-    reference.totalTime(), safety.collisions.size(), search_result.expanded_nodes);
+    reference.totalTime(), safety.collisions.size(), search_result.expanded_nodes,
+    static_cast<unsigned int>(yaw_authority), minimum_clearance);
 }
 
 void MincoPlannerNode::annotateClearance(
@@ -779,7 +794,8 @@ void MincoPlannerNode::publishPlannerStatus(
     std::uint64_t goal_id, std::uint64_t localization_epoch,
     std::uint64_t map_generation, std::uint64_t map_publication_sequence,
     std::uint8_t state, std::uint8_t failure_reason,
-    const builtin_interfaces::msg::Time &reference_stamp) {
+    const builtin_interfaces::msg::Time &reference_stamp,
+    std::uint8_t yaw_authority, bool requires_gimbal_lock) {
   if (!planner_status_pub_) {
     return;
   }
@@ -793,6 +809,8 @@ void MincoPlannerNode::publishPlannerStatus(
   status.state = state;
   status.reference_stamp = reference_stamp;
   status.failure_reason = failure_reason;
+  status.yaw_authority = yaw_authority;
+  status.requires_gimbal_lock = requires_gimbal_lock;
   planner_status_pub_->publish(status);
 }
 
@@ -811,6 +829,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     const ReferenceTrajectory &safety_reference,
     std::uint64_t goal_id, std::uint64_t localization_epoch,
     std::uint64_t map_publication_sequence,
+    std::uint8_t yaw_authority,
     bool report_status) {
   bool publish = false;
   nav_msgs::msg::Path candidate_reference;
@@ -863,7 +882,9 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
           goal_id, localization_epoch, snapshot->generation, map_publication_sequence,
           ats_navigation_interfaces::msg::PlannerStatus::STATE_REFERENCE_READY,
           ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NONE,
-          candidate_reference.header.stamp);
+          candidate_reference.header.stamp, yaw_authority,
+          yaw_authority == ats_navigation_interfaces::msg::PlannerStatus::
+            YAW_AUTHORITY_BODY_YAW_FOLLOW);
     }
   }
   return publish;

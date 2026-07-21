@@ -60,6 +60,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_yaw_spline_planner test/test_yaw_spline_planner.cpp)
   target_link_libraries(test_yaw_spline_planner ${PROJECT_NAME})
 
+  ament_add_gtest(test_yaw_authority_policy test/test_yaw_authority_policy.cpp)
+  target_link_libraries(test_yaw_authority_policy ${PROJECT_NAME})
+
   ament_add_gtest(test_planning_map_snapshot test/test_planning_map_snapshot.cpp)
   target_link_libraries(test_planning_map_snapshot ${PROJECT_NAME})
 

@@ -12,3 +12,8 @@ minco_planner:
     runtime_safety_recheck_hz: 10.0
     runtime_safety_horizon_sec: 1.0
     swept_max_corner_step_cells: 0.5
+    # A route that contains a narrow section stays in BODY_YAW_FOLLOW for the
+    # whole immutable reference.  This avoids unsafe in-motion authority flips.
+    body_yaw_follow_clearance: 0.55
+    # Route profiles for slope/contact-sensitive segments may force this mode.
+    force_body_yaw_follow: false

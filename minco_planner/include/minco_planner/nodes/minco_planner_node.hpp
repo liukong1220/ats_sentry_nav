@@ -22,6 +22,7 @@
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/safety/local_collision_repair.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
+#include "minco_planner/trajectory/yaw_authority_policy.hpp"
 #include "minco_planner/trajectory/yaw_spline_planner.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
@@ -70,6 +71,7 @@ private:
       const ReferenceTrajectory &safety_reference,
       std::uint64_t goal_id, std::uint64_t localization_epoch,
       std::uint64_t map_publication_sequence,
+      std::uint8_t yaw_authority,
       bool report_status);
   void onRuntimeSafetyRecheck();
   void publishEmergencyStop(bool stop);
@@ -79,7 +81,9 @@ private:
                        std::uint64_t map_publication_sequence,
                        std::uint8_t state, std::uint8_t failure_reason,
                        const builtin_interfaces::msg::Time &reference_stamp =
-                           builtin_interfaces::msg::Time());
+                           builtin_interfaces::msg::Time(),
+                       std::uint8_t yaw_authority = 0,
+                       bool requires_gimbal_lock = false);
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
@@ -108,6 +112,8 @@ private:
   double emergency_stop_heartbeat_period_sec_ = 0.1;
   double runtime_safety_recheck_hz_ = 10.0;
   double runtime_safety_horizon_sec_ = 1.0;
+  double body_yaw_follow_clearance_ = 0.55;
+  bool force_body_yaw_follow_ = false;
 
   GridAstar astar_;
   GridJps jps_;
