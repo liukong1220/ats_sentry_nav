@@ -9,9 +9,11 @@ import unittest
 from ament_index_python.packages import get_package_prefix
 from ats_navigation_interfaces.msg import LocalizationStatus
 from ats_navigation_interfaces.msg import ExecutionCommand
+from ats_navigation_interfaces.msg import GimbalYawStatus
 from ats_navigation_interfaces.msg import PlannerGoal
 from ats_navigation_interfaces.msg import PlannerStatus
 from ats_navigation_interfaces.msg import PlanningMapStatus
+from ats_navigation_interfaces.msg import YawAuthorityRequest
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
@@ -43,6 +45,8 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             "reference_path_topic": f"{TOPIC_PREFIX}/reference",
             "emergency_stop_topic": f"{TOPIC_PREFIX}/emergency_stop",
             "execution_command_topic": f"{TOPIC_PREFIX}/execution_command",
+            "yaw_authority_request_topic": f"{TOPIC_PREFIX}/yaw_authority_request",
+            "gimbal_status_topic": f"{TOPIC_PREFIX}/gimbal_status",
             "map_ready_topic": f"{TOPIC_PREFIX}/map_ready",
             "map_status_topic": f"{TOPIC_PREFIX}/map_status",
             "localization_status_topic": f"{TOPIC_PREFIX}/localization_status",
@@ -54,6 +58,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             "localization_status_timeout_sec": 5.0,
             "map_wait_timeout_sec": 5.0,
             "emergency_stop_heartbeat_period_sec": 0.05,
+            "gimbal_status_timeout_sec": 5.0,
         }
         command = [
             executable,
@@ -96,10 +101,15 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         cls.planner_status_pub = cls.node.create_publisher(
             PlannerStatus, f"{TOPIC_PREFIX}/planner_status", 10
         )
+        cls.gimbal_status_pub = cls.node.create_publisher(
+            GimbalYawStatus, f"{TOPIC_PREFIX}/gimbal_status", transient_qos
+        )
         cls.planner_goals = []
         cls.references = []
         cls.stop_states = []
         cls.execution_commands = []
+        cls.yaw_authority_requests = []
+        cls.gimbal_sequence = 0
         cls.node.create_subscription(
             PlannerGoal,
             f"{TOPIC_PREFIX}/planner_goal",
@@ -119,6 +129,12 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             ExecutionCommand,
             f"{TOPIC_PREFIX}/execution_command",
             cls.execution_commands.append,
+            transient_qos,
+        )
+        cls.node.create_subscription(
+            YawAuthorityRequest,
+            f"{TOPIC_PREFIX}/yaw_authority_request",
+            cls.yaw_authority_requests.append,
             transient_qos,
         )
         cls.tf_broadcaster = TransformBroadcaster(cls.node)
@@ -187,9 +203,40 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         map_status.rog_generation = epoch
         map_status.publication_sequence = epoch
         cls.map_status_pub.publish(map_status)
+        request = (
+            cls.yaw_authority_requests[-1]
+            if cls.yaw_authority_requests
+            else None
+        )
+        cls.publish_gimbal_status(
+            request.request_sequence if request else 0,
+            request.yaw_authority
+            if request
+            else GimbalYawStatus.YAW_AUTHORITY_GIMBAL_COMPENSATED,
+            request.require_gimbal_lock if request else False,
+        )
 
     @classmethod
-    def publish_candidate(cls, goal, epoch, publication_sequence=None):
+    def publish_gimbal_status(cls, request_sequence, yaw_authority, locked):
+        gimbal = GimbalYawStatus()
+        gimbal.header.stamp = cls.node.get_clock().now().to_msg()
+        cls.gimbal_sequence += 1
+        gimbal.sequence = cls.gimbal_sequence
+        gimbal.request_sequence = request_sequence
+        gimbal.yaw_authority = yaw_authority
+        gimbal.locked = locked
+        gimbal.tf_healthy = True
+        cls.gimbal_status_pub.publish(gimbal)
+
+    @classmethod
+    def publish_candidate(
+        cls,
+        goal,
+        epoch,
+        publication_sequence=None,
+        yaw_authority=PlannerStatus.YAW_AUTHORITY_GIMBAL_COMPENSATED,
+        requires_gimbal_lock=False,
+    ):
         stamp = cls.node.get_clock().now().to_msg()
         path = Path()
         path.header.stamp = stamp
@@ -211,6 +258,8 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         status.state = PlannerStatus.STATE_REFERENCE_READY
         status.reference_stamp = stamp
+        status.yaw_authority = yaw_authority
+        status.requires_gimbal_lock = requires_gimbal_lock
         cls.candidate_pub.publish(path)
         cls.planner_status_pub.publish(status)
 
@@ -295,6 +344,9 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
 
         # A reference carrying an old adapter publication sequence cannot pass
         # the final Goal Manager commit, even when goal/epoch/timestamp match.
+        # It must also clear the stale candidate and dispatch the same active
+        # goal again, rather than silently remaining in planning until timeout.
+        goal_count = len(self.planner_goals)
         self.publish_candidate(first_goal, 1, publication_sequence=0)
         self.assertFalse(
             self.spin_until(
@@ -303,7 +355,34 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
                 periodic=lambda: self.publish_health(1, 1.0),
             )
         )
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.planner_goals) > goal_count,
+                periodic=lambda: self.publish_health(1, 1.0),
+            )
+        )
+        first_goal = self.planner_goals[-1]
+        request_count = len(self.yaw_authority_requests)
         self.publish_candidate(first_goal, 1)
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.yaw_authority_requests) > request_count
+            )
+        )
+        request = self.yaw_authority_requests[-1]
+        # A current status without this exact request acknowledgement cannot
+        # authorize the candidate reference.
+        self.publish_gimbal_status(
+            request.request_sequence - 1, request.yaw_authority, False
+        )
+        self.assertFalse(
+            self.spin_until(lambda: bool(self.references), timeout=0.3)
+        )
+        self.publish_gimbal_status(
+            request.request_sequence,
+            request.yaw_authority,
+            request.require_gimbal_lock,
+        )
         self.assertTrue(self.spin_until(lambda: len(self.references) == 1))
         self.assertTrue(self.spin_until(lambda: False in self.stop_states))
         self.assertTrue(
@@ -316,6 +395,68 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
                     and len(command.reference.poses) == 2
                     for command in self.execution_commands
                 )
+            )
+        )
+
+        # A mode change while tracking must first publish a structured STOP.
+        # BODY_YAW_FOLLOW then waits for the matching *locked* acknowledgement.
+        stop_event_count = len(self.stop_states)
+        command_count = len(self.execution_commands)
+        request_count = len(self.yaw_authority_requests)
+        self.publish_candidate(
+            first_goal,
+            1,
+            yaw_authority=PlannerStatus.YAW_AUTHORITY_BODY_YAW_FOLLOW,
+            requires_gimbal_lock=True,
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.yaw_authority_requests) > request_count
+            )
+        )
+        switch_request = self.yaw_authority_requests[-1]
+        self.assertTrue(
+            self.spin_until(lambda: True in self.stop_states[stop_event_count:])
+        )
+        self.assertTrue(
+            any(
+                command.mode == ExecutionCommand.MODE_STOP
+                for command in self.execution_commands[command_count:]
+            )
+        )
+        self.publish_gimbal_status(
+            switch_request.request_sequence,
+            switch_request.yaw_authority,
+            False,
+        )
+        self.assertFalse(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_EXECUTE
+                    and command.yaw_authority
+                    == ExecutionCommand.YAW_AUTHORITY_BODY_YAW_FOLLOW
+                    for command in self.execution_commands[command_count:]
+                ),
+                timeout=0.3,
+            )
+        )
+        self.publish_gimbal_status(
+            switch_request.request_sequence,
+            switch_request.yaw_authority,
+            True,
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_EXECUTE
+                    and command.yaw_authority
+                    == ExecutionCommand.YAW_AUTHORITY_BODY_YAW_FOLLOW
+                    and command.gimbal_request_sequence
+                    == switch_request.request_sequence
+                    and command.gimbal_feedback_sequence > 0
+                    for command in self.execution_commands[command_count:]
+                ),
+                periodic=lambda: self.publish_health(1, 1.0),
             )
         )
 
@@ -341,8 +482,23 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         recovered_goal = self.planner_goals[-1]
         self.assertEqual(recovered_goal.goal_id, first_goal.goal_id)
         self.assertEqual(recovered_goal.localization_epoch, 1)
+        reference_count = len(self.references)
+        request_count = len(self.yaw_authority_requests)
         self.publish_candidate(recovered_goal, 1)
-        self.assertTrue(self.spin_until(lambda: len(self.references) == 2))
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.yaw_authority_requests) > request_count
+            )
+        )
+        request = self.yaw_authority_requests[-1]
+        self.publish_gimbal_status(
+            request.request_sequence,
+            request.yaw_authority,
+            request.require_gimbal_lock,
+        )
+        self.assertTrue(
+            self.spin_until(lambda: len(self.references) == reference_count + 1)
+        )
         first_goal = recovered_goal
 
         stop_event_count = len(self.stop_states)
@@ -395,7 +551,19 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         self.assertEqual(self.stop_states.count(False), false_count)
 
+        request_count = len(self.yaw_authority_requests)
         self.publish_candidate(second_goal, 2)
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.yaw_authority_requests) > request_count
+            )
+        )
+        request = self.yaw_authority_requests[-1]
+        self.publish_gimbal_status(
+            request.request_sequence,
+            request.yaw_authority,
+            request.require_gimbal_lock,
+        )
         self.assertTrue(
             self.spin_until(lambda: len(self.references) == reference_count + 1)
         )

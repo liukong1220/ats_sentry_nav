@@ -17,9 +17,11 @@
 #include "ats_navigation_interfaces/action/navigate_to_pose.hpp"
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
+#include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_navigation_interfaces/msg/planner_goal.hpp"
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
+#include "ats_navigation_interfaces/msg/yaw_authority_request.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
@@ -40,9 +42,11 @@ using GoalHandleNavigateToPose =
     rclcpp_action::ServerGoalHandle<NavigateToPose>;
 using LocalizationStatus = ats_navigation_interfaces::msg::LocalizationStatus;
 using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
+using GimbalYawStatus = ats_navigation_interfaces::msg::GimbalYawStatus;
 using PlanningMapStatus = ats_navigation_interfaces::msg::PlanningMapStatus;
 using PlannerGoal = ats_navigation_interfaces::msg::PlannerGoal;
 using PlannerStatus = ats_navigation_interfaces::msg::PlannerStatus;
+using YawAuthorityRequest = ats_navigation_interfaces::msg::YawAuthorityRequest;
 
 const char *plannerFailureMessage(std::uint8_t failure_reason) {
   switch (failure_reason) {
@@ -112,6 +116,8 @@ public:
         emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
     execution_command_pub_ = create_publisher<ExecutionCommand>(
         execution_command_topic_, rclcpp::QoS(1).reliable().transient_local());
+    yaw_authority_request_pub_ = create_publisher<YawAuthorityRequest>(
+        yaw_authority_request_topic_, rclcpp::QoS(1).reliable().transient_local());
     input_goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         input_goal_topic_, rclcpp::QoS(10),
         std::bind(&AtsGoalManagerNode::onTopicGoal, this,
@@ -135,6 +141,10 @@ public:
     localization_status_sub_ = create_subscription<LocalizationStatus>(
         localization_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
         std::bind(&AtsGoalManagerNode::onLocalizationStatus, this,
+                  std::placeholders::_1));
+    gimbal_status_sub_ = create_subscription<GimbalYawStatus>(
+        gimbal_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
+        std::bind(&AtsGoalManagerNode::onGimbalYawStatus, this,
                   std::placeholders::_1));
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
         odom_topic_, rclcpp::SensorDataQoS(),
@@ -191,6 +201,10 @@ private:
         "emergency_stop_topic", "/planner/emergency_stop");
     execution_command_topic_ = declare_parameter<std::string>(
         "execution_command_topic", "/planner/execution_command");
+    yaw_authority_request_topic_ = declare_parameter<std::string>(
+        "yaw_authority_request_topic", "/gimbal/yaw_authority_request");
+    gimbal_status_topic_ = declare_parameter<std::string>(
+        "gimbal_status_topic", "/gimbal/yaw_status");
     map_ready_topic_ = declare_parameter<std::string>("map_ready_topic",
                                                       "/rog_map_adapter/ready");
     map_status_topic_ = declare_parameter<std::string>(
@@ -209,6 +223,9 @@ private:
     require_localization_status_ =
         declare_parameter<bool>("require_localization_status", false);
     require_map_status_ = declare_parameter<bool>("require_map_status", true);
+    require_gimbal_status_ = declare_parameter<bool>("require_gimbal_status", true);
+    gimbal_status_timeout_sec_ = std::max(
+        0.1, declare_parameter<double>("gimbal_status_timeout_sec", 0.5));
     emergency_stop_heartbeat_period_sec_ = std::max(
         0.02,
         declare_parameter<double>("emergency_stop_heartbeat_period_sec", 0.1));
@@ -220,6 +237,12 @@ private:
         0.0, declare_parameter<double>("goal_position_tolerance", 0.08));
     goal_yaw_tolerance_ =
         std::max(0.0, declare_parameter<double>("goal_yaw_tolerance", 0.15));
+    terminal_linear_velocity_tolerance_ = std::max(
+        0.0, declare_parameter<double>("terminal_linear_velocity_tolerance", 0.05));
+    terminal_angular_velocity_tolerance_ = std::max(
+        0.0, declare_parameter<double>("terminal_angular_velocity_tolerance", 0.10));
+    terminal_dwell_sec_ = std::max(
+        0.0, declare_parameter<double>("terminal_dwell_sec", 0.30));
   }
 
   rclcpp_action::GoalResponse
@@ -296,6 +319,8 @@ private:
       candidate_reference_.reset();
       planner_ready_status_.reset();
       active_execution_command_.reset();
+      pending_yaw_authority_request_.reset();
+      terminal_converged_since_.reset();
       id = ++next_goal_id_;
       lifecycle_.start(id, mapReadyLocked() && localizationHealthyLocked());
       active_goal_ = ActiveGoal{id,
@@ -375,6 +400,8 @@ private:
       candidate_reference_.reset();
       planner_ready_status_.reset();
       active_execution_command_.reset();
+      pending_yaw_authority_request_.reset();
+      terminal_converged_since_.reset();
       fail_stop_ = true;
       lifecycle_.start(id, false);
       active_goal_->waiting_since = waiting_since.value_or(
@@ -428,12 +455,35 @@ private:
     if (message->state != PlannerStatus::STATE_REFERENCE_READY) {
       return;
     }
+    bool protected_mode_switch = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_ && active_goal_->id == message->goal_id &&
           active_goal_->localization_epoch == message->localization_epoch) {
+        protected_mode_switch = active_execution_command_ &&
+          (active_execution_command_->yaw_authority != message->yaw_authority ||
+           active_execution_command_->requires_gimbal_lock !=
+             message->requires_gimbal_lock);
+        if (protected_mode_switch) {
+          // An authority transition invalidates tracker/warm-start ownership.
+          // The new candidate can be authorized only after STOP and a fresh ack.
+          active_execution_command_.reset();
+          pending_yaw_authority_request_.reset();
+          fail_stop_ = true;
+          // referenceReady() is deliberately valid only from kPlanning.  Keep
+          // the goal active but require this newly planned reference to cross
+          // the protected request/ack gate before re-entering tracking.
+          lifecycle_.start(active_goal_->id, true);
+        }
         planner_ready_status_ = *message;
       }
+    }
+    if (protected_mode_switch) {
+      publishEmergencyStop(true);
+      publishExecutionStop(
+        message->goal_id, message->localization_epoch,
+        PlannerStatus::FAILURE_NONE, message->map_generation,
+        message->map_publication_sequence);
     }
     tryCommitReference();
   }
@@ -530,6 +580,29 @@ private:
     }
   }
 
+  void onGimbalYawStatus(const GimbalYawStatus::SharedPtr message) {
+    bool stop_active = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      gimbal_status_ = *message;
+      last_gimbal_status_signal_ = std::chrono::steady_clock::now();
+      if (active_execution_command_ &&
+          !gimbalStatusSatisfiesLocked(
+            active_execution_command_->yaw_authority,
+            active_execution_command_->requires_gimbal_lock,
+            active_execution_command_->gimbal_feedback_sequence,
+            active_execution_command_->gimbal_request_sequence)) {
+        active_execution_command_.reset();
+        fail_stop_ = true;
+        stop_active = true;
+      }
+    }
+    if (stop_active) {
+      publishEmergencyStop(true);
+    }
+    tryCommitReference();
+  }
+
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr message) {
     geometry_msgs::msg::PoseStamped input;
     input.header = message->header;
@@ -554,11 +627,48 @@ private:
     }
     std::lock_guard<std::mutex> lock(mutex_);
     current_pose_ = normalized;
+    current_linear_velocity_ = std::hypot(
+      message->twist.twist.linear.x, message->twist.twist.linear.y);
+    current_angular_velocity_ = std::abs(message->twist.twist.angular.z);
+    has_current_velocity_ = std::isfinite(current_linear_velocity_) &&
+      std::isfinite(current_angular_velocity_);
     has_current_pose_ = true;
     odom_tf_healthy_ = true;
   }
 
   void tryCommitReference() {
+    std::optional<std::uint64_t> stale_candidate_goal;
+    std::uint64_t candidate_publication_sequence = 0;
+    std::uint64_t current_publication_sequence = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Candidate/reference acceptance is intentionally bound to the current
+      // map publication.  If a long planning callback returns an older local
+      // snapshot, safely discard it and re-enter map waiting so the existing
+      // lifecycle path dispatches a fresh request.  Returning silently here
+      // leaves the action stuck in kPlanning until its deadline.
+      if (active_goal_ && candidate_reference_ && planner_ready_status_ &&
+          planner_ready_status_->goal_id == active_goal_->id &&
+          planner_ready_status_->localization_epoch == active_goal_->localization_epoch &&
+          planner_ready_status_->map_publication_sequence !=
+            map_status_publication_sequence_) {
+        stale_candidate_goal = active_goal_->id;
+        candidate_publication_sequence =
+          planner_ready_status_->map_publication_sequence;
+        current_publication_sequence = map_status_publication_sequence_;
+      }
+    }
+    if (stale_candidate_goal) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Rejecting candidate for goal %llu: map publication sequence %llu is stale; current=%llu. "
+        "Stopping and dispatching a fresh planner request.",
+        static_cast<unsigned long long>(*stale_candidate_goal),
+        static_cast<unsigned long long>(candidate_publication_sequence),
+        static_cast<unsigned long long>(current_publication_sequence));
+      suspendActiveGoal(*stale_candidate_goal);
+      return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!active_goal_ || active_goal_->cancel_requested ||
         !candidate_reference_ || !planner_ready_status_ || !mapReadyLocked() ||
@@ -573,6 +683,22 @@ private:
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
+      return;
+    }
+    const std::uint8_t yaw_authority = planner_ready_status_->yaw_authority;
+    const bool requires_gimbal_lock = planner_ready_status_->requires_gimbal_lock;
+    if (yaw_authority != PlannerStatus::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
+        yaw_authority != PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW) {
+      fail_stop_ = true;
+      return;
+    }
+    // Every reference, including GIMBAL_COMPENSATED, is bound to a fresh
+    // request/ack.  A default mode status with request_sequence=0 is not an
+    // authorization for this goal/snapshot.
+    requestYawAuthorityLocked(*planner_ready_status_);
+    if (!pending_yaw_authority_request_ ||
+        !gimbalStatusSatisfiesLocked(yaw_authority, requires_gimbal_lock, 0)) {
+      fail_stop_ = true;
       return;
     }
     if (!lifecycle_.referenceReady(active_goal_->id, true)) {
@@ -593,6 +719,10 @@ private:
     command.map_publication_sequence =
       planner_ready_status_->map_publication_sequence;
     command.failure_reason = PlannerStatus::FAILURE_NONE;
+    command.yaw_authority = yaw_authority;
+    command.requires_gimbal_lock = requires_gimbal_lock;
+    command.gimbal_request_sequence = pending_yaw_authority_request_->request_sequence;
+    command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
     fail_stop_ = false;
     active_goal_->recovering = false;
@@ -602,6 +732,7 @@ private:
     reference_path_pub_->publish(committed);
     candidate_reference_.reset();
     planner_ready_status_.reset();
+    pending_yaw_authority_request_.reset();
   }
 
   void onTick() {
@@ -620,6 +751,17 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_) {
         snapshot = active_goal_;
+        if (active_execution_command_ &&
+            !gimbalStatusSatisfiesLocked(
+              active_execution_command_->yaw_authority,
+              active_execution_command_->requires_gimbal_lock,
+              active_execution_command_->gimbal_feedback_sequence,
+              active_execution_command_->gimbal_request_sequence)) {
+          active_execution_command_.reset();
+          candidate_reference_.reset();
+          planner_ready_status_.reset();
+          fail_stop_ = true;
+        }
         const auto elapsed =
             std::chrono::steady_clock::now() - active_goal_->started;
         cancel = active_goal_->cancel_requested ||
@@ -665,8 +807,20 @@ private:
               tf2::getYaw(current_pose_.pose.orientation);
           const double yaw_error =
               std::abs(std::atan2(std::sin(yaw_delta), std::cos(yaw_delta)));
-          reached = distance <= goal_position_tolerance_ &&
-                    yaw_error <= goal_yaw_tolerance_;
+          const bool pose_converged = distance <= goal_position_tolerance_ &&
+            yaw_error <= goal_yaw_tolerance_;
+          const bool velocity_converged = has_current_velocity_ &&
+            current_linear_velocity_ <= terminal_linear_velocity_tolerance_ &&
+            current_angular_velocity_ <= terminal_angular_velocity_tolerance_;
+          if (pose_converged && velocity_converged) {
+            if (!terminal_converged_since_) {
+              terminal_converged_since_ = std::chrono::steady_clock::now();
+            }
+            reached = std::chrono::steady_clock::now() - *terminal_converged_since_ >=
+              secondsToDuration(terminal_dwell_sec_);
+          } else {
+            terminal_converged_since_.reset();
+          }
         }
         publishFeedbackLocked(elapsed, distance);
       }
@@ -769,6 +923,8 @@ private:
       candidate_reference_.reset();
       planner_ready_status_.reset();
       active_execution_command_.reset();
+      pending_yaw_authority_request_.reset();
+      terminal_converged_since_.reset();
       fail_stop_ = true;
     }
     publishEmergencyStop(true);
@@ -833,6 +989,59 @@ private:
     return lease_ok &&
            localization_status_ == LocalizationStatus::STATE_TRACKING &&
            odom_tf_healthy_;
+  }
+
+  bool gimbalStatusSatisfiesLocked(
+    std::uint8_t yaw_authority, bool requires_gimbal_lock,
+    std::uint64_t minimum_feedback_sequence,
+    std::uint64_t required_request_sequence = 0) const {
+    if (!require_gimbal_status_) {
+      return true;
+    }
+    if (!gimbal_status_ || !last_gimbal_status_signal_) {
+      return false;
+    }
+    const bool lease_ok = std::chrono::steady_clock::now() - *last_gimbal_status_signal_ <=
+      secondsToDuration(gimbal_status_timeout_sec_);
+    if (!lease_ok || !gimbal_status_->tf_healthy ||
+      gimbal_status_->yaw_authority != yaw_authority ||
+      (requires_gimbal_lock && !gimbal_status_->locked) ||
+      (minimum_feedback_sequence > 0 &&
+       gimbal_status_->sequence < minimum_feedback_sequence) ||
+      (required_request_sequence > 0 &&
+       gimbal_status_->request_sequence != required_request_sequence)) {
+      return false;
+    }
+    return !pending_yaw_authority_request_ ||
+      gimbal_status_->request_sequence == pending_yaw_authority_request_->request_sequence;
+  }
+
+  void requestYawAuthorityLocked(const PlannerStatus & status) {
+    if (!require_gimbal_status_) {
+      return;
+    }
+    if (pending_yaw_authority_request_ &&
+      pending_yaw_authority_request_->goal_id == status.goal_id &&
+      pending_yaw_authority_request_->localization_epoch == status.localization_epoch &&
+      pending_yaw_authority_request_->map_generation == status.map_generation &&
+      pending_yaw_authority_request_->map_publication_sequence ==
+        status.map_publication_sequence &&
+      pending_yaw_authority_request_->yaw_authority == status.yaw_authority &&
+      pending_yaw_authority_request_->require_gimbal_lock == status.requires_gimbal_lock) {
+      return;
+    }
+    YawAuthorityRequest request;
+    request.header.stamp = now();
+    request.header.frame_id = planning_frame_;
+    request.request_sequence = ++next_yaw_authority_request_sequence_;
+    request.goal_id = status.goal_id;
+    request.localization_epoch = status.localization_epoch;
+    request.map_generation = status.map_generation;
+    request.map_publication_sequence = status.map_publication_sequence;
+    request.yaw_authority = status.yaw_authority;
+    request.require_gimbal_lock = status.requires_gimbal_lock;
+    pending_yaw_authority_request_ = request;
+    yaw_authority_request_pub_->publish(request);
   }
 
   bool normalizePose(const geometry_msgs::msg::PoseStamped &input,
@@ -980,6 +1189,8 @@ private:
   std::string reference_path_topic_;
   std::string emergency_stop_topic_;
   std::string execution_command_topic_;
+  std::string yaw_authority_request_topic_;
+  std::string gimbal_status_topic_;
   std::string map_ready_topic_;
   std::string map_status_topic_;
   std::string localization_status_topic_;
@@ -994,8 +1205,13 @@ private:
   double default_goal_timeout_sec_{120.0};
   double goal_position_tolerance_{0.08};
   double goal_yaw_tolerance_{0.15};
+  double terminal_linear_velocity_tolerance_{0.05};
+  double terminal_angular_velocity_tolerance_{0.10};
+  double terminal_dwell_sec_{0.30};
+  double gimbal_status_timeout_sec_{0.5};
   bool require_localization_status_{false};
   bool require_map_status_{true};
+  bool require_gimbal_status_{true};
 
   std::mutex mutex_;
   GoalLifecycle lifecycle_;
@@ -1004,6 +1220,8 @@ private:
   std::optional<nav_msgs::msg::Path> candidate_reference_;
   std::optional<PlannerStatus> planner_ready_status_;
   std::optional<ExecutionCommand> active_execution_command_;
+  std::optional<YawAuthorityRequest> pending_yaw_authority_request_;
+  std::optional<GimbalYawStatus> gimbal_status_;
   bool map_ready_signal_{false};
   bool map_status_ready_{false};
   bool fail_stop_{true};
@@ -1013,18 +1231,26 @@ private:
   std::uint64_t map_status_generation_{0};
   std::uint64_t map_status_publication_sequence_{0};
   std::atomic<std::uint64_t> next_execution_command_sequence_{0};
+  std::atomic<std::uint64_t> next_yaw_authority_request_sequence_{0};
   std::optional<std::chrono::steady_clock::time_point>
       last_localization_status_signal_;
+  std::optional<std::chrono::steady_clock::time_point>
+      last_gimbal_status_signal_;
+  std::optional<std::chrono::steady_clock::time_point> terminal_converged_since_;
   std::optional<std::uint64_t> localization_epoch_;
   std::uint8_t localization_status_{LocalizationStatus::STATE_UNINITIALIZED};
   geometry_msgs::msg::PoseStamped current_pose_;
   bool has_current_pose_{false};
+  double current_linear_velocity_{std::numeric_limits<double>::infinity()};
+  double current_angular_velocity_{std::numeric_limits<double>::infinity()};
+  bool has_current_velocity_{false};
   bool odom_tf_healthy_{false};
 
   rclcpp::Publisher<PlannerGoal>::SharedPtr planner_goal_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
   rclcpp::Publisher<ExecutionCommand>::SharedPtr execution_command_pub_;
+  rclcpp::Publisher<YawAuthorityRequest>::SharedPtr yaw_authority_request_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
       input_goal_sub_;
   rclcpp::Subscription<PlannerStatus>::SharedPtr planner_status_sub_;
@@ -1032,6 +1258,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::Subscription<PlanningMapStatus>::SharedPtr map_status_sub_;
   rclcpp::Subscription<LocalizationStatus>::SharedPtr localization_status_sub_;
+  rclcpp::Subscription<GimbalYawStatus>::SharedPtr gimbal_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp_action::Server<NavigateToPose>::SharedPtr action_server_;
   rclcpp::TimerBase::SharedPtr tick_timer_;

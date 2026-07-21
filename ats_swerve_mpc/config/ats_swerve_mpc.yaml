@@ -10,6 +10,9 @@ ats_swerve_mpc:
     # or revive a tracker and legacy Bool false cannot release a stop.
     execution_command_topic: /planner/execution_command
     execution_command_timeout: 0.5
+    gimbal_status_topic: /gimbal/yaw_status
+    require_gimbal_status: true
+    gimbal_status_timeout: 0.5
     # MPC 唯一速度输出；舵轮模式下由 twist_to_motion_ctrl 转成底盘控制量。
     command_topic: /cmd_vel_mpc
     # true 时立即清空 warm start 并发布零速度；设为空可关闭该输入。

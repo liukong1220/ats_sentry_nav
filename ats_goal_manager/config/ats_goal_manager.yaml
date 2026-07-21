@@ -11,6 +11,11 @@ ats_goal_manager:
     # The MPC executes only this atomic stop/execute contract.  Path and Bool
     # topics remain diagnostics and compatibility outputs.
     execution_command_topic: /planner/execution_command
+    yaw_authority_request_topic: /gimbal/yaw_authority_request
+    gimbal_status_topic: /gimbal/yaw_status
+    # BODY_YAW_FOLLOW has no implicit lock assumption: missing/stale feedback stops.
+    require_gimbal_status: true
+    gimbal_status_timeout_sec: 0.5
     map_ready_topic: /rog_map_adapter/ready
     map_status_topic: /rog_map_adapter/status
     localization_status_topic: /localization/status
@@ -31,3 +36,6 @@ ats_goal_manager:
     default_goal_timeout_sec: 120.0
     goal_position_tolerance: 0.08
     goal_yaw_tolerance: 0.15
+    terminal_linear_velocity_tolerance: 0.05
+    terminal_angular_velocity_tolerance: 0.10
+    terminal_dwell_sec: 0.30

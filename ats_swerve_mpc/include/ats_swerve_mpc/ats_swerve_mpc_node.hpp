@@ -14,6 +14,7 @@
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
+#include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
@@ -41,10 +42,14 @@ private:
   void onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message);
   void onLocalizationStatus(
       const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
-          message);
+      message);
+  void onGimbalYawStatus(
+      const ats_navigation_interfaces::msg::GimbalYawStatus::SharedPtr message);
   void onControlTimer();
   void engageFailStop();
   bool installPath(const nav_msgs::msg::Path & message);
+  bool gimbalExecutionValidLocked(
+    const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
   Se2MpcConfig loadConfig();
   TrajectoryTrackerConfig loadTrackerConfig();
   void publishCommand(const Control &command);
@@ -61,6 +66,7 @@ private:
   std::string command_topic_;
   std::string emergency_stop_topic_;
   std::string localization_status_topic_;
+  std::string gimbal_status_topic_;
   std::string frame_id_;
   double control_rate_hz_ = 20.0;
   double fallback_path_dt_ = 0.1;
@@ -71,6 +77,8 @@ private:
   double goal_yaw_tolerance_ = 0.15;
   bool publish_debug_paths_ = true;
   bool require_localization_status_ = false;
+  bool require_gimbal_status_ = false;
+  double gimbal_status_timeout_ = 0.5;
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();
@@ -91,6 +99,8 @@ private:
   std::uint64_t last_execution_command_sequence_{0};
   std::optional<ats_navigation_interfaces::msg::ExecutionCommand>
       active_execution_command_;
+  std::optional<ats_navigation_interfaces::msg::GimbalYawStatus> gimbal_status_;
+  std::optional<std::chrono::steady_clock::time_point> last_gimbal_status_signal_;
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr trajectory_sub_;
@@ -99,6 +109,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
       SharedPtr localization_status_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::GimbalYawStatus>::SharedPtr
+      gimbal_status_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predicted_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr horizon_path_pub_;

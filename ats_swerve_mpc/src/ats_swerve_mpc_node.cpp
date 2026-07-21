@@ -44,6 +44,11 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       "emergency_stop_topic", "/planner/emergency_stop");
   localization_status_topic_ = declare_parameter<std::string>(
       "localization_status_topic", "/localization/status");
+  gimbal_status_topic_ = declare_parameter<std::string>(
+      "gimbal_status_topic", "/gimbal/yaw_status");
+  require_gimbal_status_ = declare_parameter<bool>("require_gimbal_status", false);
+  gimbal_status_timeout_ = std::max(
+      0.1, declare_parameter<double>("gimbal_status_timeout", gimbal_status_timeout_));
   require_localization_status_ =
       declare_parameter<bool>("require_localization_status", false);
   frame_id_ = declare_parameter<std::string>("frame_id", "odom");
@@ -108,6 +113,17 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
         "require_localization_status=true requires a non-empty status topic");
   } else {
     localization_tracking_.store(true);
+  }
+  if (require_gimbal_status_ && gimbal_status_topic_.empty()) {
+    throw std::invalid_argument(
+        "require_gimbal_status=true requires a non-empty gimbal status topic");
+  }
+  if (!gimbal_status_topic_.empty()) {
+    gimbal_status_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::GimbalYawStatus>(
+      gimbal_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&AtsSwerveMpcNode::onGimbalYawStatus, this,
+                std::placeholders::_1));
   }
   command_pub_ = create_publisher<geometry_msgs::msg::Twist>(command_topic_,
                                                              rclcpp::QoS(10));
@@ -328,6 +344,12 @@ void AtsSwerveMpcNode::onExecutionCommand(
     } else if (message->mode !=
         ats_navigation_interfaces::msg::ExecutionCommand::MODE_EXECUTE ||
       message->goal_id == 0 || message->reference.poses.size() < 2 ||
+      message->gimbal_request_sequence == 0 ||
+      (message->yaw_authority !=
+        ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
+       message->yaw_authority !=
+        ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_BODY_YAW_FOLLOW) ||
+      !gimbalExecutionValidLocked(*message) ||
       (require_localization_status_ &&
        (!localization_tracking_.load() || !localization_epoch_ ||
         *localization_epoch_ != message->localization_epoch))) {
@@ -402,6 +424,39 @@ void AtsSwerveMpcNode::onLocalizationStatus(
   localization_tracking_.store(true);
 }
 
+void AtsSwerveMpcNode::onGimbalYawStatus(
+    const ats_navigation_interfaces::msg::GimbalYawStatus::SharedPtr message) {
+  bool stop = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    gimbal_status_ = *message;
+    last_gimbal_status_signal_ = std::chrono::steady_clock::now();
+    stop = active_execution_command_ && !gimbalExecutionValidLocked(*active_execution_command_);
+  }
+  if (stop) {
+    engageFailStop();
+  }
+}
+
+bool AtsSwerveMpcNode::gimbalExecutionValidLocked(
+  const ats_navigation_interfaces::msg::ExecutionCommand & command) const {
+  if (!require_gimbal_status_) {
+    return true;
+  }
+  if (!gimbal_status_ || !last_gimbal_status_signal_) {
+    return false;
+  }
+  const double age = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - *last_gimbal_status_signal_).count();
+  if (age > gimbal_status_timeout_ || !gimbal_status_->tf_healthy ||
+    gimbal_status_->yaw_authority != command.yaw_authority ||
+    gimbal_status_->request_sequence != command.gimbal_request_sequence ||
+    gimbal_status_->sequence < command.gimbal_feedback_sequence) {
+    return false;
+  }
+  return !command.requires_gimbal_lock || gimbal_status_->locked;
+}
+
 //核心控制循环
 void AtsSwerveMpcNode::onControlTimer() {
   // 1. 紧急停止检查
@@ -417,7 +472,8 @@ void AtsSwerveMpcNode::onControlTimer() {
         std::chrono::steady_clock::now() >= *last_execution_command_signal_ &&
         std::chrono::duration<double>(
           std::chrono::steady_clock::now() - *last_execution_command_signal_).count() <=
-          execution_command_timeout_;
+          execution_command_timeout_ && active_execution_command_ &&
+        gimbalExecutionValidLocked(*active_execution_command_);
     }
     if (!lease_valid || fail_stop_engaged_.load()) {
       engageFailStop();

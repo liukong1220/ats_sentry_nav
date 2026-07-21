@@ -11,6 +11,7 @@
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
+#include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_swerve_mpc/ats_swerve_mpc_node.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -24,6 +25,7 @@ namespace
 using namespace std::chrono_literals;
 using LocalizationStatus = ats_navigation_interfaces::msg::LocalizationStatus;
 using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
+using GimbalYawStatus = ats_navigation_interfaces::msg::GimbalYawStatus;
 
 class MpcLocalizationGateTest : public ::testing::Test
 {
@@ -54,7 +56,10 @@ protected:
         rclcpp::Parameter("command_topic", "/test_mpc_gate/cmd"),
         rclcpp::Parameter("emergency_stop_topic", "/test_mpc_gate/stop"),
         rclcpp::Parameter("localization_status_topic", "/test_mpc_gate/status"),
+        rclcpp::Parameter("gimbal_status_topic", "/test_mpc_gate/gimbal_status"),
         rclcpp::Parameter("require_localization_status", true),
+        rclcpp::Parameter("require_gimbal_status", true),
+        rclcpp::Parameter("gimbal_status_timeout", 0.1),
         rclcpp::Parameter("control_rate_hz", 50.0),
         rclcpp::Parameter("emergency_stop_timeout", 5.0),
         rclcpp::Parameter("trajectory_timeout", 2.0),
@@ -73,6 +78,8 @@ protected:
       "/test_mpc_gate/stop", rclcpp::QoS(1).reliable().transient_local());
     status_pub_ = driver_->create_publisher<LocalizationStatus>(
       "/test_mpc_gate/status", rclcpp::QoS(1).reliable().transient_local());
+    gimbal_status_pub_ = driver_->create_publisher<GimbalYawStatus>(
+      "/test_mpc_gate/gimbal_status", rclcpp::QoS(1).reliable().transient_local());
     command_sub_ = driver_->create_subscription<geometry_msgs::msg::Twist>(
       "/test_mpc_gate/cmd", 10,
       [this](const geometry_msgs::msg::Twist::SharedPtr message) {
@@ -89,7 +96,8 @@ protected:
           path_pub_->get_subscription_count() == 1 &&
           execution_pub_->get_subscription_count() == 1 &&
           stop_pub_->get_subscription_count() == 1 &&
-          status_pub_->get_subscription_count() == 1;
+          status_pub_->get_subscription_count() == 1 &&
+          gimbal_status_pub_->get_subscription_count() == 1;
         },
         2s));
   }
@@ -100,6 +108,7 @@ protected:
     executor_.remove_node(mpc_);
     command_sub_.reset();
     status_pub_.reset();
+    gimbal_status_pub_.reset();
     stop_pub_.reset();
     path_pub_.reset();
     execution_pub_.reset();
@@ -132,6 +141,20 @@ protected:
     message.child_frame_id = "gimbal_yaw_odom";
     message.pose.pose.orientation.w = 1.0;
     odom_pub_->publish(message);
+    publishGimbalStatus();
+  }
+
+  void publishGimbalStatus(bool locked = false)
+  {
+    GimbalYawStatus message;
+    message.header.stamp = driver_->now();
+    message.sequence = ++gimbal_sequence_;
+    message.request_sequence = gimbal_request_sequence_;
+    message.yaw_authority =
+      GimbalYawStatus::YAW_AUTHORITY_GIMBAL_COMPENSATED;
+    message.locked = locked;
+    message.tf_healthy = true;
+    gimbal_status_pub_->publish(message);
   }
 
   void publishStatus(std::uint8_t state, std::uint64_t epoch)
@@ -175,7 +198,8 @@ protected:
   }
 
   void publishExecutionWithSequence(
-    std::uint64_t sequence, std::uint64_t epoch, std::uint64_t map_generation)
+    std::uint64_t sequence, std::uint64_t epoch, std::uint64_t map_generation,
+    std::uint64_t gimbal_request_sequence = 0)
   {
     ExecutionCommand command;
     command.header.stamp = driver_->now();
@@ -187,6 +211,16 @@ protected:
     command.map_generation = map_generation;
     command.map_publication_sequence = 1;
     command.failure_reason = ExecutionCommand::FAILURE_NONE;
+    command.yaw_authority =
+      ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED;
+    command.requires_gimbal_lock = false;
+    command.gimbal_request_sequence = gimbal_request_sequence == 0 ?
+      gimbal_request_sequence_ : gimbal_request_sequence;
+    // The real Goal Manager serializes only a status it has already consumed.
+    // This fixture publishes status and command from one executor, so the
+    // preceding sequence is the latest one visible to the MPC callback.
+    command.gimbal_feedback_sequence =
+      gimbal_sequence_ > 0 ? gimbal_sequence_ - 1 : 0;
     const rclcpp::Time start =
       driver_->now() + rclcpp::Duration::from_seconds(0.05);
     command.reference.header.stamp = start;
@@ -223,9 +257,12 @@ protected:
   rclcpp::Publisher<ExecutionCommand>::SharedPtr execution_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
   rclcpp::Publisher<LocalizationStatus>::SharedPtr status_pub_;
+  rclcpp::Publisher<GimbalYawStatus>::SharedPtr gimbal_status_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
   std::atomic<double> command_norm_{0.0};
   std::uint64_t execution_sequence_{0};
+  std::uint64_t gimbal_sequence_{0};
+  std::uint64_t gimbal_request_sequence_{1};
 };
 
 TEST_F(
@@ -326,6 +363,48 @@ TEST_F(MpcLocalizationGateTest, RejectsOldSequenceAndOldEpochExecutionCommands) 
         return command_norm_.load() < 1e-6;
       },
       500ms));
+}
+
+TEST_F(MpcLocalizationGateTest, StopsWhenGimbalFeedbackLeaseExpires) {
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+  ASSERT_TRUE(
+    spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishExecution(1);
+        return command_norm_.load() > 0.02;
+      },
+      2s));
+
+  ASSERT_TRUE(spinUntil(
+    [this]() {return command_norm_.load() < 1e-6;}, 500ms));
+}
+
+TEST_F(MpcLocalizationGateTest, RejectsExecutionForDifferentGimbalRequest) {
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+  publishExecutionWithSequence(
+    ++execution_sequence_, 1, 1, gimbal_request_sequence_ + 1);
+  ASSERT_TRUE(
+    spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        return command_norm_.load() < 1e-6;
+      },
+      500ms));
+
+  ASSERT_TRUE(
+    spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishExecution(1);
+        return command_norm_.load() > 0.02;
+      },
+      2s));
 }
 
 } // namespace

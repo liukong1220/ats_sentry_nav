@@ -109,4 +109,41 @@ TEST(TrajectoryTracker, UsesYawToAdvanceAnInPlaceTerminalRotation)
   EXPECT_NEAR(projection.time, 12.5, 1e-9);
 }
 
+TEST(TrajectoryTracker, ConvertsWorldReferenceVelocityToBodyFrameAtNinetyDegrees)
+{
+  std::vector<ats_swerve_mpc::TimedState> trajectory(2);
+  trajectory[0].time = 0.0;
+  trajectory[0].state << 0.0, 0.0, M_PI_2;
+  trajectory[1].time = 1.0;
+  trajectory[1].state << 0.0, 1.0, M_PI_2;
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.command_latency_compensation = 0.0;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  const auto projection = tracker.project(trajectory.front().state);
+  const auto horizon = tracker.buildHorizon(projection, 1, 0.1);
+
+  ASSERT_EQ(horizon.size(), 2U);
+  EXPECT_NEAR(horizon.front().control(0), 1.0, 1e-12);
+  EXPECT_NEAR(horizon.front().control(1), 0.0, 1e-12);
+}
+
+TEST(TrajectoryTracker, UsesShortestYawRateAcrossPiWrap)
+{
+  std::vector<ats_swerve_mpc::TimedState> trajectory(2);
+  trajectory[0].time = 0.0;
+  trajectory[0].state << 0.0, 0.0, M_PI - 0.1;
+  trajectory[1].time = 1.0;
+  trajectory[1].state << 1.0, 0.0, -M_PI + 0.1;
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.command_latency_compensation = 0.0;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  const auto projection = tracker.project(trajectory.front().state);
+  const auto horizon = tracker.buildHorizon(projection, 1, 0.1);
+
+  ASSERT_EQ(horizon.size(), 2U);
+  EXPECT_NEAR(horizon.front().control(2), 0.2, 1e-12);
+}
+
 }  // namespace
