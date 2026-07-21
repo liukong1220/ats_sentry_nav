@@ -1,4 +1,4 @@
- 
+// Copyright 2026
 
 #include "fake_vel_transform/fake_vel_transform.hpp"
 
@@ -35,6 +35,8 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->get_parameter("init_spin_speed", spin_speed_);
 
   current_robot_base_angle_ = 0.0;
+  initial_robot_base_angle_ = 0.0;
+  has_initial_robot_base_angle_ = false;
 
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -74,9 +76,14 @@ void FakeVelTransform::cmdSpinCallback(const example_interfaces::msg::Float32::S
 
 void FakeVelTransform::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr & msg)
 {
+  const double yaw = tf2::getYaw(msg->pose.pose.orientation);
+  if (!has_initial_robot_base_angle_) {
+    initial_robot_base_angle_ = yaw;
+    has_initial_robot_base_angle_ = true;
+  }
   // NOTE: Haven't synced with local_plan
   if ((rclcpp::Clock().now() - last_controller_activate_time_).seconds() > CONTROLLER_TIMEOUT) {
-    current_robot_base_angle_ = tf2::getYaw(msg->pose.pose.orientation);
+    current_robot_base_angle_ = yaw;
   }
 }
 
@@ -89,11 +96,11 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     (rclcpp::Clock().now() - last_controller_activate_time_).seconds() > CONTROLLER_TIMEOUT;
   if (is_zero_vel || controller_timeout) {
     // If received velocity cannot be synchronized, publish it directly
-    auto aft_tf_vel = transformVelocity(msg, current_robot_base_angle_);
+    auto aft_tf_vel = transformVelocity(msg);
     cmd_vel_chassis_pub_->publish(aft_tf_vel);
   } else {
     // Controller active: publish current command immediately and let sync callback refine it.
-    auto aft_tf_vel = transformVelocity(msg, current_robot_base_angle_);
+    auto aft_tf_vel = transformVelocity(msg);
     cmd_vel_chassis_pub_->publish(aft_tf_vel);
     latest_cmd_vel_ = msg;
   }
@@ -119,8 +126,11 @@ void FakeVelTransform::syncCallback(
   }
 
   current_robot_base_angle_ = tf2::getYaw(odom_msg->pose.pose.orientation);
-  float yaw_diff = current_robot_base_angle_;
-  geometry_msgs::msg::Twist aft_tf_vel = transformVelocity(current_cmd_vel, yaw_diff);
+  if (!has_initial_robot_base_angle_) {
+    initial_robot_base_angle_ = current_robot_base_angle_;
+    has_initial_robot_base_angle_ = true;
+  }
+  geometry_msgs::msg::Twist aft_tf_vel = transformVelocity(current_cmd_vel);
 
   cmd_vel_chassis_pub_->publish(aft_tf_vel);
 }
@@ -132,18 +142,24 @@ void FakeVelTransform::publishTransform()
   t.header.frame_id = robot_base_frame_;
   t.child_frame_id = fake_robot_base_frame_;
   tf2::Quaternion q;
-  q.setRPY(0, 0, -current_robot_base_angle_);
+  const double initial_yaw =
+    has_initial_robot_base_angle_ ? initial_robot_base_angle_ : current_robot_base_angle_;
+  q.setRPY(0, 0, gimbalToFakeYaw(initial_yaw, current_robot_base_angle_));
   t.transform.rotation = tf2::toMsg(q);
   tf_broadcaster_->sendTransform(t);
 }
 
 geometry_msgs::msg::Twist FakeVelTransform::transformVelocity(
-  const geometry_msgs::msg::Twist::SharedPtr & twist, float yaw_diff)
+  const geometry_msgs::msg::Twist::SharedPtr & twist)
 {
   geometry_msgs::msg::Twist aft_tf_vel;
   aft_tf_vel.angular.z = twist->angular.z + spin_speed_;
-  aft_tf_vel.linear.x = twist->linear.x * cos(yaw_diff) + twist->linear.y * sin(yaw_diff);
-  aft_tf_vel.linear.y = -twist->linear.x * sin(yaw_diff) + twist->linear.y * cos(yaw_diff);
+  const double initial_yaw =
+    has_initial_robot_base_angle_ ? initial_robot_base_angle_ : current_robot_base_angle_;
+  const PlanarVelocity transformed = fakeToGimbalVelocity(
+    {twist->linear.x, twist->linear.y}, initial_yaw, current_robot_base_angle_);
+  aft_tf_vel.linear.x = transformed.x;
+  aft_tf_vel.linear.y = transformed.y;
   return aft_tf_vel;
 }
 

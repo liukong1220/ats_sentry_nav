@@ -1,4 +1,4 @@
- 
+// Copyright 2026
 
 #ifndef FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
 #define FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
@@ -8,6 +8,7 @@
 #include <string>
 
 #include "example_interfaces/msg/float32.hpp"
+#include "fake_vel_transform/fake_yaw_math.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "message_filters/subscriber.h"
 #include "message_filters/sync_policies/approximate_time.h"
@@ -33,8 +34,7 @@ private:
   void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
   void cmdSpinCallback(example_interfaces::msg::Float32::SharedPtr msg);
   void publishTransform();
-  geometry_msgs::msg::Twist transformVelocity(
-    const geometry_msgs::msg::Twist::SharedPtr & twist, float yaw_diff);
+  geometry_msgs::msg::Twist transformVelocity(const geometry_msgs::msg::Twist::SharedPtr & twist);
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<example_interfaces::msg::Float32>::SharedPtr cmd_spin_sub_;
@@ -63,6 +63,8 @@ private:
   std::mutex cmd_vel_mutex_;
   geometry_msgs::msg::Twist::SharedPtr latest_cmd_vel_;
   double current_robot_base_angle_;
+  double initial_robot_base_angle_;
+  bool has_initial_robot_base_angle_;
   rclcpp::Time last_controller_activate_time_;
 };
 

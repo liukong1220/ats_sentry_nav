@@ -37,6 +37,9 @@ rclcpp_components_register_node(${PROJECT_NAME}
 #############
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_fake_yaw_math test/test_fake_yaw_math.cpp)
+  target_include_directories(test_fake_yaw_math PRIVATE include)
 set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
 find_package(ament_lint_auto REQUIRED)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE
