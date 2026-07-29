@@ -1,3 +1,19 @@
+# [Dead Code Suggestion] 本文件在实车与仿真 profile 里都不生效，是 Point-LIO 的
+# 第二份陈旧参数源，保留仅为历史参考，未经用户授权不删除。
+#
+# 证据（P6 三.2 审计）：
+#   - 本文件的唯一引用者是 point_lio/launch/point_lio.launch.py:38 的
+#     `point_lio_cfg_dir` 默认值，而该 launch 不被任何实车/仿真入口 include；
+#   - 实车 point_lio 节点由 ats_nav_bringup/launch/localization_launch.py:174-188
+#     启动，SLAM 由 slam_launch.py:144-157 启动，两者只传 `configured_params`
+#     （对 ats_sentry_bringup/params/node_params.yaml 做 RewrittenYaml，
+#     param_rewrites 只有 use_sim_time 与 yaml_filename）外加 prior_pcd 覆盖项。
+#
+# 因此 node_params.yaml 的 `point_lio:` 段是唯一权威源。本文件与它至少 13 项数值
+# 不同（filter_size_map 0.5/0.15、ivox_nearby_type 6/18、preprocess.blind 0.5/0.3、
+# common.cut_frame_time_interval 0.1/0.05、mapping.gravity 完全不同等），
+# 任何按本文件数值做的判断都是错的。运行时生效值以 point_lio 启动日志里的
+# `[point_lio 生效参数]` 为准（src/parameters.cpp: logEffectiveParameters）。
 /**:
     ros__parameters:
         use_imu_as_input: False                             # Change to True to use IMU as input of Point-LIO
