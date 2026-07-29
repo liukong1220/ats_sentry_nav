@@ -30,6 +30,12 @@
   <exec_depend>sentry_chassis_vel_transform</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <!-- Nav2-free profile 的静态墙 /map 发布器依赖 -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>rviz2</exec_depend>
 
