@@ -65,12 +65,27 @@ Eigen::VectorXd allocateDurations(
   return durations;
 }
 
+/**
+ * @brief 用给定航点与段时长求解一条 MINCO S3（jerk 级五次分段）轨迹。
+ * @param waypoints    航点序列，首尾为边界位置，中间为内部约束点。
+ * @param durations    每段时长 [s]，长度必须为 waypoints.size()-1。
+ * @param head_state   首端边界条件 2x3 = [位置 | 速度 | 加速度]（世界系）。
+ *                     速度/加速度非零即为"带初速重规划"，让新轨迹从当前运动状态起接。
+ * @param minco        输出：求解后的分段多项式。
+ * @return true=带状 LU 分解与回代成功且系数全为有限值。
+ * @note 由 optimize 与 refineWaypointsWithEsdf 的每轮迭代调用。
+ *       数学上首端三行直接就是多项式在 t=0 处的 0/1/2 阶导数：
+ *       \f$ p(0)=c_0,\ \dot p(0)=c_1,\ \ddot p(0)=2c_2 \f$，
+ *       所以 head.col(1)/col(2) 会分别成为方程右端第 1、2 行。
+ *       尾端仍锁为零速零加速度：目标点必须停稳（安全要求，不随重规划放开）。
+ */
 bool solveMinco(
   const std::vector<Point> & waypoints,
   const Eigen::VectorXd & durations,
-  MincoS3 & minco)
+  MincoS3 & minco,
+  const Eigen::Matrix<double, 2, 3> & head_state)
 {
-  Eigen::Matrix<double, 2, 3> head = Eigen::Matrix<double, 2, 3>::Zero();
+  Eigen::Matrix<double, 2, 3> head = head_state;
   Eigen::Matrix<double, 2, 3> tail = Eigen::Matrix<double, 2, 3>::Zero();
   head.col(0) = waypoints.front();
   tail.col(0) = waypoints.back();
@@ -108,6 +123,42 @@ Point limitNorm(const Point & value, double maximum_norm)
     return value * (maximum_norm / norm);
   }
   return value;
+}
+
+/**
+ * @brief 把可选的重规划初值裁剪成 MINCO 首端边界矩阵。
+ * @param initial_state 可为空；空或 valid=false 时返回全零（等价于原静止假设）。
+ * @param params        提供 initial_state_max_speed / max_acceleration 两个保护上限。
+ * @return 2x3 首端边界 [位置 | 速度 | 加速度]，位置列留零由 solveMinco 覆盖。
+ * @note 每次 optimize 入口调用一次。裁剪原因：定位/里程计的速度存在噪声与外推
+ *       误差，非有限值或异常大的值会让首段多项式直接冲出速度可行域，
+ *       进而被时间缩放整体拉长（表现为"重规划后全程变慢"）。
+ */
+Eigen::Matrix<double, 2, 3> makeHeadState(
+  const InitialKinematicState * initial_state,
+  const MincoTrajectoryOptimizerParams & params)
+{
+  Eigen::Matrix<double, 2, 3> head = Eigen::Matrix<double, 2, 3>::Zero();
+  if (initial_state == nullptr || !initial_state->valid) {
+    return head;
+  }
+  if (!initial_state->velocity.allFinite() || !initial_state->acceleration.allFinite()) {
+    return head;
+  }
+  // 播种量同时受"初值保护上限"和"轨迹动力学上限"约束：若首端速度本身就超过
+  // max_velocity，时间缩放永远无法把峰值压回可行域（缩放不改变边界条件），
+  // 结果是白白把整条轨迹拉长 max_time_scaling_iterations 次。
+  double speed_limit = std::max(0.0, params.initial_state_max_speed);
+  if (params.max_velocity > 0.0) {
+    speed_limit = std::min(speed_limit, params.max_velocity);
+  }
+  double acceleration_limit = std::max(0.0, params.initial_state_max_acceleration);
+  if (params.max_acceleration > 0.0) {
+    acceleration_limit = std::min(acceleration_limit, params.max_acceleration);
+  }
+  head.col(1) = limitNorm(initial_state->velocity, speed_limit);
+  head.col(2) = limitNorm(initial_state->acceleration, acceleration_limit);
+  return head;
 }
 
 double normalizeAngle(double angle)
@@ -178,7 +229,8 @@ std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
   const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
-  const ReferenceTrajectory * footprint_orientation)
+  const ReferenceTrajectory * footprint_orientation,
+  const Eigen::Matrix<double, 2, 3> & head_state)
 {
   if (!params.esdf_obstacle_optimization_enabled || !esdf || !esdf->available()) {
     return input_waypoints;
@@ -213,7 +265,9 @@ std::vector<Point> refineWaypointsWithEsdf(
     const Eigen::VectorXd durations = allocateDurations(
       waypoints, reference_speed, std::max(0.01, params.min_segment_time));
     MincoS3 minco;
-    if (!solveMinco(waypoints, durations, minco)) {
+    // 净空修正必须在与最终轨迹相同的首端边界下评估：带初速时首段形状会外扩，
+    // 若这里仍按零初速求解，修正量就落在一条实际不会被执行的曲线上。
+    if (!solveMinco(waypoints, durations, minco, head_state)) {
       break;
     }
     const double total_duration = std::max(1e-6, durations.sum());
@@ -326,7 +380,8 @@ bool MincoTrajectoryOptimizer::esdfFootprintOptimizationEnabled() const
 ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const nav_msgs::msg::Path & raw_path,
   const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
-  const ReferenceTrajectory * footprint_orientation) const
+  const ReferenceTrajectory * footprint_orientation,
+  const InitialKinematicState * initial_state) const
 {
   ReferenceTrajectory trajectory;
   trajectory.header = raw_path.header;
@@ -344,11 +399,13 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
 
   const double reference_speed = std::max(0.05, params_.reference_speed);
   const double sample_spacing = std::max(0.02, params_.sample_spacing);
-  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation);
+  const Eigen::Matrix<double, 2, 3> head_state = makeHeadState(initial_state, params_);
+  waypoints = refineWaypointsWithEsdf(
+    waypoints, params_, esdf, footprint_orientation, head_state);
   Eigen::VectorXd durations = allocateDurations(
     waypoints, reference_speed, std::max(0.01, params_.min_segment_time));
   MincoS3 minco;
-  if (!solveMinco(waypoints, durations, minco)) {
+  if (!solveMinco(waypoints, durations, minco, head_state)) {
     return trajectory;
   }
 
@@ -375,7 +432,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       scale = std::max(scale, std::sqrt(peak_acceleration / params_.max_acceleration));
     }
     durations *= scale;
-    if (!solveMinco(waypoints, durations, minco)) {
+    if (!solveMinco(waypoints, durations, minco, head_state)) {
       trajectory.points.clear();
       return trajectory;
     }

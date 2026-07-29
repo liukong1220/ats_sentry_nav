@@ -72,7 +72,22 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       declare_parameter<double>("goal_yaw_tolerance", goal_yaw_tolerance_);
   publish_debug_paths_ =
       declare_parameter<bool>("publish_debug_paths", publish_debug_paths_);
-  controller_ = std::make_unique<Se2MpcController>(loadConfig());
+  // 里程计健康监测阈值：超时判定定位链路中断，跳变判定重定位/漂移突变。
+  odometry_timeout_ =
+      std::max(0.02, declare_parameter<double>("odometry_timeout",
+                                               odometry_timeout_));
+  odometry_jump_position_ = std::max(
+      0.05, declare_parameter<double>("odometry_jump_position",
+                                      odometry_jump_position_));
+  odometry_jump_yaw_ = std::max(
+      0.05, declare_parameter<double>("odometry_jump_yaw", odometry_jump_yaw_));
+  solve_time_warn_ratio_ = std::clamp(
+      declare_parameter<double>("solve_time_warn_ratio",
+                                solve_time_warn_ratio_),
+      0.1, 1.0);
+  const Se2MpcConfig mpc_config = loadConfig();
+  validateDynamicsParameters(mpc_config);
+  controller_ = std::make_unique<Se2MpcController>(mpc_config);
   trajectory_tracker_.setConfig(loadTrackerConfig());
 
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -136,11 +151,11 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       std::bind(&AtsSwerveMpcNode::onControlTimer, this));
   publishCommand(Control::Zero());
   RCLCPP_INFO(get_logger(),
-              "ATS swerve MPC ready: odom='%s' trajectory='%s' command='%s' "
-              "horizon=%d dt=%.3f",
+              "【启动就绪】四舵轮 MPC 已启动：里程计='%s' 参考轨迹='%s' "
+              "指令输出='%s' 预测步数=%d 步长=%.3f s 控制频率=%.1f Hz",
               odom_topic_.c_str(), trajectory_topic_.c_str(),
               command_topic_.c_str(), controller_->config().horizon,
-              controller_->config().dt);
+              controller_->config().dt, control_rate_hz_);
 }
 
 // 加载 MPC 控制器参数
@@ -193,10 +208,14 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
       declare_parameter<double>("max_steer_rate", conservative_steer_rate);
   RCLCPP_INFO(
       get_logger(),
-      "Swerve limits: wheel raw=%.3fm/s conservative=%.3fm/s configured=%.3fm/s; "
-      "steer raw=%.3frad/s conservative=%.3frad/s configured=%.3frad/s",
-      raw_wheel_speed, conservative_wheel_speed, config.max_wheel_speed,
-      raw_steer_rate, conservative_steer_rate, config.max_steer_rate);
+      "【动力学参数】驱动轮：轮径 %.4f m、电机上限 %.0f rpm、减速比 %.2f → "
+      "理论轮速 %.3f m/s，按冗余系数 %.2f 降额 %.3f m/s，最终生效 %.3f m/s；"
+      "转向：电机上限 %.0f rpm、减速比 %.2f → 理论 %.3f rad/s，"
+      "降额 %.3f rad/s，最终生效 %.3f rad/s。",
+      wheel_radius, motor_max_rpm, drive_gear_ratio, raw_wheel_speed,
+      actuator_redundancy, conservative_wheel_speed, config.max_wheel_speed,
+      steer_max_rpm, steer_gear_ratio, raw_steer_rate, conservative_steer_rate,
+      config.max_steer_rate);
   config.max_iterations =
       declare_parameter<int>("max_iterations", config.max_iterations);
   config.regularization =
@@ -228,14 +247,87 @@ TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
   return config;
 }
 
-//里程计更新
+/**
+ * @brief 里程计（Point-LIO 定位输出）回调：刷新世界系状态并做数据异常检测。
+ * @param message /localization 上的 nav_msgs::msg::Odometry。
+ * @note 由 ROS 执行器在每帧定位到达时调用（SensorDataQoS，约 50~100 Hz）。
+ *       除位姿本身外，这里额外记录消息时间戳与本地接收时刻，
+ *       控制周期据此判断"定位超时"和"定位跳变"——实车上定位丢失往往先表现为
+ *       里程计停更或位姿瞬跳，若不检测会让 MPC 用过期状态继续输出速度。
+ */
 void AtsSwerveMpcNode::onOdometry(
     const nav_msgs::msg::Odometry::SharedPtr message) {
+  State incoming;
+  incoming(0) = message->pose.pose.position.x;
+  incoming(1) = message->pose.pose.position.y;
+  incoming(2) = tf2::getYaw(message->pose.pose.orientation);
+  if (!incoming.allFinite()) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                          "【传感器异常】里程计位姿包含 NaN/Inf，已丢弃该帧："
+                          "话题 '%s'，请检查定位节点输出。",
+                          odom_topic_.c_str());
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    has_odometry_ = false;
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(state_mutex_);
-  current_state_(0) = message->pose.pose.position.x;
-  current_state_(1) = message->pose.pose.position.y;
-  current_state_(2) = tf2::getYaw(message->pose.pose.orientation);
-  has_odometry_ = current_state_.allFinite();
+  // 位姿跳变检测：与上一帧比较，超过阈值说明定位发生重定位或漂移突变。
+  if (previous_odometry_state_) {
+    const double position_jump =
+        (incoming.head<2>() - previous_odometry_state_->head<2>()).norm();
+    const double yaw_jump =
+        std::abs(normalizeAngle(incoming(2) - (*previous_odometry_state_)(2)));
+    if (position_jump > odometry_jump_position_ ||
+        yaw_jump > odometry_jump_yaw_) {
+      odometry_jump_detected_ = true;
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 500,
+          "【定位跳变】里程计单帧位姿跳变过大：位置 %.3f m（阈值 %.3f），"
+          "航向 %.3f rad（阈值 %.3f）；本周期将输出零速度以防失控。",
+          position_jump, odometry_jump_position_, yaw_jump, odometry_jump_yaw_);
+    }
+  }
+  previous_odometry_state_ = incoming;
+  current_state_ = incoming;
+  last_odometry_stamp_ = rclcpp::Time(message->header.stamp);
+  last_odometry_signal_ = std::chrono::steady_clock::now();
+  has_odometry_ = true;
+}
+
+/**
+ * @brief 校验里程计可用性（是否收到、是否超时、是否刚发生跳变）。
+ * @param current 输出参数：可用时写入当前世界系状态 [x, y, yaw]。
+ * @return true=状态可用于本周期 MPC 求解；false=必须走零速度兜底。
+ * @note 每个控制周期在求解前调用一次。
+ */
+bool AtsSwerveMpcNode::odometryUsable(State &current) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!has_odometry_ || !last_odometry_signal_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                         "【通信超时】尚未收到里程计话题 '%s' 的有效数据，"
+                         "MPC 保持零速度等待定位。",
+                         odom_topic_.c_str());
+    return false;
+  }
+  const double age = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() -
+                         *last_odometry_signal_)
+                         .count();
+  if (age > odometry_timeout_) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
+                          "【传感器超时】里程计已 %.3f s 未更新（阈值 %.3f s），"
+                          "疑似定位/LiDAR 链路中断，输出零速度。",
+                          age, odometry_timeout_);
+    return false;
+  }
+  if (odometry_jump_detected_) {
+    // 跳变只封锁一个周期，随后由新帧重新建立连续性。
+    odometry_jump_detected_ = false;
+    return false;
+  }
+  current = current_state_;
+  return true;
 }
 
 // Legacy Path remains available for Nav2 comparison only.  P4 execution must
@@ -484,14 +576,11 @@ void AtsSwerveMpcNode::onControlTimer() {
     engageFailStop();
     return;
   }
-  // 2. 获取当前状态
-  State current;
-  {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (!has_odometry_) {
-      return;
-    }
-    current = current_state_;
+  // 2. 获取当前状态（不可用时必须输出确定性零速度，不能静默 return）
+  State current = State::Zero();
+  if (!odometryUsable(current)) {
+    publishZeroCommandForFailure("里程计不可用");
+    return;
   }
   // 3. 获取目标、投影、参考序列
   State goal = State::Zero();
@@ -501,6 +590,13 @@ void AtsSwerveMpcNode::onControlTimer() {
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     if (trajectory_tracker_.empty()) {
+      // 无参考轨迹同样属于失败兜底路径：必须持续发布零速度，
+      // 否则底盘会保持上一条 Twist 一直滑行（实车失控的直接来源）。
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "【通信超时】尚未收到有效参考轨迹（话题 '%s'），"
+                           "MPC 保持零速度。",
+                           trajectory_topic_.c_str());
+      publishZeroCommandForFailure(nullptr);
       return;
     }
     goal = trajectory_tracker_.goal();
@@ -517,32 +613,42 @@ void AtsSwerveMpcNode::onControlTimer() {
   if ((goal_position_error <= goal_position_tolerance_ &&
        goal_yaw_error <= goal_yaw_tolerance_) ||
       trajectory_expired) {
-    last_control_.setZero();
-    publishCommand(last_control_);
-    controller_->reset();
+    if (trajectory_expired) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                           "【轨迹过期】参考轨迹已超过有效期，停止跟踪并输出零速度；"
+                           "请检查规划器发布频率与时间戳同步。");
+    }
+    publishZeroCommandForFailure(nullptr);
     return;
   }
   // 5. 检查参考序列长度
   if (references.size() <
       static_cast<std::size_t>(controller_->config().horizon + 1)) {
-    last_control_.setZero();
-    publishCommand(last_control_);
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "【规划失败】参考序列长度 %zu 不足预测时域所需 %d 点，输出零速度。",
+        references.size(),
+        static_cast<int>(controller_->config().horizon + 1));
+    publishZeroCommandForFailure(nullptr);
     return;
   }
   // 6. 调用 MPC 求解
   const Se2MpcResult result =
       controller_->solve(current, references, last_control_);
   if (!result.success || result.controls.empty()) {
-    last_control_.setZero();
-    publishCommand(last_control_);
-    controller_->reset();
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                         "SE2 MPC solve failed.");
+    RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "【MPC求解失败】iLQR 未获得可信解：迭代 %d 次、被接受 %d 次、代价 %.4f、"
+        "耗时 %.2f ms、横向误差 %.3f m；已切换零速度兜底并复位控制器。",
+        result.iterations, result.accepted_iterations, result.cost,
+        result.solve_time_ms, projection.cross_track_error);
+    publishZeroCommandForFailure(nullptr);
     return;
   }
   // 7. 应用第一个控制量并发布
   last_control_ = result.controls.front();
   publishCommand(last_control_);
+  reportSolverDiagnostics(result);
   // 8. 发布调试路径
   if (publish_debug_paths_) {
     publishPath(result.states, predicted_path_pub_);
@@ -561,6 +667,127 @@ void AtsSwerveMpcNode::onControlTimer() {
                projection.cross_track_error,
                trajectory_tracker_.progressScale(projection.cross_track_error),
                result.cost, result.solve_time_ms);
+}
+
+/**
+ * @brief 所有非紧急停止的失败/退出路径统一出口：发布确定性零速度。
+ * @param reason_zh 可选的中文原因短语；为 nullptr 时不额外打印（调用处已打印）。
+ * @note 每个控制周期最多调用一次。零速度必须"持续发布"而非只发一次，
+ *       因为下游底盘固件按最新 Twist 执行，停止发布等于让上一条速度一直生效。
+ */
+void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
+  last_control_.setZero();
+  publishCommand(last_control_);
+  controller_->reset();
+  if (reason_zh != nullptr) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "【控制兜底】%s，已输出确定性零速度。", reason_zh);
+  }
+}
+
+/**
+ * @brief 校验动力学参数是否处于实车合理区间。
+ * @param config 已加载的 MPC 配置。
+ * @note 节点构造期调用一次。参数越界在仿真里往往看不出问题，
+ *       但实车会直接表现为超速、舵轮堵转或约束整体失效，因此必须显式告警。
+ */
+void AtsSwerveMpcNode::validateDynamicsParameters(
+    const Se2MpcConfig &config) {
+  if (config.dt <= 0.0 || config.horizon <= 0) {
+    RCLCPP_ERROR(get_logger(),
+                 "【动力学参数越界】dt=%.4f s、horizon=%d 非法，MPC 无法求解。",
+                 config.dt, config.horizon);
+  }
+  const double control_period = 1.0 / std::max(1.0, control_rate_hz_);
+  if (std::abs(config.dt - control_period) > 0.2 * control_period) {
+    RCLCPP_WARN(
+        get_logger(),
+        "【动力学参数不匹配】预测步长 dt=%.4f s 与控制周期 %.4f s（%.1f Hz）"
+        "偏差超过 20%%，预测时间轴与实际执行时间轴错位，跟踪会出现系统性滞后。",
+        config.dt, control_period, control_rate_hz_);
+  }
+  if (config.wheel_base_x <= 0.0 || config.wheel_base_y <= 0.0) {
+    RCLCPP_ERROR(get_logger(),
+                 "【动力学参数越界】轮心半轴偏置 wheel_base_x=%.3f m、"
+                 "wheel_base_y=%.3f m 必须为正值（实车约 0.270 m）；"
+                 "当前配置下四舵轮模块级约束退化，仅车体平移限幅生效。",
+                 config.wheel_base_x, config.wheel_base_y);
+  }
+  if (config.max_wheel_speed <= 1e-6) {
+    RCLCPP_ERROR(get_logger(),
+                 "【动力学参数越界】单轮最大线速度 max_wheel_speed=%.3f m/s 未配置，"
+                 "轮速上限约束完全失效，实车存在超速风险。",
+                 config.max_wheel_speed);
+  } else {
+    // 全向底盘同时平移与自转时，单轮速度上界为 hypot(v, wz*R)，
+    // 其中 R=hypot(wheel_base_x, wheel_base_y) 为轮心到底盘中心的距离。
+    const double corner_radius =
+        std::hypot(std::max(0.0, config.wheel_base_x),
+                   std::max(0.0, config.wheel_base_y));
+    const double worst_case =
+        std::hypot(std::hypot(config.max_vx, config.max_vy),
+                   config.max_wz * corner_radius);
+    if (worst_case > config.max_wheel_speed * 1.5) {
+      RCLCPP_WARN(get_logger(),
+                  "【动力学参数不一致】车体速度上限组合出的最坏单轮速度 %.3f m/s "
+                  "已达单轮上限 %.3f m/s 的 %.2f 倍，MPC 会长期工作在轮速饱和区，"
+                  "建议下调 max_vx/max_vy/max_wz。",
+                  worst_case, config.max_wheel_speed,
+                  worst_case / config.max_wheel_speed);
+    }
+  }
+  if (config.max_steer_rate <= 1e-6) {
+    RCLCPP_WARN(get_logger(),
+                "【动力学参数越界】舵轮最大转向角速度 max_steer_rate=%.3f rad/s "
+                "未配置，舵角速率约束失效，急转向时可能要求舵轮瞬间掉头。",
+                config.max_steer_rate);
+  }
+  if (config.max_wheel_acceleration <= 1e-6) {
+    RCLCPP_WARN(get_logger(),
+                "【动力学参数越界】单轮最大线加速度 max_wheel_acceleration=%.3f "
+                "m/s^2 未配置，轮端加速度约束失效。",
+                config.max_wheel_acceleration);
+  }
+}
+
+/**
+ * @brief 输出求解饱和与实时性诊断日志。
+ * @param result 本周期 MPC 求解结果。
+ * @note 每个成功周期调用一次，全部使用 THROTTLE 避免刷屏。
+ */
+void AtsSwerveMpcNode::reportSolverDiagnostics(const Se2MpcResult &result) {
+  if (!result.module_limits_active) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+                          "【动力学参数越界】四舵轮模块级约束未生效"
+                          "（wheel_base_* 或 max_wheel_speed 缺失），"
+                          "当前仅车体级限幅在保护实车，请立即检查参数文件。");
+  }
+  if (result.wheel_limit_saturated) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                         "【控制饱和】单轮速度触及上限 %.3f m/s，指令已整体等比缩放；"
+                         "跟踪精度会下降，检查参考速度是否超出底盘能力。",
+                         controller_->config().max_wheel_speed);
+  } else if (result.body_limit_saturated) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "【控制饱和】车体速度指令触及 vx/vy/wz 上限"
+                         "（%.2f/%.2f/%.2f），已限幅输出。",
+                         controller_->config().max_vx,
+                         controller_->config().max_vy,
+                         controller_->config().max_wz);
+  }
+  if (result.increment_limited) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "【控制饱和】舵角速率/轮加速度约束触发增量回退，"
+                         "本周期实际指令小于 MPC 期望值。");
+  }
+  const double control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
+  if (result.solve_time_ms > solve_time_warn_ratio_ * control_period_ms) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                         "【实时性告警】MPC 求解耗时 %.2f ms，已占控制周期 %.2f ms 的 "
+                         "%.0f%%，接近超时会导致控制周期抖动。",
+                         result.solve_time_ms, control_period_ms,
+                         100.0 * result.solve_time_ms / control_period_ms);
+  }
 }
 
 //执行紧急停止

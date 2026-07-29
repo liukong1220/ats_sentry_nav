@@ -69,24 +69,57 @@ void Se2MpcController::jacobians(const State &state, const Control &control,
   control_jacobian(2, 2) = config_.dt;
 }
 
-//将控制输入限制在最大速度和加速度范围内，避免过快或过大控制指令
-Control Se2MpcController::clampControl(const Control &control) const {
+/**
+ * @brief 四舵轮模块级约束是否完全生效。
+ * @return true=半轴偏置与单轮速度上限均已配置；false=配置缺失，仅车体级限幅可用。
+ * @note 由控制节点在参数加载后与运行期调用，用于输出实车高危配置告警。
+ */
+bool Se2MpcController::moduleLimitsActive() const {
+  return config_.wheel_base_x > 0.0 && config_.wheel_base_y > 0.0 &&
+         config_.max_wheel_speed > 1e-6;
+}
+
+/**
+ * @brief 将车体控制量限制在速度与单轮速度边界内。
+ * @param control 待限幅的车体系控制 [vx, vy, wz]。
+ * @param report  可选输出：记录本次是否触及车体级/轮级上限，供饱和日志使用。
+ * @return 限幅后的控制量。
+ * @note 每个控制周期在 clampIncrement 与 solve 内被反复调用。
+ *       轮级限幅采用整体等比缩放，保证四轮速度向量仍来自同一车体 Twist，
+ *       否则会破坏舵轮的瞬心一致性（实车表现为轮胎互相拖拽、打滑）。
+ */
+Control Se2MpcController::clampControl(const Control &control,
+                                       SaturationReport *report) const {
   Control clamped = control;
   clamped(0) = std::clamp(clamped(0), -config_.max_vx, config_.max_vx);
   clamped(1) = std::clamp(clamped(1), -config_.max_vy, config_.max_vy);
   clamped(2) = std::clamp(clamped(2), -config_.max_wz, config_.max_wz);
+  if (report != nullptr &&
+      ((clamped - control).lpNorm<Eigen::Infinity>() > 1e-9)) {
+    report->body = true;
+  }
   const double module_speed = maxModuleSpeed(clamped);
   if (config_.max_wheel_speed > 1e-6 &&
       module_speed > config_.max_wheel_speed) {
     clamped *= config_.max_wheel_speed / module_speed;
+    if (report != nullptr) {
+      report->wheel = true;
+    }
   }
   return clamped;
 }
 
+/**
+ * @brief 计算给定车体控制下四个舵轮模块中的最大轮速。
+ * @param control 车体系控制 [vx, vy, wz]。
+ * @return 四轮线速度模长的最大值 [m/s]。
+ * @note 数学关系：v_i = [vx - wz*y_i, vy + wz*x_i]，其中 (x_i, y_i) 为轮心相对
+ *       底盘中心的位置。半轴偏置未配置（<=0）时按 0 处理，四轮退化为车体平移速度，
+ *       此时函数返回 hypot(vx, vy)，仍能让单轮速度上限约束住平移分量。
+ *       此前实现直接返回 0.0，会让 clampControl 的轮速判据永远不成立，
+ *       等于把执行器边界整体关闭——属于"仿真通过实车超速"的典型来源。
+ */
 double Se2MpcController::maxModuleSpeed(const Control &control) const {
-  if (config_.wheel_base_x <= 0.0 || config_.wheel_base_y <= 0.0) {
-    return 0.0;
-  }
   double maximum = 0.0;
   for (const auto &velocity : moduleVelocities(control)) {
     maximum = std::max(maximum, velocity.norm());
@@ -112,6 +145,17 @@ Se2MpcController::moduleVelocities(const Control &control) const {
   return velocities;
 }
 
+/**
+ * @brief 判断候选控制相对上一控制是否满足四舵轮执行器增量约束。
+ * @param candidate 候选车体控制 [vx, vy, wz]。
+ * @param previous  上一周期实际下发的车体控制。
+ * @return true=四个模块的轮速、轮加速度、舵角速率都在一个 dt 内可达。
+ * @note 由 clampIncrement 的二分线搜索反复调用。
+ *       舵角变化量取两次轮速向量的真实夹角
+ *       \f$ \Delta\theta = \arccos\frac{v_k \cdot v_{k-1}}{\|v_k\|\|v_{k-1}\|} \f$，
+ *       不能对点积取绝对值：取绝对值会把 180° 反向翻转判成 0° 变化，
+ *       实车表现为舵轮被要求瞬间掉头，转向电机堵转或底盘被硬拽。
+ */
 bool Se2MpcController::moduleIncrementFeasible(
     const Control &candidate, const Control &previous) const {
   const auto candidate_velocities = moduleVelocities(candidate);
@@ -132,10 +176,11 @@ bool Se2MpcController::moduleIncrementFeasible(
     }
     if (config_.max_steer_rate > 1e-6 && candidate_speed > 1e-4 &&
         previous_speed > 1e-4) {
+      // 取带符号点积并归一到 [-1, 1]，使反向翻转得到 pi 的真实舵角变化量。
       const double cosine = std::clamp(
-          std::abs(candidate_velocities[index].dot(previous_velocities[index])) /
+          candidate_velocities[index].dot(previous_velocities[index]) /
               (candidate_speed * previous_speed),
-          0.0, 1.0);
+          -1.0, 1.0);
       if (std::acos(cosine) > max_steer_delta + 1e-9) {
         return false;
       }
@@ -144,9 +189,21 @@ bool Se2MpcController::moduleIncrementFeasible(
   return true;
 }
 
-//将控制增量限制在最大加速度范围内，避免每个 dt 内的速度变化过大
+/**
+ * @brief 将控制增量限制在车体加速度与四舵轮执行器可达范围内。
+ * @param target            期望的车体控制 [vx, vy, wz]。
+ * @param previous          上一周期实际下发的车体控制。
+ * @param report            可选输出：车体级/轮级速度限幅是否命中。
+ * @param increment_limited 可选输出：是否因模块增量不可达而被线搜索回退。
+ * @return 一个 dt 内实车可达的车体控制。
+ * @note 每步预测与每次线搜索都会调用。先按车体加速度上限裁剪 Δv，再做速度限幅；
+ *       若模块级增量仍不可达，则在 previous→limited 线段上做 40 次二分，
+ *       取最大可行比例，保证四轮速度向量始终来自同一车体 Twist。
+ */
 Control Se2MpcController::clampIncrement(const Control &target,
-                                         const Control &previous) const {
+                                         const Control &previous,
+                                         SaturationReport *report,
+                                         bool *increment_limited) const {
   const Control max_delta(config_.max_ax * config_.dt,
                           config_.max_ay * config_.dt,
                           config_.max_awz * config_.dt);
@@ -155,9 +212,12 @@ Control Se2MpcController::clampIncrement(const Control &target,
   for (int axis = 0; axis < 3; ++axis) {
     delta(axis) = std::clamp(delta(axis), -max_delta(axis), max_delta(axis));
   }
-  const Control limited = clampControl(previous + delta);
+  const Control limited = clampControl(previous + delta, report);
   if (moduleIncrementFeasible(limited, previous)) {
     return limited;
+  }
+  if (increment_limited != nullptr) {
+    *increment_limited = true;
   }
 
   // 沿上一控制到候选控制做保守线搜索，保持四轮速度向量来自同一车体 Twist。
@@ -172,7 +232,7 @@ Control Se2MpcController::clampIncrement(const Control &target,
       infeasible_scale = scale;
     }
   }
-  return clampControl(previous + feasible_scale * (limited - previous));
+  return clampControl(previous + feasible_scale * (limited - previous), report);
 }
 
 //根据初始状态和控制序列，沿离散时间动力学模型前向滚动计算状态序列
@@ -237,8 +297,12 @@ void Se2MpcController::initializeControls(
             ? 0.7 * warm_controls_[static_cast<std::size_t>(step)] +
                   0.3 * references[static_cast<std::size_t>(step)].control
             : references[static_cast<std::size_t>(step)].control;
+    // 仅第 0 步是本周期真正下发的控制，记录其限幅命中情况用于饱和诊断。
+    SaturationReport *report = step == 0 ? &first_step_saturation_ : nullptr;
+    bool *increment_limited =
+        step == 0 ? &first_step_increment_limited_ : nullptr;
     warm_controls_[static_cast<std::size_t>(step)] =
-        clampIncrement(seed, previous);
+        clampIncrement(seed, previous, report, increment_limited);
     previous = warm_controls_[static_cast<std::size_t>(step)];
   }
   has_warm_start_ = true;
@@ -320,17 +384,27 @@ Se2MpcController::solve(const State &current_state,
       references.size() < static_cast<std::size_t>(config_.horizon + 1)) {
     return result;
   }
+  first_step_saturation_ = SaturationReport{};
+  first_step_increment_limited_ = false;
   initializeControls(references, last_control);
   std::vector<Control> controls = warm_controls_;
   std::vector<State> states = rollout(current_state, controls);
   double current_cost = cost(states, controls, references, last_control);
 
+  // 解的数值可信凭据：至少完成一次成功的反向递推（Q_uu 可分解、增益有限）。
+  // 不能把"有迭代被线搜索接受"当作成功的必要条件——在速度/轮速/舵角速率约束
+  // 激活时，限幅会把所有候选压回当前序列，代价自然无法下降，但当前序列仍是
+  // 约束集内可执行的最优解。此前只校验序列长度的实现则相反：反向递推奇异
+  // （Q_uu 不可分解或增益出现 NaN）时仍判成功，等于把上一周期的暖启动序列
+  // 当作本周期解持续下发，实车表现为"MPC 看似正常但控制已失去反馈"。
+  bool solution_certified = false;
   for (int iteration = 0; iteration < config_.max_iterations; ++iteration) {
     const BackwardResult backward =
         backwardPass(states, controls, references, last_control);
     if (!backward.success) {
       break;
     }
+    solution_certified = true;
     double max_update = 0.0;
     for (const auto &update : backward.feedforward) {
       max_update = std::max(max_update, update.lpNorm<Eigen::Infinity>());
@@ -345,14 +419,19 @@ Se2MpcController::solve(const State &current_state,
       candidate_states.reserve(static_cast<std::size_t>(config_.horizon + 1));
       candidate_states.push_back(current_state);
       Control previous = last_control;
+      SaturationReport candidate_saturation;
+      bool candidate_increment_limited = false;
       for (int step = 0; step < config_.horizon; ++step) {
         const std::size_t index = static_cast<std::size_t>(step);
         const State error =
             stateDifference(candidate_states.back(), states[index]);
         const Control update = alpha * backward.feedforward[index] +
                                backward.feedback[index] * error;
-        candidate_controls[index] =
-            clampIncrement(controls[index] + update, previous);
+        // 只有第 0 步会被真正下发，其限幅命中情况才有实车诊断意义。
+        candidate_controls[index] = clampIncrement(
+            controls[index] + update, previous,
+            step == 0 ? &candidate_saturation : nullptr,
+            step == 0 ? &candidate_increment_limited : nullptr);
         candidate_states.push_back(
             dynamics(candidate_states.back(), candidate_controls[index]));
         previous = candidate_controls[index];
@@ -363,24 +442,44 @@ Se2MpcController::solve(const State &current_state,
         controls = std::move(candidate_controls);
         states = std::move(candidate_states);
         current_cost = candidate_cost;
+        // 该候选被采纳，其首步限幅记录即本周期下发控制的饱和状态。
+        first_step_saturation_ = candidate_saturation;
+        first_step_increment_limited_ = candidate_increment_limited;
         accepted = true;
         break;
       }
     }
     result.iterations = iteration + 1;
-    if (!accepted || max_update < config_.convergence_tolerance) {
+    if (accepted) {
+      ++result.accepted_iterations;
+    }
+    if (max_update < config_.convergence_tolerance) {
+      // 已处于驻点：暖启动序列本身就是当前时域的最优解。
+      break;
+    }
+    if (!accepted) {
       break;
     }
   }
+
+  // 首步饱和标志来自前向生成过程（暖启动或被采纳的线搜索候选）；
+  // 不能在此处对 controls.front() 再限幅一次取标志——它已经是限幅后的值，
+  // 再限幅恒为恒等映射，命中标志永远为 false。
+  result.body_limit_saturated = first_step_saturation_.body;
+  result.wheel_limit_saturated = first_step_saturation_.wheel;
+  result.increment_limited = first_step_increment_limited_;
+  result.module_limits_active = moduleLimitsActive();
 
   warm_controls_ = controls;
   result.controls = std::move(controls);
   result.states = std::move(states);
   result.cost = current_cost;
+  // 求解成功必须同时满足：序列长度合法、代价有限、且至少完成一次成功反向递推。
+  // 只判断长度会把"反向递推奇异后原样返回暖启动序列"误判为成功。
   result.success =
       result.controls.size() == static_cast<std::size_t>(config_.horizon) &&
       result.states.size() == static_cast<std::size_t>(config_.horizon + 1) &&
-      std::isfinite(result.cost);
+      std::isfinite(result.cost) && solution_certified;
   result.solve_time_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - start_time)
                              .count();
