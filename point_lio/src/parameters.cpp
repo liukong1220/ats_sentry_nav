@@ -1,5 +1,11 @@
 #include "parameters.h"
 
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
+
 bool is_first_frame = true;
 double lidar_end_time = 0.0, first_lidar_time = 0.0, time_con = 0.0;
 double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0;
@@ -246,7 +252,95 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
     // LOG(WARNING) << "unknown ivox_nearby_type, use NEARBY18";
     ivox_options_.nearby_type_ = IVoxType::NearbyType::NEARBY18;
   }
-  p_imu->gravity_ << VEC_FROM_ARRAY(gravity);
+  if (gravity.size() >= 3) {
+    p_imu->gravity_ << VEC_FROM_ARRAY(gravity);
+  } else {
+    RCLCPP_ERROR(
+      nh->get_logger(),
+      "[point_lio 生效参数] mapping.gravity 只有 %zu 个元素（需要 3 个）：拒绝越界读取，"
+      "保留 IMU 处理器内的默认重力。这属于参数源缺失，必须按停止条件处理。",
+      gravity.size());
+  }
+
+  logEffectiveParameters(nh);
+}
+
+void logEffectiveParameters(const std::shared_ptr<rclcpp::Node> & nh)
+{
+  // 实车只有一份权威参数源（ats_sentry_bringup/params/node_params.yaml 的
+  // point_lio 段），但 point_lio 包内还留着一份 config/mid360.yaml，两份数值不同。
+  // 这里在启动时把「真正生效的值」原样打出来，禁止靠 YAML 加载顺序或
+  // 「哪份文件先被 include」来隐式决定。日志里出现的数值就是运行时用的数值。
+  const auto join = [](const std::vector<double> & values) {
+    if (values.empty()) {
+      return std::string("[]");
+    }
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i != 0) {
+        oss << ", ";
+      }
+      oss << std::setprecision(9) << values[i];
+    }
+    oss << "]";
+    return oss.str();
+  };
+
+  bool use_sim_time = false;
+  nh->get_parameter("use_sim_time", use_sim_time);
+
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] use_sim_time=%s lid_topic=%s imu_topic=%s "
+    "point_filter_num=%d space_down_sample=%s",
+    use_sim_time ? "true" : "false", lid_topic.c_str(), imu_topic.c_str(), p_pre->point_filter_num,
+    space_down_sample ? "true" : "false");
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] filter_size_surf=%.6f filter_size_map=%.6f "
+    "ivox_nearby_type=%d ivox_grid_resolution=%.6f init_map_size=%d",
+    filter_size_surf_min, filter_size_map_min, ivox_nearby_type,
+    static_cast<double>(ivox_options_.resolution_), init_map_size);
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] cut_frame=%s cut_frame_time_interval=%.6f "
+    "lidar_time_inte=%.6f imu_time_inte=%.6f time_diff_lidar_to_imu=%.6f",
+    cut_frame ? "true" : "false", cut_frame_time_interval, lidar_time_inte, imu_time_inte,
+    time_diff_lidar_to_imu);
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] preprocess: lidar_type=%d scan_line=%d blind=%.6f "
+    "timestamp_unit=%d det_range=%.3f fov_deg=%.3f",
+    lidar_type, p_pre->N_SCANS, p_pre->blind, p_pre->time_unit, static_cast<double>(DET_RANGE),
+    fov_deg);
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] mapping: satu_acc=%.6f satu_gyro=%.6f acc_norm=%.6f "
+    "lidar_meas_cov=%.6f plane_thr=%.6f match_s=%.3f extrinsic_est_en=%s",
+    satu_acc, satu_gyro, acc_norm, laser_point_cov, static_cast<double>(plane_thr), match_s,
+    extrinsic_est_en ? "true" : "false");
+  // 外参是雷达安装位姿的唯一数值来源之一：全零意味着「没有实测外参」，
+  // 不是「外参为零」。这条日志必须能在实车日志里被直接引用为证据。
+  RCLCPP_INFO(
+    nh->get_logger(), "[point_lio 生效参数] extrinsic_T=%s extrinsic_R=%s", join(extrinT).c_str(),
+    join(extrinR).c_str());
+  RCLCPP_INFO(
+    nh->get_logger(), "[point_lio 生效参数] gravity=%s gravity_init=%s", join(gravity).c_str(),
+    join(gravity_init).c_str());
+  RCLCPP_INFO(
+    nh->get_logger(),
+    "[point_lio 生效参数] publish: path_en=%s scan_publish_en=%s "
+    "scan_bodyframe_pub_en=%s tf_send_en=%s publish_odometry_without_downsample=%s",
+    path_en ? "true" : "false", scan_pub_en ? "true" : "false",
+    scan_body_pub_en ? "true" : "false", tf_send_en ? "true" : "false",
+    publish_odometry_without_downsample ? "true" : "false");
+  if (std::all_of(extrinT.begin(), extrinT.end(), [](double v) { return v == 0.0; })) {
+    RCLCPP_WARN(
+      nh->get_logger(),
+      "[point_lio 生效参数] extrinsic_T 全零：IMU->LiDAR 外参未实测。抬轮 HIL 之外不得据此"
+      "推断定位精度。");
+  }
 }
 
 Eigen::Matrix<double, 3, 1> SO3ToEuler(const SO3 & rot)

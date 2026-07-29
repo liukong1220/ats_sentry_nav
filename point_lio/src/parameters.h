@@ -83,6 +83,10 @@ extern MeasureGroup Measures;
 
 extern ofstream fout_out, fout_imu_pbp;
 void readParameters(std::shared_ptr<rclcpp::Node> & n);
+/// 启动时打印全部实际生效的参数值。实车与仿真都存在两份候选 YAML
+/// （ats_sentry_bringup/params/node_params.yaml 与 point_lio/config/mid360.yaml），
+/// 生效值只能靠这条日志确认，禁止靠加载顺序隐式决定。
+void logEffectiveParameters(const std::shared_ptr<rclcpp::Node> & n);
 void open_file();
 Eigen::Matrix<double, 3, 1> SO3ToEuler(const SO3 & orient);
 void reset_cov(Eigen::Matrix<double, 24, 24> & P_init);
