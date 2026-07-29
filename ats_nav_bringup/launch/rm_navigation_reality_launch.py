@@ -56,6 +56,8 @@ def generate_launch_description():
     use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
     use_rviz = LaunchConfiguration("use_rviz")
     launch_joy_teleop = LaunchConfiguration("launch_joy_teleop")
+    launch_nav2 = LaunchConfiguration("launch_nav2")
+    launch_swerve_mpc = LaunchConfiguration("launch_swerve_mpc")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
@@ -64,11 +66,20 @@ def generate_launch_description():
     nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
     chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
+    minco_params_file = LaunchConfiguration("minco_params_file")
+    goal_manager_params_file = LaunchConfiguration("goal_manager_params_file")
+    mpc_params_file = LaunchConfiguration("mpc_params_file")
+    mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
+    require_gimbal_status = LaunchConfiguration("require_gimbal_status")
+    planning_grid_owner = LaunchConfiguration("planning_grid_owner")
     log_level = LaunchConfiguration("log_level")
 
+    # Nav2-free profile 下不存在任何速度变换级，话题选择必须跟着 launch_nav2 走，
+    # 否则会为一个不存在的 Nav2 输出预留 cmd_vel_nav2_result 通路。
     any_velocity_transform = PythonExpression([
-        "'", launch_fake_vel_transform, "'.lower() == 'true' or '",
-        launch_chassis_vel_transform, "'.lower() == 'true'",
+        "'", launch_nav2, "'.lower() == 'true' and ('",
+        launch_fake_vel_transform, "'.lower() == 'true' or '",
+        launch_chassis_vel_transform, "'.lower() == 'true')",
     ])
 
     # Declare the launch arguments
@@ -168,6 +179,80 @@ def generate_launch_description():
         "launch_joy_teleop",
         default_value="False",
         description="Whether to start joystick teleop nodes",
+    )
+
+    declare_launch_nav2_cmd = DeclareLaunchArgument(
+        "launch_nav2",
+        default_value="True",
+        description=(
+            "Whether to start the Nav2 comparison stack. False selects the "
+            "Nav2-free MINCO+MPC profile."
+        ),
+    )
+
+    declare_launch_swerve_mpc_cmd = DeclareLaunchArgument(
+        "launch_swerve_mpc",
+        default_value="False",
+        description=(
+            "Whether to start minco_planner/ats_goal_manager/ats_swerve_mpc. "
+            "Only effective together with launch_nav2:=False."
+        ),
+    )
+
+    declare_minco_params_file_cmd = DeclareLaunchArgument(
+        "minco_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("minco_planner"),
+            "config",
+            "minco_planner_reality.yaml",
+        ),
+        description="Authoritative minco_planner parameter file for this profile",
+    )
+
+    declare_goal_manager_params_file_cmd = DeclareLaunchArgument(
+        "goal_manager_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("ats_goal_manager"),
+            "config",
+            "ats_goal_manager_reality.yaml",
+        ),
+        description="Authoritative ats_goal_manager parameter file for this profile",
+    )
+
+    declare_mpc_params_file_cmd = DeclareLaunchArgument(
+        "mpc_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("ats_swerve_mpc"),
+            "config",
+            "ats_swerve_mpc_reality.yaml",
+        ),
+        description="Authoritative ats_swerve_mpc parameter file for this profile",
+    )
+
+    declare_mpc_cmd_vel_topic_cmd = DeclareLaunchArgument(
+        "mpc_cmd_vel_topic",
+        default_value="/cmd_vel",
+        description=(
+            "MPC body-frame [vx, vy, wz] output topic; the serial chassis is the "
+            "single consumer and no stage may follow the MPC."
+        ),
+    )
+
+    declare_require_gimbal_status_cmd = DeclareLaunchArgument(
+        "require_gimbal_status",
+        default_value="True",
+        description=(
+            "Whether ats_goal_manager/ats_swerve_mpc require a fresh "
+            "GimbalYawStatus ack. Only a controlled HIL profile may set False, "
+            "and BODY_YAW_FOLLOW is forbidden while it is False."
+        ),
+    )
+
+    declare_planning_grid_owner_cmd = DeclareLaunchArgument(
+        "planning_grid_owner",
+        default_value="rc_esdf",
+        choices=["rc_esdf", "rog_map"],
+        description="Single /rc_esdf/planning_grid owner: rc_esdf or rog_map",
     )
 
     declare_launch_trajectory_optimizer_cmd = DeclareLaunchArgument(
@@ -289,6 +374,14 @@ def generate_launch_description():
             "use_composition": use_composition,
             "use_respawn": use_respawn,
             "use_robot_state_pub": use_robot_state_pub,
+            "launch_nav2": launch_nav2,
+            "launch_swerve_mpc": launch_swerve_mpc,
+            "minco_params_file": minco_params_file,
+            "goal_manager_params_file": goal_manager_params_file,
+            "mpc_params_file": mpc_params_file,
+            "mpc_cmd_vel_topic": mpc_cmd_vel_topic,
+            "require_gimbal_status": require_gimbal_status,
+            "planning_grid_owner": planning_grid_owner,
             "launch_trajectory_optimizer": launch_trajectory_optimizer,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
             "launch_localization_fusion": launch_localization_fusion,
@@ -328,6 +421,14 @@ def generate_launch_description():
     ld.add_action(declare_use_robot_state_pub_cmd)
     ld.add_action(declare_use_rviz_cmd)
     ld.add_action(declare_launch_joy_teleop_cmd)
+    ld.add_action(declare_launch_nav2_cmd)
+    ld.add_action(declare_launch_swerve_mpc_cmd)
+    ld.add_action(declare_minco_params_file_cmd)
+    ld.add_action(declare_goal_manager_params_file_cmd)
+    ld.add_action(declare_mpc_params_file_cmd)
+    ld.add_action(declare_mpc_cmd_vel_topic_cmd)
+    ld.add_action(declare_require_gimbal_status_cmd)
+    ld.add_action(declare_planning_grid_owner_cmd)
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
     ld.add_action(declare_launch_small_gicp_relocalization_cmd)
     ld.add_action(declare_launch_localization_fusion_cmd)

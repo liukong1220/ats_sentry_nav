@@ -24,6 +24,8 @@ def generate_launch_description():
     container_name = LaunchConfiguration("container_name")
     container_name_full = (namespace, "/", container_name)
     use_respawn = LaunchConfiguration("use_respawn")
+    launch_nav2 = LaunchConfiguration("launch_nav2")
+    launch_swerve_mpc = LaunchConfiguration("launch_swerve_mpc")
     launch_trajectory_optimizer = LaunchConfiguration("launch_trajectory_optimizer")
     planning_grid_owner = LaunchConfiguration("planning_grid_owner")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
@@ -31,11 +33,39 @@ def generate_launch_description():
     nav_cmd_vel_topic = LaunchConfiguration("nav_cmd_vel_topic")
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
     chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
+    minco_params_file = LaunchConfiguration("minco_params_file")
+    goal_manager_params_file = LaunchConfiguration("goal_manager_params_file")
+    mpc_params_file = LaunchConfiguration("mpc_params_file")
+    mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
+    require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
 
+    # Nav2 对照链与自研 MINCO+MPC 链必须互斥：Nav2-free profile 显式
+    # launch_nav2:=false，此时不启动任何 Nav2 节点、lifecycle manager，
+    # 也不启动依赖 /plan 与 Nav2 cmd_vel 的 trajectory_optimizer/speed_governor。
+    # 自研链只在 launch_swerve_mpc=true 且 launch_nav2=false 时成立，
+    # 保证 /cmd_vel 与 /planner/execution_command 只有一个授权来源。
+    swerve_chain_enabled = PythonExpression([
+        "'", launch_swerve_mpc, "'.lower() == 'true' and '",
+        launch_nav2, "'.lower() == 'false'",
+    ])
+    # Nav2-free 下 fake/chassis 速度变换级会在 MPC 之后二次旋转、增益放大或
+    # 叠加 cmd_spin 角速度，必须强制关闭，命令通路只允许 MPC -> /cmd_vel。
+    fake_vel_transform_enabled = PythonExpression([
+        "'", launch_fake_vel_transform, "'.lower() == 'true' and '",
+        launch_nav2, "'.lower() == 'true'",
+    ])
+    chassis_vel_transform_enabled = PythonExpression([
+        "'", launch_chassis_vel_transform, "'.lower() == 'true' and '",
+        launch_nav2, "'.lower() == 'true'",
+    ])
+
+    # 与上面两级保持同一判据：Nav2-free 下不存在任何变换级，
+    # 不得为一个不存在的 Nav2 预留 cmd_vel_nav2_result 通路。
     any_velocity_transform = PythonExpression([
-        "'", launch_fake_vel_transform, "'.lower() == 'true' or '",
-        launch_chassis_vel_transform, "'.lower() == 'true'",
+        "'", launch_nav2, "'.lower() == 'true' and ('",
+        launch_fake_vel_transform, "'.lower() == 'true' or '",
+        launch_chassis_vel_transform, "'.lower() == 'true')",
     ])
 
     lifecycle_nodes = [
@@ -113,6 +143,75 @@ def generate_launch_description():
         "use_respawn",
         default_value="False",
         description="Whether to respawn if a node crashes. Applied when composition is disabled.",
+    )
+
+    declare_launch_nav2_cmd = DeclareLaunchArgument(
+        "launch_nav2",
+        default_value="True",
+        description=(
+            "Whether to start the Nav2 comparison stack. False selects the "
+            "Nav2-free MINCO+MPC profile (no Nav2 server, no lifecycle manager, "
+            "no /plan consumer)."
+        ),
+    )
+
+    declare_launch_swerve_mpc_cmd = DeclareLaunchArgument(
+        "launch_swerve_mpc",
+        default_value="False",
+        description=(
+            "Whether to start minco_planner/ats_goal_manager/ats_swerve_mpc. "
+            "Only effective together with launch_nav2:=False."
+        ),
+    )
+
+    declare_minco_params_file_cmd = DeclareLaunchArgument(
+        "minco_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("minco_planner"),
+            "config",
+            "minco_planner_reality.yaml",
+        ),
+        description="Authoritative minco_planner parameter file for this profile",
+    )
+
+    declare_goal_manager_params_file_cmd = DeclareLaunchArgument(
+        "goal_manager_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("ats_goal_manager"),
+            "config",
+            "ats_goal_manager_reality.yaml",
+        ),
+        description="Authoritative ats_goal_manager parameter file for this profile",
+    )
+
+    declare_mpc_params_file_cmd = DeclareLaunchArgument(
+        "mpc_params_file",
+        default_value=os.path.join(
+            get_package_share_directory("ats_swerve_mpc"),
+            "config",
+            "ats_swerve_mpc_reality.yaml",
+        ),
+        description="Authoritative ats_swerve_mpc parameter file for this profile",
+    )
+
+    declare_mpc_cmd_vel_topic_cmd = DeclareLaunchArgument(
+        "mpc_cmd_vel_topic",
+        default_value="/cmd_vel",
+        description=(
+            "MPC body-frame [vx, vy, wz] output topic. Real robot uses /cmd_vel "
+            "so that the serial chassis is the single consumer with no extra "
+            "rotation or gain stage after the MPC."
+        ),
+    )
+
+    declare_require_gimbal_status_cmd = DeclareLaunchArgument(
+        "require_gimbal_status",
+        default_value="True",
+        description=(
+            "Whether ats_goal_manager/ats_swerve_mpc require a fresh "
+            "GimbalYawStatus ack. Only a controlled HIL profile may set False, "
+            "and BODY_YAW_FOLLOW is forbidden while it is False."
+        ),
     )
 
     declare_launch_trajectory_optimizer_cmd = DeclareLaunchArgument(
@@ -220,7 +319,7 @@ def generate_launch_description():
         package="tf2_ros",
         executable="static_transform_publisher",
         name="static_transform_publisher_fake_yaw_compat",
-        condition=UnlessCondition(launch_fake_vel_transform),
+        condition=UnlessCondition(fake_vel_transform_enabled),
         output="screen",
         arguments=[
             "--frame-id",
@@ -234,7 +333,7 @@ def generate_launch_description():
         package="sentry_chassis_vel_transform",
         executable="chassis_vel_transform_node",
         name="chassis_vel_transform",
-        condition=IfCondition(launch_chassis_vel_transform),
+        condition=IfCondition(chassis_vel_transform_enabled),
         output="screen",
         respawn=use_respawn,
         respawn_delay=2.0,
@@ -272,7 +371,7 @@ def generate_launch_description():
                 package="fake_vel_transform",
                 executable="fake_vel_transform_node",
                 name="fake_vel_transform",
-                condition=IfCondition(launch_fake_vel_transform),
+                condition=IfCondition(fake_vel_transform_enabled),
                 output="screen",
                 respawn=use_respawn,
                 respawn_delay=2.0,
@@ -300,6 +399,19 @@ def generate_launch_description():
                 parameters=[configured_params],
                 arguments=["--ros-args", "--log-level", log_level],
             ),
+        ],
+    )
+
+    # Nav2 对照链（含依赖 /plan 与 Nav2 cmd_vel 的 trajectory_optimizer/
+    # trajectory_speed_governor）只在 launch_nav2:=true 且非 composition 时启动。
+    load_nav2_nodes = GroupAction(
+        condition=IfCondition(
+            PythonExpression([
+                "'", use_composition, "'.lower() == 'false' and '",
+                launch_nav2, "'.lower() == 'true'",
+            ])
+        ),
+        actions=[
             Node(
                 package="trajectory_optimizer",
                 executable="trajectory_optimizer_node",
@@ -417,6 +529,84 @@ def generate_launch_description():
         ],
     )
 
+    # 实车 Nav2-free 自研链：minco_planner -> ats_goal_manager -> ats_swerve_mpc。
+    # 参数唯一权威来自各包 `*_reality.yaml`，此处只覆盖 profile 级接线量
+    # （use_sim_time、topic 名、授权开关），禁止在此处重复给出动力学限值。
+    load_swerve_chain_nodes = GroupAction(
+        condition=IfCondition(swerve_chain_enabled),
+        actions=[
+            Node(
+                package="minco_planner",
+                executable="minco_planner_node",
+                name="minco_planner",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                arguments=["--ros-args", "--log-level", log_level],
+                parameters=[
+                    ParameterFile(minco_params_file, allow_substs=True),
+                    {
+                        "use_sim_time": use_sim_time,
+                        # 实车规划地图唯一所有者：owner 为 rog_map 时用 adapter 心跳。
+                        "map_ready_topic": PythonExpression([
+                            "'/rog_map_adapter/ready' if '", planning_grid_owner,
+                            "'.lower() == 'rog_map' else ''",
+                        ]),
+                        # Nav2-free 下显式断开 /plan 与直接 goal_pose 订阅，
+                        # 只接受目标管理器的带编号请求。
+                        "goal_topic": "",
+                        "global_plan_topic": "",
+                        "goal_request_topic": "/ats_goal_manager/planner_goal",
+                        "planner_status_topic": "/minco/planning_status",
+                        "candidate_reference_path_topic": (
+                            "/minco/reference_path_candidate"
+                        ),
+                        # 急停与执行授权归 Goal Manager，MINCO 不得越权。
+                        "planner_manages_emergency_stop": False,
+                    },
+                ],
+            ),
+            Node(
+                package="ats_goal_manager",
+                executable="ats_goal_manager_node",
+                name="ats_goal_manager",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                arguments=["--ros-args", "--log-level", log_level],
+                parameters=[
+                    ParameterFile(goal_manager_params_file, allow_substs=True),
+                    {
+                        "use_sim_time": use_sim_time,
+                        # 实车无云台反馈桥时只能在受控 HIL profile 显式关闭，
+                        # 关闭期间禁止 BODY_YAW_FOLLOW；禁止伪造 ack。
+                        "require_gimbal_status": require_gimbal_status,
+                    },
+                ],
+            ),
+            Node(
+                package="ats_swerve_mpc",
+                executable="ats_swerve_mpc_node",
+                name="ats_swerve_mpc",
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                arguments=["--ros-args", "--log-level", log_level],
+                parameters=[
+                    ParameterFile(mpc_params_file, allow_substs=True),
+                    {
+                        "use_sim_time": use_sim_time,
+                        # 实车唯一命令通路：MPC 直接产出车体系 /cmd_vel，
+                        # MPC 之后不再有旋转级或增益级。
+                        "command_topic": mpc_cmd_vel_topic,
+                        "execution_command_topic": "/planner/execution_command",
+                        "require_gimbal_status": require_gimbal_status,
+                    },
+                ],
+            ),
+        ],
+    )
+
     load_composable_nodes = LoadComposableNodes(
         condition=IfCondition(use_composition),
         target_container=container_name_full,
@@ -433,6 +623,20 @@ def generate_launch_description():
                 name="sensor_scan_generation",
                 parameters=[configured_params],
             ),
+        ],
+    )
+
+    # Nav2 对照链的 composable 版本：同样受 launch_nav2 门控，
+    # Nav2-free profile 下不得载入任何 Nav2 组件与 lifecycle manager。
+    load_nav2_composable_nodes = LoadComposableNodes(
+        condition=IfCondition(
+            PythonExpression([
+                "'", use_composition, "'.lower() == 'true' and '",
+                launch_nav2, "'.lower() == 'true'",
+            ])
+        ),
+        target_container=container_name_full,
+        composable_node_descriptions=[
             ComposableNode(
                 package="trajectory_optimizer",
                 plugin="trajectory_optimizer::TrajectorySpeedGovernor",
@@ -504,11 +708,13 @@ def generate_launch_description():
         ],
     )
 
+    # trajectory_optimizer 消费 Nav2 `/plan`，Nav2-free profile 下必须不启动。
     load_trajectory_optimizer_node = LoadComposableNodes(
         condition=IfCondition(
             PythonExpression([
                 "'", use_composition, "'.lower() == 'true' and '",
-                launch_trajectory_optimizer, "'.lower() == 'true'",
+                launch_trajectory_optimizer, "'.lower() == 'true' and '",
+                launch_nav2, "'.lower() == 'true'",
             ])
         ),
         target_container=container_name_full,
@@ -544,7 +750,8 @@ def generate_launch_description():
         condition=IfCondition(
             PythonExpression([
                 "'", use_composition, "'.lower() == 'true' and '",
-                launch_fake_vel_transform, "'.lower() == 'true'",
+                launch_fake_vel_transform, "'.lower() == 'true' and '",
+                launch_nav2, "'.lower() == 'true'",
             ])
         ),
         target_container=container_name_full,
@@ -580,6 +787,13 @@ def generate_launch_description():
     ld.add_action(declare_use_composition_cmd)
     ld.add_action(declare_container_name_cmd)
     ld.add_action(declare_use_respawn_cmd)
+    ld.add_action(declare_launch_nav2_cmd)
+    ld.add_action(declare_launch_swerve_mpc_cmd)
+    ld.add_action(declare_minco_params_file_cmd)
+    ld.add_action(declare_goal_manager_params_file_cmd)
+    ld.add_action(declare_mpc_params_file_cmd)
+    ld.add_action(declare_mpc_cmd_vel_topic_cmd)
+    ld.add_action(declare_require_gimbal_status_cmd)
     ld.add_action(declare_launch_trajectory_optimizer_cmd)
     ld.add_action(declare_planning_grid_owner_cmd)
     ld.add_action(declare_launch_fake_vel_transform_cmd)
@@ -595,7 +809,10 @@ def generate_launch_description():
     ld.add_action(static_tf_fake_yaw_compat_cmd)
     ld.add_action(start_chassis_vel_transform_cmd)
     ld.add_action(load_nodes)
+    ld.add_action(load_nav2_nodes)
+    ld.add_action(load_swerve_chain_nodes)
     ld.add_action(load_composable_nodes)
+    ld.add_action(load_nav2_composable_nodes)
     ld.add_action(load_trajectory_optimizer_node)
     ld.add_action(load_rc_esdf_map_node)
     ld.add_action(load_fake_vel_transform_node)

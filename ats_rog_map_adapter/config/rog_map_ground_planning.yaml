@@ -1,6 +1,10 @@
 ats_rog_map_adapter:
   ros__parameters:
-    use_sim_time: true
+    # 这份文件同时被实车 `bringup.launch.py` 与 MuJoCo 入口引用，两处都显式覆盖
+    # `use_sim_time`。文件级默认取实车值 false：投影快照的 deadline、心跳 10 Hz 与
+    # 0.5 s steady-clock 租约都以挂钟为基准，默认 true 会在覆盖失效时把 stale
+    # 判据整体失真。仿真侧由 launch 的 use_sim_time 参数负责置 true。
+    use_sim_time: false
     projection_service: /rog_map/get_ground_projection
     projection_rate_hz: 2.0
     projection_request_timeout_sec: 2.0

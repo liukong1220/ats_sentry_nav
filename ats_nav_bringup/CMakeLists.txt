@@ -13,6 +13,12 @@ find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+# Nav2-free profile 用的静态墙 /map 发布器，替代 nav2_map_server + lifecycle manager。
+install(PROGRAMS
+  scripts/static_map_publisher.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_auto_package(
   INSTALL_TO_SHARE
   launch

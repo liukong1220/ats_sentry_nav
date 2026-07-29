@@ -1,0 +1,46 @@
+# 实车（Nav2-free）唯一权威 ats_goal_manager 参数。
+#
+# 权威约定（P6 零.2）：实车 `ats_goal_manager` 的参数只从本文件读取。
+# `node_params.yaml` 与 `reality/nav2_params.yaml` 不得再出现同名段。
+# launch 只覆盖 use_sim_time 与 require_gimbal_status（受控 HIL 开关）。
+ats_goal_manager:
+  ros__parameters:
+    # 实车使用 wall clock。
+    use_sim_time: false
+
+    input_goal_topic: /goal_pose
+    planner_goal_topic: /ats_goal_manager/planner_goal
+    planner_status_topic: /minco/planning_status
+    candidate_reference_topic: /minco/reference_path_candidate
+    reference_path_topic: /minco/reference_path
+    emergency_stop_topic: /planner/emergency_stop
+    # MPC 的唯一执行授权；legacy Path 与单独的 Bool false 不得恢复运动。
+    execution_command_topic: /planner/execution_command
+    yaw_authority_request_topic: /gimbal/yaw_authority_request
+    gimbal_status_topic: /gimbal/yaw_status
+    # 实车默认要求真实云台 ack（由串口云台反馈桥发布）；
+    # 只有受控抬轮 HIL profile 才可由 launch 覆盖为 false，
+    # 覆盖期间禁止 BODY_YAW_FOLLOW，且禁止伪造 ack。
+    require_gimbal_status: true
+    gimbal_status_timeout_sec: 0.5
+    map_ready_topic: /rog_map_adapter/ready
+    map_status_topic: /rog_map_adapter/status
+    localization_status_topic: /localization/status
+    odom_topic: /localization
+    action_name: /ats_navigate_to_pose
+    goal_frame: map
+    planning_frame: odom
+    # 以下租约使用 steady clock，不受仿真时钟或旧 DDS 样本续命。
+    map_ready_timeout_sec: 3.0
+    localization_status_timeout_sec: 1.0
+    # 实车必须为 true：定位健康与 epoch 是执行授权的前置条件。
+    require_localization_status: true
+    require_map_status: true
+    emergency_stop_heartbeat_period_sec: 0.1
+    map_wait_timeout_sec: 5.0
+    default_goal_timeout_sec: 120.0
+    goal_position_tolerance: 0.08
+    goal_yaw_tolerance: 0.15
+    terminal_linear_velocity_tolerance: 0.05
+    terminal_angular_velocity_tolerance: 0.10
+    terminal_dwell_sec: 0.30

@@ -1,3 +1,21 @@
+# 参数权威（P6 零.2）：
+#
+# 本文件只在 `rm_navigation_reality_launch.py` 被单独启动时生效。
+# 实车官方入口 `ats_sentry_bringup/launch/real_robot_nav2_free.launch.py`
+#   -> `bringup.launch.py` -> `rm_navigation_reality_launch.py`
+# 会用 `params_file:=ats_sentry_bringup/params/node_params.yaml` 覆盖本文件的默认值，
+# 因此实车运行时的唯一生效值来自 `node_params.yaml`。
+#
+# 两份文件仍有 26 个同名节点段，数值不完全相同（controller_server/MPPI、
+# smoother_server、terrain_analysis(_ext)、trajectory_optimizer、
+# trajectory_speed_governor、velocity_smoother 等）。这些段全部属于 Nav2 对照链，
+# Nav2-free profile 下对应节点不启动，不进入实车命令通路。
+# 命令通路上的两个节点（fake_vel_transform、chassis_vel_transform）已在本轮
+# 与 `node_params.yaml` 逐值对齐，不允许再出现两处不同数值。
+#
+# 三条自研链节点（minco_planner / ats_goal_manager / ats_swerve_mpc）在这两份文件里
+# 都没有参数段，唯一权威是各包 `config/*_reality.yaml`，由 launch 显式传入。
+
 livox_ros_driver2:
   ros__parameters:
     xfer_format: 4                                      # 0-PointCloud2Msg(PointXYZRTL), 1-LivoxCustomMsg, 2-PclPxyziMsg, 3-LivoxImuMsg, 4-AllMsg
@@ -178,6 +196,9 @@ fake_vel_transform:
     input_cmd_vel_topic: "cmd_vel_nav2_result"
     output_cmd_vel_topic: "cmd_vel_gimbal_yaw_odom"
     cmd_spin_topic: "cmd_spin"
+    # 官方 profile 禁止 cmd_spin 在坐标变换之后叠加车体 wz，
+    # 否则底盘实际 wz 不再等于授权链算出的 wz。
+    enable_cmd_spin: false
     init_spin_speed: 0.0
 
 chassis_vel_transform:
@@ -189,16 +210,24 @@ chassis_vel_transform:
     big_yaw_joint_name: "gimbal_yaw_odom_joint"
     linear_gain: 1.0
     angular_gain: 1.0
-    max_linear_speed: 4.6
-    max_linear_accel: 3.6
-    max_angular_speed: 4.2
-    max_angular_accel: 5.0
+    # 与 `ats_sentry_bringup/params/node_params.yaml` 的同名段保持完全一致：
+    # 出口限幅不得松于 MPC 可行域（max_vx/vy=1.5、max_ax/ay=2.0、
+    # max_wz=2.0、max_awz=3.0），且不得超过单轮物理上限
+    # $450 \times \frac{2\pi}{60} \times 0.0425 = 1.6689711\ \mathrm{m/s}$。
+    # 原值 4.6/3.6/4.2 既不可达、也让统一归零判据的上界推导失效。
+    max_linear_speed: 1.5
+    max_linear_accel: 2.0
+    max_angular_speed: 2.0
+    max_angular_accel: 3.0
     max_yaw_transform_rate: 3.5
     transform_linear_with_big_yaw: true
     invert_big_yaw: false
     invert_output_x: false
     invert_output_y: false
-    pass_through_without_yaw: true
+    # 缺少 serial/gimbal_joint_state 时禁止静默直通（会整体偏 $\psi$）。
+    # 已知残余：该节点在 false 时是丢帧而非发布零速度，归零依赖底盘
+    # 300 ms 看门狗；节点仓库为用户未跟踪的嵌套 git，本轮不改其代码。
+    pass_through_without_yaw: false
 
 small_gicp_relocalization:
   ros__parameters:
