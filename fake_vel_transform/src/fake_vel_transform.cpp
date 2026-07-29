@@ -21,6 +21,10 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->declare_parameter<std::string>("odom_topic", "odom");
   this->declare_parameter<std::string>("local_plan_topic", "local_plan");
   this->declare_parameter<std::string>("cmd_spin_topic", "cmd_spin");
+  // 官方 profile 必须关闭 cmd_spin 角速度叠加：叠加发生在坐标变换之后，
+  // 会让底盘实际 wz 不再等于授权链算出的 wz，
+  // 「MPC 之后不改变 [vx, vy, wz]」与统一归零判据会同时失效。
+  this->declare_parameter<bool>("enable_cmd_spin", false);
   this->declare_parameter<std::string>("input_cmd_vel_topic", "");
   this->declare_parameter<std::string>("output_cmd_vel_topic", "");
   this->declare_parameter<float>("init_spin_speed", 0.0);
@@ -30,9 +34,15 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->get_parameter("odom_topic", odom_topic_);
   this->get_parameter("local_plan_topic", local_plan_topic_);
   this->get_parameter("cmd_spin_topic", cmd_spin_topic_);
+  this->get_parameter("enable_cmd_spin", enable_cmd_spin_);
   this->get_parameter("input_cmd_vel_topic", input_cmd_vel_topic_);
   this->get_parameter("output_cmd_vel_topic", output_cmd_vel_topic_);
   this->get_parameter("init_spin_speed", spin_speed_);
+
+  if (!enable_cmd_spin_) {
+    // 关闭时强制清零，避免 init_spin_speed 被误配成非零而变成常驻自旋。
+    spin_speed_ = 0.0F;
+  }
 
   current_robot_base_angle_ = 0.0;
   initial_robot_base_angle_ = 0.0;
@@ -43,8 +53,20 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   cmd_vel_chassis_pub_ =
     this->create_publisher<geometry_msgs::msg::Twist>(output_cmd_vel_topic_, 1);
 
-  cmd_spin_sub_ = this->create_subscription<example_interfaces::msg::Float32>(
-    cmd_spin_topic_, 1, std::bind(&FakeVelTransform::cmdSpinCallback, this, std::placeholders::_1));
+  if (enable_cmd_spin_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "cmd_spin 角速度叠加已启用（话题 %s）：该模式会在坐标变换之后修改车体 wz，"
+      "官方 profile 禁止使用，仅允许用于对照实验。",
+      cmd_spin_topic_.c_str());
+    cmd_spin_sub_ = this->create_subscription<example_interfaces::msg::Float32>(
+      cmd_spin_topic_, 1,
+      std::bind(&FakeVelTransform::cmdSpinCallback, this, std::placeholders::_1));
+  } else {
+    RCLCPP_INFO(
+      get_logger(), "cmd_spin 角速度叠加已关闭：不订阅 %s，wz 只来自输入命令。",
+      cmd_spin_topic_.c_str());
+  }
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
     input_cmd_vel_topic_, 10,
     std::bind(&FakeVelTransform::cmdVelCallback, this, std::placeholders::_1));
@@ -71,6 +93,10 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
 
 void FakeVelTransform::cmdSpinCallback(const example_interfaces::msg::Float32::SharedPtr msg)
 {
+  // 关闭时即使有残留发布者也不接受叠加值，保证"关闭"是行为上的关闭而非仅不订阅。
+  if (!enable_cmd_spin_) {
+    return;
+  }
   spin_speed_ = msg->data;
 }
 

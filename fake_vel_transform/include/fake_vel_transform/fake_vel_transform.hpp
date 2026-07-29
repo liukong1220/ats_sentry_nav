@@ -56,6 +56,8 @@ private:
   std::string odom_topic_;
   std::string local_plan_topic_;
   std::string cmd_spin_topic_;
+  // false（官方 profile 默认）时不订阅 cmd_spin，也不在 wz 上做任何叠加。
+  bool enable_cmd_spin_{false};
   std::string input_cmd_vel_topic_;
   std::string output_cmd_vel_topic_;
   float spin_speed_;
