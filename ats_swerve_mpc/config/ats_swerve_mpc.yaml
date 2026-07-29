@@ -1,6 +1,10 @@
 ats_swerve_mpc:
   ros__parameters:
-    # 是否使用 /clock；MuJoCo 回归为 true，实车应改为 false。
+    # 时间基准。本文件只服务包内独立 launch（`ats_swerve_mpc.launch.py`，默认 true）。
+    # 两个 MuJoCo 入口（`mujoco_navigation.launch.py`、`rmuc_2026_mujoco.launch.py`）
+    # 的 `use_sim_time` 默认是 false（顶层挂钟）并在节点上显式覆盖，因此这里的 true
+    # 对它们不生效，不要据此判断闭环回归的时钟源。
+    # 实车不读本文件，实车权威是 `ats_swerve_mpc_reality.yaml`（false）。
     use_sim_time: true
     # 当前车体状态来源，必须与参考轨迹处于同一 frame。
     odom_topic: /localization
@@ -51,10 +55,13 @@ ats_swerve_mpc:
     # 预测域起点补偿的命令传输延迟（s）。
     command_latency_compensation: 0.01
 
-    # MPC/iLQR 预测步数；实际预测时长约为 horizon * dt。
-    horizon: 20
-    # MPC 离散模型步长（s）。
-    dt: 0.1
+    # MPC/iLQR 预测步数；实际预测时长约为 horizon * dt = 30 * 0.05 = 1.5 s，
+    # 需覆盖 max_vx=1.5 m/s 下的一次完整制动距离（v^2/(2a)≈0.56 m，约 0.75 s）。
+    horizon: 30
+    # MPC 离散模型步长（s），必须等于控制周期 1/control_rate_hz=1/20=0.05。
+    # 此前为 0.1 s（模型时间轴是执行时间轴的 2 倍），一次迭代预测的"一步"实际
+    # 只执行了半步，加速度/舵角速率约束被放大 2 倍，实车表现为超调与舵轮抖振。
+    dt: 0.05
     # 每个控制周期允许的 iLQR 最大迭代次数。
     max_iterations: 6
     # Q_uu 的对角正则化，避免反向递推求解病态矩阵。

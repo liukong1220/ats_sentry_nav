@@ -1,0 +1,81 @@
+# 实车（Nav2-free）唯一权威 minco_planner 参数。
+#
+# 权威约定（P6 零.2）：实车 `minco_planner` 的参数只从本文件读取。
+# `src/ats_sentry_bringup/params/node_params.yaml` 与
+# `src/ats_sentry_nav/ats_nav_bringup/config/reality/nav2_params.yaml`
+# 均不得再出现 `minco_planner:` 段，避免同一参数出现两个不同数值。
+# launch 只覆盖 profile 级接线量（use_sim_time、map_ready_topic 与
+# Nav2-free 的 topic 断开），不得在 launch 里覆盖任何几何或动力学限值。
+minco_planner:
+  ros__parameters:
+    # 实车使用 wall clock；混用 /clock 会让 0.5 s lease 与 stale 判据失效。
+    use_sim_time: false
+
+    # RC-ESDF/ROGMap adapter 融合后的规划栅格；JPS、MINCO 与足迹检查共用它。
+    grid_topic: /rc_esdf/planning_grid
+    # Nav2-free：唯一目标入口是 ats_goal_manager 的带编号请求。
+    goal_topic: ""
+    global_plan_topic: ""
+    goal_request_topic: /ats_goal_manager/planner_goal
+    planner_status_topic: /minco/planning_status
+    raw_path_topic: minco/raw_path
+    reference_path_topic: minco/reference_path
+    # 正式 reference 由目标管理器复核并重定时后提交，MINCO 只发候选。
+    candidate_reference_path_topic: /minco/reference_path_candidate
+    debug_marker_topic: minco/debug_markers
+    # 实车规划地图唯一所有者为 rog_map adapter 的续租心跳。
+    map_ready_topic: /rog_map_adapter/ready
+    emergency_stop_topic: /planner/emergency_stop
+    # 急停与执行授权归 ats_goal_manager，MINCO 不得越权发布。
+    planner_manages_emergency_stop: false
+    map_ready_timeout_sec: 3.0
+    emergency_stop_heartbeat_period_sec: 0.1
+    runtime_safety_recheck_hz: 10.0
+    runtime_safety_horizon_sec: 1.0
+    global_frame: odom
+    robot_frame: gimbal_yaw_odom
+
+    obstacle_value_threshold: 50
+    unknown_is_obstacle: true
+    allow_diagonal: true
+    search_algorithm: jps
+    astar_fallback: true
+    jps_max_expanded_nodes: -1
+    jps_safe_distance: 0.57
+    publish_unsafe_trajectory: false
+
+    reference_speed: 1.5
+    min_segment_time: 0.05
+    sample_spacing: 0.12
+    max_velocity: 2.0
+    max_acceleration: 2.5
+    max_time_scaling_iterations: 5
+    time_scaling_factor: 1.25
+
+    esdf_obstacle_optimization_enabled: true
+    esdf_obstacle_clearance: 0.45
+    esdf_obstacle_max_iterations: 6
+    esdf_obstacle_control_point_spacing: 0.30
+    esdf_obstacle_max_step: 0.10
+    esdf_obstacle_max_deviation: 0.50
+    esdf_footprint_optimization_enabled: true
+    esdf_footprint_clearance: 0.10
+    esdf_footprint_sample_spacing: 0.10
+
+    yaw_mode: clearance_aware
+    yaw_rate_limit: 2.5
+    narrow_clearance_enter: 0.55
+    narrow_clearance_exit: 0.70
+    terminal_yaw_sample_period: 0.10
+
+    footprint_length: 0.70
+    footprint_width: 0.55
+    footprint_safety_margin: 0.05
+    swept_max_corner_step_cells: 0.5
+    body_yaw_follow_clearance: 0.55
+    # 抬轮 HIL 期间若 require_gimbal_status:=false，则禁止 BODY_YAW_FOLLOW，
+    # 因此此处必须保持 false，不得由 profile 强制车体跟随。
+    force_body_yaw_follow: false
+    local_repair_enabled: false
+    local_repair_max_iterations: 2
+    local_repair_search_radius: 0.35

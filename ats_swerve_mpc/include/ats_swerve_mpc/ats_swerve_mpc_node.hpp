@@ -50,6 +50,14 @@ private:
   bool installPath(const nav_msgs::msg::Path & message);
   bool gimbalExecutionValidLocked(
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
+  /// 发布确定性零速度并复位控制器内部状态（所有失败/退出路径共用）。
+  void publishZeroCommandForFailure(const char * reason_zh);
+  /// 校验里程计时效性与位姿跳变，返回 true 表示状态可用于本周期求解。
+  bool odometryUsable(State & current);
+  /// 检查动力学参数是否落在实车合理区间，越界时输出中文 ERROR/WARN。
+  void validateDynamicsParameters(const Se2MpcConfig & config);
+  /// 输出控制饱和与求解耗时的分级中文日志。
+  void reportSolverDiagnostics(const Se2MpcResult & result);
   Se2MpcConfig loadConfig();
   TrajectoryTrackerConfig loadTrackerConfig();
   void publishCommand(const Control &command);
@@ -79,10 +87,23 @@ private:
   bool require_localization_status_ = false;
   bool require_gimbal_status_ = false;
   double gimbal_status_timeout_ = 0.5;
+  // 里程计允许的最大数据年龄 [s]，超时视为定位链路中断。
+  double odometry_timeout_ = 0.25;
+  // 单周期允许的最大位置跳变 [m]，超过判定为定位重定位/跳变。
+  double odometry_jump_position_ = 0.5;
+  // 单周期允许的最大航向跳变 [rad]，超过判定为定位跳变。
+  double odometry_jump_yaw_ = 0.8;
+  // 求解耗时告警阈值占控制周期的比例（0~1）。
+  double solve_time_warn_ratio_ = 0.6;
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();
   bool has_odometry_ = false;
+  // 最近一帧里程计的消息时间戳与本地接收时刻，用于超时与跳变检测。
+  std::optional<rclcpp::Time> last_odometry_stamp_;
+  std::optional<std::chrono::steady_clock::time_point> last_odometry_signal_;
+  std::optional<State> previous_odometry_state_;
+  bool odometry_jump_detected_ = false;
   mutable std::mutex trajectory_mutex_;
   std::string trajectory_frame_;
   rclcpp::Time trajectory_deadline_{0, 0, RCL_ROS_TIME};
