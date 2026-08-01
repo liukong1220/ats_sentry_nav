@@ -390,6 +390,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
                 lambda: any(
                     command.mode == ExecutionCommand.MODE_EXECUTE
                     and command.goal_id == first_goal.goal_id
+                    and command.manager_incarnation > 0
                     and command.localization_epoch == 1
                     and command.map_publication_sequence == 1
                     and len(command.reference.poses) == 2

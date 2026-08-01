@@ -100,6 +100,9 @@ protected:
           gimbal_status_pub_->get_subscription_count() == 1;
         },
         2s));
+    // Production Goal Manager publishes a transient-local STOP at process
+    // start. Establish the same handoff before this fixture sends EXECUTE.
+    publishExecutionStop();
   }
 
   void TearDown() override
@@ -199,12 +202,15 @@ protected:
 
   void publishExecutionWithSequence(
     std::uint64_t sequence, std::uint64_t epoch, std::uint64_t map_generation,
-    std::uint64_t gimbal_request_sequence = 0)
+    std::uint64_t gimbal_request_sequence = 0,
+    std::uint64_t manager_incarnation = 0)
   {
     ExecutionCommand command;
     command.header.stamp = driver_->now();
     command.header.frame_id = "odom";
     command.mode = ExecutionCommand::MODE_EXECUTE;
+    command.manager_incarnation = manager_incarnation == 0 ?
+      manager_incarnation_ : manager_incarnation;
     command.command_sequence = sequence;
     command.goal_id = 1;
     command.localization_epoch = epoch;
@@ -236,13 +242,17 @@ protected:
     execution_pub_->publish(command);
   }
 
-  void publishExecutionStop()
+  void publishExecutionStop(
+    std::uint64_t manager_incarnation = 0,
+    std::uint64_t sequence = 0)
   {
     ExecutionCommand command;
     command.header.stamp = driver_->now();
     command.header.frame_id = "odom";
     command.mode = ExecutionCommand::MODE_STOP;
-    command.command_sequence = ++execution_sequence_;
+    command.manager_incarnation = manager_incarnation == 0 ?
+      manager_incarnation_ : manager_incarnation;
+    command.command_sequence = sequence == 0 ? ++execution_sequence_ : sequence;
     command.goal_id = 1;
     command.localization_epoch = 1;
     command.failure_reason = ExecutionCommand::FAILURE_RUNTIME_UNSAFE;
@@ -261,6 +271,7 @@ protected:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
   std::atomic<double> command_norm_{0.0};
   std::uint64_t execution_sequence_{0};
+  std::uint64_t manager_incarnation_{1};
   std::uint64_t gimbal_sequence_{0};
   std::uint64_t gimbal_request_sequence_{1};
 };
@@ -365,6 +376,50 @@ TEST_F(MpcLocalizationGateTest, RejectsOldSequenceAndOldEpochExecutionCommands) 
       500ms));
 }
 
+TEST_F(MpcLocalizationGateTest, RequiresStopHandshakeForNewManagerIncarnation) {
+  constexpr std::uint64_t kOldIncarnation = 100;
+  constexpr std::uint64_t kNewIncarnation = 101;
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+
+  publishExecutionStop(kOldIncarnation, 1);
+  ASSERT_TRUE(spinUntil(
+    [this]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      publishExecutionWithSequence(2, 1, 1, 0, kOldIncarnation);
+      return command_norm_.load() > 0.02;
+    },
+    2s));
+
+  // A new process cannot authorize motion until it establishes an explicit
+  // STOP handoff to the consumer.
+  publishExecutionWithSequence(1, 1, 1, 0, kNewIncarnation);
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 1s));
+
+  publishExecutionStop(kNewIncarnation, 1);
+  ASSERT_TRUE(spinUntil(
+    [this]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      publishExecutionWithSequence(2, 1, 1, 0, kNewIncarnation);
+      return command_norm_.load() > 0.02;
+    },
+    2s));
+
+  publishExecutionStop(kNewIncarnation, 3);
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 1s));
+
+  // A delayed command from the old manager cannot revive the stopped tracker.
+  publishExecutionWithSequence(99, 1, 1, 0, kOldIncarnation);
+  ASSERT_TRUE(spinUntil(
+    [this]() {
+      publishOdometry();
+      return command_norm_.load() < 1e-6;
+    },
+    500ms));
+}
+
 TEST_F(MpcLocalizationGateTest, StopsWhenGimbalFeedbackLeaseExpires) {
   publishOdometry();
   publishStatus(LocalizationStatus::STATE_TRACKING, 1);
@@ -395,6 +450,11 @@ TEST_F(MpcLocalizationGateTest, RejectsExecutionForDifferentGimbalRequest) {
         return command_norm_.load() < 1e-6;
       },
       500ms));
+
+  // Goal Manager continues publishing a structured STOP after it rejects an
+  // authorization. Mirror that recovery boundary before a new execute lease.
+  publishExecutionStop();
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 500ms));
 
   ASSERT_TRUE(
     spinUntil(
