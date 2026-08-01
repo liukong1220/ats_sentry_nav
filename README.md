@@ -1,231 +1,240 @@
 # ats_sentry_nav
 
-当前哨兵项目中的导航、定位、点云处理与恢复行为子系统。
+ATS 2026 哨兵的定位、地图、规划、轨迹与四舵轮控制仓库。
 
-本包系在当前工作区中的职责不是“整车总入口”，而是提供被总入口调用的导航能力，包括：
+> 状态：仓库同时包含 Nav2 对照资源和 Nav2-free 自研链。专用实机入口已能
+> 关闭 Nav2，但 MuJoCo 默认与部分构建依赖仍保留 Nav2，不能声明全仓移除完成。
 
-1. `ats_nav_bringup`：Nav2、定位、RViz、传感器链路启动
-2. `trajectory_optimizer`：B 样条平滑、trajectory profile、signed Traversability ESDF、governor
-3. `ats_nav2_plugins`：恢复行为与 costmap 插件
-4. `fake_vel_transform`：速度坐标系变换与自旋叠加
-5. `small_gicp_relocalization`、`point_lio`、`loam_interface`、`sensor_scan_generation`：定位与点云接口
+## 目录
 
-## 当前主链
+- [功能模块](#功能模块)
+- [依赖](#依赖)
+- [Quick Start](#quick-start)
+- [启动入口](#启动入口)
+- [话题服务与 Action](#话题服务与-action)
+- [配置文件](#配置文件)
+- [数据流](#数据流)
+- [地图与安全契约](#地图与安全契约)
+- [目录结构](#目录结构)
+- [测试](#测试)
+- [验证边界](#验证边界)
+- [参考与致谢](#参考与致谢)
 
-当前整车使用的导航执行主链为：
+## 功能模块
 
-```text
-SmacPlannerHybrid
-  -> Nav2BSplineSmoother
-  -> MPPI Controller
-  -> trajectory_speed_governor
-  -> velocity_smoother
-  -> fake_vel_transform
-  -> /cmd_vel
+| 包 | 主要职责 | 状态 |
+| :--- | :--- | :--- |
+| `point_lio` | 输出 `/localization`、`/registered_scan` | 保留，ROGMap 不替代它 |
+| `small_gicp_relocalization` | prior PCD 重定位与 `map -> odom` 约束 | 实机链 |
+| `terrain_analysis*` | 地面、高差、坡度和可通行语义 | ROGMap adapter 的输入之一 |
+| `ats_rog_map` | 概率占据、膨胀、3D ESDF、数值地面投影服务 | P2 活动实现 |
+| `ats_rog_map_adapter` | 融合 ROG 投影、static map、terrain/slope，发布规划 grid 与数值 ESDF | P2 地图 owner |
+| `minco_planner` | JPS/A* fallback、MINCO S3、独立 yaw、footprint gate/repair | 自研规划链 |
+| `ats_goal_manager` | ATS action、目标生命周期、安全 reference 提交 | P3 自研目标 owner |
+| `ats_swerve_mpc` | 全向 SE2 MPC，输出车体系 `[vx, vy, wz]` | 四舵轮控制 |
+| `ats_navigation_interfaces` | action/message schema | 接口权威 |
+| `trajectory_optimizer` | RC-ESDF 与 Nav2 B-spline 对照组件 | 过渡期保留 |
+| `ats_nav_bringup` | 定位、Nav2 对照和自研节点编排 | 过渡期入口 |
+| `ats_nav2_plugins` | Nav2 recovery/costmap 插件 | 对照资源，尚未删除 |
+| `fake_vel_transform` | Nav2 fake-yaw 兼容速度变换 | 只属于兼容 profile |
+
+## 依赖
+
+- ROS 2 Humble
+- Eigen3、PCL、OpenCV、yaml-cpp
+- `geometry_msgs`、`nav_msgs`、`sensor_msgs`、`tf2_ros`
+- `ats_navigation_interfaces`、`ats_rog_map_interfaces`
+- Nav2 依赖仅用于当前对照 profile、插件和过渡 bringup
+
+## Quick Start
+
+```bash
+cd /home/ats/ATS_2026_snetry_test
+source /opt/ros/humble/setup.bash
+
+MAKEFLAGS=-j1 colcon build --base-paths src \
+  --packages-up-to \
+    ats_rog_map ats_rog_map_adapter minco_planner \
+    ats_goal_manager ats_swerve_mpc \
+  --parallel-workers 1 \
+  --symlink-install
+
+source install/setup.bash
 ```
 
-当前恢复链为：
+不要让 `colcon` 扫描 `参考/`；活动 ROGMap 唯一位置是本仓的 `ats_rog_map`。
 
-```text
-FollowPath 失败
-  -> behavior_server
-  -> BackUpFreeSpace
-  -> 主走廊搜索
-  -> 必要时 centroid fallback
-  -> 平均走廊代价高时自动降速
+## 启动入口
+
+### 从根仓启动 Nav2-free 实机链
+
+```bash
+ros2 launch ats_sentry_bringup real_robot_nav2_free.launch.py \
+  world:=rmuc_2026 \
+  planning_grid_owner:=rog_map
 ```
 
-当前地形语义到 ESDF 的过渡链为：
+该入口固定：
 
-```text
-terrain_analysis_ext
-  -> terrain_map_ext
-  -> traversability_grid
-  -> traversability_height_diff_grid
-  -> traversability_occupancy_ratio_grid
-  -> traversability_ground_confidence_grid
-  -> traversability_slope_grid
-  -> traversability_slope_band_grid
-  -> TraversabilityEsdfProvider
-  -> Nav2BSplineSmoother / trajectory_optimizer_node
+| 参数 | 值 | 含义 |
+| :--- | :--- | :--- |
+| `launch_nav2` | `false` | 无 `bt_navigator/planner_server/controller_server/behavior_server` |
+| `launch_swerve_mpc` | `true` | 启动 MINCO、Goal Manager、MPC |
+| `launch_fake_vel_transform` | `false` | MPC 后不再二次旋转速度 |
+| `launch_chassis_vel_transform` | `false` | MPC 直接到 `/cmd_vel` |
+| `planning_grid_owner` | `rog_map` | adapter 独占 `/rc_esdf/planning_grid` |
+
+普通 `bringup.launch.py` 的默认值仍是 `launch_nav2:=true`，不能与上表混用。
+
+### 导航子系统入口
+
+```bash
+ros2 launch ats_nav_bringup rm_navigation_reality_launch.py \
+  launch_nav2:=false \
+  launch_swerve_mpc:=true \
+  planning_grid_owner:=rog_map
 ```
 
-## 当前入口
+直接启动子系统时，串口桥、行为树和根仓静态 TF 需由外层负责，不能把它视为
+完整实机入口。
 
-### 实机导航子系统入口
+## 话题服务与 Action
 
-- [ats_nav_bringup/launch/rm_navigation_reality_launch.py](./ats_nav_bringup/launch/rm_navigation_reality_launch.py)
+### 目标和执行
 
-说明：
+| 名称 | 类型 | Producer | Consumer |
+| :--- | :--- | :--- | :--- |
+| `/ats_navigate_to_pose` | `ats_navigation_interfaces/action/NavigateToPose` | Goal Manager server | 行为树/测试 client |
+| `/ats_goal_manager/planner_goal` | `PlannerGoal` | Goal Manager | MINCO |
+| `/minco/planning_status` | `PlannerStatus` | MINCO | Goal Manager |
+| `/minco/reference_path_candidate` | `nav_msgs/Path` | MINCO | Goal Manager |
+| `/minco/reference_path` | `nav_msgs/Path` | Goal Manager 提交 | 调试/legacy 观察 |
+| `/planner/execution_command` | `ExecutionCommand` | Goal Manager 唯一 owner | MPC |
+| `/planner/emergency_stop` | `std_msgs/Bool` | Goal Manager 权威心跳 | MPC/串口安全链 |
+| `/cmd_vel` | `geometry_msgs/Twist` | Nav2-free 下 MPC | 串口底盘 |
 
-- 当前整车维护优先使用工作区总入口 `ats_sentry_bringup/bringup.launch.py`
-- 本入口更适合单独排查导航、定位、点云和 RViz 相关问题
+`ExecutionCommand` 在一条 DDS sample 中携带授权模式、command sequence、goal、
+localization epoch、map generation/publication sequence、yaw authority 和 reference。
+独立的 `emergency_stop=false` 或旧 `Path` 都不能恢复运动。
 
-### loopback 导航入口
+### 地图
 
-- [../ats_sentry_bringup/launch/loopback_nav_only.launch.py](../ats_sentry_bringup/launch/loopback_nav_only.launch.py)
-- [../ats_sentry_bringup/launch/loopback_decision_sim.launch.py](../ats_sentry_bringup/launch/loopback_decision_sim.launch.py)
-- [../ats_sentry_bringup/launch/loopback_vision_test.launch.py](../ats_sentry_bringup/launch/loopback_vision_test.launch.py)
+| 名称 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `/rog_map/get_ground_projection` | `ats_rog_map_interfaces/srv/GetRogMapProjection` | 原子数值快照，禁止反解析 `/rog_map/esdf` 点云 |
+| `/rc_esdf/planning_grid` | `nav_msgs/OccupancyGrid` | `rc_esdf_map|ats_rog_map_adapter` 二选一 owner |
+| `/rc_esdf/signed_distance_grid` | 数值栅格 | signed distance，free 正、occupied 负、unknown NaN |
+| `/rog_map_adapter/status` | `PlanningMapStatus` | publication sequence 与 source/MINCO generation 不同 |
+| `/rog_map_adapter/ready` | `std_msgs/Bool` | heartbeat/lease，过期即失效 |
 
-## 当前关键目录
+### ROGMap 调试可视化
+
+ROGMap 可发布 `/rog_map/occ`、`/rog_map/inf_occ`、`/rog_map/unk`、
+`/rog_map/esdf` 等 `PointCloud2` 调试层。规划端只消费数值服务，不消费这些
+点云。P2 配置当前 `visualization.enable: false`；开启前需同步 RViz profile 和
+带宽评估，详见根仓优化文档。
+
+## 配置文件
+
+| 文件 | 用途 |
+| :--- | :--- |
+| `ats_rog_map/config/rog_map_ground_planning_mujoco.yaml` | P2 ROGMap resolution、概率、ESDF、height band |
+| `ats_rog_map_adapter/config/rog_map_ground_planning.yaml` | 投影 deadline、融合、footprint、heartbeat |
+| `minco_planner/config/minco_planner_reality.yaml` | 实机 JPS/MINCO/yaw/footprint |
+| `ats_goal_manager/config/ats_goal_manager_reality.yaml` | 实机 action、lease、terminal success |
+| `ats_swerve_mpc/config/ats_swerve_mpc_reality.yaml` | 实机 MPC/舵轮限值 |
+| `ats_swerve_mpc/config/ats_swerve_mpc.yaml` | MuJoCo 回归参数，不能与 reality 混用 |
+| `ats_nav_bringup/config/reality/nav2_params.yaml` | Nav2 对照 profile |
+
+当前三条自研节点仍从独立 `*_reality.yaml` 加载。将其迁入根仓
+`node_params.yaml` 是下一阶段任务，不是已经完成的事实。迁移后 `.msg/.srv/.action`
+仍是 schema 权威，YAML 只统一 ROS 参数和接线契约。
+
+## 数据流
+
+```text
+/localization + /registered_scan
+  -> ats_rog_map
+  -> GetRogMapProjection(grid + signed distance + gradient + generation)
+  -> ats_rog_map_adapter
+       + /map
+       + traversability/slope
+  -> immutable planning products
+  -> minco_planner(JPS -> MINCO S3 -> yaw -> footprint/repair)
+  -> candidate reference + PlannerStatus
+  -> ats_goal_manager(snapshot/heartbeat/gimbal recheck + retime)
+  -> atomic ExecutionCommand
+  -> ats_swerve_mpc
+  -> body-frame /cmd_vel
+```
+
+## 地图与安全契约
+
+- raw occupancy、概率证据、ROG inflation、JPS clearance 和 footprint margin 分层处理，禁止重复膨胀。
+- static map 更细或分辨率不整除时，对输出 cell 覆盖的源 footprint 保守聚合，保留 origin 与 yaw。
+- 任一来源 occupied 保持 occupied；新鲜明确 free 可消解另一来源 unknown；全来源无证据才输出 unknown。
+- unknown 默认按障碍；`robot_unknown_clear_radius` 当前必须保持 `0.0`。
+- projection request 使用 steady-clock deadline；timeout 清 pending 并允许新 epoch 重试。
+- 单次规划只承诺 MINCO 本地 immutable snapshot 一致，不承诺三个 generation 编号相同。
+- map stale/unready、目标不可达、unsafe trajectory 或 MPC 失败必须确定性发布零速度。
+- footprint 当前还需要 P4 连续 swept-volume 与实车边界验收；离散采样通过不等于物理零碰撞。
+
+## 目录结构
 
 ```text
 ats_sentry_nav/
-├── fake_vel_transform/            # 速度坐标系转换与自旋叠加
-├── livox_ros_driver2/             # Livox mid360 驱动
-├── loam_interface/                # point_lio 输出转换到导航 odom
-├── ats_nav_bringup/            # 导航 launch、RViz、simulation/reality 参数
-├── ats_nav2_plugins/               # BackUpFreeSpace、IntensityVoxelLayer 等插件
-├── ats_teleop_twist_joy/           # 手柄速度/云台控制
-├── pointcloud_to_laserscan/       # 建图模式下的点云转 LaserScan
-├── point_lio/                     # 点云里程计
-├── sensor_scan_generation/        # 点云 / odom / TF 相关速度与扫描生成
-├── small_gicp_relocalization/     # 全局重定位
-├── terrain_analysis/              # 近场地形分析
-├── terrain_analysis_ext/          # 远场地形分析
-└── trajectory_optimizer/          # B 样条平滑、profile、governor、ESDF 调试
+├── ats_nav_bringup/
+├── ats_navigation_interfaces/
+├── ats_goal_manager/
+├── ats_rog_map/
+├── ats_rog_map_adapter/
+├── ats_rog_map_interfaces/
+├── ats_swerve_mpc/
+├── minco_planner/
+├── point_lio/
+├── small_gicp_relocalization/
+├── terrain_analysis/
+├── terrain_analysis_ext/
+├── trajectory_optimizer/
+├── ats_nav2_plugins/          # 对照资源
+└── fake_vel_transform/        # Nav2 兼容层
 ```
 
-## 当前最重要的参数入口
+`sentry_chassis_vel_transform/` 当前是嵌套独立仓库，不能由本仓使用
+`git add .` 纳入提交。
 
-### 实机主参数
+## 测试
 
-实际整车主入口默认读取：
+```bash
+colcon test --base-paths src --packages-select \
+  ats_rog_map ats_rog_map_adapter minco_planner \
+  ats_goal_manager ats_swerve_mpc
 
-- [../ats_sentry_bringup/params/node_params.yaml](../ats_sentry_bringup/params/node_params.yaml)
+colcon test-result --test-result-base build/ats_rog_map_adapter --verbose
+```
 
-这份文件比 `ats_nav_bringup/config/reality/nav2_params.yaml` 更重要，因为它是当前工作区总入口真实加载的参数。
+P2 运行回归从根仓执行：
 
-### reality 默认参数
+```bash
+PLANNING_GRID_OWNER=rog_map P2_FAULT_CASE=none \
+  TEST_PROFILE=red_box GOAL_TIMEOUT=180 \
+  scripts/test_mujoco_minco_mpc_chain.sh
+```
 
-- [ats_nav_bringup/config/reality/nav2_params.yaml](./ats_nav_bringup/config/reality/nav2_params.yaml)
+每种 fault case 使用新的 `ROS_DOMAIN_ID` 和新的 MuJoCo 进程，不能在一次仿真中
+串行污染状态。
 
-当前主要用于：
+## 验证边界
 
-1. 导航子系统单独启动
-2. 与 `node_params.yaml` 对照
-3. 保留 `ats_nav_bringup` 包内默认配置
+- **已验证**：README 所列 launch 默认值、接口名、配置归属已静态核对。
+- **已实现未运行**：ATS action/Goal Manager/atomic command 的源码链。
+- **未验证**：本次文档更新未执行构建、MuJoCo、红框、故障注入或实车。
+- **未完成**：全仓 Nav2-free、总 YAML、ROGMap RViz 新 profile、连续 swept footprint 和落地实车验收。
 
-### loopback 参数
+相关总计划见
+[Nav2-free 优化文档](../../docs/项目优化文档/nav2free/README.md)。
 
-- [../loopback_sim/params/nav2_params.yaml](../loopback_sim/params/nav2_params.yaml)
+## 参考与致谢
 
-## 当前关键包说明
-
-### `trajectory_optimizer`
-
-关键文件：
-
-- [trajectory_optimizer/src/bspline_path_optimizer.cpp](./trajectory_optimizer/src/bspline_path_optimizer.cpp)
-- [trajectory_optimizer/src/nav2_bspline_smoother.cpp](./trajectory_optimizer/src/nav2_bspline_smoother.cpp)
-- [trajectory_optimizer/src/trajectory_speed_governor.cpp](./trajectory_optimizer/src/trajectory_speed_governor.cpp)
-
-当前已实现：
-
-1. B 样条平滑
-2. 曲率限速
-3. 障碍距离限速
-4. trajectory profile 发布
-5. trajectory profile marker
-6. FakeCostmap / TerrainPointCloud / Traversability 三类 ESDF provider
-7. signed Traversability ESDF 调试 marker
-
-当前 ESDF 主线说明：
-
-1. `trajectory_optimizer_node` 与 `Nav2BSplineSmoother` 当前都支持 `esdf_source: traversability_grid`。
-2. `TraversabilityEsdfProvider` 会融合 `traversability_grid`、`traversability_height_diff_grid`、`traversability_occupancy_ratio_grid`、`traversability_ground_confidence_grid`。
-3. fake costmap ESDF 与 terrain pointcloud ESDF 仍保留为 fallback / 历史对照路径。
-
-当前坡度语义说明：
-
-1. `traversability_slope_grid` 使用 `nav_msgs/OccupancyGrid` 编码，`-1` 表示 unknown，`0~100` 线性对应 `0 ~ slopeGridMaxDeg` 的坡度角。
-2. `traversability_slope_band_grid` 同样使用 `nav_msgs/OccupancyGrid` 编码，按 `slopeGentleDegThre / slopeModerateDegThre / slopeSteepDegThre` 分成平缓、中坡、陡坡三档。
-3. 默认这两张图优先用于任务 2 的坡道速度规则与 RViz 观测，不直接改写当前 `traversability_grid` 的二值通行逻辑。
-4. 如果希望“坡太陡就直接绕开”，把 `terrain_analysis_ext.useSlopeAsObstacle` 设为 `true`，再用 `slopeObstacleDegThre` 调整坡度障碍阈值。
-
-### `ats_nav2_plugins`
-
-关键文件：
-
-- [ats_nav2_plugins/src/behaviors/back_up_free_space.cpp](./ats_nav2_plugins/src/behaviors/back_up_free_space.cpp)
-- [ats_nav2_plugins/include/ats_nav2_plugins/behaviors/back_up_free_space.hpp](./ats_nav2_plugins/include/ats_nav2_plugins/behaviors/back_up_free_space.hpp)
-
-当前恢复行为已实现：
-
-1. 主走廊恢复搜索
-2. lookahead 前缀安全检测
-3. 连续阻塞滞回 + 冷却重规划
-4. centroid fallback
-5. 高 cost 自动降速
-6. RViz marker 区分 `corridor` / `centroid_fallback`
-
-### `small_gicp_relocalization`
-
-关键文件：
-
-- [small_gicp_relocalization/src/small_gicp_relocalization.cpp](./small_gicp_relocalization/src/small_gicp_relocalization.cpp)
-
-当前重定位逻辑已实现：
-
-1. 条件触发配准
-2. 短窗口点云累积
-3. 手动 `initialpose` 后强制注册窗口
-4. 成功结果接受时的 inlier / error 判据
-
-### `fake_vel_transform`
-
-关键文件：
-
-- [fake_vel_transform/src/fake_vel_transform.cpp](./fake_vel_transform/src/fake_vel_transform.cpp)
-
-当前作用：
-
-1. 将 `cmd_vel_nav2_result` 从 fake reference frame 变换到机器人底盘参考系
-2. 叠加 `cmd_spin`
-3. 输出最终 `/cmd_vel`
-
-## 当前常用话题
-
-### 规划 / 平滑 / 控制
-
-- `plan`
-- `smoothed_path_visual`
-- `trajectory_profile`
-- `trajectory_profile_visual`
-- `trajectory_profile_markers`
-- `trajectory_esdf_debug`
-- `traversability_grid`
-- `traversability_height_diff_grid`
-- `traversability_occupancy_ratio_grid`
-- `traversability_ground_confidence_grid`
-- `traversability_slope_grid`
-- `traversability_slope_band_grid`
-- `cmd_vel_controller`
-- `cmd_vel_controller_governed`
-- `cmd_vel_nav2_result`
-- `cmd_vel`
-
-### 恢复与局部可视化
-
-- `back_up_free_space_markers`
-- `local_costmap/costmap`
-- `global_costmap/costmap`
-- `transformed_global_plan`
-- `trajectories`
-
-## 当前维护建议
-
-1. 如果问题是“速度慢、弯前过保守、贴障限速异常”，优先看 `trajectory_optimizer`
-2. 如果问题是“规划能过但恢复动作不自然”，优先看 `ats_nav2_plugins`
-3. 如果问题是“姿态/视觉/目标点异常”，不要先改本包，优先看 `ats_sentry_behavior`
-4. 如果问题是“最终底盘速度和 Nav2 输出不一致”，同时看 `fake_vel_transform` 与 `standard_robot_pp_ros2`
-5. 若只改了 `ats_nav_bringup/config/reality/nav2_params.yaml` 却发现总入口没变化，先确认当前是不是从 `node_params.yaml` 启动的
-
-## 相关文档
-
-- [../../docs/总览.md](../../docs/总览.md)
-- [../../docs/mppi_parameter_tuning_guide.md](../../docs/mppi_parameter_tuning_guide.md)
-- [../../docs/omni_recovery_smoothing_optimization.md](../../docs/omni_recovery_smoothing_optimization.md)
-- [../../docs/上车测试清单.md](../../docs/上车测试清单.md)
-- [../../docs/仿真域说明.md](../../docs/仿真域说明.md)
-- [../../docs/nav2_to_3desdf_minco_mpc_optimization_direction.md](../../docs/nav2_to_3desdf_minco_mpc_optimization_direction.md)
+本仓包含或适配 Point-LIO、ROGMap、MINCO、Nav2 等开源组件。算法来源、修改边界
+和许可证以对应子包文件为准；`参考/` 中的项目只用于溯源，不参与活动构建。
