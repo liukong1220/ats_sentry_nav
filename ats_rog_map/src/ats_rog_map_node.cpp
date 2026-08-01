@@ -1,6 +1,7 @@
 // Copyright 2026
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "pcl/point_types.h"
 #include "nav_msgs/msg/odometry.hpp"
@@ -28,6 +30,7 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 namespace ats_rog_map
 {
@@ -67,6 +70,7 @@ public:
     tf_timeout_sec_ = std::max(0.0, declare_parameter<double>("tf_timeout_sec", 0.1));
     debug_rate_hz_ = std::max(0.0, declare_parameter<double>("debug_rate_hz", 2.0));
     esdf_visualization_height_ = declare_parameter<double>("esdf_visualization_height", 0.15);
+    debug_bounds_topic_ = declare_parameter<std::string>("debug_bounds_topic", "rog_map/bounds");
     self_filter_radius_ = std::max(0.0, declare_parameter<double>("self_filter_radius", 0.45));
     debug_qos_depth_ = std::max<int>(
       1, static_cast<int>(declare_parameter<int>("debug_qos_depth", 1)));
@@ -99,6 +103,8 @@ public:
     inflated_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("rog_map/inf_occ", debug_qos);
     unknown_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("rog_map/unk", debug_qos);
     esdf_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("rog_map/esdf", debug_qos);
+    bounds_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      debug_bounds_topic_, debug_qos);
     stale_pub_ = create_publisher<std_msgs::msg::Bool>("rog_map/stale", rclcpp::QoS(1).reliable());
     projection_service_ = create_service<ats_rog_map_interfaces::srv::GetRogMapProjection>(
       "rog_map/get_ground_projection",
@@ -269,6 +275,54 @@ private:
     return message;
   }
 
+  void publishBoundsMarker(
+    const rog_map::Vec3f & box_min, const rog_map::Vec3f & box_max)
+  {
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = last_map_stamp_;
+    marker.ns = "rog_map_bounds";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = std::max(0.02, 0.4 * map_->getResolution());
+    marker.color.r = 1.0F;
+    marker.color.g = 0.72F;
+    marker.color.b = 0.10F;
+    marker.color.a = 0.90F;
+
+    const auto point = [](const rog_map::Vec3f & value) {
+        geometry_msgs::msg::Point result;
+        result.x = value.x();
+        result.y = value.y();
+        result.z = value.z();
+        return result;
+      };
+    const std::array<geometry_msgs::msg::Point, 8> corners = {
+      point(rog_map::Vec3f(box_min.x(), box_min.y(), box_min.z())),
+      point(rog_map::Vec3f(box_max.x(), box_min.y(), box_min.z())),
+      point(rog_map::Vec3f(box_max.x(), box_max.y(), box_min.z())),
+      point(rog_map::Vec3f(box_min.x(), box_max.y(), box_min.z())),
+      point(rog_map::Vec3f(box_min.x(), box_min.y(), box_max.z())),
+      point(rog_map::Vec3f(box_max.x(), box_min.y(), box_max.z())),
+      point(rog_map::Vec3f(box_max.x(), box_max.y(), box_max.z())),
+      point(rog_map::Vec3f(box_min.x(), box_max.y(), box_max.z()))};
+    constexpr std::array<std::array<std::size_t, 2>, 12> kEdges = {{
+      {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
+      {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
+      {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}}}};
+    marker.points.reserve(2U * kEdges.size());
+    for (const auto & edge : kEdges) {
+      marker.points.push_back(corners[edge[0]]);
+      marker.points.push_back(corners[edge[1]]);
+    }
+
+    visualization_msgs::msg::MarkerArray markers;
+    markers.markers.push_back(std::move(marker));
+    bounds_pub_->publish(markers);
+  }
+
   void publishDebug()
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
@@ -280,7 +334,11 @@ private:
     const bool publish_inflated = inflated_pub_->get_subscription_count() > 0U;
     const bool publish_unknown = unknown_pub_->get_subscription_count() > 0U;
     const bool publish_esdf = esdf_pub_->get_subscription_count() > 0U && map_->hasESDF();
-    if (!publish_occupied && !publish_inflated && !publish_unknown && !publish_esdf) {
+    const bool publish_bounds = bounds_pub_->get_subscription_count() > 0U;
+    if (
+      !publish_occupied && !publish_inflated && !publish_unknown && !publish_esdf &&
+      !publish_bounds)
+    {
       return;
     }
 
@@ -289,6 +347,9 @@ private:
     rog_map::Vec3f box_min = map_center - half_map_size;
     rog_map::Vec3f box_max = map_center + half_map_size;
     map_->boundBoxByLocalMap(box_min, box_max);
+    if (publish_bounds) {
+      publishBoundsMarker(box_min, box_max);
+    }
     if (publish_occupied) {
       rog_map::vec_E<rog_map::Vec3f> occupied;
       map_->boxSearch(box_min, box_max, super_utils::OCCUPIED, occupied);
@@ -516,6 +577,7 @@ private:
   double tf_timeout_sec_{0.1};
   double debug_rate_hz_{2.0};
   double esdf_visualization_height_{0.15};
+  std::string debug_bounds_topic_;
   double self_filter_radius_{0.45};
   int debug_qos_depth_{1};
   bool input_qos_reliable_{false};
@@ -543,6 +605,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr inflated_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bounds_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stale_pub_;
   rclcpp::Service<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_service_;
   rclcpp::TimerBase::SharedPtr health_timer_;

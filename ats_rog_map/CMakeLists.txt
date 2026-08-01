@@ -22,6 +22,7 @@ find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 set(ROG_MAP_CORE_SOURCES
@@ -51,7 +52,7 @@ ament_target_dependencies(${PROJECT_NAME}_core PUBLIC
 
 add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
 target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core)
-ament_target_dependencies(ats_rog_map_node ament_index_cpp ats_rog_map_interfaces)
+ament_target_dependencies(ats_rog_map_node ament_index_cpp ats_rog_map_interfaces visualization_msgs)
 
 install(TARGETS ${PROJECT_NAME}_core ats_rog_map_node
   ARCHIVE DESTINATION lib
