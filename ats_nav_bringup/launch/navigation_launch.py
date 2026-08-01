@@ -49,20 +49,17 @@ def generate_launch_description():
         "'", launch_swerve_mpc, "'.lower() == 'true' and '",
         launch_nav2, "'.lower() == 'false'",
     ])
-    # Nav2-free 下 fake/chassis 速度变换级会在 MPC 之后二次旋转、增益放大或
-    # 叠加 cmd_spin 角速度，必须强制关闭，命令通路只允许 MPC -> /cmd_vel。
+    # 两级实机速度兼容层是独立的 frame 契约。正式参数关闭 cmd_spin，且
+    # Nav2-free 时 fake-yaw 输入改接 MPC 中间 topic，而非 Nav2 cmd_vel。
     fake_vel_transform_enabled = PythonExpression([
-        "'", launch_fake_vel_transform, "'.lower() == 'true' and '",
-        launch_nav2, "'.lower() == 'true'",
+        "'", launch_fake_vel_transform, "'.lower() == 'true'",
     ])
     chassis_vel_transform_enabled = PythonExpression([
-        "'", launch_chassis_vel_transform, "'.lower() == 'true' and '",
-        launch_nav2, "'.lower() == 'true'",
+        "'", launch_chassis_vel_transform, "'.lower() == 'true'",
     ])
 
-    # 与上面两级保持同一判据：Nav2-free 下不存在任何变换级，
-    # 不得为一个不存在的 Nav2 预留 cmd_vel_nav2_result 通路。
-    any_velocity_transform = PythonExpression([
+    # Nav2 对照的输出命名与实机自研链的中间话题分离。
+    nav2_velocity_transform = PythonExpression([
         "'", launch_nav2, "'.lower() == 'true' and ('",
         launch_fake_vel_transform, "'.lower() == 'true' or '",
         launch_chassis_vel_transform, "'.lower() == 'true')",
@@ -196,11 +193,16 @@ def generate_launch_description():
 
     declare_mpc_cmd_vel_topic_cmd = DeclareLaunchArgument(
         "mpc_cmd_vel_topic",
-        default_value="/cmd_vel",
+        default_value=IfElseSubstitution(
+            launch_fake_vel_transform,
+            "/cmd_vel_mpc",
+            IfElseSubstitution(
+                launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"
+            ),
+        ),
         description=(
-            "MPC body-frame [vx, vy, wz] output topic. Real robot uses /cmd_vel "
-            "so that the serial chassis is the single consumer with no extra "
-            "rotation or gain stage after the MPC."
+            "MPC body-frame [vx, vy, wz] source before the selected velocity "
+            "compatibility route."
         ),
     )
 
@@ -242,7 +244,7 @@ def generate_launch_description():
     declare_nav_cmd_vel_topic_cmd = DeclareLaunchArgument(
         "nav_cmd_vel_topic",
         default_value=IfElseSubstitution(
-            any_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
+            nav2_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
         ),
         description="Nav2 velocity output selected for the enabled transform chain",
     )
@@ -258,9 +260,11 @@ def generate_launch_description():
     declare_chassis_vel_input_topic_cmd = DeclareLaunchArgument(
         "chassis_vel_input_topic",
         default_value=IfElseSubstitution(
-            launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", "cmd_vel_nav2_result"
+            launch_fake_vel_transform,
+            "cmd_vel_gimbal_yaw_odom",
+            IfElseSubstitution(launch_nav2, nav_cmd_vel_topic, mpc_cmd_vel_topic),
         ),
-        description="Chassis-frame adapter input topic",
+        description="Chassis-frame adapter input selected from Nav2 or MPC",
     )
 
     declare_log_level_cmd = DeclareLaunchArgument(
@@ -378,7 +382,9 @@ def generate_launch_description():
                 parameters=[
                     configured_params,
                     {
-                        "input_cmd_vel_topic": nav_cmd_vel_topic,
+                        "input_cmd_vel_topic": IfElseSubstitution(
+                            launch_nav2, nav_cmd_vel_topic, mpc_cmd_vel_topic
+                        ),
                         "output_cmd_vel_topic": fake_vel_output_topic,
                     },
                 ],
@@ -596,8 +602,8 @@ def generate_launch_description():
                     ParameterFile(mpc_params_file, allow_substs=True),
                     {
                         "use_sim_time": use_sim_time,
-                        # 实车唯一命令通路：MPC 直接产出车体系 /cmd_vel，
-                        # MPC 之后不再有旋转级或增益级。
+                        # MPC 先发布到所选兼容链入口；固定雷达 profile
+                        # 关闭两级兼容节点时才直接发布 /cmd_vel。
                         "command_topic": mpc_cmd_vel_topic,
                         "execution_command_topic": "/planner/execution_command",
                         "require_gimbal_status": require_gimbal_status,
@@ -750,8 +756,7 @@ def generate_launch_description():
         condition=IfCondition(
             PythonExpression([
                 "'", use_composition, "'.lower() == 'true' and '",
-                launch_fake_vel_transform, "'.lower() == 'true' and '",
-                launch_nav2, "'.lower() == 'true'",
+                launch_fake_vel_transform, "'.lower() == 'true'",
             ])
         ),
         target_container=container_name_full,
@@ -763,7 +768,9 @@ def generate_launch_description():
                 parameters=[
                     configured_params,
                     {
-                        "input_cmd_vel_topic": nav_cmd_vel_topic,
+                        "input_cmd_vel_topic": IfElseSubstitution(
+                            launch_nav2, nav_cmd_vel_topic, mpc_cmd_vel_topic
+                        ),
                         "output_cmd_vel_topic": fake_vel_output_topic,
                     },
                 ],

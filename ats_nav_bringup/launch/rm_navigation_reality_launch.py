@@ -74,9 +74,9 @@ def generate_launch_description():
     planning_grid_owner = LaunchConfiguration("planning_grid_owner")
     log_level = LaunchConfiguration("log_level")
 
-    # Nav2-free profile 下不存在任何速度变换级，话题选择必须跟着 launch_nav2 走，
-    # 否则会为一个不存在的 Nav2 输出预留 cmd_vel_nav2_result 通路。
-    any_velocity_transform = PythonExpression([
+    # 仅 Nav2 对照链需要把其 cmd_vel 输出重映射进兼容层。实机兼容层本身
+    # 由独立开关控制，不能被 launch_nav2 隐式关闭。
+    nav2_velocity_transform = PythonExpression([
         "'", launch_nav2, "'.lower() == 'true' and ('",
         launch_fake_vel_transform, "'.lower() == 'true' or '",
         launch_chassis_vel_transform, "'.lower() == 'true')",
@@ -129,10 +129,8 @@ def generate_launch_description():
 
     declare_params_file_cmd = DeclareLaunchArgument(
         "params_file",
-        default_value=os.path.join(
-            bringup_dir, "config", "reality", "nav2_params.yaml"
-        ),
-        description="Full path to the ROS2 parameters file to use for all launched nodes",
+        default_value=os.path.join(assets_dir, "params", "node_params.yaml"),
+        description="Formal real-robot ROS2 parameter file shared by every launched node",
     )
 
     declare_autostart_cmd = DeclareLaunchArgument(
@@ -201,40 +199,34 @@ def generate_launch_description():
 
     declare_minco_params_file_cmd = DeclareLaunchArgument(
         "minco_params_file",
-        default_value=os.path.join(
-            get_package_share_directory("minco_planner"),
-            "config",
-            "minco_planner_reality.yaml",
-        ),
-        description="Authoritative minco_planner parameter file for this profile",
+        default_value=params_file,
+        description="Use the same formal parameter file as the rest of this profile",
     )
 
     declare_goal_manager_params_file_cmd = DeclareLaunchArgument(
         "goal_manager_params_file",
-        default_value=os.path.join(
-            get_package_share_directory("ats_goal_manager"),
-            "config",
-            "ats_goal_manager_reality.yaml",
-        ),
-        description="Authoritative ats_goal_manager parameter file for this profile",
+        default_value=params_file,
+        description="Use the same formal parameter file as the rest of this profile",
     )
 
     declare_mpc_params_file_cmd = DeclareLaunchArgument(
         "mpc_params_file",
-        default_value=os.path.join(
-            get_package_share_directory("ats_swerve_mpc"),
-            "config",
-            "ats_swerve_mpc_reality.yaml",
-        ),
-        description="Authoritative ats_swerve_mpc parameter file for this profile",
+        default_value=params_file,
+        description="Use the same formal parameter file as the rest of this profile",
     )
 
     declare_mpc_cmd_vel_topic_cmd = DeclareLaunchArgument(
         "mpc_cmd_vel_topic",
-        default_value="/cmd_vel",
+        default_value=IfElseSubstitution(
+            launch_fake_vel_transform,
+            "/cmd_vel_mpc",
+            IfElseSubstitution(
+                launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"
+            ),
+        ),
         description=(
-            "MPC body-frame [vx, vy, wz] output topic; the serial chassis is the "
-            "single consumer and no stage may follow the MPC."
+            "MPC body-frame [vx, vy, wz] source before the selected real-robot "
+            "velocity compatibility route."
         ),
     )
 
@@ -288,7 +280,7 @@ def generate_launch_description():
     declare_nav_cmd_vel_topic_cmd = DeclareLaunchArgument(
         "nav_cmd_vel_topic",
         default_value=IfElseSubstitution(
-            any_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
+            nav2_velocity_transform, "cmd_vel_nav2_result", "/cmd_vel"
         ),
         description="Nav2 velocity output selected for the enabled transform chain",
     )
@@ -304,9 +296,11 @@ def generate_launch_description():
     declare_chassis_vel_input_topic_cmd = DeclareLaunchArgument(
         "chassis_vel_input_topic",
         default_value=IfElseSubstitution(
-            launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", "cmd_vel_nav2_result"
+            launch_fake_vel_transform,
+            "cmd_vel_gimbal_yaw_odom",
+            IfElseSubstitution(launch_nav2, nav_cmd_vel_topic, mpc_cmd_vel_topic),
         ),
-        description="Chassis-frame adapter input topic",
+        description="Chassis-frame adapter input selected from Nav2 or MPC",
     )
 
     declare_log_level_cmd = DeclareLaunchArgument(
