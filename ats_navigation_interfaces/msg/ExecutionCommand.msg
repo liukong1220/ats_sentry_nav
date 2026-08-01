@@ -4,7 +4,10 @@ std_msgs/Header header
 uint8 MODE_STOP=0
 uint8 MODE_EXECUTE=1
 uint8 mode
-# Strictly monotonic per Goal Manager process.  Consumers reject stale commands.
+# Monotonic steady-clock token generated once per Goal Manager process. A new
+# incarnation must first publish MODE_STOP before consumers accept its commands.
+uint64 manager_incarnation
+# Strictly monotonic within manager_incarnation. Consumers reject stale commands.
 uint64 command_sequence
 uint64 goal_id
 uint64 localization_epoch

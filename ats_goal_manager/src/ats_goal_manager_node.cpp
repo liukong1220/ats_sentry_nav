@@ -97,6 +97,13 @@ std::chrono::steady_clock::duration secondsToDuration(double seconds) {
       std::chrono::duration<double>(std::max(0.0, seconds)));
 }
 
+std::uint64_t managerIncarnation() {
+  const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+  return nanoseconds > 0 ? static_cast<std::uint64_t>(nanoseconds) : 1;
+}
+
 } // namespace
 
 class AtsGoalManagerNode : public rclcpp::Node {
@@ -107,6 +114,7 @@ public:
         tf_listener_(
             std::make_shared<tf2_ros::TransformListener>(*tf_buffer_)) {
     loadParameters();
+    manager_incarnation_ = managerIncarnation();
 
     planner_goal_pub_ =
         create_publisher<PlannerGoal>(planner_goal_topic_, rclcpp::QoS(10));
@@ -727,8 +735,8 @@ private:
     fail_stop_ = false;
     active_goal_->recovering = false;
     active_execution_command_ = command;
-    publishExecutionCommand(command);
     publishEmergencyStop(false);
+    publishExecutionCommand(command);
     reference_path_pub_->publish(committed);
     candidate_reference_.reset();
     planner_ready_status_.reset();
@@ -1161,6 +1169,7 @@ private:
   }
 
   void publishExecutionCommand(ExecutionCommand command) {
+    command.manager_incarnation = manager_incarnation_;
     command.command_sequence = ++next_execution_command_sequence_;
     command.header.stamp = now();
     execution_command_pub_->publish(command);
@@ -1230,6 +1239,7 @@ private:
   std::uint64_t map_status_localization_epoch_{0};
   std::uint64_t map_status_generation_{0};
   std::uint64_t map_status_publication_sequence_{0};
+  std::uint64_t manager_incarnation_{0};
   std::atomic<std::uint64_t> next_execution_command_sequence_{0};
   std::atomic<std::uint64_t> next_yaw_authority_request_sequence_{0};
   std::optional<std::chrono::steady_clock::time_point>

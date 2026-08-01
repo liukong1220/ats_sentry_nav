@@ -417,7 +417,8 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
 
 void AtsSwerveMpcNode::onExecutionCommand(
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message) {
-  if (!message || message->command_sequence == 0) {
+  if (!message || message->manager_incarnation == 0 ||
+      message->command_sequence == 0) {
     engageFailStop();
     return;
   }
@@ -426,10 +427,26 @@ void AtsSwerveMpcNode::onExecutionCommand(
     ats_navigation_interfaces::msg::ExecutionCommand::MODE_STOP;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
-    if (message->command_sequence <= last_execution_command_sequence_) {
+    if (message->manager_incarnation < last_execution_command_incarnation_) {
       return;
     }
-    last_execution_command_sequence_ = message->command_sequence;
+    if (message->manager_incarnation > last_execution_command_incarnation_) {
+      // A restarted Goal Manager may reset its per-process sequence. Its first
+      // command must be STOP, so a delayed EXECUTE cannot replace the prior
+      // process's reference.
+      if (!stop) {
+        stop = true;
+        active_execution_command_.reset();
+      } else {
+        last_execution_command_incarnation_ = message->manager_incarnation;
+        last_execution_command_sequence_ = message->command_sequence;
+        active_execution_command_.reset();
+      }
+    } else if (message->command_sequence <= last_execution_command_sequence_) {
+      return;
+    } else {
+      last_execution_command_sequence_ = message->command_sequence;
+    }
     last_execution_command_signal_ = std::chrono::steady_clock::now();
     if (stop) {
       active_execution_command_.reset();

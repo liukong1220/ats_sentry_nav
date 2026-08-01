@@ -117,6 +117,7 @@ private:
   std::atomic<bool> localization_tracking_{false};
   std::optional<std::uint64_t> localization_epoch_;
   std::optional<std::chrono::steady_clock::time_point> last_execution_command_signal_;
+  std::uint64_t last_execution_command_incarnation_{0};
   std::uint64_t last_execution_command_sequence_{0};
   std::optional<ats_navigation_interfaces::msg::ExecutionCommand>
       active_execution_command_;
