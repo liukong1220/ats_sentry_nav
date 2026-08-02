@@ -14,6 +14,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ExecutionCommand.msg"
   "msg/GimbalYawStatus.msg"
   "msg/PlanningMapStatus.msg"
+  "msg/PlanningMapSnapshot.msg"
+  "msg/PlannerCandidate.msg"
   "msg/PlannerGoal.msg"
   "msg/PlannerStatus.msg"
   "msg/RelocalizationObservation.msg"
