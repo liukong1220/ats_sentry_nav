@@ -44,12 +44,6 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       goal_request_topic_, rclcpp::QoS(10).reliable(),
       std::bind(&MincoPlannerNode::onPlannerGoal, this, std::placeholders::_1), planning_options);
   }
-  // 设为空可彻底断开 Nav2 /plan；此时 goal_topic 仍可独立触发 JPS 与 MINCO。
-  if (!global_plan_topic_.empty()) {
-    global_plan_sub_ = create_subscription<nav_msgs::msg::Path>(
-      global_plan_topic_, rclcpp::QoS(1),
-      std::bind(&MincoPlannerNode::onGlobalPlan, this, std::placeholders::_1), planning_options);
-  }
   raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
   if (planner_manages_emergency_stop_) {
     reference_path_pub_ =
@@ -93,7 +87,6 @@ void MincoPlannerNode::declareAndLoadParams()
 {
   declare_parameter<std::string>("grid_topic", grid_topic_);
   declare_parameter<std::string>("goal_topic", goal_topic_);
-  declare_parameter<std::string>("global_plan_topic", global_plan_topic_);
   declare_parameter<std::string>("goal_request_topic", goal_request_topic_);
   declare_parameter<std::string>("planner_status_topic", planner_status_topic_);
   declare_parameter<std::string>("raw_path_topic", raw_path_topic_);
@@ -171,7 +164,6 @@ void MincoPlannerNode::declareAndLoadParams()
 
   get_parameter("grid_topic", grid_topic_);
   get_parameter("goal_topic", goal_topic_);
-  get_parameter("global_plan_topic", global_plan_topic_);
   get_parameter("goal_request_topic", goal_request_topic_);
   get_parameter("planner_status_topic", planner_status_topic_);
   get_parameter("raw_path_topic", raw_path_topic_);
@@ -419,16 +411,6 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
     active_reference->map_publication_sequence,
     ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
     ats_navigation_interfaces::msg::PlannerStatus::FAILURE_RUNTIME_UNSAFE);
-}
-
-void MincoPlannerNode::onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg)
-{
-  if (msg->poses.empty()) {
-    setPlanSafe(false);
-    return;
-  }
-  // 兼容 Nav2 时只取全局路径终点；真正的离散搜索仍由本节点在 RC-ESDF 上完成。
-  onGoal(std::make_shared<geometry_msgs::msg::PoseStamped>(msg->poses.back()));
 }
 
 void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)

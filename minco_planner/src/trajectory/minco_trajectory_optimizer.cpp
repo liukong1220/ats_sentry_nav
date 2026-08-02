@@ -10,7 +10,7 @@
 
 #include "minco_planner/safety/footprint_samples.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
-#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace minco_planner
 {
@@ -199,18 +199,18 @@ double interpolateReferenceYaw(const ReferenceTrajectory & reference, double pro
 }
 
 bool queryFootprintEsdf(
-  const trajectory_optimizer::RcTraversabilityEsdfProvider & esdf,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf,
   const Point & position,
   double yaw,
   const std::vector<Point> & samples,
-  trajectory_optimizer::EsdfQueryResult & result)
+  ats_rc_esdf::EsdfQueryResult & result)
 {
-  result = trajectory_optimizer::EsdfQueryResult {};
+  result = ats_rc_esdf::EsdfQueryResult {};
   const double cos_yaw = std::cos(yaw);
   const double sin_yaw = std::sin(yaw);
   bool found = false;
   for (const Point & sample : samples) {
-    trajectory_optimizer::EsdfQueryResult query;
+    ats_rc_esdf::EsdfQueryResult query;
     const Point world = position + Point(
       cos_yaw * sample.x() - sin_yaw * sample.y(),
       sin_yaw * sample.x() + cos_yaw * sample.y());
@@ -228,7 +228,7 @@ bool queryFootprintEsdf(
 std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
   const ReferenceTrajectory * footprint_orientation,
   const Eigen::Matrix<double, 2, 3> & head_state)
 {
@@ -282,7 +282,7 @@ std::vector<Point> refineWaypointsWithEsdf(
       for (int step = 1; step < steps; ++step) {
         const double fraction = static_cast<double>(step) / steps;
         const MincoSample sample = minco.sample(piece, duration * fraction);
-        trajectory_optimizer::EsdfQueryResult query;
+        ats_rc_esdf::EsdfQueryResult query;
         const bool query_ok = footprint_aware ? queryFootprintEsdf(
           *esdf, sample.position,
           interpolateReferenceYaw(*footprint_orientation,
@@ -379,7 +379,7 @@ bool MincoTrajectoryOptimizer::esdfFootprintOptimizationEnabled() const
 
 ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const nav_msgs::msg::Path & raw_path,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
   const ReferenceTrajectory * footprint_orientation,
   const InitialKinematicState * initial_state) const
 {

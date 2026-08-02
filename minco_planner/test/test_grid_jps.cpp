@@ -4,7 +4,7 @@
 
 #include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/planning/grid_jps.hpp"
-#include "trajectory_optimizer/esdf/static_map_fusion.hpp"
+#include "ats_rc_esdf/esdf/static_map_fusion.hpp"
 
 namespace
 {
@@ -108,8 +108,8 @@ TEST(GridJps, RejectsAPathBlockedByStaticMapAfterFusion)
   map_from_odom.transform.rotation.w = 1.0;
 
   nav_msgs::msg::OccupancyGrid planning_grid;
-  ASSERT_TRUE(trajectory_optimizer::StaticMapFusion::buildPlanningGrid(
-    local_grid, static_map, map_from_odom, trajectory_optimizer::StaticMapFusionParams {},
+  ASSERT_TRUE(ats_rc_esdf::StaticMapFusion::buildPlanningGrid(
+    local_grid, static_map, map_from_odom, ats_rc_esdf::StaticMapFusionParams {},
     planning_grid));
   EXPECT_EQ(planning_grid.data[10U * planning_grid.info.width + 14U], 100);
 

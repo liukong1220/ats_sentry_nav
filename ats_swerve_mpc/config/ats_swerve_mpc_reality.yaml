@@ -25,9 +25,9 @@ ats_swerve_mpc:
     # 实车默认要求真实云台 ack；受控抬轮 HIL 才可由 launch 覆盖为 false。
     require_gimbal_status: true
     gimbal_status_timeout: 0.5
-    # 实车唯一命令通路：MPC 直接产出车体系 [vx, vy, wz] 到 /cmd_vel，
-    # 串口底盘是唯一消费者；MPC 之后不再有坐标旋转级或增益放大级。
-    command_topic: /cmd_vel
+    # Real hardware defaults to fake-yaw/chassis compatibility. The chassis
+    # transform remains the only /cmd_vel publisher consumed by the serial base.
+    command_topic: /cmd_vel_mpc
     emergency_stop_topic: /planner/emergency_stop
     localization_status_topic: /localization/status
     require_localization_status: true

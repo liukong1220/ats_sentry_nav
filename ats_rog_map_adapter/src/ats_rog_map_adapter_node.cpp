@@ -23,7 +23,7 @@
 #include "std_msgs/msg/u_int64.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
-#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace ats_rog_map_adapter
 {
@@ -366,7 +366,7 @@ private:
     }
     const std::size_t injected_cells = injectDynamicObstacleForTest(fusion.planning_grid);
 
-    trajectory_optimizer::RcTraversabilityEsdfProvider esdf;
+    ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
     esdf.updateGrid(
       fusion.planning_grid, fusion_params_.terrain_obstacle_value_threshold,
       fusion_params_.unknown_is_obstacle);
