@@ -19,7 +19,7 @@ def _filtered_ld_library_path():
 
 def generate_launch_description():
     bringup_dir = get_package_share_directory("ats_nav_bringup")
-    assets_dir = get_package_share_directory("ats_sentry_bringup")
+    assets_dir = LaunchConfiguration("assets_dir")
     launch_dir = os.path.join(bringup_dir, "launch")
     namespace = LaunchConfiguration("namespace")
     world = LaunchConfiguration("world")
@@ -37,9 +37,6 @@ def generate_launch_description():
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
-    minco_params_file = LaunchConfiguration("minco_params_file")
-    goal_manager_params_file = LaunchConfiguration("goal_manager_params_file")
-    mpc_params_file = LaunchConfiguration("mpc_params_file")
     mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
     chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
@@ -48,11 +45,13 @@ def generate_launch_description():
 
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("assets_dir", description="Root-owned maps, PCDs, parameters and RViz assets"),
         DeclareLaunchArgument("world", default_value="rmul"),
         DeclareLaunchArgument(
             "map",
             default_value=[
-                TextSubstitution(text=os.path.join(assets_dir, "map", "")),
+                assets_dir,
+                TextSubstitution(text="/map/"),
                 world,
                 TextSubstitution(text=".yaml"),
             ],
@@ -60,7 +59,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "prior_pcd_file",
             default_value=[
-                TextSubstitution(text=os.path.join(assets_dir, "pcd", "")),
+                assets_dir,
+                TextSubstitution(text="/pcd/"),
                 world,
                 TextSubstitution(text=".pcd"),
             ],
@@ -68,14 +68,14 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         DeclareLaunchArgument(
             "params_file",
-            default_value=os.path.join(assets_dir, "params", "node_params.yaml"),
+            default_value=[assets_dir, TextSubstitution(text="/params/node_params.yaml")],
         ),
         DeclareLaunchArgument("use_respawn", default_value="False"),
         DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
         DeclareLaunchArgument("use_rviz", default_value="False"),
         DeclareLaunchArgument(
             "rviz_config_file",
-            default_value=os.path.join(assets_dir, "rviz", "sentry_default_view.rviz"),
+            default_value=[assets_dir, TextSubstitution(text="/rviz/sentry_default_view.rviz")],
         ),
         DeclareLaunchArgument("rviz_force_software", default_value="0"),
         DeclareLaunchArgument("launch_joy_teleop", default_value="False"),
@@ -83,24 +83,6 @@ def generate_launch_description():
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
         DeclareLaunchArgument("launch_fake_vel_transform", default_value="True"),
         DeclareLaunchArgument("launch_chassis_vel_transform", default_value="True"),
-        DeclareLaunchArgument(
-            "minco_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("minco_planner"), "config", "minco_planner_reality.yaml"
-            ),
-        ),
-        DeclareLaunchArgument(
-            "goal_manager_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("ats_goal_manager"), "config", "ats_goal_manager_reality.yaml"
-            ),
-        ),
-        DeclareLaunchArgument(
-            "mpc_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("ats_swerve_mpc"), "config", "ats_swerve_mpc_reality.yaml"
-            ),
-        ),
         DeclareLaunchArgument(
             "mpc_cmd_vel_topic",
             default_value=IfElseSubstitution(
@@ -143,9 +125,7 @@ def generate_launch_description():
             "launch_localization_fusion": launch_localization_fusion,
             "launch_fake_vel_transform": launch_fake_vel_transform,
             "launch_chassis_vel_transform": launch_chassis_vel_transform,
-            "minco_params_file": minco_params_file,
-            "goal_manager_params_file": goal_manager_params_file,
-            "mpc_params_file": mpc_params_file, "mpc_cmd_vel_topic": mpc_cmd_vel_topic,
+            "mpc_cmd_vel_topic": mpc_cmd_vel_topic,
             "fake_vel_output_topic": fake_vel_output_topic,
             "chassis_vel_input_topic": chassis_vel_input_topic,
             "require_gimbal_status": require_gimbal_status, "log_level": log_level,
