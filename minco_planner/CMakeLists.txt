@@ -66,6 +66,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_planning_map_snapshot test/test_planning_map_snapshot.cpp)
   target_link_libraries(test_planning_map_snapshot ${PROJECT_NAME})
 
+  ament_add_gtest(test_atomic_planning_contract test/test_atomic_planning_contract.cpp)
+  target_link_libraries(test_atomic_planning_contract ${PROJECT_NAME})
+
   ament_add_gtest(test_reference_path_timing test/test_reference_path_timing.cpp)
   target_link_libraries(test_reference_path_timing ${PROJECT_NAME})
 

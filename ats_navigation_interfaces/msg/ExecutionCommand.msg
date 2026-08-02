@@ -9,6 +9,12 @@ uint8 mode
 uint64 manager_incarnation
 # Strictly monotonic within manager_incarnation. Consumers reject stale commands.
 uint64 command_sequence
+# P4 correlation fields. Before the end-to-end migration they remain zero and
+# consumers retain the P3 authorization rule. P4 serial gating will require a
+# nonzero planner incarnation, candidate sequence, and content digest.
+uint64 planner_incarnation
+uint64 planner_candidate_sequence
+uint8[32] candidate_content_digest
 uint64 goal_id
 uint64 localization_epoch
 # MINCO local immutable PlanningMapSnapshot generation.
