@@ -27,10 +27,7 @@ def generate_launch_description():
         DeclareLaunchArgument("map", description="Static map YAML path"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("prior_pcd_file", default_value=""),
-        DeclareLaunchArgument(
-            "params_file",
-            default_value=os.path.join(bringup_dir, "config", "reality", "nav2_params.yaml"),
-        ),
+        DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
         DeclareLaunchArgument("use_respawn", default_value="false"),
         DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),

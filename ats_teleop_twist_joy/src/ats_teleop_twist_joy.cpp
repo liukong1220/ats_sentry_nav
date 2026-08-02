@@ -48,7 +48,8 @@ TeleopTwistJoyNode::TeleopTwistJoyNode(const rclcpp::NodeOptions & options)
 
   if (control_mode_ == "auto_control") {
     nav_to_pose_client_ =
-      rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(this, "navigate_to_pose");
+      rclcpp_action::create_client<ats_navigation_interfaces::action::NavigateToPose>(
+      this, "/ats_navigate_to_pose");
   }
 
   if (publish_stamped_twist_) {
@@ -215,13 +216,17 @@ void TeleopTwistJoyNode::sendGoalPoseAction(
   gimbal_pose.pose.position.x = x;
   gimbal_pose.pose.position.y = y;
 
-  nav2_msgs::action::NavigateToPose::Goal goal;
-  goal.pose.header.stamp = this->now();
-  goal.pose.header.frame_id = "map";
+  if (!nav_to_pose_client_) {
+    RCLCPP_ERROR(get_logger(), "auto_control requires /ats_navigate_to_pose client");
+    return;
+  }
+  ats_navigation_interfaces::action::NavigateToPose::Goal goal;
+  goal.goal_pose.header.stamp = this->now();
+  goal.goal_pose.header.frame_id = "map";
 
   try {
     auto transform = tf_buffer_->lookupTransform("map", robot_base_frame_, tf2::TimePointZero);
-    tf2::doTransform(gimbal_pose, goal.pose, transform);
+    tf2::doTransform(gimbal_pose, goal.goal_pose, transform);
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN(
       this->get_logger(), "Failed to transform goal pose from %s to map: %s",
@@ -231,7 +236,7 @@ void TeleopTwistJoyNode::sendGoalPoseAction(
   static auto last_goal_time = this->now();
   auto current_time = this->now();
   if ((current_time - last_goal_time).seconds() >= 0.25) {
-    auto goal_handle_future = nav_to_pose_client_->async_send_goal(goal);
+    nav_to_pose_client_->async_send_goal(goal);
     last_goal_time = current_time;
   }
 }
@@ -239,7 +244,9 @@ void TeleopTwistJoyNode::sendGoalPoseAction(
 void TeleopTwistJoyNode::sendZeroCommand()
 {
   if (control_mode_ == "auto_control") {
-    auto goal_handle_future = nav_to_pose_client_->async_cancel_goals_before(this->now());
+    if (nav_to_pose_client_) {
+      nav_to_pose_client_->async_cancel_all_goals();
+    }
   }
   if (publish_stamped_twist_) {
     auto cmd_vel_stamped_msg = std::make_unique<geometry_msgs::msg::TwistStamped>();

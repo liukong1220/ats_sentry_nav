@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""实车 Nav2-free profile 的静态墙 /map 发布器（不启动任何 Nav2 节点）。
+"""ATS 静态墙 `/map` 发布器。
 
-P6 零.1 要求 `launch_nav2:=false` 的运行图中不得出现 Nav2 节点与 lifecycle
-manager，但 `/rc_esdf/planning_grid` 的两个可能属主都必须拿到静态墙：
-- `ats_rog_map_adapter_node` 的 `static_map_topic` 默认 `/map`，缺图时投影直接返回；
-- `rc_esdf_map_node` 的 `static_map_topic_` 同为 `/map`，缺图时融合直接返回。
-
-因此这里保持 `nav2_map_server` 的对外数据契约不变：同一个话题、同一个
-`map` frame、同样的 transient-local 可靠 QoS、同样的 trinary 占据语义
-（100 占据 / 0 空闲 / -1 未知），只是换成一个自研节点，把 Nav2 从实车运行图里
-彻底移除。与 `map_server` 互斥启动，保证 `/map` 始终只有一个发布者。
+它保留既有地图契约：`map` frame、origin/yaw、resolution、trinary 占据语义和
+reliable + transient-local QoS。ROGMap adapter 直接订阅这份静态图，并在启动图中
+保持 `/map` 的唯一发布者。
 """
 
 from __future__ import annotations
@@ -28,7 +22,7 @@ import yaml
 
 
 def load_static_occupancy_grid(map_yaml_file: Path, frame_id: str) -> OccupancyGrid:
-    """按 Nav2 trinary map 约定解析 ROS map YAML/PGM。"""
+    """按 ROS trinary map 约定解析 map YAML/PGM。"""
     map_yaml_file = map_yaml_file.expanduser().resolve()
     with map_yaml_file.open("r", encoding="utf-8") as stream:
         metadata = yaml.safe_load(stream)

@@ -6,8 +6,6 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, PushRosNamespace, SetRemap
-from launch_ros.descriptions import ParameterFile
-from nav2_common.launch import RewrittenYaml
 
 
 def generate_launch_description():
@@ -20,19 +18,6 @@ def generate_launch_description():
     joy_vel = LaunchConfiguration("joy_vel")
     joy_dev = LaunchConfiguration("joy_dev")
     joy_config_file = LaunchConfiguration("joy_config_file")
-
-    # Create our own temporary YAML files that include substitutions
-    param_substitutions = {"use_sim_time": use_sim_time}
-
-    configured_params = ParameterFile(
-        RewrittenYaml(
-            source_file=joy_config_file,
-            root_key=namespace,
-            param_rewrites=param_substitutions,
-            convert_types=True,
-        ),
-        allow_substs=True,
-    )
 
     # Declare the launch arguments
     declare_namespace_cmd = DeclareLaunchArgument(
@@ -54,11 +39,7 @@ def generate_launch_description():
     )
 
     declare_joy_config_file_cmd = DeclareLaunchArgument(
-        "joy_config_file",
-        default_value=os.path.join(
-            bringup_dir, "config", "simulation", "nav2_params.yaml"
-        ),
-        description="The joystick configuration file path",
+        "joy_config_file", description="Root-owned joystick configuration file path"
     )
 
     declare_joy_dev_cmd = DeclareLaunchArgument(
@@ -88,7 +69,7 @@ def generate_launch_description():
                 executable="ats_teleop_twist_joy_node",
                 name="ats_teleop_twist_joy_node",
                 output="screen",
-                parameters=[configured_params],
+                parameters=[joy_config_file, {"use_sim_time": use_sim_time}],
                 remappings=[
                     ("/cmd_vel", joy_vel),
                     ("/tf", "tf"),

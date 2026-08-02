@@ -1,6 +1,3 @@
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
@@ -9,7 +6,6 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    bringup_dir = get_package_share_directory("ats_nav_bringup")
     namespace = LaunchConfiguration("namespace")
     use_sim_time = LaunchConfiguration("use_sim_time")
     params_file = LaunchConfiguration("params_file")
@@ -19,9 +15,6 @@ def generate_launch_description():
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
     chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
-    minco_params_file = LaunchConfiguration("minco_params_file")
-    goal_manager_params_file = LaunchConfiguration("goal_manager_params_file")
-    mpc_params_file = LaunchConfiguration("mpc_params_file")
     mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
     require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
@@ -29,10 +22,7 @@ def generate_launch_description():
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
-        DeclareLaunchArgument(
-            "params_file",
-            default_value=os.path.join(bringup_dir, "config", "reality", "nav2_params.yaml"),
-        ),
+        DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
         DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
         DeclareLaunchArgument("use_respawn", default_value="False"),
         DeclareLaunchArgument("launch_fake_vel_transform", default_value="True"),
@@ -47,24 +37,6 @@ def generate_launch_description():
             "chassis_vel_input_topic",
             default_value=IfElseSubstitution(
                 launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", mpc_cmd_vel_topic
-            ),
-        ),
-        DeclareLaunchArgument(
-            "minco_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("minco_planner"), "config", "minco_planner_reality.yaml"
-            ),
-        ),
-        DeclareLaunchArgument(
-            "goal_manager_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("ats_goal_manager"), "config", "ats_goal_manager_reality.yaml"
-            ),
-        ),
-        DeclareLaunchArgument(
-            "mpc_params_file",
-            default_value=os.path.join(
-                get_package_share_directory("ats_swerve_mpc"), "config", "ats_swerve_mpc_reality.yaml"
             ),
         ),
         DeclareLaunchArgument(
@@ -134,21 +106,13 @@ def generate_launch_description():
     minco = Node(
         package="minco_planner", executable="minco_planner_node", name="minco_planner",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[minco_params_file, {
-            "use_sim_time": use_sim_time,
-            "map_ready_topic": "/rog_map_adapter/ready",
-            "goal_topic": "",
-            "global_plan_topic": "",
-            "goal_request_topic": "/ats_goal_manager/planner_goal",
-            "planner_status_topic": "/minco/planning_status",
-            "candidate_reference_path_topic": "/minco/reference_path_candidate",
-            "planner_manages_emergency_stop": False,
-        }], arguments=["--ros-args", "--log-level", log_level],
+        parameters=[params_file, {"use_sim_time": use_sim_time}],
+        arguments=["--ros-args", "--log-level", log_level],
     )
     goal_manager = Node(
         package="ats_goal_manager", executable="ats_goal_manager_node", name="ats_goal_manager",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[goal_manager_params_file, {
+        parameters=[params_file, {
             "use_sim_time": use_sim_time,
             "require_gimbal_status": require_gimbal_status,
         }], arguments=["--ros-args", "--log-level", log_level],
@@ -156,7 +120,7 @@ def generate_launch_description():
     mpc = Node(
         package="ats_swerve_mpc", executable="ats_swerve_mpc_node", name="ats_swerve_mpc",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[mpc_params_file, {
+        parameters=[params_file, {
             "use_sim_time": use_sim_time,
             "command_topic": mpc_cmd_vel_topic,
             "execution_command_topic": "/planner/execution_command",
