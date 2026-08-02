@@ -27,8 +27,9 @@ ats_rog_map_adapter:
     generation_topic: /rog_map_adapter/generation
     map_status_topic: /rog_map_adapter/status
     localization_status_topic: /localization/status
-    # P3 MuJoCo 无融合节点时保持 false；P4 实机入口由 launch/参数覆盖为 true。
-    require_localization_status: false
+    # Formal profile: localization health is an execution precondition.
+    # MuJoCo explicitly overrides this controlled simulation-only gate to false.
+    require_localization_status: true
     localization_status_timeout_sec: 1.0
 
     static_obstacle_value_threshold: 50

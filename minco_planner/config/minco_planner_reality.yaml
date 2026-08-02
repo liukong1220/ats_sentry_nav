@@ -1,11 +1,10 @@
-# 实车（Nav2-free）唯一权威 minco_planner 参数。
+# 实车唯一权威 minco_planner 参数。
 #
 # 权威约定（P6 零.2）：实车 `minco_planner` 的参数只从本文件读取。
 # `src/ats_sentry_bringup/params/node_params.yaml` 与
-# `src/ats_sentry_nav/ats_nav_bringup/config/reality/nav2_params.yaml`
 # 均不得再出现 `minco_planner:` 段，避免同一参数出现两个不同数值。
-# launch 只覆盖 profile 级接线量（use_sim_time、map_ready_topic 与
-# Nav2-free 的 topic 断开），不得在 launch 里覆盖任何几何或动力学限值。
+# launch 只覆盖 profile 级接线量（use_sim_time、map_ready_topic），
+# 不得在 launch 里覆盖任何几何或动力学限值。
 minco_planner:
   ros__parameters:
     # 实车使用 wall clock；混用 /clock 会让 0.5 s lease 与 stale 判据失效。
@@ -13,9 +12,8 @@ minco_planner:
 
     # RC-ESDF/ROGMap adapter 融合后的规划栅格；JPS、MINCO 与足迹检查共用它。
     grid_topic: /rc_esdf/planning_grid
-    # Nav2-free：唯一目标入口是 ats_goal_manager 的带编号请求。
+    # 唯一目标入口是 ats_goal_manager 的带编号请求。
     goal_topic: ""
-    global_plan_topic: ""
     goal_request_topic: /ats_goal_manager/planner_goal
     planner_status_topic: /minco/planning_status
     raw_path_topic: minco/raw_path

@@ -22,7 +22,7 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>eigen</depend>
-  <depend>trajectory_optimizer</depend>
+  <depend>ats_rc_esdf</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

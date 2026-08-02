@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "ament_index_cpp/get_package_share_directory.hpp"
+#include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "geometry_msgs/msg/point.hpp"
@@ -40,6 +40,114 @@ namespace
 
 using SteadyTime = std::chrono::steady_clock::time_point;
 
+template<std::size_t Size>
+std::array<double, Size> declareFixedArray(
+  rclcpp::Node & node, const std::string & name, const std::array<double, Size> & defaults)
+{
+  const auto values = node.declare_parameter<std::vector<double>>(
+    name, std::vector<double>(defaults.begin(), defaults.end()));
+  if (values.size() != Size) {
+    throw std::invalid_argument(name + " must contain exactly " + std::to_string(Size) + " values");
+  }
+  std::array<double, Size> result{};
+  std::copy(values.begin(), values.end(), result.begin());
+  return result;
+}
+
+RogMapCoreParameters declareCoreParameters(rclcpp::Node & node)
+{
+  RogMapCoreParameters parameters;
+  parameters.esdf_enable = node.declare_parameter<bool>("core.esdf.enable", parameters.esdf_enable);
+  parameters.esdf_resolution = node.declare_parameter<double>("core.esdf.resolution", parameters.esdf_resolution);
+  parameters.esdf_local_update_box = declareFixedArray(
+    node, "core.esdf.local_update_box", parameters.esdf_local_update_box);
+  parameters.esdf_update_interval_updates = node.declare_parameter<int>(
+    "core.esdf.update_interval_updates", parameters.esdf_update_interval_updates);
+  parameters.load_pcd_enable = node.declare_parameter<bool>("core.load_pcd_enable", parameters.load_pcd_enable);
+  parameters.pcd_name = node.declare_parameter<std::string>("core.pcd_name", parameters.pcd_name);
+  parameters.map_sliding_enable = node.declare_parameter<bool>(
+    "core.map_sliding.enable", parameters.map_sliding_enable);
+  parameters.map_sliding_threshold = node.declare_parameter<double>(
+    "core.map_sliding.threshold", parameters.map_sliding_threshold);
+  parameters.fix_map_origin = declareFixedArray(node, "core.fix_map_origin", parameters.fix_map_origin);
+  parameters.frontier_extraction_enable = node.declare_parameter<bool>(
+    "core.frontier_extraction_enable", parameters.frontier_extraction_enable);
+  parameters.ros_callback_enable = node.declare_parameter<bool>(
+    "core.ros_callback.enable", parameters.ros_callback_enable);
+  parameters.ros_callback_cloud_topic = node.declare_parameter<std::string>(
+    "core.ros_callback.cloud_topic", parameters.ros_callback_cloud_topic);
+  parameters.ros_callback_odom_topic = node.declare_parameter<std::string>(
+    "core.ros_callback.odom_topic", parameters.ros_callback_odom_topic);
+  parameters.ros_callback_odom_timeout = node.declare_parameter<double>(
+    "core.ros_callback.odom_timeout", parameters.ros_callback_odom_timeout);
+  parameters.visualization_enable = node.declare_parameter<bool>(
+    "core.visualization.enable", parameters.visualization_enable);
+  parameters.visualization_publish_unknown = node.declare_parameter<bool>(
+    "core.visualization.publish_unknown", parameters.visualization_publish_unknown);
+  parameters.visualization_frame_id = node.declare_parameter<std::string>(
+    "core.visualization.frame_id", parameters.visualization_frame_id);
+  parameters.visualization_time_rate = node.declare_parameter<double>(
+    "core.visualization.time_rate", parameters.visualization_time_rate);
+  parameters.visualization_frame_rate = node.declare_parameter<int>(
+    "core.visualization.frame_rate", parameters.visualization_frame_rate);
+  parameters.visualization_range = declareFixedArray(
+    node, "core.visualization.range", parameters.visualization_range);
+  parameters.resolution = node.declare_parameter<double>("core.resolution", parameters.resolution);
+  parameters.inflation_resolution = node.declare_parameter<double>(
+    "core.inflation_resolution", parameters.inflation_resolution);
+  parameters.unknown_inflation_enable = node.declare_parameter<bool>(
+    "core.unknown_inflation.enable", parameters.unknown_inflation_enable);
+  parameters.unknown_inflation_step = node.declare_parameter<int>(
+    "core.unknown_inflation.step", parameters.unknown_inflation_step);
+  parameters.inflation_step = node.declare_parameter<int>("core.inflation_step", parameters.inflation_step);
+  parameters.intensity_threshold = node.declare_parameter<int>(
+    "core.intensity_threshold", parameters.intensity_threshold);
+  parameters.map_size = declareFixedArray(node, "core.map_size", parameters.map_size);
+  parameters.point_filter_count = node.declare_parameter<int>(
+    "core.point_filter_count", parameters.point_filter_count);
+  parameters.raycasting_enable = node.declare_parameter<bool>(
+    "core.raycasting.enable", parameters.raycasting_enable);
+  parameters.raycasting_batch_update_size = node.declare_parameter<int>(
+    "core.raycasting.batch_update_size", parameters.raycasting_batch_update_size);
+  parameters.raycasting_unknown_threshold = node.declare_parameter<double>(
+    "core.raycasting.unknown_threshold", parameters.raycasting_unknown_threshold);
+  parameters.raycasting_p_hit = node.declare_parameter<double>(
+    "core.raycasting.p_hit", parameters.raycasting_p_hit);
+  parameters.raycasting_p_miss = node.declare_parameter<double>(
+    "core.raycasting.p_miss", parameters.raycasting_p_miss);
+  parameters.raycasting_p_min = node.declare_parameter<double>(
+    "core.raycasting.p_min", parameters.raycasting_p_min);
+  parameters.raycasting_p_max = node.declare_parameter<double>(
+    "core.raycasting.p_max", parameters.raycasting_p_max);
+  parameters.raycasting_p_occupied = node.declare_parameter<double>(
+    "core.raycasting.p_occupied", parameters.raycasting_p_occupied);
+  parameters.raycasting_p_free = node.declare_parameter<double>(
+    "core.raycasting.p_free", parameters.raycasting_p_free);
+  parameters.raycasting_range = declareFixedArray(
+    node, "core.raycasting.range", parameters.raycasting_range);
+  parameters.raycasting_local_update_box = declareFixedArray(
+    node, "core.raycasting.local_update_box", parameters.raycasting_local_update_box);
+  parameters.stale_decay_enable = node.declare_parameter<bool>(
+    "core.raycasting.stale_decay.enable", parameters.stale_decay_enable);
+  parameters.stale_decay_soft_ttl_updates = node.declare_parameter<int>(
+    "core.raycasting.stale_decay.soft_ttl_updates", parameters.stale_decay_soft_ttl_updates);
+  parameters.stale_decay_hard_ttl_updates = node.declare_parameter<int>(
+    "core.raycasting.stale_decay.hard_ttl_updates", parameters.stale_decay_hard_ttl_updates);
+  parameters.stale_decay_log_odds_step = node.declare_parameter<double>(
+    "core.raycasting.stale_decay.log_odds_step", parameters.stale_decay_log_odds_step);
+  parameters.stale_decay_sweep_interval_updates = node.declare_parameter<int>(
+    "core.raycasting.stale_decay.sweep_interval_updates", parameters.stale_decay_sweep_interval_updates);
+  parameters.stale_decay_local_update_box_only = node.declare_parameter<bool>(
+    "core.raycasting.stale_decay.local_update_box_only", parameters.stale_decay_local_update_box_only);
+  parameters.clear_clipped_endpoint = node.declare_parameter<bool>(
+    "core.raycasting.clear_clipped_endpoint", parameters.clear_clipped_endpoint);
+  parameters.virtual_ground_height = node.declare_parameter<double>(
+    "core.virtual_ground_height", parameters.virtual_ground_height);
+  parameters.virtual_ceil_height = node.declare_parameter<double>(
+    "core.virtual_ceil_height", parameters.virtual_ceil_height);
+  return parameters;
+}
+
 rog_map::Pose poseFromTransform(const geometry_msgs::msg::TransformStamped & transform)
 {
   const auto & translation = transform.transform.translation;
@@ -57,9 +165,6 @@ public:
   AtsRogMapNode()
   : Node("ats_rog_map"), tf_buffer_(get_clock()), tf_listener_(tf_buffer_)
   {
-    const auto package_share = ament_index_cpp::get_package_share_directory("ats_rog_map");
-    map_config_file_ = declare_parameter<std::string>(
-      "map_config_file", package_share + "/config/rog_map.yaml");
     map_frame_ = declare_parameter<std::string>("map_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "gimbal_yaw_odom");
     sensor_frame_ = declare_parameter<std::string>("sensor_frame", "front_mid360");
@@ -77,7 +182,7 @@ public:
     input_qos_reliable_ = declare_parameter<bool>("input_qos_reliable", false);
     debug_qos_reliable_ = declare_parameter<bool>("debug_qos_reliable", false);
 
-    map_ = std::make_unique<RogMapEngine>(get_clock(), map_config_file_);
+    map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(declareCoreParameters(*this)));
 
     odom_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     cloud_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -137,9 +242,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "ROGMap ready: odom='%s' cloud='%s' map='%s' base='%s' sensor='%s' config='%s'",
+      "ROGMap ready: odom='%s' cloud='%s' map='%s' base='%s' sensor='%s' core=ROS-parameters",
       odom_topic_.c_str(), cloud_topic_.c_str(), map_frame_.c_str(), base_frame_.c_str(),
-      sensor_frame_.c_str(), map_config_file_.c_str());
+      sensor_frame_.c_str());
   }
 
 private:
@@ -566,7 +671,6 @@ private:
       response->stale ? "true" : "false");
   }
 
-  std::string map_config_file_;
   std::string map_frame_;
   std::string base_frame_;
   std::string sensor_frame_;

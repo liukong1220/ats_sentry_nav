@@ -1,45 +1,68 @@
-rog_map:
-  esdf:
-    enable: true
-    resolution: 0.10
-    local_update_box: [8.0, 8.0, 1.0]
-    # P2 numeric snapshots require occupancy and 3D ESDF to share one update generation.
-    update_interval_updates: 1
-  map_sliding:
-    enable: true
-    threshold: 1.0
-  fix_map_origin: [0.0, 0.0, 0.5]
-  frontier_extraction_en: false
-  ros_callback:
-    enable: false
-  visualization:
-    enable: false
-  resolution: 0.10
-  inflation_resolution: 0.10
-  inflation_step: 2
-  unk_inflation_en: false
-  map_size: [10.0, 10.0, 1.0]
-  point_filt_num: 1
-  raycasting:
-    enable: true
-    batch_update_size: 1
-    unk_thresh: 0.70
-    p_hit: 0.70
-    p_miss: 0.30
-    p_min: 0.12
-    p_max: 0.97
-    # P2 planning requires repeated evidence before a voxel enters occupancy and 3D ESDF.
-    p_occ: 0.80
-    p_free: 0.30
-    ray_range: [0.30, 10.0]
-    local_update_box: [8.0, 8.0, 1.0]
-    clear_clipped_endpoint: true
-    stale_decay:
-      enable: true
-      soft_ttl_updates: 30
-      hard_ttl_updates: 90
-      decay_log_odds_step: 0.25
-      sweep_interval_updates: 1
-      local_update_box_only: true
-  virtual_ground_height: -0.50
-  virtual_ceil_height: 1.00
+ats_rog_map:
+  ros__parameters:
+    # The formal P2 MuJoCo profile has one parameter source. The node builds
+    # rog_map::Config from these ROS parameters, not from a nested YAML loader.
+    use_sim_time: true
+    map_frame: odom
+    base_frame: gimbal_yaw_odom
+    sensor_frame: front_mid360
+    odom_topic: /localization
+    cloud_topic: /registered_scan
+    cloud_timeout_sec: 2.0
+    odom_timeout_sec: 2.0
+    tf_timeout_sec: 0.1
+    debug_rate_hz: 2.0
+    esdf_visualization_height: 0.15
+    self_filter_radius: 0.45
+    debug_qos_depth: 1
+    input_qos_reliable: false
+    debug_qos_reliable: false
+    debug_bounds_topic: /rog_map/bounds
+    core.esdf.enable: true
+    core.esdf.resolution: 0.10
+    core.esdf.local_update_box: [8.0, 8.0, 1.0]
+    core.esdf.update_interval_updates: 1
+    core.load_pcd_enable: false
+    core.pcd_name: map.pcd
+    core.map_sliding.enable: true
+    core.map_sliding.threshold: 1.0
+    core.fix_map_origin: [0.0, 0.0, 0.5]
+    core.frontier_extraction_enable: false
+    core.ros_callback.enable: false
+    core.ros_callback.cloud_topic: /cloud_registered
+    core.ros_callback.odom_topic: /lidar_slam/odom
+    core.ros_callback.odom_timeout: 0.05
+    core.visualization.enable: false
+    core.visualization.publish_unknown: false
+    core.visualization.frame_id: world
+    core.visualization.time_rate: 0.0
+    core.visualization.frame_rate: 0
+    core.visualization.range: [0.0, 0.0, 0.0]
+    core.resolution: 0.10
+    core.inflation_resolution: 0.10
+    core.unknown_inflation.enable: false
+    core.unknown_inflation.step: 1
+    core.inflation_step: 2
+    core.intensity_threshold: -1
+    core.map_size: [10.0, 10.0, 1.0]
+    core.point_filter_count: 1
+    core.raycasting.enable: true
+    core.raycasting.batch_update_size: 1
+    core.raycasting.unknown_threshold: 0.70
+    core.raycasting.p_hit: 0.70
+    core.raycasting.p_miss: 0.30
+    core.raycasting.p_min: 0.12
+    core.raycasting.p_max: 0.97
+    core.raycasting.p_occupied: 0.80
+    core.raycasting.p_free: 0.30
+    core.raycasting.range: [0.30, 10.0]
+    core.raycasting.local_update_box: [8.0, 8.0, 1.0]
+    core.raycasting.stale_decay.enable: true
+    core.raycasting.stale_decay.soft_ttl_updates: 30
+    core.raycasting.stale_decay.hard_ttl_updates: 90
+    core.raycasting.stale_decay.log_odds_step: 0.25
+    core.raycasting.stale_decay.sweep_interval_updates: 1
+    core.raycasting.stale_decay.local_update_box_only: true
+    core.raycasting.clear_clipped_endpoint: true
+    core.virtual_ground_height: -0.50
+    core.virtual_ceil_height: 1.00

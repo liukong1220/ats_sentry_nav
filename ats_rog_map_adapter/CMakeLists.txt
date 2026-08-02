@@ -19,7 +19,7 @@ find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(trajectory_optimizer REQUIRED)
+find_package(ats_rc_esdf REQUIRED)
 
 add_library(${PROJECT_NAME}_core src/ground_projection_fusion.cpp)
 target_include_directories(${PROJECT_NAME}_core PUBLIC
@@ -27,13 +27,13 @@ target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 ament_target_dependencies(${PROJECT_NAME}_core
-  ats_rog_map_interfaces geometry_msgs nav_msgs tf2 tf2_geometry_msgs trajectory_optimizer
+  ats_rog_map_interfaces geometry_msgs nav_msgs tf2 tf2_geometry_msgs ats_rc_esdf
 )
 
 add_executable(ats_rog_map_adapter_node src/ats_rog_map_adapter_node.cpp)
 target_link_libraries(ats_rog_map_adapter_node ${PROJECT_NAME}_core)
 ament_target_dependencies(ats_rog_map_adapter_node
-  ats_navigation_interfaces ats_rog_map_interfaces rclcpp std_msgs tf2_ros trajectory_optimizer
+  ats_navigation_interfaces ats_rog_map_interfaces rclcpp std_msgs tf2_ros ats_rc_esdf
 )
 
 install(TARGETS ${PROJECT_NAME}_core ats_rog_map_adapter_node
@@ -51,5 +51,5 @@ endif()
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME}_core)
-ament_export_dependencies(ats_rog_map_interfaces nav_msgs trajectory_optimizer)
+ament_export_dependencies(ats_rog_map_interfaces nav_msgs ats_rc_esdf)
 ament_package()

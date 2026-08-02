@@ -8,7 +8,7 @@
 
 #include "minco_planner/safety/footprint_samples.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
-#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace
 {
@@ -47,7 +47,7 @@ nav_msgs::msg::Path makeObstacleSkimmingPath()
   return path;
 }
 
-void populateOffsetObstacleEsdf(trajectory_optimizer::RcTraversabilityEsdfProvider & esdf)
+void populateOffsetObstacleEsdf(ats_rc_esdf::RcTraversabilityEsdfProvider & esdf)
 {
   nav_msgs::msg::OccupancyGrid grid;
   grid.header.frame_id = "map";
@@ -68,7 +68,7 @@ void populateOffsetObstacleEsdf(trajectory_optimizer::RcTraversabilityEsdfProvid
   esdf.updateGrid(grid, 50, true);
 }
 
-void populateFootprintEdgeObstacleEsdf(trajectory_optimizer::RcTraversabilityEsdfProvider & esdf)
+void populateFootprintEdgeObstacleEsdf(ats_rc_esdf::RcTraversabilityEsdfProvider & esdf)
 {
   nav_msgs::msg::OccupancyGrid grid;
   grid.header.frame_id = "map";
@@ -93,7 +93,7 @@ void populateFootprintEdgeObstacleEsdf(trajectory_optimizer::RcTraversabilityEsd
 
 double minimumDistance(
   const minco_planner::ReferenceTrajectory & trajectory,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider & esdf)
+  const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf)
 {
   double minimum = std::numeric_limits<double>::infinity();
   for (const auto & point : trajectory.points) {
@@ -104,7 +104,7 @@ double minimumDistance(
 
 double minimumFootprintDistance(
   const minco_planner::ReferenceTrajectory & trajectory,
-  const trajectory_optimizer::RcTraversabilityEsdfProvider & esdf,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf,
   double length,
   double width,
   double safety_margin,
@@ -172,7 +172,7 @@ TEST(MincoTrajectoryOptimizer, UsesEsdfGradientToIncreaseObstacleClearance)
   params.esdf_obstacle_max_step = 0.10;
   params.esdf_obstacle_max_deviation = 0.60;
   minco_planner::MincoTrajectoryOptimizer optimizer(params);
-  trajectory_optimizer::RcTraversabilityEsdfProvider esdf;
+  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
   populateOffsetObstacleEsdf(esdf);
   const auto baseline = optimizer.optimize(makeObstacleSkimmingPath());
   const auto optimized = optimizer.optimize(makeObstacleSkimmingPath(), &esdf);
@@ -205,7 +205,7 @@ TEST(MincoTrajectoryOptimizer, UsesYawAwareFootprintToIncreaseEdgeClearance)
   params.footprint_width = 0.40;
   params.footprint_safety_margin = 0.0;
   minco_planner::MincoTrajectoryOptimizer optimizer(params);
-  trajectory_optimizer::RcTraversabilityEsdfProvider esdf;
+  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
   populateFootprintEdgeObstacleEsdf(esdf);
 
   const auto center_reference = optimizer.optimize(makeObstacleSkimmingPath(), &esdf);

@@ -8,7 +8,7 @@
 #include "minco_planner/trajectory/reference_trajectory.hpp"
 #include "nav_msgs/msg/path.hpp"
 
-namespace trajectory_optimizer
+namespace ats_rc_esdf
 {
 class RcTraversabilityEsdfProvider;
 }
@@ -94,7 +94,7 @@ public:
    */
   ReferenceTrajectory optimize(
     const nav_msgs::msg::Path & raw_path,
-    const trajectory_optimizer::RcTraversabilityEsdfProvider * esdf = nullptr,
+    const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf = nullptr,
     const ReferenceTrajectory * footprint_orientation = nullptr,
     const InitialKinematicState * initial_state = nullptr) const;
 

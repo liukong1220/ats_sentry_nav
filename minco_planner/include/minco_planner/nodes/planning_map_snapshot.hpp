@@ -9,7 +9,7 @@
 #include <optional>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
-#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace minco_planner
 {
@@ -47,7 +47,7 @@ struct PlanningMapSnapshot
 {
   std::uint64_t generation{0};
   nav_msgs::msg::OccupancyGrid grid;
-  std::shared_ptr<const trajectory_optimizer::RcTraversabilityEsdfProvider> clearance_esdf;
+  std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> clearance_esdf;
 
   static std::shared_ptr<const PlanningMapSnapshot> create(
     std::uint64_t generation,

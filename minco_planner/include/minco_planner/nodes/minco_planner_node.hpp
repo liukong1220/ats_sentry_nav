@@ -30,7 +30,7 @@
 #include "std_msgs/msg/bool.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
-#include "trajectory_optimizer/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 
 namespace minco_planner
@@ -47,7 +47,6 @@ private:
   void onMapReadyWatchdog();
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void onPlannerGoal(const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg);
-  void onGlobalPlan(const nav_msgs::msg::Path::SharedPtr msg);
   void planGoal(const geometry_msgs::msg::PoseStamped &goal,
                 std::uint64_t goal_id, std::uint64_t localization_epoch,
                 std::uint64_t map_publication_sequence,
@@ -88,7 +87,6 @@ private:
 
   std::string grid_topic_ = "traversability_grid";
   std::string goal_topic_ = "goal_pose";
-  std::string global_plan_topic_ = "/plan";
   std::string goal_request_topic_;
   std::string planner_status_topic_;
   std::string raw_path_topic_ = "minco/raw_path";
@@ -142,7 +140,6 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerGoal>::SharedPtr goal_request_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_plan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::TimerBase::SharedPtr safety_watchdog_timer_;
   rclcpp::TimerBase::SharedPtr runtime_safety_recheck_timer_;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "rclcpp/clock.hpp"
 #include "rog_map/rog_map.h"
@@ -19,6 +20,13 @@ public:
   : clock_(clock)
   {
     cfg_ = rog_map::Config(config_file);
+    init();
+  }
+
+  RogMapEngine(const rclcpp::Clock::SharedPtr & clock, rog_map::Config config)
+  : clock_(clock)
+  {
+    cfg_ = std::move(config);
     init();
   }
 

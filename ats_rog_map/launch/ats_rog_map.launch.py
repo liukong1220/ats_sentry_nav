@@ -16,9 +16,9 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("cloud_topic", default_value="/registered_scan"),
         DeclareLaunchArgument("self_filter_radius", default_value="0.45"),
         DeclareLaunchArgument(
-            "map_config_file",
+            "params_file",
             default_value=PathJoinSubstitution([
-                FindPackageShare("ats_rog_map"), "config", "rog_map.yaml",
+                FindPackageShare("ats_rog_map"), "config", "rog_map_ground_planning_mujoco.yaml",
             ]),
         ),
         Node(
@@ -26,7 +26,7 @@ def generate_launch_description() -> LaunchDescription:
             executable="ats_rog_map_node",
             name="ats_rog_map",
             output="screen",
-            parameters=[{
+            parameters=[LaunchConfiguration("params_file"), {
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "map_frame": LaunchConfiguration("map_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),
@@ -34,7 +34,6 @@ def generate_launch_description() -> LaunchDescription:
                 "odom_topic": LaunchConfiguration("odom_topic"),
                 "cloud_topic": LaunchConfiguration("cloud_topic"),
                 "self_filter_radius": LaunchConfiguration("self_filter_radius"),
-                "map_config_file": LaunchConfiguration("map_config_file"),
             }],
         ),
     ])
