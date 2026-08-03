@@ -6,11 +6,16 @@ ats_rog_map_adapter:
     # 判据整体失真。仿真侧由 launch 的 use_sim_time 参数负责置 true。
     use_sim_time: false
     projection_service: /rog_map/get_ground_projection
-    projection_rate_hz: 2.0
-    projection_request_timeout_sec: 2.0
-    projection_snapshot_timeout_sec: 2.0
-    # Terrain/slope and the ROGMap projection must describe the same sensor-time neighborhood.
-    input_sync_tolerance_sec: 1.0
+    # The 100 x 100 x 7 numerical projection takes 0.9--3.2 s in the
+    # MuJoCo CPU profile. Do not queue another request while its immutable
+    # snapshot is still being built; ROGMap's 2.0 s source-health gate
+    # remains the authority for sensor freshness.
+    projection_rate_hz: 0.5
+    projection_request_timeout_sec: 4.0
+    projection_snapshot_timeout_sec: 4.0
+    # CPU projection latency was measured at up to 1.794 s; both sources
+    # still have to pass the independent 2.0 s freshness gate below.
+    input_sync_tolerance_sec: 1.8
     # At 0.10 m voxels, start at z=0.15 m so flat-ground hits centered at z=-0.05 m
     # do not enter the ground-planning projection. Terrain layers retain low-step semantics.
     projection_min_height: 0.10

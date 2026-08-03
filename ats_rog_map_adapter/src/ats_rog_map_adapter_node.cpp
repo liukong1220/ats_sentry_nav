@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,15 @@ public:
     projection_min_height_ = declare_parameter<double>("projection_min_height", 0.10);
     projection_max_height_ = declare_parameter<double>("projection_max_height", 0.80);
     planning_resolution_ = std::max(0.01, declare_parameter<double>("planning_resolution", 0.10));
+    planning_grid_owner_ = declare_parameter<std::string>("planning_grid_owner", "rog_map");
+    if (planning_grid_owner_ != "rog_map" && planning_grid_owner_ != "rc_esdf") {
+      throw std::invalid_argument(
+        "planning_grid_owner must be 'rog_map' or 'rc_esdf'");
+    }
+    if (planning_grid_owner_ == "rc_esdf") {
+      throw std::runtime_error(
+        "rc_esdf planning-grid owner has no active publisher in this launch; refusing duplicate ownership");
+    }
     static_map_topic_ = declare_parameter<std::string>("static_map_topic", "/map");
     traversability_grid_topic_ = declare_parameter<std::string>(
       "traversability_grid_topic", "/traversability_grid");
@@ -316,11 +326,40 @@ private:
       traversability = traversability_grid_;
       slope = slope_grid_;
     }
-    if (!static_map || !traversability || !slope || !inputFresh(*traversability) ||
-      !inputFresh(*slope) ||
-      !inputSynchronized(*traversability, response.occupancy_grid.header.stamp) ||
-      !inputSynchronized(*slope, response.occupancy_grid.header.stamp))
+    const bool traversability_fresh = traversability && inputFresh(*traversability);
+    const bool slope_fresh = slope && inputFresh(*slope);
+    const bool traversability_synchronized = traversability && inputSynchronized(
+      *traversability, response.occupancy_grid.header.stamp);
+    const bool slope_synchronized = slope && inputSynchronized(
+      *slope, response.occupancy_grid.header.stamp);
+    if (!static_map || !traversability_fresh || !slope_fresh ||
+      !traversability_synchronized || !slope_synchronized)
     {
+      const auto message_age = [this](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid) {
+          if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0) {
+            return std::numeric_limits<double>::quiet_NaN();
+          }
+          return (now() - rclcpp::Time(grid->header.stamp)).seconds();
+        };
+      const auto timestamp_delta = [](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid,
+                                      const builtin_interfaces::msg::Time & projection_stamp) {
+          if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0 ||
+            rclcpp::Time(projection_stamp).nanoseconds() <= 0)
+          {
+            return std::numeric_limits<double>::quiet_NaN();
+          }
+          return std::abs((rclcpp::Time(grid->header.stamp) -
+            rclcpp::Time(projection_stamp)).seconds());
+        };
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Terrain rejected: static=%d traversal fresh=%d sync=%d age=%.3f delta=%.3f; "
+        "slope fresh=%d sync=%d age=%.3f delta=%.3f",
+        static_map ? 1 : 0, traversability_fresh ? 1 : 0,
+        traversability_synchronized ? 1 : 0, message_age(traversability),
+        timestamp_delta(traversability, response.occupancy_grid.header.stamp),
+        slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0, message_age(slope),
+        timestamp_delta(slope, response.occupancy_grid.header.stamp));
       publishUnavailable("Terrain inputs are missing, stale, or unsynchronized");
       return;
     }
@@ -518,6 +557,7 @@ private:
   std::string traversability_grid_topic_;
   std::string slope_grid_topic_;
   std::string planning_grid_topic_;
+  std::string planning_grid_owner_;
   std::string signed_distance_grid_topic_;
   std::string footprint_clearance_grid_topic_;
   std::string ready_topic_;
