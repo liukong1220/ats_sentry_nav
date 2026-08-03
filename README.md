@@ -136,6 +136,16 @@ P3 运行链已经使用该授权；P4 的 candidate digest 关联字段已定�
 - Eigen3、PCL、OpenCV、yaml-cpp、glog、libunwind；
 - Livox SDK/driver、small_gicp 及工作区内 ATS interface/bringup 包。
 
+独立克隆本仓时，用仓内 manifest 补齐外置的底盘速度 frame adapter：
+
+```bash
+cd /home/ats/ATS_2026_snetry_test
+vcs import --skip-existing src < src/ats_sentry_nav/dependencies.repos
+```
+
+Point-LIO、Livox driver、small_gicp、ROGMap、RC-ESDF、MINCO、Goal Manager 和 MPC
+已经由本仓直接版本控制，不再通过旧 `.gitmodules` 拉取 PB/Nav2 子模块。
+
 建议优先由 `rosdep` 根据活动源码安装系统依赖：
 
 ```bash
@@ -158,20 +168,20 @@ rosdep install --from-paths src --ignore-src -r -y
 ```bash
 cd /home/ats/ATS_2026_snetry_test
 source /opt/ros/humble/setup.bash
-MAKEFLAGS=-j1 colcon build --base-paths src --symlink-install \
-  --parallel-workers 1
+MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
+  --parallel-workers 6
 source install/setup.bash
 ```
 
 只构建导航核心时可使用：
 
 ```bash
-MAKEFLAGS=-j1 colcon build --base-paths src --symlink-install \
+MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
   --packages-select \
     ats_navigation_interfaces ats_rog_map_interfaces ats_rc_esdf \
     ats_rog_map ats_rog_map_adapter minco_planner ats_goal_manager \
     ats_swerve_mpc ats_nav_bringup ats_sentry_nav \
-  --parallel-workers 1
+  --parallel-workers 6
 ```
 
 ### 启动前检查
@@ -414,6 +424,7 @@ ats_sentry_nav/
 ├── terrain_analysis*/           # 地形与 traversability
 ├── fake_vel_transform/          # 云台 yaw 速度 frame 兼容层
 ├── sensor_scan_generation/      # 点云/TF 链适配
+├── dependencies.repos           # standalone 外置源码依赖
 └── ats_sentry_nav/              # 导航聚合包
 ```
 
