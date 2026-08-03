@@ -118,6 +118,12 @@ Vec3f ProbMap::getLocalMapSize() const {
     return cfg_.map_size_d;
 }
 
+void ProbMap::getRaycastLocalUpdateBox(Vec3f & box_min, Vec3f & box_max) const {
+    std::lock_guard<std::mutex> lock(raycast_data_.raycast_range_mtx);
+    box_min = raycast_data_.local_update_box_min;
+    box_max = raycast_data_.local_update_box_max;
+}
+
 // Query====================================================
 bool ProbMap::isOccupied(const Vec3f& pos) const {
     if (!insideLocalMap(pos)) {
@@ -341,6 +347,9 @@ void ProbMap::updateProbMap(
         std::cout << YELLOW << " -- [ROGMapCore] cur_pose out of map range, reset the map." << RESET << std::endl;
         std::cout << YELLOW << " -- [ROGMapCore] Sliding to map center at: " << map_center.transpose() << RESET << std::endl;
         slideAllMap(map_center);
+        // Keep diagnostics and the next raycast decision aligned with the new
+        // sliding window even though this frame has no map update yet.
+        updateLocalBox(map_center);
         return;
     }
 

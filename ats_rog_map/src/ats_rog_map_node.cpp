@@ -176,6 +176,7 @@ public:
     debug_rate_hz_ = std::max(0.0, declare_parameter<double>("debug_rate_hz", 2.0));
     esdf_visualization_height_ = declare_parameter<double>("esdf_visualization_height", 0.15);
     debug_bounds_topic_ = declare_parameter<std::string>("debug_bounds_topic", "rog_map/bounds");
+    debug_bounds_show_labels_ = declare_parameter<bool>("debug_bounds_show_labels", true);
     self_filter_radius_ = std::max(0.0, declare_parameter<double>("self_filter_radius", 0.45));
     debug_qos_depth_ = std::max<int>(
       1, static_cast<int>(declare_parameter<int>("debug_qos_depth", 1)));
@@ -327,7 +328,11 @@ private:
           static_cast<unsigned long long>(map_->generation()), stats.input_points,
           stats.raycast_endpoint_points, stats.hit_endpoint_points, stats.occupied_touched_cells,
           stats.stale_decayed_cells);
-        last_map_stamp_ = stamp;
+        // The published grid is an immutable ROGMap snapshot assembled at
+        // commit time.  Sensor header time remains the TF lookup key above;
+        // using it as the grid stamp would make a healthy queued cloud appear
+        // seconds older than terrain/slope inputs during projection.
+        last_map_stamp_ = now();
         has_map_data_ = true;
       }
     }
@@ -380,22 +385,31 @@ private:
     return message;
   }
 
-  void publishBoundsMarker(
-    const rog_map::Vec3f & box_min, const rog_map::Vec3f & box_max)
+  static bool validBounds(const rog_map::Vec3f & box_min, const rog_map::Vec3f & box_max)
+  {
+    return box_min.array().isFinite().all() && box_max.array().isFinite().all() &&
+           ((box_max - box_min).array() > 1e-6F).all();
+  }
+
+  void appendBoundsMarker(
+    visualization_msgs::msg::MarkerArray & markers, const rog_map::Vec3f & box_min,
+    const rog_map::Vec3f & box_max, const std::string & ns, const std::string & label,
+    int id, float red, float green, float blue, float alpha)
   {
     visualization_msgs::msg::Marker marker;
     marker.header.frame_id = map_frame_;
     marker.header.stamp = last_map_stamp_;
-    marker.ns = "rog_map_bounds";
-    marker.id = 0;
+    marker.ns = ns;
+    marker.id = id;
     marker.type = visualization_msgs::msg::Marker::LINE_LIST;
-    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.action = validBounds(box_min, box_max) ? visualization_msgs::msg::Marker::ADD :
+      visualization_msgs::msg::Marker::DELETE;
     marker.pose.orientation.w = 1.0;
     marker.scale.x = std::max(0.02, 0.4 * map_->getResolution());
-    marker.color.r = 1.0F;
-    marker.color.g = 0.72F;
-    marker.color.b = 0.10F;
-    marker.color.a = 0.90F;
+    marker.color.r = red;
+    marker.color.g = green;
+    marker.color.b = blue;
+    marker.color.a = alpha;
 
     const auto point = [](const rog_map::Vec3f & value) {
         geometry_msgs::msg::Point result;
@@ -417,14 +431,51 @@ private:
       {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
       {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
       {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}}}};
-    marker.points.reserve(2U * kEdges.size());
-    for (const auto & edge : kEdges) {
-      marker.points.push_back(corners[edge[0]]);
-      marker.points.push_back(corners[edge[1]]);
+    if (marker.action == visualization_msgs::msg::Marker::ADD) {
+      marker.points.reserve(2U * kEdges.size());
+      for (const auto & edge : kEdges) {
+        marker.points.push_back(corners[edge[0]]);
+        marker.points.push_back(corners[edge[1]]);
+      }
     }
-
-    visualization_msgs::msg::MarkerArray markers;
     markers.markers.push_back(std::move(marker));
+
+    visualization_msgs::msg::Marker text;
+    text.header.frame_id = map_frame_;
+    text.header.stamp = last_map_stamp_;
+    text.ns = ns + "_label";
+    text.id = id + 100;
+    text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    text.action = (debug_bounds_show_labels_ && validBounds(box_min, box_max)) ?
+      visualization_msgs::msg::Marker::ADD : visualization_msgs::msg::Marker::DELETE;
+    text.pose.orientation.w = 1.0;
+    text.pose.position.x = 0.5 * (box_min.x() + box_max.x());
+    text.pose.position.y = 0.5 * (box_min.y() + box_max.y());
+    text.pose.position.z = box_max.z() + 0.12;
+    text.scale.z = 0.18;
+    text.color.r = red;
+    text.color.g = green;
+    text.color.b = blue;
+    text.color.a = alpha;
+    text.text = label;
+    markers.markers.push_back(std::move(text));
+  }
+
+  void publishBoundsMarkers(
+    const rog_map::Vec3f & local_min, const rog_map::Vec3f & local_max,
+    const rog_map::Vec3f & visualization_min, const rog_map::Vec3f & visualization_max,
+    const rog_map::Vec3f & update_min, const rog_map::Vec3f & update_max)
+  {
+    visualization_msgs::msg::MarkerArray markers;
+    appendBoundsMarker(
+      markers, local_min, local_max, "rog_map_local_map", "Local Map Range", 0,
+      1.0F, 0.50F, 0.0F, 0.95F);
+    appendBoundsMarker(
+      markers, visualization_min, visualization_max, "rog_map_visualization", "Visualization Range", 1,
+      0.50F, 0.0F, 1.0F, 0.90F);
+    appendBoundsMarker(
+      markers, update_min, update_max, "rog_map_local_update", "Raycast Update Range", 2,
+      0.0F, 1.0F, 0.0F, 0.90F);
     bounds_pub_->publish(markers);
   }
 
@@ -449,12 +500,32 @@ private:
 
     const rog_map::Vec3f map_center = map_->getLocalMapOrigin();
     const rog_map::Vec3f half_map_size = 0.5F * map_->getLocalMapSize();
-    rog_map::Vec3f box_min = map_center - half_map_size;
-    rog_map::Vec3f box_max = map_center + half_map_size;
-    map_->boundBoxByLocalMap(box_min, box_max);
-    if (publish_bounds) {
-      publishBoundsMarker(box_min, box_max);
+    rog_map::Vec3f local_box_min = map_center - half_map_size;
+    rog_map::Vec3f local_box_max = map_center + half_map_size;
+    map_->boundBoxByLocalMap(local_box_min, local_box_max);
+
+    rog_map::Vec3f visualization_box_min = local_box_min;
+    rog_map::Vec3f visualization_box_max = local_box_max;
+    const auto config = map_->getMapConfig();
+    if ((config.visualization_range.array() > 0.0F).all()) {
+      const rog_map::Vec3f robot_position = map_->getRobotState().p;
+      const rog_map::Vec3f half_visualization_range = 0.5F * config.visualization_range;
+      visualization_box_min = robot_position - half_visualization_range;
+      visualization_box_max = robot_position + half_visualization_range;
+      map_->boundBoxByLocalMap(visualization_box_min, visualization_box_max);
     }
+
+    rog_map::Vec3f update_box_min;
+    rog_map::Vec3f update_box_max;
+    map_->getRaycastLocalUpdateBox(update_box_min, update_box_max);
+    map_->boundBoxByLocalMap(update_box_min, update_box_max);
+    if (publish_bounds) {
+      publishBoundsMarkers(
+        local_box_min, local_box_max, visualization_box_min, visualization_box_max,
+        update_box_min, update_box_max);
+    }
+    const rog_map::Vec3f box_min = visualization_box_min;
+    const rog_map::Vec3f box_max = visualization_box_max;
     if (publish_occupied) {
       rog_map::vec_E<rog_map::Vec3f> occupied;
       map_->boxSearch(box_min, box_max, super_utils::OCCUPIED, occupied);
@@ -474,7 +545,11 @@ private:
       rog_map::Vec3f esdf_box_min;
       rog_map::Vec3f esdf_box_max;
       if (map_->getCurrentEsdfBounds(esdf_box_min, esdf_box_max)) {
-        esdf_pub_->publish(makeEsdfCloud(esdf_box_min, esdf_box_max, last_map_stamp_));
+        esdf_box_min = esdf_box_min.cwiseMax(box_min);
+        esdf_box_max = esdf_box_max.cwiseMin(box_max);
+        if (validBounds(esdf_box_min, esdf_box_max)) {
+          esdf_pub_->publish(makeEsdfCloud(esdf_box_min, esdf_box_max, last_map_stamp_));
+        }
       }
     }
   }
@@ -682,6 +757,7 @@ private:
   double debug_rate_hz_{2.0};
   double esdf_visualization_height_{0.15};
   std::string debug_bounds_topic_;
+  bool debug_bounds_show_labels_{true};
   double self_filter_radius_{0.45};
   int debug_qos_depth_{1};
   bool input_qos_reliable_{false};
