@@ -57,6 +57,14 @@ TEST(RogMapEngineSnapshot, InvalidatesEsdfForMapUpdatesAndSlidingResets)
   EXPECT_LE(esdf_min.x(), 10.0);
   EXPECT_GE(esdf_max.x(), 10.0);
 
+  rog_map::Vec3f update_box_min;
+  rog_map::Vec3f update_box_max;
+  map.getRaycastLocalUpdateBox(update_box_min, update_box_max);
+  EXPECT_LE(update_box_min.x(), 10.0);
+  EXPECT_GE(update_box_max.x(), 10.0);
+  EXPECT_LE(update_box_min.y(), 0.0);
+  EXPECT_GE(update_box_max.y(), 0.0);
+
   const auto generation_before_rejected_update = map.generation();
   EXPECT_FALSE(map.update(makeCloud(11.0F), makePose(10.0F), makePose(10.0F, 2.0F)));
   EXPECT_EQ(map.generation(), generation_before_rejected_update);

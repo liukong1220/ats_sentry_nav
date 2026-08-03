@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <rog_map/inf_map.h>
 #include <rog_map/free_cnt_map.h>
@@ -186,6 +187,10 @@ namespace rog_map {
 
         Vec3f getLocalMapSize() const;
 
+        // The raycast update box is the quantized, map-clipped region used by
+        // the current update cycle. It is exposed for diagnostics only.
+        void getRaycastLocalUpdateBox(Vec3f & box_min, Vec3f & box_max) const;
+
         double getResolution() const{
             return sc_.resolution;
         }
@@ -272,7 +277,7 @@ namespace rog_map {
             std::vector<uint16_t> hit_cnt;
             Vec3f cache_box_max, cache_box_min, local_update_box_max, local_update_box_min;
             int batch_update_counter{0};
-            std::mutex raycast_range_mtx;
+            mutable std::mutex raycast_range_mtx;
         } raycast_data_;
 
         vector<double> time_consuming_;

@@ -18,6 +18,7 @@ ats_rog_map:
     input_qos_reliable: false
     debug_qos_reliable: false
     debug_bounds_topic: /rog_map/bounds
+    debug_bounds_show_labels: true
     core.esdf.enable: true
     core.esdf.resolution: 0.10
     core.esdf.local_update_box: [8.0, 8.0, 1.0]
@@ -37,7 +38,8 @@ ats_rog_map:
     core.visualization.frame_id: world
     core.visualization.time_rate: 0.0
     core.visualization.frame_rate: 0
-    core.visualization.range: [0.0, 0.0, 0.0]
+    # Robot-centred debug window; the orange marker remains the full sliding map.
+    core.visualization.range: [8.0, 8.0, 1.0]
     core.resolution: 0.10
     core.inflation_resolution: 0.10
     core.unknown_inflation.enable: false
