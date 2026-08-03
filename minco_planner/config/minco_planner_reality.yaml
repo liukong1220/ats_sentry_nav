@@ -26,7 +26,7 @@ minco_planner:
     emergency_stop_topic: /planner/emergency_stop
     # 急停与执行授权归 ats_goal_manager，MINCO 不得越权发布。
     planner_manages_emergency_stop: false
-    map_ready_timeout_sec: 3.0
+    map_ready_timeout_sec: 5.0
     emergency_stop_heartbeat_period_sec: 0.1
     runtime_safety_recheck_hz: 10.0
     runtime_safety_horizon_sec: 1.0

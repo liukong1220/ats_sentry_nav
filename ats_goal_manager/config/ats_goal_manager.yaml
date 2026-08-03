@@ -25,7 +25,7 @@ ats_goal_manager:
     goal_frame: map
     planning_frame: odom
     # 该租约使用 steady clock，不能由仿真时钟跳变或旧 DDS 样本续命。
-    map_ready_timeout_sec: 3.0
+    map_ready_timeout_sec: 5.0
     localization_status_timeout_sec: 1.0
     # MuJoCo P3 直接使用真值 /localization 时保持 false；P4 实机入口覆盖为 true。
     require_localization_status: false

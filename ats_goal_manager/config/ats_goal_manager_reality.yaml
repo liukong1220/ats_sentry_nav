@@ -31,7 +31,7 @@ ats_goal_manager:
     goal_frame: map
     planning_frame: odom
     # 以下租约使用 steady clock，不受仿真时钟或旧 DDS 样本续命。
-    map_ready_timeout_sec: 3.0
+    map_ready_timeout_sec: 5.0
     localization_status_timeout_sec: 1.0
     # 实车必须为 true：定位健康与 epoch 是执行授权的前置条件。
     require_localization_status: true
