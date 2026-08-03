@@ -1,0 +1,13 @@
+# Standalone source dependency manifest for ats_sentry_nav.
+#
+# Import from an ATS workspace root after cloning this repository to
+# src/ats_sentry_nav:
+#   vcs import --skip-existing src < src/ats_sentry_nav/dependencies.repos
+#
+# All map, planning, action and MPC packages are owned by ats_sentry_nav itself.
+# The chassis-frame velocity adapter remains an independent repository.
+repositories:
+  ats_sentry_nav/sentry_chassis_vel_transform:
+    type: git
+    url: https://github.com/liukong1220/sentry_chassis_vel_transform.git
+    version: develop
