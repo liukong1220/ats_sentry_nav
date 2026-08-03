@@ -25,6 +25,4 @@ ament_auto_package(
   map
   pcd
   config
-  behavior_trees
-  rviz
 )
