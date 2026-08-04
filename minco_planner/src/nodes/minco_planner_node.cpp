@@ -407,7 +407,8 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
     static_cast<unsigned long long>(snapshot->generation), safety.collisions.size(),
     safety.discrete_samples_checked, safety.swept_samples_checked);
   publishPlannerStatus(
-    active_reference->goal_id, active_reference->localization_epoch, snapshot->generation,
+    active_reference->goal_id, active_reference->localization_epoch,
+    active_reference->plan_request_sequence, snapshot->generation,
     active_reference->map_publication_sequence,
     ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
     ats_navigation_interfaces::msg::PlannerStatus::FAILURE_RUNTIME_UNSAFE);
@@ -416,43 +417,49 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
 void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
   // P2/P3 过渡兼容入口：P2 保持直接 PoseStamped，不携带任务生命周期编号。
-  planGoal(*msg, 0, 0, 0, false);
+  planGoal(*msg, 0, 0, 0, 0, false);
 }
 
 void MincoPlannerNode::onPlannerGoal(
   const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg)
 {
-  if (msg->goal_id == 0) {
+  if (msg->goal_id == 0 || msg->plan_request_sequence == 0) {
     publishPlannerStatus(
-        0, msg->localization_epoch, 0, msg->map_publication_sequence,
+        0, msg->localization_epoch, msg->plan_request_sequence, 0,
+        msg->map_publication_sequence,
         ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
         ats_navigation_interfaces::msg::PlannerStatus::FAILURE_INVALID_GOAL);
     return;
   }
   publishPlannerStatus(
-      msg->goal_id, msg->localization_epoch, 0, msg->map_publication_sequence,
+      msg->goal_id, msg->localization_epoch, msg->plan_request_sequence, 0,
+      msg->map_publication_sequence,
       ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED,
       ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NONE);
   planGoal(
     msg->goal_pose, msg->goal_id, msg->localization_epoch,
+    msg->plan_request_sequence,
     msg->map_publication_sequence, true);
 }
 
 void MincoPlannerNode::planGoal(
     const geometry_msgs::msg::PoseStamped &input_goal, std::uint64_t goal_id,
-    std::uint64_t localization_epoch, std::uint64_t map_publication_sequence,
+    std::uint64_t localization_epoch, std::uint64_t plan_request_sequence,
+    std::uint64_t map_publication_sequence,
     bool report_status) {
   setPlanSafe(false);
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
     active_safety_reference_.reset();
   }
-  const auto fail = [this, goal_id, localization_epoch, map_publication_sequence, report_status](
+  const auto fail = [this, goal_id, localization_epoch, plan_request_sequence,
+                     map_publication_sequence, report_status](
                         std::uint8_t failure_reason, std::uint64_t generation) {
     setPlanSafe(false);
     if (report_status) {
       publishPlannerStatus(
-          goal_id, localization_epoch, generation, map_publication_sequence,
+          goal_id, localization_epoch, plan_request_sequence, generation,
+          map_publication_sequence,
           ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED, failure_reason);
     }
   };
@@ -624,7 +631,7 @@ void MincoPlannerNode::planGoal(
     reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
   if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch,
                                  control_reference, reference, goal_id, localization_epoch,
-                                 map_publication_sequence, yaw_authority,
+                                 plan_request_sequence, map_publication_sequence, yaw_authority,
                                  report_status)) {
     RCLCPP_WARN(
       get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
@@ -774,6 +781,7 @@ void MincoPlannerNode::publishEmergencyStop(bool stop)
 
 void MincoPlannerNode::publishPlannerStatus(
     std::uint64_t goal_id, std::uint64_t localization_epoch,
+    std::uint64_t plan_request_sequence,
     std::uint64_t map_generation, std::uint64_t map_publication_sequence,
     std::uint8_t state, std::uint8_t failure_reason,
     const builtin_interfaces::msg::Time &reference_stamp,
@@ -786,6 +794,7 @@ void MincoPlannerNode::publishPlannerStatus(
   status.header.frame_id = global_frame_;
   status.goal_id = goal_id;
   status.localization_epoch = localization_epoch;
+  status.plan_request_sequence = plan_request_sequence;
   status.map_generation = map_generation;
   status.map_publication_sequence = map_publication_sequence;
   status.state = state;
@@ -810,6 +819,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     std::uint64_t map_health_epoch, const nav_msgs::msg::Path &reference_path,
     const ReferenceTrajectory &safety_reference,
     std::uint64_t goal_id, std::uint64_t localization_epoch,
+    std::uint64_t plan_request_sequence,
     std::uint64_t map_publication_sequence,
     std::uint8_t yaw_authority,
     bool report_status) {
@@ -837,6 +847,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
       active_reference.trajectory.header.stamp = committed_reference.header.stamp;
       active_reference.goal_id = goal_id;
       active_reference.localization_epoch = localization_epoch;
+      active_reference.plan_request_sequence = plan_request_sequence;
       active_reference.map_generation = snapshot->generation;
       active_reference.map_publication_sequence = map_publication_sequence;
       active_safety_reference_ = std::move(active_reference);
@@ -861,7 +872,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     candidate_reference_path_pub_->publish(candidate_reference);
     if (report_status) {
       publishPlannerStatus(
-          goal_id, localization_epoch, snapshot->generation, map_publication_sequence,
+          goal_id, localization_epoch, plan_request_sequence,
+          snapshot->generation, map_publication_sequence,
           ats_navigation_interfaces::msg::PlannerStatus::STATE_REFERENCE_READY,
           ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NONE,
           candidate_reference.header.stamp, yaw_authority,
