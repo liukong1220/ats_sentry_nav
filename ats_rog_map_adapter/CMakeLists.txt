@@ -47,6 +47,10 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 if(BUILD_TESTING)
   ament_add_gtest(test_ground_projection_fusion test/test_ground_projection_fusion.cpp)
   target_link_libraries(test_ground_projection_fusion ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_planning_map_snapshot test/test_planning_map_snapshot.cpp)
+  target_include_directories(test_planning_map_snapshot PRIVATE include)
+  ament_target_dependencies(test_planning_map_snapshot ats_navigation_interfaces nav_msgs)
 endif()
 
 ament_export_include_directories(include)

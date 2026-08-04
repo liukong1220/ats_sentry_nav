@@ -13,9 +13,10 @@ ats_rog_map_adapter:
     projection_rate_hz: 0.5
     projection_request_timeout_sec: 4.0
     projection_snapshot_timeout_sec: 4.0
-    # CPU projection latency was measured at up to 1.794 s; both sources
-    # still have to pass the independent 2.0 s freshness gate below.
-    input_sync_tolerance_sec: 1.8
+    # The CPU profile shows up to 1.94 s between projection and terrain/slope
+    # stamps; align this with the independent 2.0 s source-health gate without
+    # extending the source input timeout itself.
+    input_sync_tolerance_sec: 2.0
     # At 0.10 m voxels, start at z=0.15 m so flat-ground hits centered at z=-0.05 m
     # do not enter the ground-planning projection. Terrain layers retain low-step semantics.
     projection_min_height: 0.10
@@ -31,6 +32,9 @@ ats_rog_map_adapter:
     ready_topic: /rog_map_adapter/ready
     generation_topic: /rog_map_adapter/generation
     map_status_topic: /rog_map_adapter/status
+    # Immutable, numeric adapter publication used by Goal Manager only for the
+    # P2.4 restart gate. MINCO retains its own local PlanningMapSnapshot.
+    planning_snapshot_topic: /rog_map_adapter/planning_snapshot
     localization_status_topic: /localization/status
     # Formal profile: localization health is an execution precondition.
     # MuJoCo explicitly overrides this controlled simulation-only gate to false.

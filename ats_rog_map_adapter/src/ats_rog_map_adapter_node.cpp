@@ -15,8 +15,10 @@
 #include <vector>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
 #include "ats_rog_map_adapter/ground_projection_fusion.hpp"
+#include "ats_rog_map_adapter/planning_map_snapshot.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -70,6 +72,8 @@ public:
       "generation_topic", "/rog_map_adapter/generation");
     map_status_topic_ = declare_parameter<std::string>(
         "map_status_topic", "/rog_map_adapter/status");
+    planning_snapshot_topic_ = declare_parameter<std::string>(
+      "planning_snapshot_topic", "/rog_map_adapter/planning_snapshot");
     localization_status_topic_ = declare_parameter<std::string>(
         "localization_status_topic", "/localization/status");
     require_localization_status_ =
@@ -144,6 +148,8 @@ public:
     map_status_pub_ =
         create_publisher<ats_navigation_interfaces::msg::PlanningMapStatus>(
             map_status_topic_, output_qos);
+    planning_snapshot_pub_ = create_publisher<
+      ats_navigation_interfaces::msg::PlanningMapSnapshot>(planning_snapshot_topic_, output_qos);
     projection_client_ = create_client<ats_rog_map_interfaces::srv::GetRogMapProjection>(
       projection_service_);
 
@@ -423,6 +429,16 @@ private:
     }
     last_numeric_snapshot_ = numeric_snapshot;
     last_blocking_grid_ = fusion.planning_grid;
+    const builtin_interfaces::msg::Time publication_stamp = now();
+    const auto publication_sequence = map_status_sequence_ + 1U;
+    const auto planning_snapshot = makePlanningMapSnapshot(
+      fusion.planning_grid, signed_distance, publication_stamp, localization_epoch,
+      response.generation, publication_sequence, fusion_params_.unknown_is_obstacle,
+      fusion_params_.terrain_obstacle_value_threshold);
+    if (!planning_snapshot.ready) {
+      publishUnavailable("fused planning snapshot serialization failed");
+      return;
+    }
     planning_grid_pub_->publish(fusion.planning_grid);
     signed_distance_grid_pub_->publish(
       encodeDistanceGrid(fusion.planning_grid, signed_distance, 0.0));
@@ -435,6 +451,7 @@ private:
     generation.data = response.generation;
     generation_pub_->publish(generation);
     last_rog_generation_ = response.generation;
+    planning_snapshot_pub_->publish(planning_snapshot);
     publishMapStatus(true, response.generation, "planning snapshot ready");
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
@@ -530,6 +547,12 @@ private:
 
   void publishUnavailable(const char * reason)
   {
+    const auto publication_sequence = map_status_sequence_ + 1U;
+    const builtin_interfaces::msg::Time publication_stamp = now();
+    planning_snapshot_pub_->publish(makeUnavailablePlanningMapSnapshot(
+      last_blocking_grid_, publication_stamp, localization_epoch_, last_rog_generation_,
+      publication_sequence, fusion_params_.unknown_is_obstacle,
+      fusion_params_.terrain_obstacle_value_threshold));
     publishMapStatus(false, last_rog_generation_, reason);
     publishBlockedGrid(last_blocking_grid_);
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", reason);
@@ -563,6 +586,7 @@ private:
   std::string ready_topic_;
   std::string generation_topic_;
   std::string map_status_topic_;
+  std::string planning_snapshot_topic_;
   std::string localization_status_topic_;
   std::string robot_frame_;
   double projection_rate_hz_{2.0};
@@ -616,6 +640,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::
       SharedPtr map_status_pub_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapSnapshot>::
+      SharedPtr planning_snapshot_pub_;
   rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_client_;
   rclcpp::TimerBase::SharedPtr projection_timer_;
 };

@@ -49,6 +49,7 @@ private:
   void onPlannerGoal(const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg);
   void planGoal(const geometry_msgs::msg::PoseStamped &goal,
                 std::uint64_t goal_id, std::uint64_t localization_epoch,
+                std::uint64_t plan_request_sequence,
                 std::uint64_t map_publication_sequence,
                 bool report_status);
   bool lookupStartPose(
@@ -69,6 +70,7 @@ private:
       std::uint64_t map_health_epoch, const nav_msgs::msg::Path &reference_path,
       const ReferenceTrajectory &safety_reference,
       std::uint64_t goal_id, std::uint64_t localization_epoch,
+      std::uint64_t plan_request_sequence,
       std::uint64_t map_publication_sequence,
       std::uint8_t yaw_authority,
       bool report_status);
@@ -76,6 +78,7 @@ private:
   void publishEmergencyStop(bool stop);
   void
   publishPlannerStatus(std::uint64_t goal_id, std::uint64_t localization_epoch,
+                       std::uint64_t plan_request_sequence,
                        std::uint64_t map_generation,
                        std::uint64_t map_publication_sequence,
                        std::uint8_t state, std::uint8_t failure_reason,
@@ -132,6 +135,7 @@ private:
     ReferenceTrajectory trajectory;
     std::uint64_t goal_id{0};
     std::uint64_t localization_epoch{0};
+    std::uint64_t plan_request_sequence{0};
     std::uint64_t map_generation{0};
     std::uint64_t map_publication_sequence{0};
   };

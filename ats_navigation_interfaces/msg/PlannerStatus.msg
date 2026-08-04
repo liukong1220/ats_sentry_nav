@@ -2,6 +2,10 @@
 std_msgs/Header header
 uint64 goal_id
 uint64 localization_epoch
+# Echoes PlannerGoal.plan_request_sequence.  Together with goal_id and the
+# localization identity this rejects delayed status/reference pairs from a
+# prior recovery attempt.
+uint64 plan_request_sequence
 # MINCO local immutable PlanningMapSnapshot generation, not the ROG generation.
 uint64 map_generation
 uint64 map_publication_sequence
