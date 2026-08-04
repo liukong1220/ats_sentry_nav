@@ -1,6 +1,8 @@
 // Copyright 2026
 
 #include "ats_goal_manager/goal_lifecycle.hpp"
+#include "ats_goal_manager/plan_progress_watchdog.hpp"
+#include "ats_goal_manager/planning_snapshot_safety.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -21,6 +23,7 @@
 #include "ats_navigation_interfaces/msg/planner_goal.hpp"
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_navigation_interfaces/msg/yaw_authority_request.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -44,6 +47,7 @@ using LocalizationStatus = ats_navigation_interfaces::msg::LocalizationStatus;
 using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
 using GimbalYawStatus = ats_navigation_interfaces::msg::GimbalYawStatus;
 using PlanningMapStatus = ats_navigation_interfaces::msg::PlanningMapStatus;
+using PlanningMapSnapshot = ats_navigation_interfaces::msg::PlanningMapSnapshot;
 using PlannerGoal = ats_navigation_interfaces::msg::PlannerGoal;
 using PlannerStatus = ats_navigation_interfaces::msg::PlannerStatus;
 using YawAuthorityRequest = ats_navigation_interfaces::msg::YawAuthorityRequest;
@@ -146,6 +150,10 @@ public:
         map_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
         std::bind(&AtsGoalManagerNode::onMapStatus, this,
                   std::placeholders::_1));
+    planning_snapshot_sub_ = create_subscription<PlanningMapSnapshot>(
+        planning_snapshot_topic_, rclcpp::QoS(1).reliable().transient_local(),
+        std::bind(&AtsGoalManagerNode::onPlanningSnapshot, this,
+                  std::placeholders::_1));
     localization_status_sub_ = create_subscription<LocalizationStatus>(
         localization_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
         std::bind(&AtsGoalManagerNode::onLocalizationStatus, this,
@@ -190,6 +198,8 @@ private:
     std::shared_ptr<GoalHandleNavigateToPose> action_handle;
     bool cancel_requested{false};
     std::uint64_t localization_epoch{0};
+    std::uint64_t next_plan_request_sequence{0};
+    std::uint64_t expected_plan_request_sequence{0};
     std::optional<std::chrono::steady_clock::time_point> waiting_since;
     bool recovering{false};
   };
@@ -217,6 +227,8 @@ private:
                                                       "/rog_map_adapter/ready");
     map_status_topic_ = declare_parameter<std::string>(
         "map_status_topic", "/rog_map_adapter/status");
+    planning_snapshot_topic_ = declare_parameter<std::string>(
+        "planning_snapshot_topic", "/rog_map_adapter/planning_snapshot");
     localization_status_topic_ = declare_parameter<std::string>(
         "localization_status_topic", "/localization/status");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/localization");
@@ -251,6 +263,28 @@ private:
         0.0, declare_parameter<double>("terminal_angular_velocity_tolerance", 0.10));
     terminal_dwell_sec_ = std::max(
         0.0, declare_parameter<double>("terminal_dwell_sec", 0.30));
+    PlanProgressWatchdogParams progress_params;
+    progress_params.progress_min_delta_m = std::max(
+      0.0, declare_parameter<double>("progress_min_delta_m", 0.10));
+    progress_params.replan_stall_timeout_sec = std::max(
+      0.01, declare_parameter<double>("replan_stall_timeout_sec", 4.0));
+    progress_params.replan_min_interval_sec = std::max(
+      0.0, declare_parameter<double>("replan_min_interval_sec", 2.0));
+    const auto max_consecutive_replans = declare_parameter<int>("max_consecutive_replans", 2);
+    progress_params.max_consecutive_replans = max_consecutive_replans > 0
+      ? static_cast<std::uint32_t>(max_consecutive_replans)
+      : 0U;
+    progress_watchdog_.setParams(progress_params);
+    planning_snapshot_timeout_sec_ = std::max(
+      0.1, declare_parameter<double>("planning_snapshot_timeout_sec", map_ready_timeout_sec_));
+    require_planning_snapshot_ =
+      declare_parameter<bool>("require_planning_snapshot", false);
+    planning_snapshot_safety_params_.footprint_length = std::max(
+      0.0, declare_parameter<double>("footprint_length", 0.70));
+    planning_snapshot_safety_params_.footprint_width = std::max(
+      0.0, declare_parameter<double>("footprint_width", 0.55));
+    planning_snapshot_safety_params_.footprint_safety_margin = std::max(
+      0.0, declare_parameter<double>("footprint_safety_margin", 0.05));
   }
 
   rclcpp_action::GoalResponse
@@ -338,8 +372,11 @@ private:
                                 handle,
                                 false,
                                 0,
+                                0,
+                                0,
                                 std::nullopt,
                                 false};
+      progress_watchdog_.resetGoal(id);
       localization_epoch = localization_epoch_.value_or(0);
       map_publication_sequence = map_status_publication_sequence_;
       active_goal_->localization_epoch = localization_epoch;
@@ -367,7 +404,8 @@ private:
   }
 
   bool publishPlannerGoal(std::uint64_t id, std::uint64_t localization_epoch,
-                          const geometry_msgs::msg::PoseStamped &canonical_target) {
+                          const geometry_msgs::msg::PoseStamped &canonical_target,
+                          std::uint64_t required_snapshot_sequence = 0) {
     geometry_msgs::msg::PoseStamped target;
     std::string reason;
     if (!normalizePose(canonical_target, planning_frame_, target, reason)) {
@@ -387,7 +425,14 @@ private:
           !mapReadyLocked() || !localizationHealthyLocked()) {
         return false;
       }
-      request.map_publication_sequence = map_status_publication_sequence_;
+      if (required_snapshot_sequence != 0U &&
+        !planningSnapshotUsableLocked(required_snapshot_sequence, localization_epoch)) {
+        return false;
+      }
+      request.map_publication_sequence = required_snapshot_sequence != 0U ?
+        required_snapshot_sequence : map_status_publication_sequence_;
+      request.plan_request_sequence = ++active_goal_->next_plan_request_sequence;
+      active_goal_->expected_plan_request_sequence = request.plan_request_sequence;
     }
     request.goal_pose = target;
     planner_goal_pub_->publish(request);
@@ -429,7 +474,9 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         matches =
             active_goal_ && active_goal_->id == message->goal_id &&
-            active_goal_->localization_epoch == message->localization_epoch;
+            active_goal_->localization_epoch == message->localization_epoch &&
+            active_goal_->expected_plan_request_sequence ==
+              message->plan_request_sequence;
         transient_failure =
             matches &&
             (message->failure_reason == PlannerStatus::FAILURE_MAP_UNREADY ||
@@ -467,7 +514,9 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_ && active_goal_->id == message->goal_id &&
-          active_goal_->localization_epoch == message->localization_epoch) {
+          active_goal_->localization_epoch == message->localization_epoch &&
+          active_goal_->expected_plan_request_sequence ==
+            message->plan_request_sequence) {
         protected_mode_switch = active_execution_command_ &&
           (active_execution_command_->yaw_authority != message->yaw_authority ||
            active_execution_command_->requires_gimbal_lock !=
@@ -547,6 +596,40 @@ private:
     }
   }
 
+  void onPlanningSnapshot(const PlanningMapSnapshot::SharedPtr message) {
+    std::optional<std::uint64_t> suspend_goal_id;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (localization_epoch_ && message->localization_epoch != *localization_epoch_) {
+        return;
+      }
+      if (planning_snapshot_ &&
+        planning_snapshot_->localization_epoch == message->localization_epoch &&
+        message->publication_sequence < planning_snapshot_->publication_sequence)
+      {
+        return;
+      }
+      planning_snapshot_ = *message;
+      last_planning_snapshot_signal_ = std::chrono::steady_clock::now();
+      if (active_goal_ && !message->ready &&
+        message->localization_epoch == active_goal_->localization_epoch)
+      {
+        active_goal_->recovering = true;
+        suspend_goal_id = active_goal_->id;
+      }
+    }
+    if (suspend_goal_id) {
+      // Snapshot and map status are separate DDS topics.  An unavailable
+      // snapshot must stop execution even if its status callback arrives next.
+      suspendActiveGoal(*suspend_goal_id);
+      return;
+    }
+    // A candidate can legitimately arrive just before the same adapter
+    // publication's snapshot.  Re-run the commit gate; it still requires the
+    // exact goal, localization, request and publication identities below.
+    tryCommitReference();
+  }
+
   void onLocalizationStatus(const LocalizationStatus::SharedPtr message) {
     if (!require_localization_status_) {
       return;
@@ -590,6 +673,7 @@ private:
 
   void onGimbalYawStatus(const GimbalYawStatus::SharedPtr message) {
     bool stop_active = false;
+    std::optional<std::uint64_t> recover_goal_id;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       gimbal_status_ = *message;
@@ -603,10 +687,19 @@ private:
         active_execution_command_.reset();
         fail_stop_ = true;
         stop_active = true;
+        if (active_goal_) {
+          active_goal_->recovering = true;
+          recover_goal_id = active_goal_->id;
+        }
       }
     }
     if (stop_active) {
       publishEmergencyStop(true);
+    }
+    if (recover_goal_id) {
+      // A lost yaw lease invalidates the tracker.  Re-enter planning so the
+      // eventual release can only use a newly timed candidate and fresh ACK.
+      suspendActiveGoal(*recover_goal_id);
     }
     tryCommitReference();
   }
@@ -616,8 +709,10 @@ private:
     input.header = message->header;
     input.pose = message->pose.pose;
     geometry_msgs::msg::PoseStamped normalized;
+    geometry_msgs::msg::PoseStamped planning_normalized;
     std::string reason;
-    if (!normalizePose(input, goal_frame_, normalized, reason, false)) {
+    if (!normalizePose(input, goal_frame_, normalized, reason, false) ||
+      !normalizePose(input, planning_frame_, planning_normalized, reason, false)) {
       std::optional<std::uint64_t> suspend_goal_id;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -635,12 +730,14 @@ private:
     }
     std::lock_guard<std::mutex> lock(mutex_);
     current_pose_ = normalized;
+    current_planning_pose_ = planning_normalized;
     current_linear_velocity_ = std::hypot(
       message->twist.twist.linear.x, message->twist.twist.linear.y);
     current_angular_velocity_ = std::abs(message->twist.twist.angular.z);
     has_current_velocity_ = std::isfinite(current_linear_velocity_) &&
       std::isfinite(current_angular_velocity_);
     has_current_pose_ = true;
+    has_current_planning_pose_ = true;
     odom_tf_healthy_ = true;
   }
 
@@ -650,16 +747,17 @@ private:
     std::uint64_t current_publication_sequence = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      // Candidate/reference acceptance is intentionally bound to the current
-      // map publication.  If a long planning callback returns an older local
-      // snapshot, safely discard it and re-enter map waiting so the existing
-      // lifecycle path dispatches a fresh request.  Returning silently here
-      // leaves the action stuck in kPlanning until its deadline.
+      // A zero or future publication sequence is malformed.  A lower sequence
+      // is allowed because a heartbeat may advance while MINCO is planning;
+      // the latest snapshot still has to pass the final safety gate below.
       if (active_goal_ && candidate_reference_ && planner_ready_status_ &&
           planner_ready_status_->goal_id == active_goal_->id &&
           planner_ready_status_->localization_epoch == active_goal_->localization_epoch &&
-          planner_ready_status_->map_publication_sequence !=
-            map_status_publication_sequence_) {
+          planner_ready_status_->plan_request_sequence ==
+            active_goal_->expected_plan_request_sequence &&
+          (planner_ready_status_->map_publication_sequence == 0U ||
+           planner_ready_status_->map_publication_sequence >
+             map_status_publication_sequence_)) {
         stale_candidate_goal = active_goal_->id;
         candidate_publication_sequence =
           planner_ready_status_->map_publication_sequence;
@@ -684,10 +782,17 @@ private:
         planner_ready_status_->goal_id != active_goal_->id ||
         planner_ready_status_->localization_epoch !=
             active_goal_->localization_epoch ||
+        planner_ready_status_->plan_request_sequence !=
+            active_goal_->expected_plan_request_sequence ||
         (localization_epoch_ &&
          planner_ready_status_->localization_epoch != *localization_epoch_) ||
-        planner_ready_status_->map_publication_sequence !=
-            map_status_publication_sequence_ ||
+        (planner_ready_status_->map_publication_sequence == 0U ||
+         planner_ready_status_->map_publication_sequence >
+           map_status_publication_sequence_) ||
+        (require_planning_snapshot_ &&
+         !planningSnapshotUsableLocked(
+           planner_ready_status_->map_publication_sequence,
+           planner_ready_status_->localization_epoch, true)) ||
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
@@ -735,6 +840,23 @@ private:
     fail_stop_ = false;
     active_goal_->recovering = false;
     active_execution_command_ = command;
+    PlanProgressIdentity progress_identity;
+    progress_identity.goal_id = active_goal_->id;
+    progress_identity.localization_epoch = active_goal_->localization_epoch;
+    progress_identity.map_generation = planner_ready_status_->map_generation;
+    progress_identity.map_publication_sequence =
+      planner_ready_status_->map_publication_sequence;
+    progress_identity.plan_request_sequence =
+      planner_ready_status_->plan_request_sequence;
+    if (planning_snapshot_) {
+      progress_identity.source_generation = planning_snapshot_->source_generation;
+    }
+    if (has_current_pose_) {
+      progress_watchdog_.observeReference(
+        progress_identity,
+        std::hypot(active_goal_->target.pose.position.x - current_pose_.pose.position.x,
+                   active_goal_->target.pose.position.y - current_pose_.pose.position.y));
+    }
     publishEmergencyStop(false);
     publishExecutionCommand(command);
     reference_path_pub_->publish(committed);
@@ -753,13 +875,19 @@ private:
     bool localization_wait_timeout = false;
     bool localization_suspended = false;
     bool reached = false;
+    std::optional<ActiveGoal> progress_replan;
+    std::uint64_t progress_replan_snapshot_sequence = 0;
+    std::uint32_t progress_replan_count = 0;
+    std::optional<std::string> progress_failure;
+    std::optional<std::uint64_t> progress_suspend_goal_id;
+    std::optional<std::uint64_t> gimbal_recovery_goal_id;
     double distance = std::numeric_limits<double>::infinity();
     std::uint64_t dispatch_epoch = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_) {
         snapshot = active_goal_;
-        if (active_execution_command_ &&
+          if (active_execution_command_ &&
             !gimbalStatusSatisfiesLocked(
               active_execution_command_->yaw_authority,
               active_execution_command_->requires_gimbal_lock,
@@ -768,7 +896,11 @@ private:
           active_execution_command_.reset();
           candidate_reference_.reset();
           planner_ready_status_.reset();
-          fail_stop_ = true;
+            fail_stop_ = true;
+          if (active_goal_) {
+            active_goal_->recovering = true;
+            gimbal_recovery_goal_id = active_goal_->id;
+          }
         }
         const auto elapsed =
             std::chrono::steady_clock::now() - active_goal_->started;
@@ -829,6 +961,96 @@ private:
           } else {
             terminal_converged_since_.reset();
           }
+          if (require_planning_snapshot_ && !pose_converged) {
+            PlanningSnapshotSafetyResult snapshot_safety;
+            const bool snapshot_matches_status = planning_snapshot_ &&
+              planning_snapshot_->publication_sequence == map_status_publication_sequence_;
+            const bool snapshot_usable = snapshot_matches_status &&
+              planningSnapshotUsableLocked(
+                planning_snapshot_->publication_sequence,
+                active_goal_->localization_epoch);
+            const geometry_msgs::msg::Pose *snapshot_pose = nullptr;
+            if (snapshot_usable && planning_snapshot_ && has_current_pose_ &&
+              planning_snapshot_->header.frame_id == current_pose_.header.frame_id)
+            {
+              snapshot_pose = &current_pose_.pose;
+            } else if (snapshot_usable && planning_snapshot_ &&
+              has_current_planning_pose_ &&
+              planning_snapshot_->header.frame_id == current_planning_pose_.header.frame_id)
+            {
+              snapshot_pose = &current_planning_pose_.pose;
+            }
+            if (snapshot_pose) {
+              snapshot_safety = checkPlanningSnapshotFootprint(
+                *planning_snapshot_, *snapshot_pose, planning_snapshot_safety_params_);
+            }
+            PlanProgressGate gate;
+            gate.goal_active = true;
+            gate.cancel_or_preempt = cancel;
+            gate.emergency_stop = fail_stop_ || lifecycle_.emergencyStopRequired();
+            gate.map_fresh = map_ready && snapshot_usable;
+            gate.localization_fresh = localization_ready;
+            gate.tf_healthy = odom_tf_healthy_ && snapshot_pose != nullptr;
+            gate.robot_inside_map = snapshot_safety.inside_map;
+            gate.robot_cell_free = snapshot_safety.robot_cell_free;
+            gate.footprint_safe = snapshot_safety.footprint_safe;
+            gate.has_current_reference = active_execution_command_.has_value();
+            gate.distance_to_goal_m = distance;
+            gate.identity.goal_id = active_goal_->id;
+            gate.identity.localization_epoch = active_goal_->localization_epoch;
+            gate.identity.map_generation = active_execution_command_ ?
+              active_execution_command_->map_generation : 0;
+            gate.identity.map_publication_sequence = active_execution_command_ ?
+              active_execution_command_->map_publication_sequence : 0;
+            gate.identity.plan_request_sequence = active_goal_->expected_plan_request_sequence;
+            if (active_execution_command_ && planning_snapshot_) {
+              // Keep the reference identity stable across adapter refreshes;
+              // the current snapshot is a safety gate, not an excuse to reset
+              // a stalled timer every publication.
+              gate.identity.source_generation = planning_snapshot_->source_generation;
+            }
+            const PlanProgressDecision decision = progress_watchdog_.evaluate(gate);
+            if (decision == PlanProgressDecision::kReplan && planning_snapshot_) {
+              progress_replan = *active_goal_;
+              progress_replan_snapshot_sequence = planning_snapshot_->publication_sequence;
+              progress_replan_count = progress_watchdog_.consecutiveReplans();
+              candidate_reference_.reset();
+              planner_ready_status_.reset();
+              active_execution_command_.reset();
+              pending_yaw_authority_request_.reset();
+              terminal_converged_since_.reset();
+              fail_stop_ = true;
+              active_goal_->recovering = true;
+              lifecycle_.start(active_goal_->id, true);
+              active_goal_->waiting_since.reset();
+              snapshot = active_goal_;
+            } else if (decision == PlanProgressDecision::kExhausted) {
+              progress_failure = "progress watchdog exhausted bounded replans";
+            } else if (decision == PlanProgressDecision::kUnsafe) {
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Progress watchdog unsafe gate: map_fresh=%d localization=%d tf=%d "
+                "inside=%d cell_free=%d footprint=%d reference=%d snapshot_frame=%s "
+                "current_frame=%s pose=(%.3f, %.3f)",
+                gate.map_fresh, gate.localization_fresh, gate.tf_healthy,
+                gate.robot_inside_map, gate.robot_cell_free, gate.footprint_safe,
+                gate.has_current_reference,
+                planning_snapshot_ ? planning_snapshot_->header.frame_id.c_str() : "<none>",
+                current_pose_.header.frame_id.c_str(),
+                snapshot_pose ? snapshot_pose->position.x : std::numeric_limits<double>::quiet_NaN(),
+                snapshot_pose ? snapshot_pose->position.y : std::numeric_limits<double>::quiet_NaN());
+              if (!gate.map_fresh || !gate.localization_fresh || !gate.tf_healthy) {
+                // A missing lease or transform is recoverable.  Stop and use
+                // the existing map-wait path; only healthy static evidence may
+                // turn a task-level watchdog result into a terminal failure.
+                active_goal_->recovering = true;
+                progress_suspend_goal_id = active_goal_->id;
+              } else {
+                progress_failure =
+                  "progress watchdog rejected outside-map, occupied, or unsafe footprint";
+              }
+            }
+          }
         }
         publishFeedbackLocked(elapsed, distance);
       }
@@ -838,6 +1060,29 @@ private:
       if (!publishPlannerGoal(snapshot->id, dispatch_epoch, snapshot->target)) {
         suspendActiveGoal(snapshot->id, snapshot->waiting_since);
       }
+    }
+    if (progress_replan) {
+      publishEmergencyStop(true);
+      publishExecutionStop(
+        progress_replan->id, progress_replan->localization_epoch,
+        PlannerStatus::FAILURE_NONE, 0, progress_replan_snapshot_sequence);
+      RCLCPP_WARN(
+        get_logger(),
+        "Progress watchdog replan=%u goal=%llu snapshot publication=%llu after no distance progress.",
+        progress_replan_count,
+        static_cast<unsigned long long>(progress_replan->id),
+        static_cast<unsigned long long>(progress_replan_snapshot_sequence));
+      if (!publishPlannerGoal(
+          progress_replan->id, progress_replan->localization_epoch,
+          progress_replan->target, progress_replan_snapshot_sequence)) {
+        suspendActiveGoal(progress_replan->id);
+      }
+    }
+    if (gimbal_recovery_goal_id && !progress_replan) {
+      suspendActiveGoal(*gimbal_recovery_goal_id);
+    }
+    if (progress_suspend_goal_id && !progress_replan && !gimbal_recovery_goal_id) {
+      suspendActiveGoal(*progress_suspend_goal_id);
     }
     if (localization_suspended) {
       publishEmergencyStop(true);
@@ -863,6 +1108,9 @@ private:
     } else if (reached) {
       finishActive(NavigateToPose::Result::RESULT_SUCCEEDED, "goal reached",
                    GoalLifecycleState::kSucceeded);
+    } else if (progress_failure) {
+      finishActive(NavigateToPose::Result::RESULT_PLANNING_FAILED,
+                   *progress_failure, GoalLifecycleState::kFailed);
     }
 
     bool stop = true;
@@ -982,6 +1230,24 @@ private:
     return map_ready_signal_ && last_map_ready_signal_ &&
            std::chrono::steady_clock::now() - *last_map_ready_signal_ <=
                secondsToDuration(map_ready_timeout_sec_);
+  }
+
+  bool planningSnapshotUsableLocked(
+      std::uint64_t publication_sequence, std::uint64_t localization_epoch,
+      bool allow_newer_publication = false) const {
+    if (!planning_snapshot_ || !last_planning_snapshot_signal_ ||
+      !validPlanningSnapshot(*planning_snapshot_) ||
+      (allow_newer_publication
+       ? planning_snapshot_->publication_sequence < publication_sequence
+       : planning_snapshot_->publication_sequence != publication_sequence) ||
+      planning_snapshot_->localization_epoch != localization_epoch ||
+      std::chrono::steady_clock::now() < *last_planning_snapshot_signal_)
+    {
+      return false;
+    }
+    return std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - *last_planning_snapshot_signal_).count() <=
+      planning_snapshot_timeout_sec_;
   }
 
   bool localizationHealthyLocked() const {
@@ -1202,6 +1468,7 @@ private:
   std::string gimbal_status_topic_;
   std::string map_ready_topic_;
   std::string map_status_topic_;
+  std::string planning_snapshot_topic_;
   std::string localization_status_topic_;
   std::string odom_topic_;
   std::string action_name_;
@@ -1217,10 +1484,12 @@ private:
   double terminal_linear_velocity_tolerance_{0.05};
   double terminal_angular_velocity_tolerance_{0.10};
   double terminal_dwell_sec_{0.30};
+  double planning_snapshot_timeout_sec_{5.0};
   double gimbal_status_timeout_sec_{0.5};
   bool require_localization_status_{false};
   bool require_map_status_{true};
   bool require_gimbal_status_{true};
+  bool require_planning_snapshot_{false};
 
   std::mutex mutex_;
   GoalLifecycle lifecycle_;
@@ -1236,6 +1505,8 @@ private:
   bool fail_stop_{true};
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;
+  std::optional<std::chrono::steady_clock::time_point> last_planning_snapshot_signal_;
+  std::optional<PlanningMapSnapshot> planning_snapshot_;
   std::uint64_t map_status_localization_epoch_{0};
   std::uint64_t map_status_generation_{0};
   std::uint64_t map_status_publication_sequence_{0};
@@ -1250,11 +1521,15 @@ private:
   std::optional<std::uint64_t> localization_epoch_;
   std::uint8_t localization_status_{LocalizationStatus::STATE_UNINITIALIZED};
   geometry_msgs::msg::PoseStamped current_pose_;
+  geometry_msgs::msg::PoseStamped current_planning_pose_;
   bool has_current_pose_{false};
+  bool has_current_planning_pose_{false};
   double current_linear_velocity_{std::numeric_limits<double>::infinity()};
   double current_angular_velocity_{std::numeric_limits<double>::infinity()};
   bool has_current_velocity_{false};
   bool odom_tf_healthy_{false};
+  PlanProgressWatchdog progress_watchdog_;
+  PlanningSnapshotSafetyParams planning_snapshot_safety_params_;
 
   rclcpp::Publisher<PlannerGoal>::SharedPtr planner_goal_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
@@ -1267,6 +1542,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr candidate_reference_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::Subscription<PlanningMapStatus>::SharedPtr map_status_sub_;
+  rclcpp::Subscription<PlanningMapSnapshot>::SharedPtr planning_snapshot_sub_;
   rclcpp::Subscription<LocalizationStatus>::SharedPtr localization_status_sub_;
   rclcpp::Subscription<GimbalYawStatus>::SharedPtr gimbal_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
