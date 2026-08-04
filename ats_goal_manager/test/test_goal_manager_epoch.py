@@ -13,6 +13,7 @@ from ats_navigation_interfaces.msg import GimbalYawStatus
 from ats_navigation_interfaces.msg import PlannerGoal
 from ats_navigation_interfaces.msg import PlannerStatus
 from ats_navigation_interfaces.msg import PlanningMapStatus
+from ats_navigation_interfaces.msg import PlanningMapSnapshot
 from ats_navigation_interfaces.msg import YawAuthorityRequest
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import TransformStamped
@@ -49,11 +50,18 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             "gimbal_status_topic": f"{TOPIC_PREFIX}/gimbal_status",
             "map_ready_topic": f"{TOPIC_PREFIX}/map_ready",
             "map_status_topic": f"{TOPIC_PREFIX}/map_status",
+            "planning_snapshot_topic": f"{TOPIC_PREFIX}/planning_snapshot",
             "localization_status_topic": f"{TOPIC_PREFIX}/localization_status",
             "odom_topic": f"{TOPIC_PREFIX}/odometry",
             "action_name": f"{TOPIC_PREFIX}/navigate_to_pose",
             "require_localization_status": True,
             "require_map_status": True,
+            "require_planning_snapshot": True,
+            "planning_snapshot_timeout_sec": 5.0,
+            "replan_stall_timeout_sec": 30.0,
+            "footprint_length": 0.1,
+            "footprint_width": 0.1,
+            "footprint_safety_margin": 0.0,
             "map_ready_timeout_sec": 5.0,
             "localization_status_timeout_sec": 5.0,
             "map_wait_timeout_sec": 5.0,
@@ -91,6 +99,11 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         cls.map_status_pub = cls.node.create_publisher(
             PlanningMapStatus, f"{TOPIC_PREFIX}/map_status", transient_qos
+        )
+        cls.planning_snapshot_pub = cls.node.create_publisher(
+            PlanningMapSnapshot,
+            f"{TOPIC_PREFIX}/planning_snapshot",
+            transient_qos,
         )
         cls.candidate_pub = cls.node.create_publisher(
             Path, f"{TOPIC_PREFIX}/candidate", 1
@@ -203,6 +216,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         map_status.rog_generation = epoch
         map_status.publication_sequence = epoch
         cls.map_status_pub.publish(map_status)
+        cls.publish_planning_snapshot(epoch)
         request = (
             cls.yaw_authority_requests[-1]
             if cls.yaw_authority_requests
@@ -215,6 +229,32 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             else GimbalYawStatus.YAW_AUTHORITY_GIMBAL_COMPENSATED,
             request.require_gimbal_lock if request else False,
         )
+
+    @classmethod
+    def publish_planning_snapshot(cls, epoch):
+        snapshot = PlanningMapSnapshot()
+        stamp = cls.node.get_clock().now().to_msg()
+        snapshot.header.stamp = stamp
+        snapshot.header.frame_id = "odom"
+        snapshot.source_stamp = stamp
+        snapshot.ready = True
+        snapshot.unknown_is_obstacle = True
+        snapshot.occupied_value_threshold = 50
+        snapshot.localization_epoch = epoch
+        snapshot.source_generation = epoch
+        snapshot.publication_sequence = epoch
+        snapshot.info.resolution = 1.0
+        snapshot.info.width = 50
+        snapshot.info.height = 50
+        snapshot.info.origin.position.x = -20.0
+        snapshot.info.origin.position.y = -20.0
+        snapshot.info.origin.orientation.w = 1.0
+        count = snapshot.info.width * snapshot.info.height
+        snapshot.occupancy = [0] * count
+        snapshot.signed_distance_m = [1.0] * count
+        snapshot.gradient_x = [0.0] * count
+        snapshot.gradient_y = [0.0] * count
+        cls.planning_snapshot_pub.publish(snapshot)
 
     @classmethod
     def publish_gimbal_status(cls, request_sequence, yaw_authority, locked):
@@ -234,6 +274,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         goal,
         epoch,
         publication_sequence=None,
+        plan_request_sequence=None,
         yaw_authority=PlannerStatus.YAW_AUTHORITY_GIMBAL_COMPENSATED,
         requires_gimbal_lock=False,
     ):
@@ -252,6 +293,11 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         status.header.stamp = cls.node.get_clock().now().to_msg()
         status.goal_id = goal.goal_id
         status.localization_epoch = epoch
+        status.plan_request_sequence = (
+            goal.plan_request_sequence
+            if plan_request_sequence is None
+            else plan_request_sequence
+        )
         status.map_generation = epoch
         status.map_publication_sequence = (
             epoch if publication_sequence is None else publication_sequence
@@ -305,6 +351,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         transient_failure.header.stamp = self.node.get_clock().now().to_msg()
         transient_failure.goal_id = first_goal.goal_id
         transient_failure.localization_epoch = first_goal.localization_epoch
+        transient_failure.plan_request_sequence = first_goal.plan_request_sequence
         transient_failure.state = PlannerStatus.STATE_FAILED
         transient_failure.failure_reason = PlannerStatus.FAILURE_MAP_UNREADY
         transient_failure.map_publication_sequence = first_goal.map_publication_sequence
@@ -324,6 +371,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         blocked_snapshot_failure.header.stamp = self.node.get_clock().now().to_msg()
         blocked_snapshot_failure.goal_id = retried_goal.goal_id
         blocked_snapshot_failure.localization_epoch = retried_goal.localization_epoch
+        blocked_snapshot_failure.plan_request_sequence = retried_goal.plan_request_sequence
         blocked_snapshot_failure.state = PlannerStatus.STATE_FAILED
         blocked_snapshot_failure.failure_reason = (
             PlannerStatus.FAILURE_START_OR_GOAL_OCCUPIED
@@ -363,6 +411,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         first_goal = self.planner_goals[-1]
         request_count = len(self.yaw_authority_requests)
+        reference_count = len(self.references)
         self.publish_candidate(first_goal, 1)
         self.assertTrue(
             self.spin_until(
@@ -376,14 +425,18 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             request.request_sequence - 1, request.yaw_authority, False
         )
         self.assertFalse(
-            self.spin_until(lambda: bool(self.references), timeout=0.3)
+            self.spin_until(
+                lambda: len(self.references) > reference_count, timeout=0.3
+            )
         )
         self.publish_gimbal_status(
             request.request_sequence,
             request.yaw_authority,
             request.require_gimbal_lock,
         )
-        self.assertTrue(self.spin_until(lambda: len(self.references) == 1))
+        self.assertTrue(
+            self.spin_until(lambda: len(self.references) == reference_count + 1)
+        )
         self.assertTrue(self.spin_until(lambda: False in self.stop_states))
         self.assertTrue(
             self.spin_until(
@@ -570,4 +623,21 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         self.assertTrue(
             self.spin_until(lambda: self.stop_states.count(False) > false_count)
+        )
+
+        # A delayed candidate/status from the previous planning request cannot
+        # re-authorize motion after the current request has been committed.
+        reference_count = len(self.references)
+        stale_request_sequence = max(0, second_goal.plan_request_sequence - 1)
+        self.publish_candidate(
+            second_goal,
+            2,
+            plan_request_sequence=stale_request_sequence,
+        )
+        self.assertFalse(
+            self.spin_until(
+                lambda: len(self.references) > reference_count,
+                timeout=0.4,
+                periodic=lambda: self.publish_health(2, 2.0),
+            )
         )
