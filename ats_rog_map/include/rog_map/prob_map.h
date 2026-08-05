@@ -235,6 +235,14 @@ namespace rog_map {
                                     int stride = 1,
                                     bool include_unknown = true) const;
 
+        // Read-only diagnostic export for a bounded region of the local map. This is separate
+        // from the numerical projection and planning interfaces.
+        void collectVoxelDebugInBox(const Vec3f &box_min, const Vec3f &box_max,
+                                    std::vector<VoxelDebugCell> &cells,
+                                    VoxelDebugStats &stats,
+                                    int stride = 1,
+                                    bool include_unknown = true) const;
+
         static float applyRaycastLogOddsUpdate(float value,
                                                float l_hit,
                                                float l_miss,
