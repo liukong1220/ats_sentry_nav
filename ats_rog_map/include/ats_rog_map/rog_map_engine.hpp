@@ -45,7 +45,11 @@ public:
       (getLocalMapOrigin() - previous_origin).cwiseAbs().maxCoeff() > 1e-9;
     if (mutated) {
       ++snapshot_generation_;
-      esdf_generation_ = 0;
+      const bool core_rebuilt_esdf = map_update_index_ != previous_map_update && cfg_.esdf_en &&
+        map_update_index_ % static_cast<std::uint64_t>(cfg_.esdf_update_interval_updates) == 0U;
+      // updateProbMap() performs this rebuild at the configured update interval.  Keep the
+      // immutable snapshot generation aligned so projection does not rebuild the same ESDF.
+      esdf_generation_ = core_rebuilt_esdf ? snapshot_generation_ : 0U;
     }
     return mutated;
   }
