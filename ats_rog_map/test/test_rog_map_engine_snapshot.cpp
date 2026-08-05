@@ -27,7 +27,7 @@ rog_map::Pose makePose(float x, float z = 0.0F)
   return {rog_map::Vec3f(x, 0.0F, z), super_utils::Quatf::Identity()};
 }
 
-TEST(RogMapEngineSnapshot, InvalidatesEsdfForMapUpdatesAndSlidingResets)
+TEST(RogMapEngineSnapshot, ReusesEsdfRebuiltByEveryMapUpdate)
 {
   auto clock = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
   ats_rog_map::RogMapEngine map(clock, ATS_ROG_MAP_TEST_CONFIG);
@@ -38,19 +38,20 @@ TEST(RogMapEngineSnapshot, InvalidatesEsdfForMapUpdatesAndSlidingResets)
 
   rog_map::Vec3f esdf_min;
   rog_map::Vec3f esdf_max;
-  EXPECT_FALSE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
-  ASSERT_TRUE(map.ensureCurrentEsdf());
+  // The test configuration rebuilds ESDF on every map update.  The engine must expose that
+  // current ESDF for the same immutable snapshot without rebuilding it in a projection request.
   ASSERT_TRUE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
   EXPECT_LE(esdf_min.x(), 0.0);
   EXPECT_GE(esdf_max.x(), 0.0);
 
   EXPECT_TRUE(map.update(makeCloud(1.0F), makePose(0.0F), makePose(0.0F)));
   EXPECT_EQ(map.generation(), 2U);
-  EXPECT_FALSE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
+  EXPECT_TRUE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
 
-  ASSERT_TRUE(map.ensureCurrentEsdf());
   EXPECT_TRUE(map.update(makeCloud(11.0F), makePose(10.0F), makePose(10.0F)));
   EXPECT_EQ(map.generation(), 3U);
+  // A sliding reset can change the snapshot origin without a probabilistic map update, so it
+  // must invalidate the old ESDF rather than claiming that the previous bounds are current.
   EXPECT_FALSE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
   ASSERT_TRUE(map.ensureCurrentEsdf());
   ASSERT_TRUE(map.getCurrentEsdfBounds(esdf_min, esdf_max));

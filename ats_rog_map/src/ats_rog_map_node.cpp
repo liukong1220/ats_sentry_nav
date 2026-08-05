@@ -481,6 +481,7 @@ private:
 
   void publishDebug()
   {
+    const auto debug_started = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (!has_map_data_) {
       return;
@@ -552,6 +553,15 @@ private:
         }
       }
     }
+    const double debug_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - debug_started).count();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "P2 debug build generation=%llu occupied=%d inflated=%d unknown=%d esdf=%d bounds=%d "
+      "total_ms=%.1f",
+      static_cast<unsigned long long>(map_->generation()), publish_occupied ? 1 : 0,
+      publish_inflated ? 1 : 0, publish_unknown ? 1 : 0, publish_esdf ? 1 : 0,
+      publish_bounds ? 1 : 0, debug_ms);
   }
 
   void publishHealth()
@@ -622,6 +632,10 @@ private:
     const rclcpp::Time projection_start_stamp = now();
     const std::uint64_t request_sequence = ++projection_request_sequence_;
     const InputHealth health_at_start = inputHealth();
+    double map_lock_wait_ms = 0.0;
+    double esdf_refresh_ms = 0.0;
+    double sample_ms = 0.0;
+    double gradient_ms = 0.0;
     response->stale = health_at_start.map_update_stale || health_at_start.odom_stale;
     RCLCPP_INFO(
       get_logger(),
@@ -641,6 +655,7 @@ private:
           get_logger(),
           "P2 projection end request=%llu start_ns=%lld end_ns=%lld source_generation=%llu "
           "source_stamp_ns=%lld ready=%d stale=%d compute_ms=%.1f "
+          "map_lock_wait_ms=%.1f esdf_refresh_ms=%.1f sample_ms=%.1f gradient_ms=%.1f "
           "map_age_start=%.3f map_age_end=%.3f odom_age_start=%.3f odom_age_end=%.3f "
           "cloud_age_start=%.3f cloud_age_end=%.3f",
           static_cast<unsigned long long>(request_sequence),
@@ -649,14 +664,21 @@ private:
           static_cast<unsigned long long>(response->generation),
           static_cast<long long>(rclcpp::Time(response->occupancy_grid.header.stamp).nanoseconds()),
           response->ready ? 1 : 0, response->stale ? 1 : 0, projection_ms,
+          map_lock_wait_ms, esdf_refresh_ms, sample_ms, gradient_ms,
           health_at_start.map_update_age_sec, health_at_end.map_update_age_sec,
           health_at_start.odom_age_sec, health_at_end.odom_age_sec,
           health_at_start.cloud_age_sec, health_at_end.cloud_age_sec);
       };
 
-    std::lock_guard<std::mutex> lock(map_mutex_);
+    const auto map_lock_wait_started = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(map_mutex_);
+    map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - map_lock_wait_started).count();
     response->generation = map_->generation();
+    const auto esdf_refresh_started = std::chrono::steady_clock::now();
     response->ready = has_map_data_ && map_->ensureCurrentEsdf();
+    esdf_refresh_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - esdf_refresh_started).count();
     if (!response->ready) {
       log_projection_end();
       return;
@@ -717,6 +739,7 @@ private:
         return (point.array() >= (esdf_box_min.array() - tolerance)).all() &&
                (point.array() <= (esdf_box_max.array() + tolerance)).all();
       };
+    const auto sample_started = std::chrono::steady_clock::now();
     for (std::uint32_t my = 0; my < grid.info.height; ++my) {
       for (std::uint32_t mx = 0; mx < grid.info.width; ++mx) {
         const std::size_t index =
@@ -758,10 +781,13 @@ private:
         }
       }
     }
+    sample_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - sample_started).count();
 
     const auto index_of = [&grid](std::uint32_t x, std::uint32_t y) {
         return static_cast<std::size_t>(y) * static_cast<std::size_t>(grid.info.width) + x;
       };
+    const auto gradient_started = std::chrono::steady_clock::now();
     for (std::uint32_t my = 0; my < grid.info.height; ++my) {
       for (std::uint32_t mx = 0; mx < grid.info.width; ++mx) {
         const std::size_t index = index_of(mx, my);
@@ -795,6 +821,8 @@ private:
         }
       }
     }
+    gradient_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - gradient_started).count();
 
     const InputHealth health_at_end = inputHealth();
     response->stale = health_at_end.map_update_stale || health_at_end.odom_stale;
