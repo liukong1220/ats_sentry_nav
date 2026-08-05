@@ -575,14 +575,43 @@ private:
   void getHealthStaleness(
     bool & map_update_stale, bool & odom_stale, bool & raw_cloud_stale)
   {
+    const InputHealth health = inputHealth();
+    map_update_stale = health.map_update_stale;
+    odom_stale = health.odom_stale;
+    raw_cloud_stale = health.raw_cloud_stale;
+  }
+
+  struct InputHealth
+  {
+    double map_update_age_sec{std::numeric_limits<double>::infinity()};
+    double odom_age_sec{std::numeric_limits<double>::infinity()};
+    double cloud_age_sec{std::numeric_limits<double>::infinity()};
+    bool map_update_stale{true};
+    bool odom_stale{true};
+    bool raw_cloud_stale{true};
+  };
+
+  InputHealth inputHealth()
+  {
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(input_mutex_);
-    raw_cloud_stale = !last_cloud_receive_time_ ||
-      std::chrono::duration<double>(now - *last_cloud_receive_time_).count() > cloud_timeout_sec_;
-    map_update_stale = !last_map_update_time_ ||
-      std::chrono::duration<double>(now - *last_map_update_time_).count() > cloud_timeout_sec_;
-    odom_stale = !last_odom_receive_time_ ||
-      std::chrono::duration<double>(now - *last_odom_receive_time_).count() > odom_timeout_sec_;
+    InputHealth health;
+    if (last_cloud_receive_time_) {
+      health.cloud_age_sec =
+        std::chrono::duration<double>(now - *last_cloud_receive_time_).count();
+    }
+    if (last_map_update_time_) {
+      health.map_update_age_sec =
+        std::chrono::duration<double>(now - *last_map_update_time_).count();
+    }
+    if (last_odom_receive_time_) {
+      health.odom_age_sec =
+        std::chrono::duration<double>(now - *last_odom_receive_time_).count();
+    }
+    health.raw_cloud_stale = health.cloud_age_sec > cloud_timeout_sec_;
+    health.map_update_stale = health.map_update_age_sec > cloud_timeout_sec_;
+    health.odom_stale = health.odom_age_sec > odom_timeout_sec_;
+    return health;
   }
 
   void getGroundProjection(
@@ -590,22 +619,53 @@ private:
     std::shared_ptr<ats_rog_map_interfaces::srv::GetRogMapProjection::Response> response)
   {
     const auto projection_started = std::chrono::steady_clock::now();
-    bool map_update_stale = true;
-    bool odom_stale = true;
-    bool raw_cloud_stale = true;
-    getHealthStaleness(map_update_stale, odom_stale, raw_cloud_stale);
-    response->stale = map_update_stale || odom_stale;
+    const rclcpp::Time projection_start_stamp = now();
+    const std::uint64_t request_sequence = ++projection_request_sequence_;
+    const InputHealth health_at_start = inputHealth();
+    response->stale = health_at_start.map_update_stale || health_at_start.odom_stale;
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 projection begin request=%llu start_ns=%lld map_age=%.3f odom_age=%.3f cloud_age=%.3f "
+      "map_stale=%d odom_stale=%d cloud_stale=%d",
+      static_cast<unsigned long long>(request_sequence),
+      static_cast<long long>(projection_start_stamp.nanoseconds()),
+      health_at_start.map_update_age_sec, health_at_start.odom_age_sec,
+      health_at_start.cloud_age_sec, health_at_start.map_update_stale ? 1 : 0,
+      health_at_start.odom_stale ? 1 : 0, health_at_start.raw_cloud_stale ? 1 : 0);
+    const auto log_projection_end = [&]() {
+        const InputHealth health_at_end = inputHealth();
+        const rclcpp::Time projection_end_stamp = now();
+        const double projection_ms = 1000.0 * std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - projection_started).count();
+        RCLCPP_INFO(
+          get_logger(),
+          "P2 projection end request=%llu start_ns=%lld end_ns=%lld source_generation=%llu "
+          "source_stamp_ns=%lld ready=%d stale=%d compute_ms=%.1f "
+          "map_age_start=%.3f map_age_end=%.3f odom_age_start=%.3f odom_age_end=%.3f "
+          "cloud_age_start=%.3f cloud_age_end=%.3f",
+          static_cast<unsigned long long>(request_sequence),
+          static_cast<long long>(projection_start_stamp.nanoseconds()),
+          static_cast<long long>(projection_end_stamp.nanoseconds()),
+          static_cast<unsigned long long>(response->generation),
+          static_cast<long long>(rclcpp::Time(response->occupancy_grid.header.stamp).nanoseconds()),
+          response->ready ? 1 : 0, response->stale ? 1 : 0, projection_ms,
+          health_at_start.map_update_age_sec, health_at_end.map_update_age_sec,
+          health_at_start.odom_age_sec, health_at_end.odom_age_sec,
+          health_at_start.cloud_age_sec, health_at_end.cloud_age_sec);
+      };
 
     std::lock_guard<std::mutex> lock(map_mutex_);
     response->generation = map_->generation();
     response->ready = has_map_data_ && map_->ensureCurrentEsdf();
     if (!response->ready) {
+      log_projection_end();
       return;
     }
     rog_map::Vec3f esdf_box_min;
     rog_map::Vec3f esdf_box_max;
     if (!map_->getCurrentEsdfBounds(esdf_box_min, esdf_box_max)) {
       response->ready = false;
+      log_projection_end();
       return;
     }
 
@@ -625,6 +685,7 @@ private:
       std::max(static_cast<double>(request->min_height), static_cast<double>(request->max_height)));
     if (z_max < z_min) {
       response->ready = false;
+      log_projection_end();
       return;
     }
 
@@ -735,8 +796,8 @@ private:
       }
     }
 
-    getHealthStaleness(map_update_stale, odom_stale, raw_cloud_stale);
-    response->stale = map_update_stale || odom_stale;
+    const InputHealth health_at_end = inputHealth();
+    response->stale = health_at_end.map_update_stale || health_at_end.odom_stale;
     const double projection_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - projection_started).count();
     RCLCPP_INFO_THROTTLE(
@@ -744,6 +805,7 @@ private:
       "ROGMap projection generation=%llu cells=%zu compute=%.1f ms stale=%s",
       static_cast<unsigned long long>(response->generation), cell_count, projection_ms,
       response->stale ? "true" : "false");
+    log_projection_end();
   }
 
   std::string map_frame_;
@@ -771,6 +833,7 @@ private:
   std::optional<SteadyTime> last_cloud_receive_time_;
   std::optional<SteadyTime> last_map_update_time_;
   std::optional<SteadyTime> last_odom_receive_time_;
+  std::uint64_t projection_request_sequence_{0};
   rclcpp::Time last_map_stamp_{0, 0, RCL_ROS_TIME};
   bool has_map_data_{false};
 
