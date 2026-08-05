@@ -272,13 +272,14 @@ private:
     request->resolution = static_cast<float>(planning_resolution_);
     const std::uint64_t epoch = ++next_request_epoch_;
     const std::uint64_t localization_epoch = localization_epoch_;
+    const rclcpp::Time request_start_stamp = now();
     active_request_epoch_ = epoch;
     active_request_sent_time_ = std::chrono::steady_clock::now();
     request_pending_ = true;
     try {
       const auto pending = projection_client_->async_send_request(
           request,
-          [this, epoch, localization_epoch](
+          [this, epoch, localization_epoch, request_start_stamp](
               rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::
                   SharedFuture future) {
             if (!request_pending_ || epoch != active_request_epoch_) {
@@ -292,7 +293,21 @@ private:
                     "discarded projection from an obsolete localization epoch");
                 return;
               }
-              processProjection(*future.get(), localization_epoch);
+              const auto & response = *future.get();
+              const rclcpp::Time response_stamp = now();
+              const double round_trip_ms = 1000.0 * std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - active_request_sent_time_).count();
+              RCLCPP_INFO(
+                get_logger(),
+                "P2 adapter projection end request=%llu start_ns=%lld end_ns=%lld "
+                "round_trip_ms=%.1f source_generation=%llu source_stamp_ns=%lld ready=%d stale=%d",
+                static_cast<unsigned long long>(epoch),
+                static_cast<long long>(request_start_stamp.nanoseconds()),
+                static_cast<long long>(response_stamp.nanoseconds()), round_trip_ms,
+                static_cast<unsigned long long>(response.generation),
+                static_cast<long long>(rclcpp::Time(response.occupancy_grid.header.stamp).nanoseconds()),
+                response.ready ? 1 : 0, response.stale ? 1 : 0);
+              processProjection(response, localization_epoch, epoch);
             } catch (const std::exception &exception) {
               RCLCPP_ERROR(get_logger(),
                            "ROGMap projection response failed: %s",
@@ -301,6 +316,13 @@ private:
             }
           });
       active_request_id_ = pending.request_id;
+      RCLCPP_INFO(
+        get_logger(),
+        "P2 adapter projection begin request=%llu request_id=%ld start_ns=%lld "
+        "localization_epoch=%llu deadline_sec=%.3f",
+        static_cast<unsigned long long>(epoch), static_cast<long>(active_request_id_),
+        static_cast<long long>(request_start_stamp.nanoseconds()),
+        static_cast<unsigned long long>(localization_epoch), projection_request_timeout_sec_);
     } catch (const std::exception & exception) {
       request_pending_ = false;
       RCLCPP_ERROR(get_logger(), "ROGMap projection request failed: %s", exception.what());
@@ -311,18 +333,13 @@ private:
   void processProjection(
       const ats_rog_map_interfaces::srv::GetRogMapProjection::Response
           &response,
-      std::uint64_t localization_epoch) {
+      std::uint64_t localization_epoch, std::uint64_t request_epoch) {
     const RogMapEsdfSnapshot numeric_snapshot = RogMapEsdfSnapshot::fromResponse(response);
     if (response.occupancy_grid.info.width > 0 && response.occupancy_grid.info.height > 0 &&
       !response.occupancy_grid.data.empty())
     {
       last_blocking_grid_ = response.occupancy_grid;
     }
-    if (!numeric_snapshot.available() || !projectionFresh(response.occupancy_grid)) {
-      publishUnavailable("ROGMap projection is unavailable or stale");
-      return;
-    }
-
     nav_msgs::msg::OccupancyGrid::SharedPtr static_map;
     nav_msgs::msg::OccupancyGrid::SharedPtr traversability;
     nav_msgs::msg::OccupancyGrid::SharedPtr slope;
@@ -331,6 +348,42 @@ private:
       static_map = static_map_;
       traversability = traversability_grid_;
       slope = slope_grid_;
+    }
+    const auto message_stamp_ns = [](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid) {
+        return grid ? static_cast<long long>(rclcpp::Time(grid->header.stamp).nanoseconds()) : 0LL;
+      };
+    const auto message_age = [this](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid) {
+        if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0) {
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        return (now() - rclcpp::Time(grid->header.stamp)).seconds();
+      };
+    const auto timestamp_delta = [](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid,
+                                    const builtin_interfaces::msg::Time & projection_stamp) {
+        if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0 ||
+          rclcpp::Time(projection_stamp).nanoseconds() <= 0)
+        {
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        return std::abs((rclcpp::Time(grid->header.stamp) -
+          rclcpp::Time(projection_stamp)).seconds());
+      };
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 adapter projection inputs request=%llu localization_epoch=%llu source_generation=%llu "
+      "projection_stamp_ns=%lld terrain_stamp_ns=%lld terrain_age=%.3f terrain_delta=%.3f "
+      "slope_stamp_ns=%lld slope_age=%.3f slope_delta=%.3f",
+      static_cast<unsigned long long>(request_epoch),
+      static_cast<unsigned long long>(localization_epoch),
+      static_cast<unsigned long long>(response.generation),
+      static_cast<long long>(rclcpp::Time(response.occupancy_grid.header.stamp).nanoseconds()),
+      message_stamp_ns(traversability), message_age(traversability),
+      timestamp_delta(traversability, response.occupancy_grid.header.stamp),
+      message_stamp_ns(slope), message_age(slope),
+      timestamp_delta(slope, response.occupancy_grid.header.stamp));
+    if (!numeric_snapshot.available() || !projectionFresh(response.occupancy_grid)) {
+      publishUnavailable("ROGMap projection is unavailable or stale");
+      return;
     }
     const bool traversability_fresh = traversability && inputFresh(*traversability);
     const bool slope_fresh = slope && inputFresh(*slope);
@@ -341,22 +394,6 @@ private:
     if (!static_map || !traversability_fresh || !slope_fresh ||
       !traversability_synchronized || !slope_synchronized)
     {
-      const auto message_age = [this](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid) {
-          if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0) {
-            return std::numeric_limits<double>::quiet_NaN();
-          }
-          return (now() - rclcpp::Time(grid->header.stamp)).seconds();
-        };
-      const auto timestamp_delta = [](const nav_msgs::msg::OccupancyGrid::SharedPtr & grid,
-                                      const builtin_interfaces::msg::Time & projection_stamp) {
-          if (!grid || rclcpp::Time(grid->header.stamp).nanoseconds() <= 0 ||
-            rclcpp::Time(projection_stamp).nanoseconds() <= 0)
-          {
-            return std::numeric_limits<double>::quiet_NaN();
-          }
-          return std::abs((rclcpp::Time(grid->header.stamp) -
-            rclcpp::Time(projection_stamp)).seconds());
-        };
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Terrain rejected: static=%d traversal fresh=%d sync=%d age=%.3f delta=%.3f; "
@@ -573,6 +610,14 @@ private:
     status.publication_sequence = ++map_status_sequence_;
     status.message = reason;
     map_status_pub_->publish(status);
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 adapter heartbeat ready=%d publication_sequence=%llu source_generation=%llu "
+      "localization_epoch=%llu stamp_ns=%lld reason=%s",
+      ready ? 1 : 0, static_cast<unsigned long long>(status.publication_sequence),
+      static_cast<unsigned long long>(status.rog_generation),
+      static_cast<unsigned long long>(status.localization_epoch),
+      static_cast<long long>(rclcpp::Time(status.header.stamp).nanoseconds()), reason.c_str());
   }
 
   std::string projection_service_;

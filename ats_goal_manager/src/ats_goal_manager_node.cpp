@@ -589,6 +589,15 @@ private:
         active_goal_->waiting_since.reset();
       }
     }
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 goal map heartbeat ready=%d publication_sequence=%llu source_generation=%llu "
+      "localization_epoch=%llu received_ns=%lld",
+      message->ready ? 1 : 0,
+      static_cast<unsigned long long>(message->publication_sequence),
+      static_cast<unsigned long long>(message->rog_generation),
+      static_cast<unsigned long long>(message->localization_epoch),
+      static_cast<long long>(now().nanoseconds()));
     if (suspend_goal_id) {
       // map status 与 grid/TF 更新跨 topic，不具备原子顺序。先急停并进入有界等待；
       // 恢复后重规划，持续超时才由 tick 返回 MAP_UNREADY。
@@ -857,6 +866,20 @@ private:
         std::hypot(active_goal_->target.pose.position.x - current_pose_.pose.position.x,
                    active_goal_->target.pose.position.y - current_pose_.pose.position.y));
     }
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 reference commit goal=%llu localization_epoch=%llu plan_request_sequence=%llu "
+      "source_generation=%llu map_generation=%llu map_publication_sequence=%llu "
+      "reference_stamp_ns=%lld poses=%zu",
+      static_cast<unsigned long long>(command.goal_id),
+      static_cast<unsigned long long>(command.localization_epoch),
+      static_cast<unsigned long long>(planner_ready_status_->plan_request_sequence),
+      static_cast<unsigned long long>(
+        planning_snapshot_ ? planning_snapshot_->source_generation : 0U),
+      static_cast<unsigned long long>(command.map_generation),
+      static_cast<unsigned long long>(command.map_publication_sequence),
+      static_cast<long long>(rclcpp::Time(command.reference.header.stamp).nanoseconds()),
+      command.reference.poses.size());
     publishEmergencyStop(false);
     publishExecutionCommand(command);
     reference_path_pub_->publish(committed);
@@ -929,6 +952,29 @@ private:
         }
         map_stale = lifecycle_.state() != GoalLifecycleState::kWaitingForMap &&
                     !map_ready;
+        if (map_stale) {
+          const auto steady_now = std::chrono::steady_clock::now();
+          const double heartbeat_age = last_map_status_signal_ ?
+            std::chrono::duration<double>(steady_now - *last_map_status_signal_).count() :
+            std::numeric_limits<double>::infinity();
+          const double snapshot_age = last_planning_snapshot_signal_ ?
+            std::chrono::duration<double>(steady_now - *last_planning_snapshot_signal_).count() :
+            std::numeric_limits<double>::infinity();
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "P2 goal map lease lost goal=%llu plan_request_sequence=%llu ready=%d "
+            "heartbeat_age=%.3f status_sequence=%llu source_generation=%llu "
+            "snapshot_age=%.3f snapshot_sequence=%llu snapshot_source_generation=%llu",
+            static_cast<unsigned long long>(active_goal_->id),
+            static_cast<unsigned long long>(active_goal_->expected_plan_request_sequence),
+            map_status_ready_ ? 1 : 0, heartbeat_age,
+            static_cast<unsigned long long>(map_status_publication_sequence_),
+            static_cast<unsigned long long>(map_status_generation_), snapshot_age,
+            static_cast<unsigned long long>(
+              planning_snapshot_ ? planning_snapshot_->publication_sequence : 0U),
+            static_cast<unsigned long long>(
+              planning_snapshot_ ? planning_snapshot_->source_generation : 0U));
+        }
         const bool wait_expired =
             lifecycle_.state() == GoalLifecycleState::kWaitingForMap &&
             active_goal_->waiting_since &&
@@ -1432,6 +1478,18 @@ private:
     std_msgs::msg::Bool message;
     message.data = stop;
     emergency_stop_pub_->publish(message);
+    bool transition = false;
+    {
+      std::lock_guard<std::mutex> lock(emergency_stop_log_mutex_);
+      transition = !last_emergency_stop_published_ ||
+        *last_emergency_stop_published_ != stop;
+      last_emergency_stop_published_ = stop;
+    }
+    if (transition) {
+      RCLCPP_WARN(
+        get_logger(), "P2 emergency-stop transition value=%d stamp_ns=%lld",
+        stop ? 1 : 0, static_cast<long long>(now().nanoseconds()));
+    }
   }
 
   void publishExecutionCommand(ExecutionCommand command) {
@@ -1492,6 +1550,7 @@ private:
   bool require_planning_snapshot_{false};
 
   std::mutex mutex_;
+  std::mutex emergency_stop_log_mutex_;
   GoalLifecycle lifecycle_;
   std::uint64_t next_goal_id_{0};
   std::optional<ActiveGoal> active_goal_;
@@ -1503,6 +1562,7 @@ private:
   bool map_ready_signal_{false};
   bool map_status_ready_{false};
   bool fail_stop_{true};
+  std::optional<bool> last_emergency_stop_published_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_planning_snapshot_signal_;
