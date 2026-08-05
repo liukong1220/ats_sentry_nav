@@ -141,6 +141,30 @@ public:
         map_update_index_ = 1;
     }
 
+    void setupThreeStateVoxelMapForDebug() {
+        cfg_.l_free = -1.0F;
+        cfg_.l_occ = 1.0F;
+        cfg_.virtual_ground_height = -10.0F;
+        cfg_.virtual_ceil_height = 10.0F;
+        sc_.resolution = 1.0;
+        sc_.resolution_inv = 1.0;
+        sc_.half_map_size_i = rog_map::Vec3i(1, 0, 0);
+        sc_.map_size_i = rog_map::Vec3i(3, 1, 1);
+        sc_.map_vox_num = 3;
+        updateLocalMapOriginAndBound(rog_map::Vec3f::Zero(), rog_map::Vec3i::Zero());
+        occupancy_buffer_ = {-2.0F, 2.0F, 0.0F};
+        cell_last_observed_update_index_.assign(3, 1);
+        cell_last_update_index_.assign(3, 1);
+        cell_last_hit_update_index_.assign(3, 0);
+        cell_last_miss_update_index_.assign(3, 0);
+        cell_last_hit_count_.assign(3, 0);
+        cell_last_miss_count_.assign(3, 0);
+        occupied_cell_flags_.assign(3, 0U);
+        occupied_cell_listed_flags_.assign(3, 0U);
+        occupied_cell_hash_ids_.clear();
+        map_update_index_ = 7;
+    }
+
     void resetCellForTest(const int hash_id) {
         resetCell(hash_id);
     }
@@ -187,6 +211,10 @@ public:
         sc_.map_vox_num = 1;
         local_map_origin_i_ = rog_map::Vec3i::Zero();
         local_map_origin_d_ = rog_map::Vec3f::Zero();
+        local_map_bound_min_i_ = rog_map::Vec3i::Zero();
+        local_map_bound_max_i_ = rog_map::Vec3i::Zero();
+        local_map_bound_min_d_ = rog_map::Vec3f(-0.5F, -0.5F, -0.5F);
+        local_map_bound_max_d_ = rog_map::Vec3f(0.5F, 0.5F, 0.5F);
         occupancy_buffer_.assign(1, 2.0F);
         cell_last_observed_update_index_.assign(1, last_observed);
         cell_last_update_index_.assign(1, 0);
@@ -389,6 +417,39 @@ int main() {
             static_cast<std::size_t>(stats.miss_this_frame_cells),
             1,
             "voxel debug stats should count miss-this-frame") && ok;
+    }
+
+    TestProbMap visualization_map;
+    visualization_map.setupThreeStateVoxelMapForDebug();
+    {
+        std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
+        rog_map::ProbMap::VoxelDebugStats stats;
+        visualization_map.collectVoxelDebugInBox(
+            rog_map::Vec3f(-100.0F, -1.0F, -1.0F),
+            rog_map::Vec3f(100.0F, 1.0F, 1.0F), cells, stats, 1, true);
+        ok = expectEqualSize(cells.size(), 3, "bounded voxel debug should clip to local map") && ok;
+        ok = expectEqual(
+            stats.known_free_cells == 1, true,
+            "voxel debug should classify known free") && ok;
+        ok = expectEqual(
+            stats.occupied_cells == 1, true,
+            "voxel debug should classify occupied") && ok;
+        ok = expectEqual(
+            stats.unknown_cells == 1, true,
+            "voxel debug should classify unknown") && ok;
+        ok = expectEqualUint64(
+            stats.update_index, 7, "voxel debug must not mutate map generation") && ok;
+    }
+    {
+        std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
+        rog_map::ProbMap::VoxelDebugStats stats;
+        visualization_map.collectVoxelDebugInBox(
+            rog_map::Vec3f(1.0F, -1.0F, -1.0F),
+            rog_map::Vec3f(2.0F, 1.0F, 1.0F), cells, stats, 1, false);
+        ok = expectEqualSize(
+            cells.size(), 0, "unknown-only voxel range must respect include_unknown=false") && ok;
+        ok = expectEqualUint64(
+            stats.update_index, 7, "filtered voxel debug must remain read-only") && ok;
     }
 
     TestProbMap hit_map;

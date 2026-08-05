@@ -479,6 +479,16 @@ void ProbMap::collectLocalVoxelDebug(std::vector<VoxelDebugCell>& cells,   // �
                                      VoxelDebugStats& stats,                // 输出统计量
                                      int stride,                            // 采样步长
                                      const bool include_unknown) const {    // 是否要将 unknown也放进 cells
+    collectVoxelDebugInBox(
+        local_map_bound_min_d_, local_map_bound_max_d_,
+        cells, stats, stride, include_unknown);
+}
+
+void ProbMap::collectVoxelDebugInBox(const Vec3f &box_min, const Vec3f &box_max,
+                                     std::vector<VoxelDebugCell>& cells,
+                                     VoxelDebugStats& stats,
+                                     int stride,
+                                     const bool include_unknown) const {
     cells.clear();
     stats = VoxelDebugStats{};
     stats.update_index = map_update_index_;
@@ -501,10 +511,37 @@ void ProbMap::collectLocalVoxelDebug(std::vector<VoxelDebugCell>& cells,   // �
             ? static_cast<std::uint64_t>(cfg_.stale_hard_ttl_updates)
             : 0;
 
-    for (int lx = -sc_.half_map_size_i.x(); lx <= sc_.half_map_size_i.x(); lx += stride) {
-        for (int ly = -sc_.half_map_size_i.y(); ly <= sc_.half_map_size_i.y(); ly += stride) {
-            for (int lz = -sc_.half_map_size_i.z(); lz <= sc_.half_map_size_i.z(); lz += stride) {
-                const Vec3i id_l(lx, ly, lz);
+    if ((box_max - box_min).minCoeff() < 0.0F) {
+        return;
+    }
+
+    Vec3i requested_min_id_g;
+    Vec3i requested_max_id_g;
+    posToGlobalIndex(box_min, requested_min_id_g);
+    posToGlobalIndex(box_max, requested_max_id_g);
+    const Vec3i scan_min_id_g = (requested_min_id_g - Vec3i::Ones()).cwiseMax(
+        local_map_bound_min_i_);
+    const Vec3i scan_max_id_g = (requested_max_id_g + Vec3i::Ones()).cwiseMin(
+        local_map_bound_max_i_);
+    if ((scan_max_id_g - scan_min_id_g).minCoeff() < 0) {
+        return;
+    }
+
+    for (int gx = scan_min_id_g.x(); gx <= scan_max_id_g.x(); gx += stride) {
+        for (int gy = scan_min_id_g.y(); gy <= scan_max_id_g.y(); gy += stride) {
+            for (int gz = scan_min_id_g.z(); gz <= scan_max_id_g.z(); gz += stride) {
+                const Vec3i id_g(gx, gy, gz);
+                Vec3f center;
+                globalIndexToPos(id_g, center);
+                if (
+                    !insideLocalMap(id_g) ||
+                    (center.array() < box_min.array()).any() ||
+                    (center.array() > box_max.array()).any())
+                {
+                    continue;
+                }
+                Vec3i id_l;
+                globalIndexToLocalIndex(id_g, id_l);
                 const int hash_id = getLocalIndexHash(id_l);
                 if (hash_id < 0 || hash_id >= static_cast<int>(occupancy_buffer_.size())) {
                     continue;
@@ -528,8 +565,8 @@ void ProbMap::collectLocalVoxelDebug(std::vector<VoxelDebugCell>& cells,   // �
                 }
 
                 VoxelDebugCell cell;
-                localIndexToGlobalIndex(id_l, cell.id_g);
-                localIndexToPos(id_l, cell.center);
+                cell.id_g = id_g;
+                cell.center = center;
                 cell.type = type;
                 cell.log_odds = value;
 
