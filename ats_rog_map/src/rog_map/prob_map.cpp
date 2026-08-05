@@ -527,6 +527,24 @@ void ProbMap::collectVoxelDebugInBox(const Vec3f &box_min, const Vec3f &box_max,
         return;
     }
 
+    const auto sampled_axis_count = [stride](const int min_index, const int max_index) {
+        return static_cast<std::size_t>(max_index - min_index) /
+            static_cast<std::size_t>(stride) + 1U;
+    };
+    const auto saturated_multiply = [](const std::size_t left, const std::size_t right) {
+        return left > std::numeric_limits<std::size_t>::max() / right
+            ? std::numeric_limits<std::size_t>::max()
+            : left * right;
+    };
+    const std::size_t sampled_cells = saturated_multiply(
+        saturated_multiply(
+            sampled_axis_count(scan_min_id_g.x(), scan_max_id_g.x()),
+            sampled_axis_count(scan_min_id_g.y(), scan_max_id_g.y())),
+        sampled_axis_count(scan_min_id_g.z(), scan_max_id_g.z()));
+    // The export is bounded by the requested visualization box. Reserving that exact upper
+    // bound keeps snapshot collection from repeatedly reallocating without copying the map.
+    cells.reserve(std::min(sampled_cells, occupancy_buffer_.size()));
+
     for (int gx = scan_min_id_g.x(); gx <= scan_max_id_g.x(); gx += stride) {
         for (int gy = scan_min_id_g.y(); gy <= scan_max_id_g.y(); gy += stride) {
             for (int gz = scan_min_id_g.z(); gz <= scan_max_id_g.z(); gz += stride) {
