@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "ats_rog_map/debug_viz.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
@@ -362,13 +363,18 @@ private:
     return message;
   }
 
-  sensor_msgs::msg::PointCloud2 makeEsdfCloud(
-    const rog_map::Vec3f & box_min, const rog_map::Vec3f & box_max, const rclcpp::Time & stamp) const
+  void collectEsdfDebugPoints(
+    const rog_map::Vec3f & box_min, const rog_map::Vec3f & box_max,
+    pcl::PointCloud<pcl::PointXYZI> & cloud) const
   {
-    pcl::PointCloud<pcl::PointXYZI> cloud;
+    cloud.clear();
     const double resolution = std::max(map_->getResolution(), 0.01);
     const float z = static_cast<float>(std::clamp(
       esdf_visualization_height_, static_cast<double>(box_min.z()), static_cast<double>(box_max.z())));
+    const auto axis_count = [resolution](const float min_value, const float max_value) {
+        return static_cast<std::size_t>(std::floor((max_value - min_value) / resolution + 1.0));
+      };
+    cloud.reserve(axis_count(box_min.x(), box_max.x()) * axis_count(box_min.y(), box_max.y()));
     for (double x = box_min.x(); x <= box_max.x(); x += resolution) {
       for (double y = box_min.y(); y <= box_max.y(); y += resolution) {
         const rog_map::Vec3f point(static_cast<float>(x), static_cast<float>(y), z);
@@ -383,6 +389,11 @@ private:
         }
       }
     }
+  }
+
+  sensor_msgs::msg::PointCloud2 makeEsdfCloud(
+    const pcl::PointCloud<pcl::PointXYZI> & cloud, const rclcpp::Time & stamp) const
+  {
     sensor_msgs::msg::PointCloud2 message;
     pcl::toROSMsg(cloud, message);
     message.header.frame_id = map_frame_;
@@ -401,23 +412,10 @@ private:
       point.x = cell.center.x();
       point.y = cell.center.y();
       point.z = cell.center.z();
-      switch (cell.type) {
-        case super_utils::OCCUPIED:
-          point.r = 245U;
-          point.g = 70U;
-          point.b = 70U;
-          break;
-        case super_utils::KNOWN_FREE:
-          point.r = 92U;
-          point.g = 220U;
-          point.b = 235U;
-          break;
-        default:
-          point.r = 130U;
-          point.g = 120U;
-          point.b = 150U;
-          break;
-      }
+      const VoxelDebugRgb color = voxelDebugRgb(cell.type);
+      point.r = color.red;
+      point.g = color.green;
+      point.b = color.blue;
       cloud.push_back(point);
     }
     sensor_msgs::msg::PointCloud2 message;
@@ -436,18 +434,19 @@ private:
   void appendBoundsMarker(
     visualization_msgs::msg::MarkerArray & markers, const rog_map::Vec3f & box_min,
     const rog_map::Vec3f & box_max, const std::string & ns, const std::string & label,
-    int id, float red, float green, float blue, float alpha)
+    int id, float red, float green, float blue, float alpha, float line_width,
+    const rclcpp::Time & stamp)
   {
     visualization_msgs::msg::Marker marker;
     marker.header.frame_id = map_frame_;
-    marker.header.stamp = last_map_stamp_;
+    marker.header.stamp = stamp;
     marker.ns = ns;
     marker.id = id;
     marker.type = visualization_msgs::msg::Marker::LINE_LIST;
     marker.action = validBounds(box_min, box_max) ? visualization_msgs::msg::Marker::ADD :
       visualization_msgs::msg::Marker::DELETE;
     marker.pose.orientation.w = 1.0;
-    marker.scale.x = std::max(0.02, 0.4 * map_->getResolution());
+    marker.scale.x = line_width;
     marker.color.r = red;
     marker.color.g = green;
     marker.color.b = blue;
@@ -484,7 +483,7 @@ private:
 
     visualization_msgs::msg::Marker text;
     text.header.frame_id = map_frame_;
-    text.header.stamp = last_map_stamp_;
+    text.header.stamp = stamp;
     text.ns = ns + "_label";
     text.id = id + 100;
     text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
@@ -503,121 +502,180 @@ private:
     markers.markers.push_back(std::move(text));
   }
 
-  void publishBoundsMarkers(
+  visualization_msgs::msg::MarkerArray makeBoundsMarkers(
     const rog_map::Vec3f & local_min, const rog_map::Vec3f & local_max,
     const rog_map::Vec3f & visualization_min, const rog_map::Vec3f & visualization_max,
-    const rog_map::Vec3f & update_min, const rog_map::Vec3f & update_max)
+    const rog_map::Vec3f & update_min, const rog_map::Vec3f & update_max, const double resolution,
+    const rclcpp::Time & stamp)
   {
     visualization_msgs::msg::MarkerArray markers;
+    const float line_width = static_cast<float>(std::max(0.02, 0.4 * resolution));
     appendBoundsMarker(
       markers, local_min, local_max, "rog_map_local_map", "Local Map Range", 0,
-      1.0F, 0.50F, 0.0F, 0.95F);
+      1.0F, 0.50F, 0.0F, 0.95F, line_width, stamp);
     appendBoundsMarker(
       markers, visualization_min, visualization_max, "rog_map_visualization", "Visualization Range", 1,
-      0.50F, 0.0F, 1.0F, 0.90F);
+      0.50F, 0.0F, 1.0F, 0.90F, line_width, stamp);
     appendBoundsMarker(
       markers, update_min, update_max, "rog_map_local_update", "Raycast Update Range", 2,
-      0.0F, 1.0F, 0.0F, 0.90F);
-    bounds_pub_->publish(markers);
+      0.0F, 1.0F, 0.0F, 0.90F, line_width, stamp);
+    return markers;
   }
+
+  struct DebugSnapshot
+  {
+    std::uint64_t source_generation{0U};
+    rclcpp::Time map_stamp{0, 0, RCL_ROS_TIME};
+    bool publish_occupied{false};
+    bool publish_inflated{false};
+    bool publish_unknown{false};
+    bool publish_esdf{false};
+    bool publish_viz{false};
+    bool publish_bounds{false};
+    rog_map::vec_E<rog_map::Vec3f> occupied;
+    rog_map::vec_E<rog_map::Vec3f> inflated;
+    rog_map::vec_E<rog_map::Vec3f> unknown;
+    std::vector<rog_map::ProbMap::VoxelDebugCell> viz_cells;
+    rog_map::ProbMap::VoxelDebugStats viz_stats;
+    pcl::PointCloud<pcl::PointXYZI> esdf_points;
+    visualization_msgs::msg::MarkerArray bounds_markers;
+    double map_lock_wait_ms{0.0};
+    double map_lock_hold_ms{0.0};
+    double viz_collect_ms{0.0};
+    double viz_serialize_ms{0.0};
+    double viz_publish_ms{0.0};
+  };
 
   void publishDebug()
   {
     const auto debug_started = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    if (!has_map_data_) {
-      return;
-    }
-
-    const bool publish_occupied = occupied_pub_->get_subscription_count() > 0U;
-    const bool publish_inflated = inflated_pub_->get_subscription_count() > 0U;
-    const bool publish_unknown = unknown_pub_->get_subscription_count() > 0U;
-    const bool publish_esdf = esdf_pub_->get_subscription_count() > 0U && map_->hasESDF();
-    const bool publish_viz = viz_pub_->get_subscription_count() > 0U;
-    const bool publish_bounds = bounds_pub_->get_subscription_count() > 0U;
+    DebugSnapshot snapshot;
+    snapshot.publish_occupied = occupied_pub_->get_subscription_count() > 0U;
+    snapshot.publish_inflated = inflated_pub_->get_subscription_count() > 0U;
+    snapshot.publish_unknown = unknown_pub_->get_subscription_count() > 0U;
+    snapshot.publish_viz = shouldBuildDebugVisualization(viz_pub_->get_subscription_count());
+    snapshot.publish_bounds = bounds_pub_->get_subscription_count() > 0U;
     if (
-      !publish_occupied && !publish_inflated && !publish_unknown && !publish_esdf &&
-      !publish_viz && !publish_bounds)
+      !snapshot.publish_occupied && !snapshot.publish_inflated && !snapshot.publish_unknown &&
+      !snapshot.publish_viz && !snapshot.publish_bounds && esdf_pub_->get_subscription_count() == 0U)
     {
       return;
     }
 
-    const rog_map::Vec3f map_center = map_->getLocalMapOrigin();
-    const rog_map::Vec3f half_map_size = 0.5F * map_->getLocalMapSize();
-    rog_map::Vec3f local_box_min = map_center - half_map_size;
-    rog_map::Vec3f local_box_max = map_center + half_map_size;
-    map_->boundBoxByLocalMap(local_box_min, local_box_max);
+    const auto map_lock_wait_started = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lock(map_mutex_);
+      snapshot.map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - map_lock_wait_started).count();
+      const auto map_lock_hold_started = std::chrono::steady_clock::now();
+      if (!has_map_data_) {
+        return;
+      }
+      snapshot.source_generation = map_->generation();
+      snapshot.map_stamp = last_map_stamp_;
+      snapshot.publish_esdf = esdf_pub_->get_subscription_count() > 0U && map_->hasESDF();
 
-    rog_map::Vec3f visualization_box_min = local_box_min;
-    rog_map::Vec3f visualization_box_max = local_box_max;
-    const auto config = map_->getMapConfig();
-    if ((config.visualization_range.array() > 0.0F).all()) {
-      const rog_map::Vec3f robot_position = map_->getRobotState().p;
-      const rog_map::Vec3f half_visualization_range = 0.5F * config.visualization_range;
-      visualization_box_min = robot_position - half_visualization_range;
-      visualization_box_max = robot_position + half_visualization_range;
-      map_->boundBoxByLocalMap(visualization_box_min, visualization_box_max);
-    }
+      const rog_map::Vec3f map_center = map_->getLocalMapOrigin();
+      const rog_map::Vec3f half_map_size = 0.5F * map_->getLocalMapSize();
+      rog_map::Vec3f local_box_min = map_center - half_map_size;
+      rog_map::Vec3f local_box_max = map_center + half_map_size;
+      map_->boundBoxByLocalMap(local_box_min, local_box_max);
 
-    rog_map::Vec3f update_box_min;
-    rog_map::Vec3f update_box_max;
-    map_->getRaycastLocalUpdateBox(update_box_min, update_box_max);
-    map_->boundBoxByLocalMap(update_box_min, update_box_max);
-    if (publish_bounds) {
-      publishBoundsMarkers(
-        local_box_min, local_box_max, visualization_box_min, visualization_box_max,
-        update_box_min, update_box_max);
-    }
-    const rog_map::Vec3f box_min = visualization_box_min;
-    const rog_map::Vec3f box_max = visualization_box_max;
-    std::size_t viz_cells = 0U;
-    double viz_build_ms = 0.0;
-    if (publish_viz) {
-      const auto viz_started = std::chrono::steady_clock::now();
-      std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
-      rog_map::ProbMap::VoxelDebugStats stats;
-      map_->collectVoxelDebugInBox(
-        box_min, box_max, cells, stats, debug_viz_stride_, debug_viz_include_unknown_);
-      viz_cells = cells.size();
-      viz_pub_->publish(makeVoxelDebugCloud(cells, last_map_stamp_));
-      viz_build_ms = 1000.0 * std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - viz_started).count();
-    }
-    if (publish_occupied) {
-      rog_map::vec_E<rog_map::Vec3f> occupied;
-      map_->boxSearch(box_min, box_max, super_utils::OCCUPIED, occupied);
-      occupied_pub_->publish(makeCloud(occupied, last_map_stamp_));
-    }
-    if (publish_inflated) {
-      rog_map::vec_E<rog_map::Vec3f> inflated;
-      map_->boxSearchInflate(box_min, box_max, super_utils::OCCUPIED, inflated);
-      inflated_pub_->publish(makeCloud(inflated, last_map_stamp_));
-    }
-    if (publish_unknown) {
-      rog_map::vec_E<rog_map::Vec3f> unknown;
-      map_->boxSearch(box_min, box_max, super_utils::UNKNOWN, unknown);
-      unknown_pub_->publish(makeCloud(unknown, last_map_stamp_));
-    }
-    if (publish_esdf && map_->ensureCurrentEsdf()) {
-      rog_map::Vec3f esdf_box_min;
-      rog_map::Vec3f esdf_box_max;
-      if (map_->getCurrentEsdfBounds(esdf_box_min, esdf_box_max)) {
-        esdf_box_min = esdf_box_min.cwiseMax(box_min);
-        esdf_box_max = esdf_box_max.cwiseMin(box_max);
-        if (validBounds(esdf_box_min, esdf_box_max)) {
-          esdf_pub_->publish(makeEsdfCloud(esdf_box_min, esdf_box_max, last_map_stamp_));
+      rog_map::Vec3f visualization_box_min = local_box_min;
+      rog_map::Vec3f visualization_box_max = local_box_max;
+      const auto config = map_->getMapConfig();
+      if ((config.visualization_range.array() > 0.0F).all()) {
+        const rog_map::Vec3f robot_position = map_->getRobotState().p;
+        const rog_map::Vec3f half_visualization_range = 0.5F * config.visualization_range;
+        visualization_box_min = robot_position - half_visualization_range;
+        visualization_box_max = robot_position + half_visualization_range;
+        map_->boundBoxByLocalMap(visualization_box_min, visualization_box_max);
+      }
+
+      rog_map::Vec3f update_box_min;
+      rog_map::Vec3f update_box_max;
+      map_->getRaycastLocalUpdateBox(update_box_min, update_box_max);
+      map_->boundBoxByLocalMap(update_box_min, update_box_max);
+      const rog_map::Vec3f box_min = visualization_box_min;
+      const rog_map::Vec3f box_max = visualization_box_max;
+      if (snapshot.publish_bounds) {
+        snapshot.bounds_markers = makeBoundsMarkers(
+          local_box_min, local_box_max, visualization_box_min, visualization_box_max,
+          update_box_min, update_box_max, map_->getResolution(), snapshot.map_stamp);
+      }
+      if (snapshot.publish_viz) {
+        const auto viz_collect_started = std::chrono::steady_clock::now();
+        map_->collectVoxelDebugInBox(
+          box_min, box_max, snapshot.viz_cells, snapshot.viz_stats, debug_viz_stride_,
+          debug_viz_include_unknown_);
+        snapshot.viz_collect_ms = 1000.0 * std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - viz_collect_started).count();
+      }
+      if (snapshot.publish_occupied) {
+        map_->boxSearch(box_min, box_max, super_utils::OCCUPIED, snapshot.occupied);
+      }
+      if (snapshot.publish_inflated) {
+        map_->boxSearchInflate(box_min, box_max, super_utils::OCCUPIED, snapshot.inflated);
+      }
+      if (snapshot.publish_unknown) {
+        map_->boxSearch(box_min, box_max, super_utils::UNKNOWN, snapshot.unknown);
+      }
+      if (snapshot.publish_esdf && map_->ensureCurrentEsdf()) {
+        rog_map::Vec3f esdf_box_min;
+        rog_map::Vec3f esdf_box_max;
+        if (map_->getCurrentEsdfBounds(esdf_box_min, esdf_box_max)) {
+          esdf_box_min = esdf_box_min.cwiseMax(box_min);
+          esdf_box_max = esdf_box_max.cwiseMin(box_max);
+          if (validBounds(esdf_box_min, esdf_box_max)) {
+            collectEsdfDebugPoints(esdf_box_min, esdf_box_max, snapshot.esdf_points);
+          }
         }
       }
+      snapshot.map_lock_hold_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - map_lock_hold_started).count();
+    }
+
+    if (snapshot.publish_bounds) {
+      bounds_pub_->publish(snapshot.bounds_markers);
+    }
+    if (snapshot.publish_viz) {
+      const auto viz_serialize_started = std::chrono::steady_clock::now();
+      const auto message = makeVoxelDebugCloud(snapshot.viz_cells, snapshot.map_stamp);
+      snapshot.viz_serialize_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - viz_serialize_started).count();
+      const auto viz_publish_started = std::chrono::steady_clock::now();
+      viz_pub_->publish(message);
+      snapshot.viz_publish_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - viz_publish_started).count();
+    }
+    if (snapshot.publish_occupied) {
+      occupied_pub_->publish(makeCloud(snapshot.occupied, snapshot.map_stamp));
+    }
+    if (snapshot.publish_inflated) {
+      inflated_pub_->publish(makeCloud(snapshot.inflated, snapshot.map_stamp));
+    }
+    if (snapshot.publish_unknown) {
+      unknown_pub_->publish(makeCloud(snapshot.unknown, snapshot.map_stamp));
+    }
+    if (snapshot.publish_esdf && !snapshot.esdf_points.empty()) {
+      esdf_pub_->publish(makeEsdfCloud(snapshot.esdf_points, snapshot.map_stamp));
     }
     const double debug_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - debug_started).count();
+    const double viz_build_ms =
+      snapshot.viz_collect_ms + snapshot.viz_serialize_ms + snapshot.viz_publish_ms;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "P2 debug build generation=%llu occupied=%d inflated=%d unknown=%d esdf=%d viz=%d "
-      "viz_cells=%zu viz_build_ms=%.1f bounds=%d total_ms=%.1f",
-      static_cast<unsigned long long>(map_->generation()), publish_occupied ? 1 : 0,
-      publish_inflated ? 1 : 0, publish_unknown ? 1 : 0, publish_esdf ? 1 : 0,
-      publish_viz ? 1 : 0, viz_cells, viz_build_ms, publish_bounds ? 1 : 0, debug_ms);
+      "viz_cells=%zu viz_unknown=%d viz_build_ms=%.1f viz_collect_ms=%.1f "
+      "viz_serialize_ms=%.1f viz_publish_ms=%.1f map_lock_wait_ms=%.1f "
+      "map_lock_hold_ms=%.1f bounds=%d total_ms=%.1f",
+      static_cast<unsigned long long>(snapshot.source_generation), snapshot.publish_occupied ? 1 : 0,
+      snapshot.publish_inflated ? 1 : 0, snapshot.publish_unknown ? 1 : 0,
+      snapshot.publish_esdf ? 1 : 0, snapshot.publish_viz ? 1 : 0, snapshot.viz_cells.size(),
+      snapshot.viz_stats.unknown_cells, viz_build_ms, snapshot.viz_collect_ms,
+      snapshot.viz_serialize_ms, snapshot.viz_publish_ms, snapshot.map_lock_wait_ms,
+      snapshot.map_lock_hold_ms, snapshot.publish_bounds ? 1 : 0, debug_ms);
   }
 
   void publishHealth()

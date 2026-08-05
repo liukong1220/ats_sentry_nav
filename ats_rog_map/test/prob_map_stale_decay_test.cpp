@@ -1,5 +1,7 @@
 #include <rog_map/prob_map.h>
 
+#include "ats_rog_map/debug_viz.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -304,11 +306,42 @@ bool expectEqualSize(const std::size_t actual,
     return false;
 }
 
+bool expectRgb(const ats_rog_map::VoxelDebugRgb actual,
+               const std::uint8_t red,
+               const std::uint8_t green,
+               const std::uint8_t blue,
+               const char *label) {
+    if (actual.red == red && actual.green == green && actual.blue == blue) {
+        return true;
+    }
+    std::cerr << label << ": expected rgb(" << static_cast<int>(red) << ", "
+              << static_cast<int>(green) << ", " << static_cast<int>(blue) << "), got rgb("
+              << static_cast<int>(actual.red) << ", " << static_cast<int>(actual.green) << ", "
+              << static_cast<int>(actual.blue) << ")" << std::endl;
+    return false;
+}
+
 }  // namespace
 
 int main() {
     bool ok = true;
     bool hard_clear = false;
+
+    ok = expectEqual(
+        ats_rog_map::shouldBuildDebugVisualization(0U), false,
+        "debug visualization must not build without a subscriber") && ok;
+    ok = expectEqual(
+        ats_rog_map::shouldBuildDebugVisualization(1U), true,
+        "debug visualization must build for a subscriber") && ok;
+    ok = expectRgb(
+        ats_rog_map::voxelDebugRgb(super_utils::OCCUPIED), 245U, 70U, 70U,
+        "occupied debug color") && ok;
+    ok = expectRgb(
+        ats_rog_map::voxelDebugRgb(super_utils::KNOWN_FREE), 92U, 220U, 235U,
+        "known-free debug color") && ok;
+    ok = expectRgb(
+        ats_rog_map::voxelDebugRgb(super_utils::UNKNOWN), 130U, 120U, 150U,
+        "unknown debug color") && ok;
 
     ok = expectNear(
         rog_map::ProbMap::applyStaleDecayUpdate(
@@ -444,10 +477,41 @@ int main() {
         std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
         rog_map::ProbMap::VoxelDebugStats stats;
         visualization_map.collectVoxelDebugInBox(
+            rog_map::Vec3f(-0.49F, -0.49F, -0.49F),
+            rog_map::Vec3f(0.51F, 0.51F, 0.51F), cells, stats, 1, true);
+        ok = expectEqualSize(
+            cells.size(), 1,
+            "non-integral visualization bounds must export only the enclosed cell center") && ok;
+        if (!cells.empty()) {
+            ok = expectEqual(
+                cells.front().type == super_utils::OCCUPIED, true,
+                "non-integral visualization bounds must preserve the enclosed cell type") && ok;
+        }
+        ok = expectEqualUint64(
+            stats.update_index, 7, "non-integral debug snapshot must remain read-only") && ok;
+    }
+    {
+        std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
+        rog_map::ProbMap::VoxelDebugStats stats;
+        visualization_map.collectVoxelDebugInBox(
+            rog_map::Vec3f(-1.0F, -1.0F, -1.0F),
+            rog_map::Vec3f(2.0F, 1.0F, 1.0F), cells, stats, 2, true);
+        ok = expectEqualSize(cells.size(), 2, "stride must reduce the bounded debug snapshot") && ok;
+        ok = expectEqual(
+            stats.known_free_cells == 1 && stats.unknown_cells == 1 && stats.occupied_cells == 0,
+            true, "stride must preserve sampled voxel statistics") && ok;
+    }
+    {
+        std::vector<rog_map::ProbMap::VoxelDebugCell> cells;
+        rog_map::ProbMap::VoxelDebugStats stats;
+        visualization_map.collectVoxelDebugInBox(
             rog_map::Vec3f(1.0F, -1.0F, -1.0F),
             rog_map::Vec3f(2.0F, 1.0F, 1.0F), cells, stats, 1, false);
         ok = expectEqualSize(
             cells.size(), 0, "unknown-only voxel range must respect include_unknown=false") && ok;
+        ok = expectEqual(
+            stats.unknown_cells == 1, true,
+            "filtered unknown cells must remain in debug statistics") && ok;
         ok = expectEqualUint64(
             stats.update_index, 7, "filtered voxel debug must remain read-only") && ok;
     }
