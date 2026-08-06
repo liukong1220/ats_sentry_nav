@@ -24,6 +24,7 @@ add_library(${PROJECT_NAME}_lib
   src/se2_model.cpp
   src/se2_mpc_controller.cpp
   src/ltv_qp_problem.cpp
+  src/ltv_qp_solver.cpp
   src/trajectory_tracker.cpp
 )
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
@@ -60,6 +61,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_ltv_qp_problem test/test_ltv_qp_problem.cpp)
   target_link_libraries(test_ltv_qp_problem ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_ltv_qp_solver test/test_ltv_qp_solver.cpp)
+  target_link_libraries(test_ltv_qp_solver ${PROJECT_NAME}_lib)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)
