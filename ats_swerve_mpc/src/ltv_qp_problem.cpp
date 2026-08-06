@@ -71,38 +71,16 @@ void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
 
 }  // namespace
 
-LtvQpProblem LtvQpBuilder::build(
-    const State &current_state, const std::vector<State> &nominal_states,
-    const std::vector<Control> &nominal_controls,
-    const std::vector<Se2Reference> &references, const Control &last_control,
-    const Se2MpcConfig &config, const ZeroSpeedGuardConfig &guard_config) {
+LtvQpProblem LtvQpBuilder::allocate(int horizon) {
   LtvQpProblem problem;
-  problem.horizon = config.horizon;
-  if (config.horizon <= 0 || config.dt <= 0.0) {
-    problem.validation_error = "horizon and dt must be positive";
+  problem.horizon = horizon;
+  if (horizon <= 0) {
+    problem.validation_error = "horizon must be positive";
     return problem;
   }
-  const std::size_t horizon = static_cast<std::size_t>(config.horizon);
-  if (nominal_states.size() != horizon + 1 ||
-      nominal_controls.size() != horizon || references.size() < horizon + 1) {
-    problem.validation_error = "nominal/reference horizon size mismatch";
-    return problem;
-  }
-  if (!current_state.allFinite() || !last_control.allFinite() ||
-      !finiteStates(nominal_states) || !finiteControls(nominal_controls)) {
-    problem.validation_error = "non-finite state or control input";
-    return problem;
-  }
-  if ((config.max_vx < 0.0) || (config.max_vy < 0.0) ||
-      (config.max_wz < 0.0) || (config.max_ax < 0.0) ||
-      (config.max_ay < 0.0) || (config.max_awz < 0.0)) {
-    problem.validation_error = "negative body limit";
-    return problem;
-  }
-
   const int decision_size = problem.decisionSize();
-  const int equality_rows = 3 * (config.horizon + 1);
-  const int inequality_rows = 3 * config.horizon;
+  const int equality_rows = 3 * (horizon + 1);
+  const int inequality_rows = 3 * horizon;
   const double infinity = std::numeric_limits<double>::infinity();
   problem.hessian = Eigen::MatrixXd::Zero(decision_size, decision_size);
   problem.gradient = Eigen::VectorXd::Zero(decision_size);
@@ -114,6 +92,69 @@ LtvQpProblem LtvQpBuilder::build(
   problem.inequality_upper = Eigen::VectorXd::Zero(inequality_rows);
   problem.lower_bound = Eigen::VectorXd::Constant(decision_size, -infinity);
   problem.upper_bound = Eigen::VectorXd::Constant(decision_size, infinity);
+  return problem;
+}
+
+LtvQpProblem LtvQpBuilder::build(
+    const State &current_state, const std::vector<State> &nominal_states,
+    const std::vector<Control> &nominal_controls,
+    const std::vector<Se2Reference> &references, const Control &last_control,
+    const Se2MpcConfig &config, const ZeroSpeedGuardConfig &guard_config) {
+  LtvQpProblem problem = allocate(config.horizon);
+  build(current_state, nominal_states, nominal_controls, references, last_control,
+        config, problem, guard_config);
+  return problem;
+}
+
+bool LtvQpBuilder::build(
+    const State &current_state, const std::vector<State> &nominal_states,
+    const std::vector<Control> &nominal_controls,
+    const std::vector<Se2Reference> &references, const Control &last_control,
+    const Se2MpcConfig &config, LtvQpProblem &problem,
+    const ZeroSpeedGuardConfig &guard_config) {
+  if (problem.horizon != config.horizon ||
+      problem.hessian.rows() != 6 * config.horizon + 3 ||
+      problem.equality_matrix.rows() != 3 * (config.horizon + 1) ||
+      problem.inequality_matrix.rows() != 3 * config.horizon) {
+    problem = allocate(config.horizon);
+  }
+  problem.valid = false;
+  problem.validation_error.clear();
+  problem.zero_speed_guard_active = false;
+  problem.angle_rate_linearization_valid.fill(false);
+  if (config.horizon <= 0 || config.dt <= 0.0) {
+    problem.validation_error = "horizon and dt must be positive";
+    return false;
+  }
+  const std::size_t horizon = static_cast<std::size_t>(config.horizon);
+  if (nominal_states.size() != horizon + 1 ||
+      nominal_controls.size() != horizon || references.size() < horizon + 1) {
+    problem.validation_error = "nominal/reference horizon size mismatch";
+    return false;
+  }
+  if (!current_state.allFinite() || !last_control.allFinite() ||
+      !finiteStates(nominal_states) || !finiteControls(nominal_controls)) {
+    problem.validation_error = "non-finite state or control input";
+    return false;
+  }
+  if ((config.max_vx < 0.0) || (config.max_vy < 0.0) ||
+      (config.max_wz < 0.0) || (config.max_ax < 0.0) ||
+      (config.max_ay < 0.0) || (config.max_awz < 0.0)) {
+    problem.validation_error = "negative body limit";
+    return false;
+  }
+
+  const double infinity = std::numeric_limits<double>::infinity();
+  problem.hessian.setZero();
+  problem.gradient.setZero();
+  problem.equality_matrix.setZero();
+  problem.equality_lower.setZero();
+  problem.equality_upper.setZero();
+  problem.inequality_matrix.setZero();
+  problem.inequality_lower.setZero();
+  problem.inequality_upper.setZero();
+  problem.lower_bound.setConstant(-infinity);
+  problem.upper_bound.setConstant(infinity);
 
   const Matrix3 q = config.state_weight.asDiagonal();
   const Matrix3 r = config.control_weight.asDiagonal();
@@ -219,7 +260,7 @@ LtvQpProblem LtvQpBuilder::build(
   if (!problem.valid) {
     problem.validation_error = "constructed QP contains non-finite values";
   }
-  return problem;
+  return problem.valid;
 }
 
 }  // namespace ats_swerve_mpc

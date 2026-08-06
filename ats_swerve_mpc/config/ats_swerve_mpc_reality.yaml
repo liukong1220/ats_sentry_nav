@@ -40,6 +40,17 @@ ats_swerve_mpc:
     goal_yaw_tolerance: 0.15
     publish_debug_paths: true
 
+    # 默认保持 iLQR 唯一 `/cmd_vel_mpc` owner。qp_shadow 仅记录 OSQP 诊断；
+    # qp 控制发布尚未实现，传入 solver_mode:=qp 会拒绝启动。
+    solver_mode: ilqr
+    # OSQP v1.0.0 固定 CSC workspace 限制，尚非 HIL/实车实时性测量值。
+    qp_max_iterations: 400
+    qp_time_limit_ms: 10.0
+    qp_max_primal_residual: 1.0e-4
+    qp_max_dual_residual: 1.0e-4
+    qp_max_tracking_slack: 0.0
+    qp_max_hard_constraint_violation: 1.0e-7
+
     projection_backward_window: 0.20
     projection_forward_window: 2.00
     cross_track_slowdown_start: 0.15

@@ -1,11 +1,21 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.18)
 project(ats_swerve_mpc)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+set(OSQP_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
+set(OSQP_BUILD_DEMO_EXE OFF CACHE BOOL "" FORCE)
+set(OSQP_BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(OSQP_CODEGEN OFF CACHE BOOL "" FORCE)
+set(OSQP_ENABLE_PRINTING OFF CACHE BOOL "" FORCE)
+set(OSQP_ENABLE_PROFILING ON CACHE BOOL "" FORCE)
+set(OSQP_ENABLE_INTERRUPT ON CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp
+                 ${CMAKE_CURRENT_BINARY_DIR}/osqp EXCLUDE_FROM_ALL)
+if(TARGET osqpstatic AND NOT TARGET osqp::osqpstatic)
+  add_library(osqp::osqpstatic ALIAS osqpstatic)
 endif()
 
 find_package(ament_cmake REQUIRED)
@@ -25,13 +35,17 @@ add_library(${PROJECT_NAME}_lib
   src/se2_mpc_controller.cpp
   src/ltv_qp_problem.cpp
   src/ltv_qp_solver.cpp
+  src/ltv_qp_osqp_solver.cpp
   src/trajectory_tracker.cpp
 )
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(${PROJECT_NAME}_lib Eigen3::Eigen)
+target_link_libraries(${PROJECT_NAME}_lib Eigen3::Eigen osqp::osqpstatic)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(${PROJECT_NAME}_lib PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
 ament_target_dependencies(${PROJECT_NAME}_lib
   ats_navigation_interfaces geometry_msgs nav_msgs rclcpp std_msgs tf2 tf2_geometry_msgs
 )
@@ -47,6 +61,11 @@ install(TARGETS ${PROJECT_NAME}_lib ${PROJECT_NAME}_node
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(FILES README.md DESTINATION share/${PROJECT_NAME})
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp/LICENSE
+              ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp/NOTICE
+        DESTINATION share/${PROJECT_NAME}/third_party/osqp)
+install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/osqp/include/public/
+        DESTINATION include/osqp FILES_MATCHING PATTERN "*.h")
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -64,6 +83,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_ltv_qp_solver test/test_ltv_qp_solver.cpp)
   target_link_libraries(test_ltv_qp_solver ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_ltv_qp_osqp_solver test/test_ltv_qp_osqp_solver.cpp)
+  target_link_libraries(test_ltv_qp_osqp_solver ${PROJECT_NAME}_lib)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)

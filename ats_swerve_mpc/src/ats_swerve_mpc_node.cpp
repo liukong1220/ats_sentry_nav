@@ -85,9 +85,46 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       declare_parameter<double>("solve_time_warn_ratio",
                                 solve_time_warn_ratio_),
       0.1, 1.0);
+  solver_mode_ = declare_parameter<std::string>("solver_mode", "ilqr");
+  if (solver_mode_ != "ilqr" && solver_mode_ != "qp_shadow" &&
+      solver_mode_ != "qp") {
+    throw std::invalid_argument(
+        "solver_mode must be one of ilqr, qp_shadow, qp");
+  }
+  if (solver_mode_ == "qp") {
+    throw std::invalid_argument(
+        "solver_mode=qp is reserved and cannot publish QP control in this phase");
+  }
+  qp_solver_settings_.max_iterations = declare_parameter<int>(
+      "qp_max_iterations", 400);
+  qp_solver_settings_.time_limit_ms = declare_parameter<double>(
+      "qp_time_limit_ms", 10.0);
+  qp_solver_settings_.max_primal_residual = declare_parameter<double>(
+      "qp_max_primal_residual", 1e-4);
+  qp_solver_settings_.max_dual_residual = declare_parameter<double>(
+      "qp_max_dual_residual", 1e-4);
+  qp_solver_settings_.max_tracking_slack = declare_parameter<double>(
+      "qp_max_tracking_slack", 0.0);
+  qp_solver_settings_.max_hard_constraint_violation = declare_parameter<double>(
+      "qp_max_hard_constraint_violation", 1e-7);
   const Se2MpcConfig mpc_config = loadConfig();
   validateDynamicsParameters(mpc_config);
   controller_ = std::make_unique<Se2MpcController>(mpc_config);
+  if (solver_mode_ == "qp_shadow") {
+    qp_problem_buffer_ = LtvQpBuilder::allocate(mpc_config.horizon);
+    const int decision_size = 3 * (mpc_config.horizon + 1) +
+                              3 * mpc_config.horizon;
+    const int constraint_rows = 3 * (mpc_config.horizon + 1) +
+                                3 * mpc_config.horizon + decision_size;
+    qp_solver_ = std::make_unique<LtvQpOsqpSolver>(
+        decision_size, constraint_rows, qp_solver_settings_);
+    if (!qp_solver_->initialized()) {
+      RCLCPP_ERROR(get_logger(),
+                   "OSQP v1.0.0 shadow 后端 setup 失败；保持 iLQR 主链，"
+                   "不生成伪造 QP 结果。");
+      qp_solver_.reset();
+    }
+  }
   trajectory_tracker_.setConfig(loadTrackerConfig());
 
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -156,6 +193,9 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
               odom_topic_.c_str(), trajectory_topic_.c_str(),
               command_topic_.c_str(), controller_->config().horizon,
               controller_->config().dt, control_rate_hz_);
+  RCLCPP_INFO(get_logger(),
+              "LTV-QP solver_mode=%s（qp_shadow 仅诊断，iLQR 保持唯一输出 owner）",
+              solver_mode_.c_str());
 }
 
 // 加载 MPC 控制器参数
@@ -650,6 +690,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     return;
   }
   // 6. 调用 MPC 求解
+  const Control last_control_before_solve = last_control_;
   const Se2MpcResult result =
       controller_->solve(current, references, last_control_);
   if (!result.success || result.controls.empty()) {
@@ -666,6 +707,9 @@ void AtsSwerveMpcNode::onControlTimer() {
   last_control_ = result.controls.front();
   publishCommand(last_control_);
   reportSolverDiagnostics(result);
+  if (solver_mode_ == "qp_shadow") {
+    runQpShadow(current, references, last_control_before_solve, result);
+  }
   // 8. 发布调试路径
   if (publish_debug_paths_) {
     publishPath(result.states, predicted_path_pub_);
@@ -684,6 +728,55 @@ void AtsSwerveMpcNode::onControlTimer() {
                projection.cross_track_error,
                trajectory_tracker_.progressScale(projection.cross_track_error),
                result.cost, result.solve_time_ms);
+}
+
+void AtsSwerveMpcNode::runQpShadow(
+    const State &current, const std::vector<Se2Reference> &references,
+    const Control &last_control, const Se2MpcResult &ilqr_result) {
+  if (!qp_solver_ || !qp_solver_->initialized()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "QP shadow 后端不可用；iLQR 仍是唯一控制输出。");
+    return;
+  }
+  LtvQpBuilder::build(current, ilqr_result.states, ilqr_result.controls,
+                      references, last_control, controller_->config(),
+                      qp_problem_buffer_);
+  const LtvQpProblem &problem = qp_problem_buffer_;
+  const LtvQpSolveResult result = qp_solver_->solveLtvProblem(
+      problem, qp_solver_settings_,
+      qp_warm_start_valid_ ? &qp_warm_start_ : nullptr);
+  if (result.status == LtvQpSolverStatus::kSolved &&
+      result.primal_solution.size() == problem.decisionSize() &&
+      result.dual_solution.size() == qp_solver_->constraintStructure().rows &&
+      result.primal_solution.allFinite() && result.dual_solution.allFinite()) {
+    qp_warm_start_.primal = result.primal_solution;
+    qp_warm_start_.dual = result.dual_solution;
+    qp_warm_start_valid_ = true;
+  } else {
+    qp_solver_->resetWarmStart();
+    qp_warm_start_valid_ = false;
+  }
+  LtvQpCandidateSafety safety;
+  safety.inputs_healthy = true;
+  safety.emergency_stop_active = false;
+  // This Twist-only node has no collision/footprint health producer. Unknown
+  // collision state is a hard reject, never an optimistic admission.
+  safety.collision_free = false;
+  const LtvQpCandidateAudit audit = LtvQpCandidateValidator::validate(
+      problem, ilqr_result.controls, last_control, controller_->config(),
+      ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result);
+  RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "QP shadow backend=%s status=%s iter=%d solve=%.3fms prim=%.3g dual=%.3g "
+      "slack=%.3g hard=%.3g feasible=%s reject=%s warm=%s collision_gate=hard_reject",
+      qp_solver_->backendName(), ltvQpSolverStatusName(result.status),
+      result.iterations, result.solve_time_ms, result.primal_residual,
+      result.dual_residual, result.slack_maximum,
+      std::max(result.hard_constraint_maximum_violation,
+               audit.actual_hard_constraint_maximum_violation),
+      audit.feasible ? "true" : "false",
+      audit.rejection_reason.empty() ? "none" : audit.rejection_reason.c_str(),
+      result.warm_start_used ? "true" : "false");
 }
 
 /**
