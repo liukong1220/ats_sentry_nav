@@ -64,6 +64,7 @@ protected:
         rclcpp::Parameter("emergency_stop_timeout", 5.0),
         rclcpp::Parameter("trajectory_timeout", 2.0),
         rclcpp::Parameter("publish_debug_paths", false),
+        rclcpp::Parameter("solver_mode", "qp_shadow"),
       });
     mpc_ = std::make_shared<ats_swerve_mpc::AtsSwerveMpcNode>(options);
     driver_ =
@@ -327,6 +328,22 @@ TEST_F(
         return command_norm_.load() > 0.02;
       },
       2s));
+}
+
+TEST_F(MpcLocalizationGateTest, QpShadowRetainsTheSingleIlqrCommandPublisher) {
+  ASSERT_EQ(command_sub_->get_publisher_count(), 1u);
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+  ASSERT_TRUE(
+    spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishExecution(1);
+        return command_norm_.load() > 0.02;
+      },
+      2s));
+  EXPECT_EQ(command_sub_->get_publisher_count(), 1u);
 }
 
 TEST_F(MpcLocalizationGateTest, RejectsOldSequenceAndOldEpochExecutionCommands) {

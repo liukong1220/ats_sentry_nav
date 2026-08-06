@@ -1,0 +1,7 @@
+# Keep the audited OSQP v1.0.0 vendor snapshot byte-for-byte upstream.
+# Its upstream documentation has historical whitespace; ATS source remains
+# subject to the repository's normal diff whitespace checks.
+# The upstream documentation also contains literal seven-character conflict
+# examples.  A larger vendor-only marker size prevents diff --check treating
+# those unchanged examples as ATS merge artifacts.
+third_party/osqp/** -whitespace conflict-marker-size=255

@@ -54,6 +54,11 @@ struct LtvQpProblem {
 class LtvQpBuilder {
 public:
   /**
+   * @brief Allocate a fixed-horizon dense work buffer outside the control timer.
+   */
+  static LtvQpProblem allocate(int horizon);
+
+  /**
    * @brief Build a convex quadratic tracking problem around a nominal rollout.
    *
    * The first phase includes linearized SE(2) dynamics, body velocity bounds
@@ -67,6 +72,20 @@ public:
       const std::vector<Control> &nominal_controls,
       const std::vector<Se2Reference> &references, const Control &last_control,
       const Se2MpcConfig &config,
+      const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig());
+
+  /**
+   * @brief Refill a preallocated work buffer without changing its dimensions.
+   *
+   * The function only allocates if the caller supplied a buffer for a different
+   * horizon.  The node creates a matching buffer during construction, so the
+   * control timer only overwrites existing numerical storage.
+   */
+  static bool build(
+      const State &current_state, const std::vector<State> &nominal_states,
+      const std::vector<Control> &nominal_controls,
+      const std::vector<Se2Reference> &references, const Control &last_control,
+      const Se2MpcConfig &config, LtvQpProblem &problem,
       const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig());
 };
 

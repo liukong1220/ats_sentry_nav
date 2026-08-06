@@ -16,6 +16,7 @@
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
+#include "ats_swerve_mpc/ltv_qp_osqp_solver.hpp"
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
 #include "geometry_msgs/msg/twist.hpp"
@@ -58,6 +59,10 @@ private:
   void validateDynamicsParameters(const Se2MpcConfig & config);
   /// 输出控制饱和与求解耗时的分级中文日志。
   void reportSolverDiagnostics(const Se2MpcResult & result);
+  void runQpShadow(const State &current,
+                   const std::vector<Se2Reference> &references,
+                   const Control &last_control,
+                   const Se2MpcResult &ilqr_result);
   Se2MpcConfig loadConfig();
   TrajectoryTrackerConfig loadTrackerConfig();
   void publishCommand(const Control &command);
@@ -95,6 +100,12 @@ private:
   double odometry_jump_yaw_ = 0.8;
   // 求解耗时告警阈值占控制周期的比例（0~1）。
   double solve_time_warn_ratio_ = 0.6;
+  std::string solver_mode_ = "ilqr";
+  LtvQpSolverSettings qp_solver_settings_;
+  std::unique_ptr<LtvQpOsqpSolver> qp_solver_;
+  LtvQpProblem qp_problem_buffer_;
+  LtvQpWarmStart qp_warm_start_;
+  bool qp_warm_start_valid_ = false;
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();

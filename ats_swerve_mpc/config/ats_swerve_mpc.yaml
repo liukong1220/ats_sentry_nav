@@ -42,6 +42,18 @@ ats_swerve_mpc:
     # 是否发布预测轨迹和参考预测域，供 RViz 与回归脚本检查。
     publish_debug_paths: true
 
+    # 默认保持既有 iLQR 控制链。qp_shadow 只使用同周期输入做 OSQP 诊断，
+    # 不发布 QP Twist；qp 本阶段保留为拒绝启动的未来模式。
+    solver_mode: ilqr
+    # OSQP v1.0.0 的固定 CSC workspace 参数。数值为配置上限，非性能实测结论。
+    qp_max_iterations: 400
+    qp_time_limit_ms: 10.0
+    qp_max_primal_residual: 1.0e-4
+    qp_max_dual_residual: 1.0e-4
+    # 当前决策布局没有 slack 列，非零 slack 一律拒绝。
+    qp_max_tracking_slack: 0.0
+    qp_max_hard_constraint_violation: 1.0e-7
+
     # 从上次进度向后允许重新投影的时间窗口（s），用于吸收小幅定位抖动。
     projection_backward_window: 0.20
     # 从上次进度向前允许搜索的最大时间窗口（s），防止误投影到远处路径段。
