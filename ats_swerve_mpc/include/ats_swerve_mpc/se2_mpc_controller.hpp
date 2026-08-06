@@ -9,10 +9,9 @@
 #include <Eigen/Cholesky>
 #include <Eigen/Core>
 
-namespace ats_swerve_mpc {
+#include "ats_swerve_mpc/se2_model.hpp"
 
-using State = Eigen::Vector3d;
-using Control = Eigen::Vector3d;
+namespace ats_swerve_mpc {
 
 /**
  * @brief 四舵轮底盘 SE(2) MPC（iLQR）配置。
@@ -171,6 +170,8 @@ private:
                           const Control &last_control);
 
   Se2MpcConfig config_;
+  // iLQR and the future LTV-QP backend share this model implementation.
+  Se2Model model_;
   std::vector<Control> warm_controls_;
   bool has_warm_start_ = false;
   // 本周期首步（即真正下发的那一步）限幅命中记录：在前向生成过程中累积，

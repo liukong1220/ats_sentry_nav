@@ -10,10 +10,11 @@
 namespace ats_swerve_mpc {
 
 Se2MpcController::Se2MpcController(const Se2MpcConfig &config)
-    : config_(config) {}
+    : config_(config), model_(config.dt) {}
 
 void Se2MpcController::setConfig(const Se2MpcConfig &config) {
   config_ = config;
+  model_.setTimeStep(config.dt);
   reset();
 }
 
@@ -25,48 +26,26 @@ void Se2MpcController::reset() {
 
 //将任意角度归一到 (-π, π]，避免角度跳变
 double Se2MpcController::normalizeAngle(double angle) {
-  return std::atan2(std::sin(angle), std::cos(angle));
+  return Se2Model::normalizeAngle(angle);
 }
 
 //计算SE(2) 状态（x, y, yaw）的差，角度差值归一化到 (-π, π]
 State Se2MpcController::stateDifference(const State &lhs, const State &rhs) {
-  State difference = lhs - rhs;
-  difference(2) = normalizeAngle(difference(2));
-  return difference;
+  return Se2Model::stateDifference(lhs, rhs);
 }
 
 //将 SE(2) 状态（x, y, yaw）与控制（vx, vy,
 //wz）应用于离散时间动力学模型，计算下一状态
 State Se2MpcController::dynamics(const State &state,
                                  const Control &control) const {
-  // 状态位于世界系 [x, y, yaw]，而 vx/vy 是车体系控制；此处完成 SE2 坐标变换。
-  const double yaw = state(2);
-  State next = state;
-  next(0) +=
-      config_.dt * (control(0) * std::cos(yaw) - control(1) * std::sin(yaw));
-  next(1) +=
-      config_.dt * (control(0) * std::sin(yaw) + control(1) * std::cos(yaw));
-  next(2) = normalizeAngle(state(2) + config_.dt * control(2));
-  return next;
+  return model_.dynamics(state, control);
 }
 
 //计算离散时间动力学模型的雅可比矩阵，分别对状态和控制求偏导
 void Se2MpcController::jacobians(const State &state, const Control &control,
                                  Matrix3 &state_jacobian,
                                  Matrix3 &control_jacobian) const {
-  const double yaw = state(2);
-  const double cosine = std::cos(yaw);
-  const double sine = std::sin(yaw);
-  state_jacobian.setIdentity();
-  state_jacobian(0, 2) =
-      config_.dt * (-control(0) * sine - control(1) * cosine);
-  state_jacobian(1, 2) = config_.dt * (control(0) * cosine - control(1) * sine);
-  control_jacobian.setZero();
-  control_jacobian(0, 0) = config_.dt * cosine;
-  control_jacobian(0, 1) = -config_.dt * sine;
-  control_jacobian(1, 0) = config_.dt * sine;
-  control_jacobian(1, 1) = config_.dt * cosine;
-  control_jacobian(2, 2) = config_.dt;
+  model_.jacobians(state, control, state_jacobian, control_jacobian);
 }
 
 /**
@@ -239,13 +218,7 @@ Control Se2MpcController::clampIncrement(const Control &target,
 std::vector<State>
 Se2MpcController::rollout(const State &initial,
                           const std::vector<Control> &controls) const {
-  std::vector<State> states;
-  states.reserve(controls.size() + 1);
-  states.push_back(initial);
-  for (const auto &control : controls) {
-    states.push_back(dynamics(states.back(), control));
-  }
-  return states;
+  return model_.rollout(initial, controls);
 }
 
 //计算给定状态序列、控制序列和参考轨迹的总代价，包括状态误差、控制误差、控制增量误差和终端状态误差

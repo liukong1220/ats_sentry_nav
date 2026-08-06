@@ -26,6 +26,28 @@ When enabled, the launch disables `fake_vel_transform`, routes MPC output throug
 `/cmd_vel_mpc`, and makes `twist_to_motion_ctrl` the single subscriber that feeds
 MuJoCo `/motion_control`. The default launch remains the Nav2 MPPI baseline.
 
+## LTV-QP migration status
+
+The production controller still uses the existing constrained iLQR path. The
+first QP migration slice is intentionally solver-independent:
+
+- `Se2Model` is the shared SE(2) dynamics, Jacobian and rollout implementation
+  used by the current iLQR controller and the future LTV-QP backend.
+- `ZeroSpeedGuard` prevents steering-angle linearization when a wheel velocity
+  vector has no defined direction near zero speed. It uses hysteresis and does
+  not invent an in-place steering command; the current Twist-only interface
+  still requires the lower-level steering state machine for that behavior.
+- `LtvQpBuilder` constructs a convex, linearized tracking problem with SE(2)
+  equality dynamics, body velocity bounds and body control-increment bounds.
+  It exposes low-speed angle validity but does not yet approximate wheel-norm
+  or steering-rate constraints and is not connected to the ROS control timer.
+
+No QP package is currently available in the workspace or system dependency set.
+Until a bounded, warm-started backend is added and its hard-constraint residuals
+are verified, the QP description is shadow-only and must not be described as
+the real-robot solver. Emergency-stop, localization, lease, reference freshness
+and zero-velocity behavior remain owned by the existing node.
+
 Autonomous regression:
 
 ```bash

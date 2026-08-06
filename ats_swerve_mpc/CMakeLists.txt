@@ -21,7 +21,9 @@ find_package(tf2_geometry_msgs REQUIRED)
 
 add_library(${PROJECT_NAME}_lib
   src/ats_swerve_mpc_node.cpp
+  src/se2_model.cpp
   src/se2_mpc_controller.cpp
+  src/ltv_qp_problem.cpp
   src/trajectory_tracker.cpp
 )
 target_include_directories(${PROJECT_NAME}_lib PUBLIC
@@ -49,6 +51,15 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_se2_mpc_controller test/test_se2_mpc_controller.cpp)
   target_link_libraries(test_se2_mpc_controller ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_se2_model test/test_se2_model.cpp)
+  target_link_libraries(test_se2_model ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_zero_speed_guard test/test_zero_speed_guard.cpp)
+  target_link_libraries(test_zero_speed_guard ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_ltv_qp_problem test/test_ltv_qp_problem.cpp)
+  target_link_libraries(test_ltv_qp_problem ${PROJECT_NAME}_lib)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)
