@@ -110,14 +110,23 @@ class Se2MpcController {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  /** @brief 创建 iLQR 控制器并初始化共享 SE(2) 模型和 warm-start 状态。 */
   explicit Se2MpcController(const Se2MpcConfig &config = Se2MpcConfig());
 
+  /**
+   * @brief 在当前状态和参考 horizon 上执行一次完整 iLQR 控制周期。
+   * @details 该函数保留既有主控制链：先生成/复用控制序列，再做 rollout、
+   *          backward pass、线搜索和真实四轮硬约束限幅，返回的首个控制才可发布。
+   */
   Se2MpcResult solve(const State &current_state,
                      const std::vector<Se2Reference> &references,
                      const Control &last_control);
+  /** @brief 替换动力学和代价配置，并清空与旧配置不兼容的 warm start。 */
   void setConfig(const Se2MpcConfig &config);
+  /** @brief 清空控制序列和求解器内部状态，使下一周期回到确定性初始路径。 */
   void reset();
 
+  /** @brief 只读返回当前生效的 MPC 参数，供 node 和 QP adapter 共用。 */
   const Se2MpcConfig &config() const { return config_; }
 
   /**
@@ -143,29 +152,42 @@ private:
     std::vector<Matrix3> feedback;
   };
 
+  /** @brief 对内部代价和 rollout 统一执行 yaw 归一化。 */
   static double normalizeAngle(double angle);
+  /** @brief 计算 iLQR 代价使用的 SE(2) 最短状态误差。 */
   static State stateDifference(const State &lhs, const State &rhs);
+  /** @brief 使用共享模型推进一个控制步，避免 iLQR 与 QP 动力学分叉。 */
   State dynamics(const State &state, const Control &control) const;
+  /** @brief 计算 iLQR backward pass 所需的状态/控制线性化矩阵。 */
   void jacobians(const State &state, const Control &control,
                  Matrix3 &state_jacobian, Matrix3 &control_jacobian) const;
+  /** @brief 施加车体速度和真实四轮速度幅值限制，并记录饱和来源。 */
   Control clampControl(const Control &control,
                        SaturationReport *report = nullptr) const;
+  /** @brief 计算四轮轮心速度中的最大模长，用于执行器速度门限。 */
   double maxModuleSpeed(const Control &control) const;
+  /** @brief 将车体 Twist 映射为四个轮心的车体系二维速度向量。 */
   std::array<Eigen::Vector2d, 4> moduleVelocities(const Control &control) const;
+  /** @brief 独立检查候选相对上一控制的轮速、轮加速度和有效舵角速率。 */
   bool moduleIncrementFeasible(const Control &candidate, const Control &previous) const;
+  /** @brief 在上一控制到目标控制之间二分寻找一个真实可达的增量。 */
   Control clampIncrement(const Control &target, const Control &previous,
                          SaturationReport *report = nullptr,
                          bool *increment_limited = nullptr) const;
+  /** @brief 使用共享模型生成当前 iLQR 名义轨迹。 */
   std::vector<State> rollout(const State &initial,
                              const std::vector<Control> &controls) const;
+  /** @brief 计算状态跟踪、控制幅值、控制增量和 terminal 总代价。 */
   double cost(const std::vector<State> &states,
               const std::vector<Control> &controls,
               const std::vector<Se2Reference> &references,
               const Control &last_control) const;
+  /** @brief 对名义 rollout 执行 iLQR 反向递推，生成反馈/前馈增益。 */
   BackwardResult backwardPass(const std::vector<State> &states,
                               const std::vector<Control> &controls,
                               const std::vector<Se2Reference> &references,
                               const Control &last_control) const;
+  /** @brief 生成有效参考控制 warm start，并逐步投影到真实执行器约束内。 */
   void initializeControls(const std::vector<Se2Reference> &references,
                           const Control &last_control);
 

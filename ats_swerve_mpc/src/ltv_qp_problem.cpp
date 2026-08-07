@@ -1,6 +1,6 @@
 // Copyright 2026
 
-#include "ats_swerve_mpc/ltv_qp_problem.hpp"
+#include "ats_swerve_mpc/qp/ltv_qp_problem.hpp"
 
 #include <cmath>
 #include <limits>
@@ -10,6 +10,7 @@ namespace {
 
 using Matrix3 = Eigen::Matrix3d;
 
+/** @brief 检查名义状态序列是否全部有限，防止 NaN 进入矩阵线性化。 */
 bool finiteStates(const std::vector<State> &states) {
   for (const auto &state : states) {
     if (!state.allFinite()) {
@@ -19,6 +20,7 @@ bool finiteStates(const std::vector<State> &states) {
   return true;
 }
 
+/** @brief 检查名义控制序列是否全部有限，防止无效 Twist 污染 QP。 */
 bool finiteControls(const std::vector<Control> &controls) {
   for (const auto &control : controls) {
     if (!control.allFinite()) {
@@ -28,6 +30,7 @@ bool finiteControls(const std::vector<Control> &controls) {
   return true;
 }
 
+/** @brief 用与 iLQR 相同的四轮几何计算名义轮速向量，仅用于低速方向可定义性。 */
 std::array<Eigen::Vector2d, 4> moduleVelocities(
     const Control &control, const Se2MpcConfig &config) {
   const double x = std::max(0.0, config.wheel_base_x);
@@ -43,12 +46,14 @@ std::array<Eigen::Vector2d, 4> moduleVelocities(
   return velocities;
 }
 
+/** @brief 向目标的 Hessian/gradient 加入一个三维二次误差块。 */
 void addQuadraticBlock(LtvQpProblem &problem, int offset, const Matrix3 &weight,
                        const Eigen::Vector3d &error) {
   problem.hessian.block<3, 3>(offset, offset).noalias() += 2.0 * weight;
   problem.gradient.segment<3>(offset).noalias() += 2.0 * weight * error;
 }
 
+/** @brief 写入相邻控制偏差的二次惩罚，保留固定 banded Hessian 结构。 */
 void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
                        int previous_offset, const Matrix3 &weight,
                        const Control &nominal_delta) {
@@ -71,6 +76,10 @@ void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
 
 }  // namespace
 
+/**
+ * @brief 在控制 timer 外分配指定 horizon 的 dense LTV-QP 数值缓冲。
+ * @details 固定的 decision/row 数和矩阵尺寸是后续 OSQP CSC pattern 一次 setup 的前提。
+ */
 LtvQpProblem LtvQpBuilder::allocate(int horizon) {
   LtvQpProblem problem;
   problem.horizon = horizon;
@@ -95,6 +104,7 @@ LtvQpProblem LtvQpBuilder::allocate(int horizon) {
   return problem;
 }
 
+/** @brief 便捷构造一次性 LTV 问题；shadow runtime 使用其预分配 overload。 */
 LtvQpProblem LtvQpBuilder::build(
     const State &current_state, const std::vector<State> &nominal_states,
     const std::vector<Control> &nominal_controls,
@@ -106,6 +116,12 @@ LtvQpProblem LtvQpBuilder::build(
   return problem;
 }
 
+/**
+ * @brief 围绕 iLQR 名义 rollout 原地刷新 LTV-QP 的全部数值。
+ * @details 写入状态/控制/增量代价、初值与线性化动力学等式、body 速度与加速度硬边界；
+ *          不把轮速圆、轮向量增量和舵角速率伪装为未经验证的线性 QP 约束，后者由
+ *          candidate validator 和 ZeroSpeedGuard 作真实复核。
+ */
 bool LtvQpBuilder::build(
     const State &current_state, const std::vector<State> &nominal_states,
     const std::vector<Control> &nominal_controls,

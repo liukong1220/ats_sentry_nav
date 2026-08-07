@@ -6,6 +6,11 @@
 
 namespace ats_swerve_mpc {
 
+/**
+ * @brief 以车体系全向速度推进世界系状态一个 dt。
+ * @details vx/vy 先按当前 yaw 旋转至世界系，wz 只更新 yaw；该函数是 iLQR
+ *          名义轨迹和 QP primal 重建共用的唯一离散动力学实现。
+ */
 State Se2Model::dynamics(const State &state, const Control &control) const {
   const double yaw = state(2);
   State next = state;
@@ -15,6 +20,11 @@ State Se2Model::dynamics(const State &state, const Control &control) const {
   return next;
 }
 
+/**
+ * @brief 计算离散动力学的一阶 Jacobian。
+ * @details 状态 Jacobian 保留 yaw 对世界系平移的耦合，控制 Jacobian 完成车体系到
+ *          世界系的旋转映射，确保 LTV-QP 和 iLQR 使用同一线性化假设。
+ */
 void Se2Model::jacobians(const State &state, const Control &control,
                          Eigen::Matrix3d &state_jacobian,
                          Eigen::Matrix3d &control_jacobian) const {
@@ -32,6 +42,11 @@ void Se2Model::jacobians(const State &state, const Control &control,
   control_jacobian(2, 2) = dt_;
 }
 
+/**
+ * @brief 对控制序列执行确定性前向仿真。
+ * @details 返回值始终包含初始状态，故长度为 controls.size()+1；调用者必须自行对
+ *          输入有限性和长度进行门控，避免把无效求解结果转为诊断轨迹。
+ */
 std::vector<State> Se2Model::rollout(
     const State &initial, const std::vector<Control> &controls) const {
   std::vector<State> states;
@@ -43,10 +58,12 @@ std::vector<State> Se2Model::rollout(
   return states;
 }
 
+/** @brief 用 atan2(sin,cos) 折返航向，避免在 +/-pi 边界累积角度漂移。 */
 double Se2Model::normalizeAngle(double angle) {
   return std::atan2(std::sin(angle), std::cos(angle));
 }
 
+/** @brief 返回 lhs-rhs 的 SE(2) 误差，其中 yaw 采用最短旋转方向。 */
 State Se2Model::stateDifference(const State &lhs, const State &rhs) {
   State difference = lhs - rhs;
   difference(2) = normalizeAngle(difference(2));

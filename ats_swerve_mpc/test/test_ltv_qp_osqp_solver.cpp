@@ -4,7 +4,7 @@
 
 #include <cmath>
 
-#include "ats_swerve_mpc/ltv_qp_osqp_solver.hpp"
+#include "ats_swerve_mpc/qp/ltv_qp_osqp_solver.hpp"
 
 namespace {
 
@@ -56,6 +56,7 @@ TEST(LtvQpOsqpSolver, SolvesAndReusesFixedWorkspaceWithWarmStart) {
   ASSERT_EQ(first.primal_solution.size(), 1);
   EXPECT_NEAR(first.primal_solution(0), 0.5, 1e-3);
   EXPECT_TRUE(std::isfinite(first.solve_time_ms));
+  EXPECT_TRUE(std::isfinite(first.update_time_ms));
   EXPECT_TRUE(std::isfinite(first.primal_residual));
   EXPECT_TRUE(std::isfinite(first.dual_residual));
 
