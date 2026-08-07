@@ -13,11 +13,12 @@ using State = Eigen::Vector3d;
 using Control = Eigen::Vector3d;
 
 /**
- * @brief Shared holonomic SE(2) prediction model.
+ * @brief iLQR 与 LTV-QP 共用的全向 SE(2) 离散预测模型。
  *
- * State is world-frame [x, y, yaw]. Control is body-frame [vx, vy, wz].
- * The model is intentionally independent of ROS and solver implementation so
- * iLQR and LTV-QP can use the same dynamics, Jacobians and rollout.
+ * @details 状态固定为世界系 `[x,y,yaw]`，控制固定为车体系 `[vx,vy,wz]`。
+ *          该模型刻意不依赖 ROS、OSQP 或节点状态：iLQR 名义轨迹、LTV 线性化和
+ *          QP candidate 非线性复核均必须调用同一套动力学、Jacobian 与 rollout，
+ *          从而避免不同实现造成 frame 或离散时间轴分叉。
  */
 class Se2Model {
 public:

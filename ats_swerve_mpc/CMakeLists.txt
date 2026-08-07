@@ -31,6 +31,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 
 add_library(${PROJECT_NAME}_lib
   src/ats_swerve_mpc_node.cpp
+  src/control_cycle_snapshot.cpp
   src/se2_model.cpp
   src/se2_mpc_controller.cpp
   src/ltv_qp_problem.cpp
@@ -86,6 +87,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_ltv_qp_osqp_solver test/test_ltv_qp_osqp_solver.cpp)
   target_link_libraries(test_ltv_qp_osqp_solver ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_control_cycle_snapshot test/test_control_cycle_snapshot.cpp)
+  target_link_libraries(test_control_cycle_snapshot ${PROJECT_NAME}_lib)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)

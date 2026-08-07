@@ -192,7 +192,7 @@ private:
                           const Control &last_control);
 
   Se2MpcConfig config_;
-  // iLQR and the future LTV-QP backend share this model implementation.
+  // iLQR 名义轨迹与 LTV-QP candidate 非线性复核共用此模型，禁止维护第二套动力学。
   Se2Model model_;
   std::vector<Control> warm_controls_;
   bool has_warm_start_ = false;
