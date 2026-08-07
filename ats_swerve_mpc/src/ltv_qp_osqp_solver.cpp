@@ -1,6 +1,6 @@
 // Copyright 2026
 
-#include "ats_swerve_mpc/ltv_qp_osqp_solver.hpp"
+#include "ats_swerve_mpc/qp/ltv_qp_osqp_solver.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +11,7 @@
 namespace ats_swerve_mpc {
 namespace {
 
+/** @brief 反解 [delta_x,delta_u] 固定布局对应的 horizon；非 LTV 尺寸返回 -1。 */
 int ltvHorizonForDecisionSize(int decision_size) {
   if (decision_size < 9 || (decision_size - 3) % 6 != 0) {
     return -1;
@@ -18,11 +19,13 @@ int ltvHorizonForDecisionSize(int decision_size) {
   return (decision_size - 3) / 6;
 }
 
+/** @brief 判断 rows 是否与 ATS 动力学、增量和 identity bounds 的固定数量匹配。 */
 bool isLtvDimensions(int decision_size, int constraint_rows) {
   const int horizon = ltvHorizonForDecisionSize(decision_size);
   return horizon > 0 && constraint_rows == 12 * horizon + 6;
 }
 
+/** @brief 以固定行堆叠顺序读取 dense LTV 值，避免每周期重建 CSC 索引。 */
 double ltvConstraintValue(const LtvQpProblem &problem, int row, int column) {
   const int equality_rows = problem.equality_matrix.rows();
   const int inequality_rows = problem.inequality_matrix.rows();
@@ -37,6 +40,11 @@ double ltvConstraintValue(const LtvQpProblem &problem, int row, int column) {
 
 }  // namespace
 
+/**
+ * @brief 将 dense LTV 问题转为可审计的 CSC 输入快照。
+ * @details 该便捷函数主要用于组件测试；控制 timer 走预分配 `copyLtvNumericalValues`，
+ *          以避免重复分配大型稀疏数组。
+ */
 LtvQpSparseProblem makeLtvQpSparseProblem(const LtvQpProblem &problem) {
   LtvQpSparseProblem sparse;
   if (!problem.valid || problem.decisionSize() <= 0 ||
@@ -94,6 +102,7 @@ LtvQpSparseProblem makeLtvQpSparseProblem(const LtvQpProblem &problem) {
   return sparse;
 }
 
+/** @brief 生成通用上三角 CSC Hessian pattern，供 adapter 单元测试使用。 */
 LtvQpSparseStructure LtvQpOsqpSolver::denseUpperPattern(int size) {
   LtvQpSparseStructure pattern;
   pattern.rows = size;
@@ -111,6 +120,7 @@ LtvQpSparseStructure LtvQpOsqpSolver::denseUpperPattern(int size) {
   return pattern;
 }
 
+/** @brief 生成通用稠密 CSC pattern，仅作为非 LTV 输入的测试回退。 */
 LtvQpSparseStructure LtvQpOsqpSolver::densePattern(int rows, int columns) {
   LtvQpSparseStructure pattern;
   pattern.rows = rows;
@@ -128,6 +138,7 @@ LtvQpSparseStructure LtvQpOsqpSolver::densePattern(int rows, int columns) {
   return pattern;
 }
 
+/** @brief 生成 ATS LTV Hessian 的固定对角/相邻控制增量稀疏结构。 */
 LtvQpSparseStructure LtvQpOsqpSolver::ltvHessianPattern(
     int decision_size) {
   const int horizon = ltvHorizonForDecisionSize(decision_size);
@@ -151,6 +162,11 @@ LtvQpSparseStructure LtvQpOsqpSolver::ltvHessianPattern(
   return pattern;
 }
 
+/**
+ * @brief 生成 ATS LTV 约束矩阵的固定 CSC 行列 pattern。
+ * @details 行顺序固定为 initial/dynamics equality、控制增量 inequality 与变量 bounds；
+ *          数值更新绝不改变任一 row/column 索引。
+ */
 LtvQpSparseStructure LtvQpOsqpSolver::ltvConstraintPattern(
     int decision_size, int constraint_rows) {
   if (!isLtvDimensions(decision_size, constraint_rows)) {
@@ -211,12 +227,17 @@ LtvQpSparseStructure LtvQpOsqpSolver::ltvConstraintPattern(
   return pattern;
 }
 
+/** @brief 通过 OSQP 官方 cleanup 释放一次 setup 创建的 workspace。 */
 void LtvQpOsqpSolver::OsqpDeleter::operator()(OSQPSolver *solver) const {
   if (solver != nullptr) {
     osqp_cleanup(solver);
   }
 }
 
+/**
+ * @brief 预分配全部 OSQP CSC/向量存储并调用唯一一次 osqp_setup。
+ * @details 初始化失败仅留下 initialized=false；node 会保留 iLQR 主链且不伪造 QP 结果。
+ */
 LtvQpOsqpSolver::LtvQpOsqpSolver(
     int decision_size, int constraint_rows,
     const LtvQpSolverSettings &setup_settings)
@@ -274,14 +295,17 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(
   }
 }
 
+/** @brief RAII 析构；实际资源回收由 OsqpDeleter 调用官方 API。 */
 LtvQpOsqpSolver::~LtvQpOsqpSolver() = default;
 
+/** @brief 显式清除 OSQP 内部迭代状态，阻止 reject 解被下一周期 warm-start 复用。 */
 void LtvQpOsqpSolver::resetWarmStart() {
   if (solver_ != nullptr) {
     osqp_cold_start(solver_.get());
   }
 }
 
+/** @brief 将一般 CSC 输入的数值写入既有缓冲，拒绝尺寸或 finite 契约不匹配。 */
 bool LtvQpOsqpSolver::copyNumericalValues(
     const LtvQpSparseProblem &problem, std::vector<double> &hessian_values,
     std::vector<double> &constraint_values, std::vector<double> &gradient,
@@ -307,6 +331,7 @@ bool LtvQpOsqpSolver::copyNumericalValues(
   return true;
 }
 
+/** @brief 映射 OSQP 终止码；只有精确 solved 才可能进入后续 candidate 审计。 */
 LtvQpSolverStatus LtvQpOsqpSolver::mapStatus(int status) {
   switch (status) {
     case OSQP_SOLVED:
@@ -331,6 +356,11 @@ LtvQpSolverStatus LtvQpOsqpSolver::mapStatus(int status) {
   }
 }
 
+/**
+ * @brief 求解任意固定 CSC 输入。
+ * @details 在比较完整 pattern 后仅复制数值并调用 solvePrepared；结构漂移返回
+ *          invalid_problem，不会在控制周期新建 OSQP workspace。
+ */
 LtvQpSolveResult LtvQpOsqpSolver::solve(
     const LtvQpSparseProblem &problem, const LtvQpSolverSettings &settings,
     const LtvQpWarmStart *warm_start) {
@@ -352,6 +382,10 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
   return solvePrepared(settings, warm_start);
 }
 
+/**
+ * @brief 将 iLQR 名义轨迹生成的 dense LTV 数值填入预分配 OSQP 缓冲。
+ * @details 只覆盖 P/A/q/l/u 的值，保留构造期的 CSC 索引和 vector capacity。
+ */
 bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
   if (!problem.valid || problem.decisionSize() != decision_size_ ||
       !isLtvDimensions(decision_size_, constraint_rows_) ||
@@ -401,6 +435,7 @@ bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
   return true;
 }
 
+/** @brief 为 shadow runtime 求解预分配 LTV buffer；失败返回明确状态但不影响 iLQR。 */
 LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
     const LtvQpProblem &problem, const LtvQpSolverSettings &settings,
     const LtvQpWarmStart *warm_start) {
@@ -413,6 +448,11 @@ LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
   return solvePrepared(settings, warm_start);
 }
 
+/**
+ * @brief 执行 OSQP 数值更新、可选 primal/dual warm-start 和一次求解。
+ * @details 回填 iteration、solve/update time、残差和 primal/dual payload；slack 当前
+ *          不在固定决策布局中，故报告 0 而不将其误写为已实现软约束。
+ */
 LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
     const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start) {
   LtvQpSolveResult result;
@@ -456,6 +496,7 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
   }
   result.iterations = static_cast<int>(info.iter);
   result.solve_time_ms = 1000.0 * static_cast<double>(info.solve_time);
+  result.update_time_ms = 1000.0 * static_cast<double>(info.update_time);
   result.primal_residual = static_cast<double>(info.prim_res);
   result.dual_residual = static_cast<double>(info.dual_res);
   result.slack_maximum = 0.0;

@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "ats_swerve_mpc/ltv_qp_problem.hpp"
+#include "ats_swerve_mpc/qp/ltv_qp_problem.hpp"
 
 namespace {
 

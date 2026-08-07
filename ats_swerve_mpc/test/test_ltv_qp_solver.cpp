@@ -2,9 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <limits>
 
-#include "ats_swerve_mpc/ltv_qp_solver.hpp"
+#include "ats_swerve_mpc/qp/ltv_qp_solver.hpp"
 
 namespace {
 
@@ -75,6 +76,11 @@ LtvQpCandidateSafety healthySafety() {
   safety.inputs_healthy = true;
   safety.emergency_stop_active = false;
   safety.collision_free = true;
+  safety.localization_fresh = true;
+  safety.reference_fresh = true;
+  safety.execution_lease_valid = true;
+  safety.gimbal_valid = true;
+  safety.map_fresh = true;
   return safety;
 }
 
@@ -155,6 +161,39 @@ TEST(LtvQpCandidateValidator, AcceptsOnlyACompleteFeasibleCandidate) {
   EXPECT_NEAR(audit.actual_hard_constraint_maximum_violation, 0.0, 1e-8);
 }
 
+TEST(LtvQpCandidateReconstructor, RebuildsDeltaControlAndNonlinearRollout) {
+  CandidateFixture fixture;
+  fixture.result.primal_solution(fixture.problem.controlOffset(0)) = 0.10;
+  fixture.result.primal_solution(fixture.problem.controlOffset(0) + 1) = -0.02;
+  const auto candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State(1.0, -2.0, 3.13), fixture.problem, fixture.nominal_controls,
+      fixture.config, fixture.result);
+  ASSERT_TRUE(candidate.valid) << candidate.validation_error;
+  ASSERT_EQ(candidate.controls.size(), fixture.nominal_controls.size());
+  EXPECT_NEAR(candidate.controls.front()(0),
+              fixture.nominal_controls.front()(0) + 0.10, 1e-12);
+  EXPECT_NEAR(candidate.controls.front()(1),
+              fixture.nominal_controls.front()(1) - 0.02, 1e-12);
+  ASSERT_EQ(candidate.states.size(), fixture.nominal_controls.size() + 1);
+  EXPECT_TRUE(candidate.states.front().isApprox(State(1.0, -2.0, 3.13)));
+  EXPECT_GE(candidate.states.back()(2), -3.141592653589793);
+  EXPECT_LE(candidate.states.back()(2), 3.141592653589793);
+}
+
+TEST(LtvQpCandidateValidator, ReconstructionRejectsMalformedNominalDimensions) {
+  CandidateFixture fixture;
+  const auto candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), fixture.problem, std::vector<Control>{Control::Zero()},
+      fixture.config, fixture.result);
+  EXPECT_FALSE(candidate.valid);
+  const auto audit = LtvQpCandidateValidator::validate(
+      fixture.problem, std::vector<Control>{Control::Zero()}, Control::Zero(),
+      fixture.config, ZeroSpeedGuardConfig(), validSettings(), healthySafety(),
+      fixture.result, candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "nonlinear_rollout_reconstruction_reject");
+}
+
 TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   CandidateFixture fixture;
   fixture.result.solve_time_ms = 20.0;
@@ -170,6 +209,26 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   fixture.result.status = LtvQpSolverStatus::kSolvedInaccurate;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "solver_status_not_solved");
+}
+
+TEST(LtvQpCandidateValidator, RejectsEveryNonSolvedBackendStatus) {
+  const std::array<LtvQpSolverStatus, 8> rejected_statuses{{
+      LtvQpSolverStatus::kSolvedInaccurate,
+      LtvQpSolverStatus::kMaxIterations,
+      LtvQpSolverStatus::kTimeLimit,
+      LtvQpSolverStatus::kPrimalInfeasible,
+      LtvQpSolverStatus::kDualInfeasible,
+      LtvQpSolverStatus::kNumericalFailure,
+      LtvQpSolverStatus::kInvalidProblem,
+      LtvQpSolverStatus::kBackendUnavailable,
+  }};
+  for (const auto status : rejected_statuses) {
+    CandidateFixture fixture;
+    fixture.result.status = status;
+    const auto audit = fixture.audit();
+    EXPECT_FALSE(audit.feasible) << ats_swerve_mpc::ltvQpSolverStatusName(status);
+    EXPECT_EQ(audit.rejection_reason, "solver_status_not_solved");
+  }
 }
 
 TEST(LtvQpCandidateValidator, RejectsInputHealthEmergencyAndCollisionFailures) {
@@ -188,6 +247,36 @@ TEST(LtvQpCandidateValidator, RejectsInputHealthEmergencyAndCollisionFailures) {
 
   safety = healthySafety();
   safety.collision_free = false;
+  EXPECT_FALSE(LtvQpCandidateValidator::validate(
+      fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
+      ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);
+
+  safety = healthySafety();
+  safety.localization_fresh = false;
+  EXPECT_FALSE(LtvQpCandidateValidator::validate(
+      fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
+      ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);
+
+  safety = healthySafety();
+  safety.reference_fresh = false;
+  EXPECT_FALSE(LtvQpCandidateValidator::validate(
+      fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
+      ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);
+
+  safety = healthySafety();
+  safety.execution_lease_valid = false;
+  EXPECT_FALSE(LtvQpCandidateValidator::validate(
+      fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
+      ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);
+
+  safety = healthySafety();
+  safety.gimbal_valid = false;
+  EXPECT_FALSE(LtvQpCandidateValidator::validate(
+      fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
+      ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);
+
+  safety = healthySafety();
+  safety.map_fresh = false;
   EXPECT_FALSE(LtvQpCandidateValidator::validate(
       fixture.problem, fixture.nominal_controls, Control::Zero(), fixture.config,
       ZeroSpeedGuardConfig(), validSettings(), safety, fixture.result).feasible);

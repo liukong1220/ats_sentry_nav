@@ -9,39 +9,40 @@
 
 namespace ats_swerve_mpc {
 
+/** @brief 用配置初始化 iLQR 状态；SE(2) 模型步长必须与 config.dt 同步。 */
 Se2MpcController::Se2MpcController(const Se2MpcConfig &config)
     : config_(config), model_(config.dt) {}
 
+/** @brief 切换控制配置后同步模型步长并清除旧 horizon 的 warm start。 */
 void Se2MpcController::setConfig(const Se2MpcConfig &config) {
   config_ = config;
   model_.setTimeStep(config.dt);
   reset();
 }
 
-//清空上一次优化的控制序列
+/** @brief 清空上次求解序列，防止急停、重定位或新轨迹复用过期控制。 */
 void Se2MpcController::reset() {
   warm_controls_.clear();
   has_warm_start_ = false;
 }
 
-//将任意角度归一到 (-π, π]，避免角度跳变
+/** @brief 委托共享模型归一化 yaw，使 iLQR/QP 的角度语义一致。 */
 double Se2MpcController::normalizeAngle(double angle) {
   return Se2Model::normalizeAngle(angle);
 }
 
-//计算SE(2) 状态（x, y, yaw）的差，角度差值归一化到 (-π, π]
+/** @brief 计算世界系位置差与最短 yaw 差，作为 iLQR 阶段和终端误差。 */
 State Se2MpcController::stateDifference(const State &lhs, const State &rhs) {
   return Se2Model::stateDifference(lhs, rhs);
 }
 
-//将 SE(2) 状态（x, y, yaw）与控制（vx, vy,
-//wz）应用于离散时间动力学模型，计算下一状态
+/** @brief 以共享 SE(2) 模型推进一拍，禁止在 controller 内维护另一套动力学。 */
 State Se2MpcController::dynamics(const State &state,
                                  const Control &control) const {
   return model_.dynamics(state, control);
 }
 
-//计算离散时间动力学模型的雅可比矩阵，分别对状态和控制求偏导
+/** @brief 以共享 SE(2) 模型获得反向递推所需的局部 Jacobian。 */
 void Se2MpcController::jacobians(const State &state, const Control &control,
                                  Matrix3 &state_jacobian,
                                  Matrix3 &control_jacobian) const {
@@ -106,6 +107,11 @@ double Se2MpcController::maxModuleSpeed(const Control &control) const {
   return maximum;
 }
 
+/**
+ * @brief 按底盘几何把 [vx,vy,wz] 映射为四个轮心速度向量。
+ * @details 每个轮速为 [vx-wz*y_i, vy+wz*x_i]；该向量是轮速、增量和舵角速率
+ *          约束的共同物理依据，禁止把四轮独立改写成不一致的 Twist。
+ */
 std::array<Eigen::Vector2d, 4>
 Se2MpcController::moduleVelocities(const Control &control) const {
   const double x = std::max(0.0, config_.wheel_base_x);
@@ -214,14 +220,18 @@ Control Se2MpcController::clampIncrement(const Control &target,
   return clampControl(previous + feasible_scale * (limited - previous), report);
 }
 
-//根据初始状态和控制序列，沿离散时间动力学模型前向滚动计算状态序列
+/** @brief 生成 iLQR 名义/候选状态序列，结果长度恒为控制数加一。 */
 std::vector<State>
 Se2MpcController::rollout(const State &initial,
                           const std::vector<Control> &controls) const {
   return model_.rollout(initial, controls);
 }
 
-//计算给定状态序列、控制序列和参考轨迹的总代价，包括状态误差、控制误差、控制增量误差和终端状态误差
+/**
+ * @brief 评估一个完整控制序列的二次 iLQR 目标。
+ * @details 包含阶段状态跟踪、控制参考、相邻控制增量及 terminal 误差；输入长度不一致
+ *          时返回 infinity，保证线搜索不会接纳结构错误的候选。
+ */
 double Se2MpcController::cost(const std::vector<State> &states,
                               const std::vector<Control> &controls,
                               const std::vector<Se2Reference> &references,
@@ -250,8 +260,10 @@ double Se2MpcController::cost(const std::vector<State> &states,
   return total + final_error.dot(terminal * final_error);
 }
 
-//根据当前状态、参考轨迹和上一次控制量，调用 iLQR
-//算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
+/**
+ * @brief 构造或移动 iLQR warm start，并逐步投影到真实四轮执行器可达集合。
+ * @details 首步单独记录饱和/增量回退，因为只有它会进入 `/cmd_vel_mpc`。
+ */
 void Se2MpcController::initializeControls(
     const std::vector<Se2Reference> &references, const Control &last_control) {
   if (!has_warm_start_ ||
@@ -281,8 +293,11 @@ void Se2MpcController::initializeControls(
   has_warm_start_ = true;
 }
 
-//反向传播:根据当前状态、参考轨迹和上一次控制量，调用 iLQR
-//算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
+/**
+ * @brief 从 terminal cost 向前执行 iLQR 反向递推。
+ * @details 对 Q_uu 做正则化并要求 LDLT、前馈和反馈均有限；任一失败均拒绝把旧
+ *          warm-start 当成当前闭环解。
+ */
 Se2MpcController::BackwardResult
 Se2MpcController::backwardPass(const std::vector<State> &states,
                                const std::vector<Control> &controls,
@@ -345,8 +360,12 @@ Se2MpcController::backwardPass(const std::vector<State> &states,
   return result;
 }
 
-//主求解:根据当前状态、参考轨迹和上一次控制量，调用 iLQR
-//算法求解最优控制序列，并返回求解结果，包括控制序列、状态序列、总代价和求解时间
+/**
+ * @brief iLQR 主求解入口。
+ * @details 先建立物理可达 warm start，再交替进行 rollout、backward pass 与受约束线搜索。
+ *          只有成功完成至少一次数值有效的反向递推后才返回 success，失败交由 node
+ *          发布确定性零速度；该函数不创建第二个速度发布者。
+ */
 Se2MpcResult
 Se2MpcController::solve(const State &current_state,
                         const std::vector<Se2Reference> &references,

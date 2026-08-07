@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -14,7 +15,7 @@
 namespace ats_swerve_mpc {
 
 namespace {
-// 匿名辅助函数：加载三维向量参数
+/** @brief 读取三元素参数并在维度错误时保留物理安全默认值。 */
 Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
                                 const Eigen::Vector3d &defaults) {
   const std::vector<double> values =
@@ -28,9 +29,26 @@ Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
   return Eigen::Vector3d(values[0], values[1], values[2]);
 }
 
+/** @brief 在固定容量 telemetry 窗口上计算最近分位数，不分配动态容器。 */
+template <std::size_t N>
+double percentile(std::array<double, N> samples, std::size_t count,
+                  double quantile) {
+  if (count == 0) {
+    return 0.0;
+  }
+  std::sort(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(count));
+  const std::size_t index = std::min(
+      count - 1, static_cast<std::size_t>(quantile * static_cast<double>(count - 1)));
+  return samples[index];
+}
+
 } // namespace
 
-// 节点类的构造函数,参数声明与加载
+/**
+ * @brief 初始化 ATS iLQR 主链、输入订阅、唯一速度发布者和可选 OSQP shadow。
+ * @details `solver_mode=ilqr` 是默认；`qp_shadow` 仅预分配后端和缓冲，`qp` 显式拒绝，
+ *          因而构造过程不会改变 `/cmd_vel_mpc`、急停或底盘所有权。
+ */
 AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
     : Node("ats_swerve_mpc", options) {
   odom_topic_ = declare_parameter<std::string>("odom_topic", "/localization");
@@ -198,7 +216,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
               solver_mode_.c_str());
 }
 
-// 加载 MPC 控制器参数
+/** @brief 加载 iLQR/四轮物理参数，保持控制为 body-frame [vx,vy,wz] 的既有契约。 */
 Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
   Se2MpcConfig config;
   config.horizon = declare_parameter<int>("horizon", config.horizon);
@@ -269,7 +287,7 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
   return config;
 }
 
-// 加载轨迹跟踪器参数
+/** @brief 加载路径投影、横向偏差降速和时延补偿参数。 */
 TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
   TrajectoryTrackerConfig config;
   config.backward_search_window = declare_parameter<double>(
@@ -370,8 +388,11 @@ bool AtsSwerveMpcNode::odometryUsable(State &current) {
   return true;
 }
 
-// Legacy Path remains available for Nav2 comparison only.  P4 execution must
-// arrive as one atomic ExecutionCommand.
+/**
+ * @brief 处理 legacy Path 兼容入口。
+ * @details 一旦启用 ExecutionCommand，该回调只记录警告且不修改 tracker，防止独立 DDS
+ *          topic 绕开原子执行授权；legacy 模式下才委托 installPath。
+ */
 void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
   if (execution_command_enabled_) {
     RCLCPP_WARN_THROTTLE(
@@ -382,6 +403,11 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
   installPath(*message);
 }
 
+/**
+ * @brief 校验 frame/时间并把 Path 转为 tracker 的相对时间 reference。
+ * @details 成功时设置 reference deadline、重置 iLQR warm start 与 last control；失败不
+ *          覆盖原有安全状态，调用方负责进入 fail-stop。
+ */
 bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
   if (require_localization_status_ && !localization_tracking_.load()) {
     RCLCPP_WARN_THROTTLE(
@@ -455,6 +481,11 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
   return true;
 }
 
+/**
+ * @brief 接收唯一的执行授权和 reference 原子快照。
+ * @details 严格拒绝 incarnation/sequence 倒退、gimbal 或 localization epoch 不匹配；STOP
+ *          与任何非法 EXECUTE 都走既有急停，而不是只停止 QP shadow。
+ */
 void AtsSwerveMpcNode::onExecutionCommand(
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message) {
   if (!message || message->manager_incarnation == 0 ||
@@ -532,7 +563,11 @@ void AtsSwerveMpcNode::onExecutionCommand(
   fail_stop_engaged_.store(false);
 }
 
-//紧急停止信号处理,当接收到紧急停止信号时，节点会立即停止控制器，并清除当前轨迹，确保机器人处于安全状态。
+/**
+ * @brief 处理 legacy emergency-stop 心跳。
+ * @details structured ExecutionCommand 模式下 legacy false 永远不能恢复运动；其它模式中
+ *          watchdog 的 stop 状态拥有优先权，并由 engageFailStop 实际发布零速度。
+ */
 void AtsSwerveMpcNode::onEmergencyStop(
     const std_msgs::msg::Bool::SharedPtr message) {
   if (execution_command_enabled_) {
@@ -557,6 +592,7 @@ void AtsSwerveMpcNode::onEmergencyStop(
   }
 }
 
+/** @brief 只接受 TRACKING 定位状态；epoch 切换或失跟立即使当前轨迹和 warm-start 失效。 */
 void AtsSwerveMpcNode::onLocalizationStatus(
     const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
         message) {
@@ -573,6 +609,7 @@ void AtsSwerveMpcNode::onLocalizationStatus(
   localization_tracking_.store(true);
 }
 
+/** @brief 更新云台回执并在 active command 的 yaw 权限失效时触发急停。 */
 void AtsSwerveMpcNode::onGimbalYawStatus(
     const ats_navigation_interfaces::msg::GimbalYawStatus::SharedPtr message) {
   bool stop = false;
@@ -587,6 +624,10 @@ void AtsSwerveMpcNode::onGimbalYawStatus(
   }
 }
 
+/**
+ * @brief 在 trajectory mutex 已持有时验证云台回执的新鲜性、authority 和序列。
+ * @details 未要求云台状态时返回 true；要求时任何缺失、超时或 lock 不满足都不可授权控制。
+ */
 bool AtsSwerveMpcNode::gimbalExecutionValidLocked(
   const ats_navigation_interfaces::msg::ExecutionCommand & command) const {
   if (!require_gimbal_status_) {
@@ -606,25 +647,38 @@ bool AtsSwerveMpcNode::gimbalExecutionValidLocked(
   return !command.requires_gimbal_lock || gimbal_status_->locked;
 }
 
-//核心控制循环
+/**
+ * @brief iLQR 唯一控制周期。
+ * @details 依次执行输入健康/急停、reference 新鲜度、目标到达检查、iLQR 求解和唯一 Twist
+ *          发布；随后 qp_shadow 仅读取冻结的 ControlCycleSnapshot，不能重读 ROS 状态或
+ *          改动 tracker、last_control、emergency stop 与 publisher 所有权。
+ */
 void AtsSwerveMpcNode::onControlTimer() {
+  const auto cycle_start = std::chrono::steady_clock::now();
+  const std::uint64_t cycle_sequence = ++control_cycle_sequence_;
+  bool execution_lease_valid = !execution_command_enabled_;
+  bool gimbal_valid = !require_gimbal_status_;
+  const bool localization_fresh =
+      !require_localization_status_ || localization_tracking_.load();
   // 1. 紧急停止检查
-  if (require_localization_status_ && !localization_tracking_.load()) {
+  if (!localization_fresh) {
     engageFailStop();
     return;
   }
   if (execution_command_enabled_) {
-    bool lease_valid = false;
+    const auto lease_check_time = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
-      lease_valid = last_execution_command_signal_ &&
-        std::chrono::steady_clock::now() >= *last_execution_command_signal_ &&
+      execution_lease_valid = last_execution_command_signal_ &&
+        lease_check_time >= *last_execution_command_signal_ &&
         std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - *last_execution_command_signal_).count() <=
+          lease_check_time - *last_execution_command_signal_).count() <=
           execution_command_timeout_ && active_execution_command_ &&
         gimbalExecutionValidLocked(*active_execution_command_);
+      gimbal_valid = active_execution_command_ &&
+                     gimbalExecutionValidLocked(*active_execution_command_);
     }
-    if (!lease_valid || fail_stop_engaged_.load()) {
+    if (!execution_lease_valid || fail_stop_engaged_.load()) {
       engageFailStop();
       return;
     }
@@ -690,9 +744,45 @@ void AtsSwerveMpcNode::onControlTimer() {
     return;
   }
   // 6. 调用 MPC 求解
-  const Control last_control_before_solve = last_control_;
+  ControlCycleSnapshot snapshot;
+  snapshot.cycle_sequence = cycle_sequence;
+  snapshot.steady_start = cycle_start;
+  snapshot.current_state = current;
+  snapshot.references = references;
+  snapshot.last_control_before_solve = last_control_;
+  snapshot.reference_fresh = projection.valid && !trajectory_expired &&
+                             references.size() >= static_cast<std::size_t>(
+                                 controller_->config().horizon + 1);
+  snapshot.localization_fresh = localization_fresh;
+  snapshot.execution_lease_valid = execution_lease_valid;
+  snapshot.gimbal_valid = gimbal_valid;
+  snapshot.emergency_stop_active = fail_stop_engaged_.load() ||
+      (emergency_stop_watchdog_enabled_ &&
+       emergency_stop_watchdog_.stopRequired());
+  // There is no independent map/footprint health producer in this node.
+  snapshot.map_fresh = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    snapshot.reference_frame = trajectory_frame_.empty() ? frame_id_ : trajectory_frame_;
+    snapshot.reference_deadline_ns = trajectory_deadline_.nanoseconds();
+    if (active_execution_command_) {
+      const auto &command = *active_execution_command_;
+      snapshot.manager_incarnation = command.manager_incarnation;
+      snapshot.command_sequence = command.command_sequence;
+      snapshot.goal_id = command.goal_id;
+      snapshot.localization_epoch = command.localization_epoch;
+      snapshot.map_generation = command.map_generation;
+      snapshot.map_publication_sequence = command.map_publication_sequence;
+      snapshot.reference_stamp_ns =
+          rclcpp::Time(command.reference.header.stamp).nanoseconds();
+      if (!command.reference.header.frame_id.empty()) {
+        snapshot.reference_frame = command.reference.header.frame_id;
+      }
+    }
+  }
   const Se2MpcResult result =
-      controller_->solve(current, references, last_control_);
+      controller_->solve(snapshot.current_state, snapshot.references,
+                         snapshot.last_control_before_solve);
   if (!result.success || result.controls.empty()) {
     RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -707,8 +797,9 @@ void AtsSwerveMpcNode::onControlTimer() {
   last_control_ = result.controls.front();
   publishCommand(last_control_);
   reportSolverDiagnostics(result);
+  snapshot.ilqr_result = result;
   if (solver_mode_ == "qp_shadow") {
-    runQpShadow(current, references, last_control_before_solve, result);
+    runQpShadow(snapshot);
   }
   // 8. 发布调试路径
   if (publish_debug_paths_) {
@@ -730,21 +821,33 @@ void AtsSwerveMpcNode::onControlTimer() {
                result.cost, result.solve_time_ms);
 }
 
-void AtsSwerveMpcNode::runQpShadow(
-    const State &current, const std::vector<Se2Reference> &references,
-    const Control &last_control, const Se2MpcResult &ilqr_result) {
-  if (!qp_solver_ || !qp_solver_->initialized()) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                         "QP shadow 后端不可用；iLQR 仍是唯一控制输出。");
-    return;
+/**
+ * @brief 对已发布 iLQR 同周期名义轨迹执行 OSQP shadow 审计。
+ * @details 用 snapshot 的 current/reference/solve 前 last_control 构建固定结构 LTV-QP，
+ *          再从 primal 重建 delta_u、做共享模型非线性 rollout 和 hard-check；无论 solved、
+ *          timeout 或 reject 都不发布 QP 控制，也不影响 iLQR warm-start。
+ */
+void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
+  LtvQpSolveResult result;
+  LtvQpPrimalCandidate candidate;
+  LtvQpCandidateAudit audit;
+  const bool backend_available = qp_solver_ && qp_solver_->initialized();
+  const bool problem_built = backend_available && LtvQpBuilder::build(
+      snapshot.current_state, snapshot.ilqr_result.states,
+      snapshot.ilqr_result.controls, snapshot.references,
+      snapshot.last_control_before_solve, controller_->config(),
+      qp_problem_buffer_);
+  if (!backend_available) {
+    result.status = LtvQpSolverStatus::kBackendUnavailable;
+  } else if (!problem_built) {
+    result.status = LtvQpSolverStatus::kInvalidProblem;
+  } else {
+    const LtvQpProblem &problem = qp_problem_buffer_;
+    result = qp_solver_->solveLtvProblem(
+        problem, qp_solver_settings_,
+        qp_warm_start_valid_ ? &qp_warm_start_ : nullptr);
   }
-  LtvQpBuilder::build(current, ilqr_result.states, ilqr_result.controls,
-                      references, last_control, controller_->config(),
-                      qp_problem_buffer_);
   const LtvQpProblem &problem = qp_problem_buffer_;
-  const LtvQpSolveResult result = qp_solver_->solveLtvProblem(
-      problem, qp_solver_settings_,
-      qp_warm_start_valid_ ? &qp_warm_start_ : nullptr);
   if (result.status == LtvQpSolverStatus::kSolved &&
       result.primal_solution.size() == problem.decisionSize() &&
       result.dual_solution.size() == qp_solver_->constraintStructure().rows &&
@@ -753,30 +856,163 @@ void AtsSwerveMpcNode::runQpShadow(
     qp_warm_start_.dual = result.dual_solution;
     qp_warm_start_valid_ = true;
   } else {
-    qp_solver_->resetWarmStart();
+    if (qp_solver_) {
+      qp_solver_->resetWarmStart();
+    }
     qp_warm_start_valid_ = false;
   }
   LtvQpCandidateSafety safety;
-  safety.inputs_healthy = true;
-  safety.emergency_stop_active = false;
-  // This Twist-only node has no collision/footprint health producer. Unknown
-  // collision state is a hard reject, never an optimistic admission.
+  safety.inputs_healthy = snapshot.localization_fresh &&
+                          snapshot.reference_fresh &&
+                          snapshot.execution_lease_valid &&
+                          snapshot.gimbal_valid;
+  safety.emergency_stop_active = snapshot.emergency_stop_active;
   safety.collision_free = false;
-  const LtvQpCandidateAudit audit = LtvQpCandidateValidator::validate(
-      problem, ilqr_result.controls, last_control, controller_->config(),
-      ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result);
+  safety.localization_fresh = snapshot.localization_fresh;
+  safety.reference_fresh = snapshot.reference_fresh;
+  safety.execution_lease_valid = snapshot.execution_lease_valid;
+  safety.gimbal_valid = snapshot.gimbal_valid;
+  safety.map_fresh = snapshot.map_fresh;
+  if (result.status == LtvQpSolverStatus::kSolved && problem_built) {
+    candidate = LtvQpCandidateReconstructor::reconstruct(
+        snapshot.current_state, problem, snapshot.ilqr_result.controls,
+        controller_->config(), result);
+    audit = LtvQpCandidateValidator::validate(
+        problem, snapshot.ilqr_result.controls,
+        snapshot.last_control_before_solve, controller_->config(),
+        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result, candidate);
+  } else {
+    audit = LtvQpCandidateValidator::validate(
+        problem, snapshot.ilqr_result.controls,
+        snapshot.last_control_before_solve, controller_->config(),
+        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result);
+  }
+  recordQpShadowTelemetry(snapshot, result, audit,
+                          candidate.valid ? &candidate : nullptr);
   RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "QP shadow backend=%s status=%s iter=%d solve=%.3fms prim=%.3g dual=%.3g "
-      "slack=%.3g hard=%.3g feasible=%s reject=%s warm=%s collision_gate=hard_reject",
-      qp_solver_->backendName(), ltvQpSolverStatusName(result.status),
-      result.iterations, result.solve_time_ms, result.primal_residual,
-      result.dual_residual, result.slack_maximum,
+      "QP shadow backend=%s cycle=%llu status=%s iter=%d solve=%.3fms update=%.3fms "
+      "prim=%.3g dual=%.3g slack=%.3g hard=%.3g feasible=%s reject=%s "
+      "warm=%s same_snapshot=true collision_gate=hard_reject map_gate=hard_reject",
+      backend_available ? qp_solver_->backendName() : "unavailable",
+      static_cast<unsigned long long>(snapshot.cycle_sequence),
+      ltvQpSolverStatusName(result.status),
+      result.iterations, result.solve_time_ms, result.update_time_ms,
+      result.primal_residual, result.dual_residual, result.slack_maximum,
       std::max(result.hard_constraint_maximum_violation,
                audit.actual_hard_constraint_maximum_violation),
       audit.feasible ? "true" : "false",
       audit.rejection_reason.empty() ? "none" : audit.rejection_reason.c_str(),
       result.warm_start_used ? "true" : "false");
+}
+
+/**
+ * @brief 将一次 shadow 尝试写入固定容量诊断环。
+ * @details 记录 status/residual/计时、QP-iLQR 首控差、hard margin 与安全门；每 16 个周期
+ *          基于现有槽位计算 p50/p95/p99，避免保存整条路径或无限增长历史。
+ */
+void AtsSwerveMpcNode::recordQpShadowTelemetry(
+    const ControlCycleSnapshot &snapshot, const LtvQpSolveResult &result,
+    const LtvQpCandidateAudit &audit,
+    const LtvQpPrimalCandidate *candidate) {
+  QpShadowTelemetry telemetry;
+  telemetry.cycle_sequence = snapshot.cycle_sequence;
+  telemetry.same_snapshot_identity = snapshot.current_state.allFinite() &&
+      snapshot.references.size() ==
+          static_cast<std::size_t>(controller_->config().horizon + 1) &&
+      snapshot.ilqr_result.controls.size() ==
+          static_cast<std::size_t>(controller_->config().horizon) &&
+      snapshot.ilqr_result.states.size() ==
+          static_cast<std::size_t>(controller_->config().horizon + 1);
+  telemetry.status = result.status;
+  telemetry.iterations = result.iterations;
+  telemetry.warm_start_used = result.warm_start_used;
+  telemetry.solve_time_ms = result.solve_time_ms;
+  telemetry.update_time_ms = result.update_time_ms;
+  telemetry.callback_elapsed_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - snapshot.steady_start).count();
+  telemetry.primal_residual = result.primal_residual;
+  telemetry.dual_residual = result.dual_residual;
+  telemetry.hard_constraint_margin =
+      qp_solver_settings_.max_hard_constraint_violation -
+      std::max(result.hard_constraint_maximum_violation,
+               audit.actual_hard_constraint_maximum_violation);
+  telemetry.slack_maximum = std::max(result.slack_maximum,
+                                     audit.actual_slack_maximum);
+  if (!snapshot.ilqr_result.controls.empty()) {
+    const Control &ilqr = snapshot.ilqr_result.controls.front();
+    for (int axis = 0; axis < 3; ++axis) {
+      telemetry.ilqr_first_control[static_cast<std::size_t>(axis)] = ilqr(axis);
+    }
+  }
+  if (candidate != nullptr && !candidate->controls.empty()) {
+    const Control &qp = candidate->controls.front();
+    for (int axis = 0; axis < 3; ++axis) {
+      telemetry.qp_first_control[static_cast<std::size_t>(axis)] = qp(axis);
+      telemetry.first_control_delta[static_cast<std::size_t>(axis)] =
+          qp(axis) - telemetry.ilqr_first_control[static_cast<std::size_t>(axis)];
+    }
+  }
+  telemetry.candidate_feasible = audit.feasible;
+  const char *reason = audit.rejection_reason.empty() ? "none" :
+                       audit.rejection_reason.c_str();
+  std::snprintf(telemetry.rejection_reason.data(),
+                telemetry.rejection_reason.size(), "%s", reason);
+  telemetry.deadline_miss_count =
+      (result.status == LtvQpSolverStatus::kTimeLimit ||
+       result.solve_time_ms > qp_solver_settings_.time_limit_ms ||
+       telemetry.callback_elapsed_ms >
+           1000.0 / std::max(1.0, control_rate_hz_)) ? 1u : 0u;
+  telemetry.collision_gate = false;
+  telemetry.map_gate = snapshot.map_fresh;
+  telemetry.fallback_count = 0;
+  if (telemetry.deadline_miss_count > 0) {
+    ++qp_shadow_deadline_miss_count_;
+  }
+  if (!telemetry.candidate_feasible) {
+    ++qp_shadow_candidate_reject_count_;
+  }
+  telemetry.deadline_miss_count = qp_shadow_deadline_miss_count_;
+  telemetry.candidate_reject_count = qp_shadow_candidate_reject_count_;
+
+  qp_shadow_telemetry_[qp_shadow_telemetry_cursor_] = telemetry;
+  qp_shadow_telemetry_cursor_ =
+      (qp_shadow_telemetry_cursor_ + 1) % kQpShadowTelemetryCapacity;
+  qp_shadow_telemetry_count_ = std::min(
+      kQpShadowTelemetryCapacity, qp_shadow_telemetry_count_ + 1);
+
+  if (snapshot.cycle_sequence % 16 == 0) {
+    std::array<double, kQpShadowTelemetryCapacity> solve_samples{};
+    std::array<double, kQpShadowTelemetryCapacity> callback_samples{};
+    for (std::size_t index = 0; index < qp_shadow_telemetry_count_; ++index) {
+      solve_samples[index] = qp_shadow_telemetry_[index].solve_time_ms;
+      callback_samples[index] = qp_shadow_telemetry_[index].callback_elapsed_ms;
+    }
+    RCLCPP_INFO(
+        get_logger(),
+        "QP shadow telemetry cycle=%llu same_snapshot=%s status=%s iter=%d "
+        "warm=%s solve=%.3fms update=%.3fms callback=%.3fms "
+        "solve_p50/p95/p99=%.3f/%.3f/%.3f callback_p50/p95/p99=%.3f/%.3f/%.3f "
+        "hard_margin=%.3g slack=%.3g delta=(%.4f,%.4f,%.4f) "
+        "feasible=%s reject_count=%llu deadline_miss=%llu fallback=0",
+        static_cast<unsigned long long>(snapshot.cycle_sequence),
+        telemetry.same_snapshot_identity ? "true" : "false",
+        ltvQpSolverStatusName(telemetry.status), telemetry.iterations,
+        telemetry.warm_start_used ? "true" : "false", telemetry.solve_time_ms,
+        telemetry.update_time_ms, telemetry.callback_elapsed_ms,
+        percentile(solve_samples, qp_shadow_telemetry_count_, 0.50),
+        percentile(solve_samples, qp_shadow_telemetry_count_, 0.95),
+        percentile(solve_samples, qp_shadow_telemetry_count_, 0.99),
+        percentile(callback_samples, qp_shadow_telemetry_count_, 0.50),
+        percentile(callback_samples, qp_shadow_telemetry_count_, 0.95),
+        percentile(callback_samples, qp_shadow_telemetry_count_, 0.99),
+        telemetry.hard_constraint_margin, telemetry.slack_maximum,
+        telemetry.first_control_delta[0], telemetry.first_control_delta[1],
+        telemetry.first_control_delta[2],
+        telemetry.candidate_feasible ? "true" : "false",
+        static_cast<unsigned long long>(telemetry.candidate_reject_count),
+        static_cast<unsigned long long>(telemetry.deadline_miss_count));
+  }
 }
 
 /**
@@ -900,7 +1136,11 @@ void AtsSwerveMpcNode::reportSolverDiagnostics(const Se2MpcResult &result) {
   }
 }
 
-//执行紧急停止
+/**
+ * @brief 执行节点级 fail-stop。
+ * @details 首次进入时清空 reference、controller warm state 和 frame/deadline；每次调用都通过
+ *          同一 command publisher 重发零速度，防止下游保持最后一条非零 Twist。
+ */
 void AtsSwerveMpcNode::engageFailStop() {
   const bool was_engaged = fail_stop_engaged_.exchange(true);
   if (!was_engaged) {
@@ -915,7 +1155,7 @@ void AtsSwerveMpcNode::engageFailStop() {
   publishCommand(last_control_);
 }
 
-// 发布控制指令到 ROS 话题
+/** @brief 将内部车体系 Control 映射到唯一 `geometry_msgs::msg::Twist` 发布通道。 */
 void AtsSwerveMpcNode::publishCommand(const Control &command) {
   geometry_msgs::msg::Twist message;
   message.linear.x = command(0);
@@ -924,6 +1164,7 @@ void AtsSwerveMpcNode::publishCommand(const Control &command) {
   command_pub_->publish(message);
 }
 
+/** @brief 发布调试状态序列为 Path；仅供观察，不是 QP/iLQR 的控制输入。 */
 void AtsSwerveMpcNode::publishPath(
     const std::vector<State> &states,
     const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &publisher) const {
@@ -944,6 +1185,7 @@ void AtsSwerveMpcNode::publishPath(
   publisher->publish(path);
 }
 
+/** @brief 计算最短 yaw 差，供终点判定和定位跳变检测复用。 */
 double AtsSwerveMpcNode::normalizeAngle(double angle) {
   return std::atan2(std::sin(angle), std::cos(angle));
 }
