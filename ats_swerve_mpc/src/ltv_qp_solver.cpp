@@ -285,6 +285,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       !result.primal_solution.allFinite() ||
       !std::isfinite(result.solve_time_ms) ||
       !std::isfinite(result.update_time_ms) ||
+      !std::isfinite(result.wall_update_time_ms) ||
+      !std::isfinite(result.wall_solve_time_ms) ||
       !std::isfinite(result.primal_residual) ||
       !std::isfinite(result.dual_residual) ||
       !std::isfinite(result.slack_maximum) ||

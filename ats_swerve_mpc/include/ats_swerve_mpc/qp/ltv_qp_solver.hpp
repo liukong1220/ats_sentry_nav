@@ -99,6 +99,9 @@ struct LtvQpSolveResult {
   int iterations = 0;
   double solve_time_ms = 0.0;
   double update_time_ms = 0.0;
+  // OSQPInfo 计时之外的完整 C API 墙钟，用于区分 backend reported time 和 adapter 开销。
+  double wall_update_time_ms = 0.0;
+  double wall_solve_time_ms = 0.0;
   double primal_residual = 0.0;
   double dual_residual = 0.0;
   double slack_maximum = 0.0;

@@ -3,6 +3,7 @@
 #include "ats_swerve_mpc/qp/ltv_qp_osqp_solver.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -468,22 +469,30 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
       return result;
     }
   }
+  const auto update_start = std::chrono::steady_clock::now();
   if (osqp_update_data_vec(solver_.get(), gradient_.data(), lower_.data(),
                            upper_.data()) != 0 ||
       osqp_update_data_mat(solver_.get(), hessian_values_.data(), nullptr,
                            static_cast<OSQPInt>(hessian_values_.size()),
                            constraint_values_.data(), nullptr,
                            static_cast<OSQPInt>(constraint_values_.size())) != 0) {
+    result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - update_start).count();
     result.status = LtvQpSolverStatus::kNumericalFailure;
     return result;
   }
+  result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - update_start).count();
   if (warm_start != nullptr &&
       warm_start->validFor(decision_size_, constraint_rows_)) {
     result.warm_start_used =
         osqp_warm_start(solver_.get(), warm_start->primal.data(),
                         warm_start->dual.data()) == 0;
   }
+  const auto solve_start = std::chrono::steady_clock::now();
   const OSQPInt solve_result = osqp_solve(solver_.get());
+  result.wall_solve_time_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - solve_start).count();
   if (solver_->info == nullptr) {
     result.status = solve_result == 0 ? LtvQpSolverStatus::kNumericalFailure
                                       : LtvQpSolverStatus::kBackendUnavailable;

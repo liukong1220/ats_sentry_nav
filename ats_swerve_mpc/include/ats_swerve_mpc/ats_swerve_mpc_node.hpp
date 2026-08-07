@@ -18,6 +18,7 @@
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
 #include "ats_swerve_mpc/qp/control_cycle_snapshot.hpp"
+#include "ats_swerve_mpc/qp/control_cycle_telemetry.hpp"
 #include "ats_swerve_mpc/qp/ltv_qp_osqp_solver.hpp"
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
@@ -25,6 +26,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "std_msgs/msg/bool.hpp"
 
 /**
@@ -77,46 +79,21 @@ private:
   void validateDynamicsParameters(const Se2MpcConfig & config);
   /** @brief 输出车体/轮级饱和与 iLQR 求解耗时的分级中文诊断日志。 */
   void reportSolverDiagnostics(const Se2MpcResult & result);
-  /**
-   * @brief 有界 shadow 诊断槽位。
-   * @details 固定容量避免 timer 中累积路径、控制序列或无界日志；fallback 始终为 0，
-   *          因为 shadow 从不接管 iLQR 控制输出。
-   */
-  struct QpShadowTelemetry {
-    std::uint64_t cycle_sequence = 0;
-    // 固定字节序输入摘要；日志仅暴露该短标识，不输出完整 reference 路径。
-    std::uint64_t snapshot_identity_digest = 0;
-    bool same_snapshot_identity = false;
-    LtvQpSolverStatus status = LtvQpSolverStatus::kBackendUnavailable;
-    int iterations = 0;
-    bool warm_start_used = false;
-    double solve_time_ms = 0.0;
-    double update_time_ms = 0.0;
-    double callback_elapsed_ms = 0.0;
-    double primal_residual = 0.0;
-    double dual_residual = 0.0;
-    double hard_constraint_margin = 0.0;
-    double slack_maximum = 0.0;
-    std::array<double, 3> qp_first_control{{0.0, 0.0, 0.0}};
-    std::array<double, 3> ilqr_first_control{{0.0, 0.0, 0.0}};
-    std::array<double, 3> first_control_delta{{0.0, 0.0, 0.0}};
-    bool candidate_feasible = false;
-    std::array<char, 96> rejection_reason{{}};
-    std::uint64_t deadline_miss_count = 0;
-    std::uint64_t candidate_reject_count = 0;
-    std::uint64_t fallback_count = 0;
-    bool collision_gate = false;
-    bool map_gate = false;
-  };
-
   /** @brief 对同周期 iLQR 名义轨迹构造/求解 QP，仅记录复核结果。 */
-  void runQpShadow(const ControlCycleSnapshot &snapshot);
-  /** @brief 写入固定 telemetry ring，并按窗口输出 solve/callback p50/p95/p99。 */
-  void recordQpShadowTelemetry(
-      const ControlCycleSnapshot &snapshot,
-      const LtvQpSolveResult &result,
-      const LtvQpCandidateAudit &audit,
-      const LtvQpPrimalCandidate *candidate);
+  void runQpShadow(const ControlCycleSnapshot &snapshot,
+                   ControlCycleTelemetrySample &telemetry);
+  /**
+   * @brief 提交本次 iLQR/QP 周期的定长 telemetry，并拆分所有 deadline 根因。
+   * @details 本函数只更新固定 128 槽数组及饱和计数，不进行 JSON、文件或阻塞 I/O；它不能
+   *          改写 iLQR command、tracker、warm-start 或任何外部安全状态。
+   */
+  void finalizeControlTelemetry(
+      ControlCycleTelemetrySample telemetry,
+      std::chrono::steady_clock::time_point cycle_start);
+  /** @brief 在非控制回调中复制固定 telemetry 环并返回 JSON，不产生文件或控制副作用。 */
+  void dumpControlTelemetry(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   /** @brief 从 ROS 参数加载 SE(2) 物理约束和 iLQR 权重，不改变 frame 语义。 */
   Se2MpcConfig loadConfig();
   /** @brief 从 ROS 参数加载有限路径搜索窗、偏差降速和时延补偿。 */
@@ -165,13 +142,11 @@ private:
   LtvQpProblem qp_problem_buffer_;
   LtvQpWarmStart qp_warm_start_;
   bool qp_warm_start_valid_ = false;
-  static constexpr std::size_t kQpShadowTelemetryCapacity = 128;
-  std::array<QpShadowTelemetry, kQpShadowTelemetryCapacity>
-      qp_shadow_telemetry_{};
-  std::size_t qp_shadow_telemetry_count_ = 0;
-  std::size_t qp_shadow_telemetry_cursor_ = 0;
-  std::uint64_t qp_shadow_deadline_miss_count_ = 0;
-  std::uint64_t qp_shadow_candidate_reject_count_ = 0;
+  // 计时环同时记录 ilqr baseline 与 qp_shadow，服务导出时复制，控制 timer 不做字符串序列化。
+  ControlCycleTelemetryRing control_telemetry_;
+  mutable std::mutex control_telemetry_mutex_;
+  std::optional<std::chrono::steady_clock::time_point>
+      previous_control_cycle_start_;
   std::uint64_t control_cycle_sequence_ = 0;
 
   mutable std::mutex state_mutex_;
@@ -214,6 +189,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predicted_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr horizon_path_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
+      control_telemetry_dump_service_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 };
 

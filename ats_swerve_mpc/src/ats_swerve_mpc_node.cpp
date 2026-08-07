@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -29,18 +30,74 @@ Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
   return Eigen::Vector3d(values[0], values[1], values[2]);
 }
 
-/** @brief 在固定容量 telemetry 窗口上计算最近分位数，不分配动态容器。 */
-template <std::size_t N>
-double percentile(std::array<double, N> samples, std::size_t count,
-                  double quantile) {
-  if (count == 0) {
-    return 0.0;
-  }
-  std::sort(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(count));
-  const std::size_t index = std::min(
-      count - 1, static_cast<std::size_t>(quantile * static_cast<double>(count - 1)));
-  return samples[index];
+/** @brief 把 steady-clock 相邻时刻转换为毫秒，统一 timer 内所有阶段的时间单位。 */
+double elapsedMilliseconds(std::chrono::steady_clock::time_point start,
+                           std::chrono::steady_clock::time_point end) {
+  return 1000.0 * std::chrono::duration<double>(end - start).count();
 }
+
+/** @brief 填写一个有限阶段计时，禁止让无效 duration 混入后续 p50/p95/p99。 */
+void recordTiming(ControlCycleTelemetrySample &telemetry,
+                  ControlCycleTimingStage stage, double milliseconds) {
+  const std::size_t index = controlCycleTimingStageIndex(stage);
+  telemetry.stage_ms[index] = milliseconds;
+  telemetry.stage_recorded[index] = std::isfinite(milliseconds) && milliseconds >= 0.0;
+}
+
+/** @brief 读取当前 DDS domain；缺失或格式错误时返回 -1 而非伪造 domain。 */
+int currentRosDomainId() {
+  const char *value = std::getenv("ROS_DOMAIN_ID");
+  if (value == nullptr || *value == '\0') {
+    return -1;
+  }
+  char *end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 || parsed > 232) {
+    return -1;
+  }
+  return static_cast<int>(parsed);
+}
+
+/**
+ * @brief 提取真实 LTV 矩阵的有限尺度指标，供离线收敛归因而非在线调参。
+ * @details 只扫描已经预分配的 dense buffer；不复制矩阵、不修改 QP 数值，也不把指标用于
+ *          candidate 准入。zero-delta residual 指 $z=0$ 时动态等式的最大绝对残差。
+ */
+void recordQpProblemMetrics(const LtvQpProblem &problem,
+                            ControlCycleTelemetrySample &telemetry) {
+  if (!problem.valid || problem.hessian.rows() <= 0 ||
+      problem.hessian.rows() != problem.hessian.cols() ||
+      problem.equality_matrix.rows() < 3 || !problem.hessian.allFinite() ||
+      !problem.equality_matrix.allFinite() || !problem.inequality_matrix.allFinite() ||
+      !problem.equality_lower.allFinite()) {
+    return;
+  }
+  telemetry.hessian_diagonal_minimum = problem.hessian.diagonal().minCoeff();
+  telemetry.hessian_diagonal_maximum = problem.hessian.diagonal().maxCoeff();
+  telemetry.constraint_row_l2_minimum = std::numeric_limits<double>::infinity();
+  telemetry.constraint_row_l2_maximum = 0.0;
+  const auto update_row_range = [&telemetry](const Eigen::MatrixXd &matrix) {
+    for (int row = 0; row < matrix.rows(); ++row) {
+      const double norm = matrix.row(row).norm();
+      telemetry.constraint_row_l2_minimum =
+          std::min(telemetry.constraint_row_l2_minimum, norm);
+      telemetry.constraint_row_l2_maximum =
+          std::max(telemetry.constraint_row_l2_maximum, norm);
+    }
+  };
+  update_row_range(problem.equality_matrix);
+  update_row_range(problem.inequality_matrix);
+  telemetry.zero_delta_dynamic_equality_residual = problem.equality_lower.tail(
+      problem.equality_lower.size() - 3).cwiseAbs().maxCoeff();
+  telemetry.qp_problem_metrics_recorded =
+      std::isfinite(telemetry.hessian_diagonal_minimum) &&
+      std::isfinite(telemetry.hessian_diagonal_maximum) &&
+      std::isfinite(telemetry.constraint_row_l2_minimum) &&
+      std::isfinite(telemetry.constraint_row_l2_maximum) &&
+      std::isfinite(telemetry.zero_delta_dynamic_equality_residual);
+}
+
+constexpr std::uint64_t kTelemetrySummaryInterval = 16;
 
 } // namespace
 
@@ -201,6 +258,11 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       create_publisher<nav_msgs::msg::Path>("~/predicted_path", rclcpp::QoS(1));
   horizon_path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "~/reference_horizon", rclcpp::QoS(1));
+  // 导出服务只复制固定遥测环并返回字符串，不发布控制、不会重新运行 QP，也不改变 warm-start。
+  control_telemetry_dump_service_ = create_service<std_srvs::srv::Trigger>(
+      "~/dump_control_telemetry",
+      std::bind(&AtsSwerveMpcNode::dumpControlTelemetry, this,
+                std::placeholders::_1, std::placeholders::_2));
   control_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / std::max(1.0, control_rate_hz_)),
       std::bind(&AtsSwerveMpcNode::onControlTimer, this));
@@ -654,6 +716,9 @@ bool AtsSwerveMpcNode::gimbalExecutionValidLocked(
  */
 void AtsSwerveMpcNode::onControlTimer() {
   const auto cycle_start = std::chrono::steady_clock::now();
+  const std::optional<std::chrono::steady_clock::time_point> previous_cycle_start =
+      previous_control_cycle_start_;
+  previous_control_cycle_start_ = cycle_start;
   const std::uint64_t cycle_sequence = ++control_cycle_sequence_;
   bool execution_lease_valid = !execution_command_enabled_;
   bool gimbal_valid = !require_gimbal_status_;
@@ -743,6 +808,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     return;
   }
   // 6. 调用 MPC 求解
+  const auto snapshot_start = cycle_start;
   ControlCycleSnapshot snapshot;
   snapshot.cycle_sequence = cycle_sequence;
   snapshot.steady_start = cycle_start;
@@ -785,9 +851,28 @@ void AtsSwerveMpcNode::onControlTimer() {
       controlCycleSnapshotIdentityInputsFinite(snapshot);
   snapshot.identity_digest = snapshot.identity_digest_valid ?
       controlCycleSnapshotIdentityDigest(snapshot) : 0;
+  ControlCycleTelemetrySample telemetry;
+  telemetry.cycle_sequence = snapshot.cycle_sequence;
+  telemetry.snapshot_identity_digest = snapshot.identity_digest;
+  telemetry.command_sequence = snapshot.command_sequence;
+  telemetry.goal_id = snapshot.goal_id;
+  telemetry.map_generation = snapshot.map_generation;
+  telemetry.reference_stamp_ns = snapshot.reference_stamp_ns;
+  std::snprintf(telemetry.reference_frame.data(), telemetry.reference_frame.size(),
+                "%s", snapshot.reference_frame.c_str());
+  if (previous_cycle_start) {
+    recordTiming(telemetry, ControlCycleTimingStage::kTimerInterarrival,
+                 elapsedMilliseconds(*previous_cycle_start, cycle_start));
+  }
+  recordTiming(telemetry, ControlCycleTimingStage::kStateTrajectorySnapshot,
+               elapsedMilliseconds(snapshot_start, std::chrono::steady_clock::now()));
+
+  const auto ilqr_start = std::chrono::steady_clock::now();
   const Se2MpcResult result =
       controller_->solve(snapshot.current_state, snapshot.references,
                          snapshot.last_control_before_solve);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrSolve,
+               elapsedMilliseconds(ilqr_start, std::chrono::steady_clock::now()));
   if (!result.success || result.controls.empty()) {
     RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -800,11 +885,21 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   // 7. 应用第一个控制量并发布
   last_control_ = result.controls.front();
+  const auto command_publish_start = std::chrono::steady_clock::now();
   publishCommand(last_control_);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrCommandPublish,
+               elapsedMilliseconds(command_publish_start,
+                                   std::chrono::steady_clock::now()));
+  for (int axis = 0; axis < 3; ++axis) {
+    telemetry.ilqr_first_control[static_cast<std::size_t>(axis)] = last_control_(axis);
+  }
+  const auto diagnostics_log_start = std::chrono::steady_clock::now();
   reportSolverDiagnostics(result);
+  double logging_publish_ms = elapsedMilliseconds(
+      diagnostics_log_start, std::chrono::steady_clock::now());
   snapshot.ilqr_result = result;
   if (solver_mode_ == "qp_shadow") {
-    runQpShadow(snapshot);
+    runQpShadow(snapshot, telemetry);
   }
   // 8. 发布调试路径
   if (publish_debug_paths_) {
@@ -816,6 +911,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     }
     publishPath(reference_states, horizon_path_pub_);
   }
+  const auto debug_log_start = std::chrono::steady_clock::now();
   RCLCPP_DEBUG(get_logger(),
                "MPC vx=%.3f vy=%.3f wz=%.3f cross_track=%.3f "
                "progress_scale=%.2f cost=%.3f "
@@ -824,6 +920,11 @@ void AtsSwerveMpcNode::onControlTimer() {
                projection.cross_track_error,
                trajectory_tracker_.progressScale(projection.cross_track_error),
                result.cost, result.solve_time_ms);
+  logging_publish_ms += elapsedMilliseconds(debug_log_start,
+                                             std::chrono::steady_clock::now());
+  recordTiming(telemetry, ControlCycleTimingStage::kLoggingPublish,
+               logging_publish_ms);
+  finalizeControlTelemetry(telemetry, cycle_start);
 }
 
 /**
@@ -832,16 +933,25 @@ void AtsSwerveMpcNode::onControlTimer() {
  *          再从 primal 重建 delta_u、做共享模型非线性 rollout 和 hard-check；无论 solved、
  *          timeout 或 reject 都不发布 QP 控制，也不影响 iLQR warm-start。
  */
-void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
+void AtsSwerveMpcNode::runQpShadow(
+    const ControlCycleSnapshot &snapshot,
+    ControlCycleTelemetrySample &telemetry) {
   LtvQpSolveResult result;
   LtvQpPrimalCandidate candidate;
   LtvQpCandidateAudit audit;
   const bool backend_available = qp_solver_ && qp_solver_->initialized();
+  const auto problem_build_start = std::chrono::steady_clock::now();
   const bool problem_built = backend_available && LtvQpBuilder::build(
       snapshot.current_state, snapshot.ilqr_result.states,
       snapshot.ilqr_result.controls, snapshot.references,
       snapshot.last_control_before_solve, controller_->config(),
       qp_problem_buffer_);
+  if (problem_built) {
+    recordQpProblemMetrics(qp_problem_buffer_, telemetry);
+  }
+  recordTiming(telemetry, ControlCycleTimingStage::kQpProblemBuild,
+               elapsedMilliseconds(problem_build_start,
+                                   std::chrono::steady_clock::now()));
   if (!backend_available) {
     result.status = LtvQpSolverStatus::kBackendUnavailable;
   } else if (!problem_built) {
@@ -851,6 +961,12 @@ void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
     result = qp_solver_->solveLtvProblem(
         problem, qp_solver_settings_,
         qp_warm_start_valid_ ? &qp_warm_start_ : nullptr);
+  }
+  if (problem_built) {
+    recordTiming(telemetry, ControlCycleTimingStage::kOsqpNumericUpdate,
+                 result.wall_update_time_ms);
+    recordTiming(telemetry, ControlCycleTimingStage::kOsqpSolve,
+                 result.wall_solve_time_ms);
   }
   const LtvQpProblem &problem = qp_problem_buffer_;
   if (result.status == LtvQpSolverStatus::kSolved &&
@@ -879,64 +995,41 @@ void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
   safety.gimbal_valid = snapshot.gimbal_valid;
   safety.map_fresh = snapshot.map_fresh;
   if (result.status == LtvQpSolverStatus::kSolved && problem_built) {
+    const auto reconstruction_start = std::chrono::steady_clock::now();
     candidate = LtvQpCandidateReconstructor::reconstruct(
         snapshot.current_state, problem, snapshot.ilqr_result.controls,
         controller_->config(), result);
+    recordTiming(telemetry,
+                 ControlCycleTimingStage::kPrimalReconstructionRollout,
+                 elapsedMilliseconds(reconstruction_start,
+                                     std::chrono::steady_clock::now()));
+    const auto audit_start = std::chrono::steady_clock::now();
     audit = LtvQpCandidateValidator::validate(
         problem, snapshot.ilqr_result.controls,
         snapshot.last_control_before_solve, controller_->config(),
         ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result, candidate);
+    recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
+                 elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
   } else {
+    const auto audit_start = std::chrono::steady_clock::now();
     audit = LtvQpCandidateValidator::validate(
         problem, snapshot.ilqr_result.controls,
         snapshot.last_control_before_solve, controller_->config(),
         ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result);
+    recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
+                 elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
   }
-  recordQpShadowTelemetry(snapshot, result, audit,
-                          candidate.valid ? &candidate : nullptr);
-  const bool same_snapshot_identity = snapshot.identity_digest_valid &&
-      snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
-  RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "QP shadow backend=%s cycle=%llu status=%s iter=%d solve=%.3fms update=%.3fms "
-      "prim=%.3g dual=%.3g slack=%.3g hard=%.3g feasible=%s reject=%s "
-      "warm=%s same_snapshot=%s snapshot_digest=%016llx "
-      "collision_gate=hard_reject map_gate=hard_reject",
-      backend_available ? qp_solver_->backendName() : "unavailable",
-      static_cast<unsigned long long>(snapshot.cycle_sequence),
-      ltvQpSolverStatusName(result.status),
-      result.iterations, result.solve_time_ms, result.update_time_ms,
-      result.primal_residual, result.dual_residual, result.slack_maximum,
-      std::max(result.hard_constraint_maximum_violation,
-               audit.actual_hard_constraint_maximum_violation),
-      audit.feasible ? "true" : "false",
-      audit.rejection_reason.empty() ? "none" : audit.rejection_reason.c_str(),
-      result.warm_start_used ? "true" : "false",
-      same_snapshot_identity ? "true" : "false",
-      static_cast<unsigned long long>(snapshot.identity_digest));
-}
 
-/**
- * @brief 将一次 shadow 尝试写入固定容量诊断环。
- * @details 记录 status/residual/计时、QP-iLQR 首控差、hard margin 与安全门；每 16 个周期
- *          基于现有槽位计算 p50/p95/p99，避免保存整条路径或无限增长历史。
- */
-void AtsSwerveMpcNode::recordQpShadowTelemetry(
-    const ControlCycleSnapshot &snapshot, const LtvQpSolveResult &result,
-    const LtvQpCandidateAudit &audit,
-    const LtvQpPrimalCandidate *candidate) {
-  QpShadowTelemetry telemetry;
-  telemetry.cycle_sequence = snapshot.cycle_sequence;
-  telemetry.snapshot_identity_digest = snapshot.identity_digest;
+  telemetry.qp_shadow_attempted = true;
   telemetry.same_snapshot_identity = snapshot.identity_digest_valid &&
       snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
   telemetry.status = result.status;
   telemetry.iterations = result.iterations;
   telemetry.warm_start_used = result.warm_start_used;
-  telemetry.solve_time_ms = result.solve_time_ms;
-  telemetry.update_time_ms = result.update_time_ms;
-  telemetry.callback_elapsed_ms = 1000.0 * std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - snapshot.steady_start).count();
+  telemetry.osqp_reported_update_ms = result.update_time_ms;
+  telemetry.osqp_reported_solve_ms = result.solve_time_ms;
+  telemetry.osqp_wall_update_ms = result.wall_update_time_ms;
+  telemetry.osqp_wall_solve_ms = result.wall_solve_time_ms;
   telemetry.primal_residual = result.primal_residual;
   telemetry.dual_residual = result.dual_residual;
   telemetry.hard_constraint_margin =
@@ -945,82 +1038,164 @@ void AtsSwerveMpcNode::recordQpShadowTelemetry(
                audit.actual_hard_constraint_maximum_violation);
   telemetry.slack_maximum = std::max(result.slack_maximum,
                                      audit.actual_slack_maximum);
-  if (!snapshot.ilqr_result.controls.empty()) {
-    const Control &ilqr = snapshot.ilqr_result.controls.front();
-    for (int axis = 0; axis < 3; ++axis) {
-      telemetry.ilqr_first_control[static_cast<std::size_t>(axis)] = ilqr(axis);
-    }
-  }
-  if (candidate != nullptr && !candidate->controls.empty()) {
-    const Control &qp = candidate->controls.front();
-    for (int axis = 0; axis < 3; ++axis) {
-      telemetry.qp_first_control[static_cast<std::size_t>(axis)] = qp(axis);
-      telemetry.first_control_delta[static_cast<std::size_t>(axis)] =
-          qp(axis) - telemetry.ilqr_first_control[static_cast<std::size_t>(axis)];
-    }
-  }
   telemetry.candidate_feasible = audit.feasible;
   const char *reason = audit.rejection_reason.empty() ? "none" :
                        audit.rejection_reason.c_str();
   std::snprintf(telemetry.rejection_reason.data(),
                 telemetry.rejection_reason.size(), "%s", reason);
-  telemetry.deadline_miss_count =
-      (result.status == LtvQpSolverStatus::kTimeLimit ||
-       result.solve_time_ms > qp_solver_settings_.time_limit_ms ||
-       telemetry.callback_elapsed_ms >
-           1000.0 / std::max(1.0, control_rate_hz_)) ? 1u : 0u;
-  telemetry.collision_gate = false;
-  telemetry.map_gate = snapshot.map_fresh;
-  telemetry.fallback_count = 0;
-  if (telemetry.deadline_miss_count > 0) {
-    ++qp_shadow_deadline_miss_count_;
-  }
-  if (!telemetry.candidate_feasible) {
-    ++qp_shadow_candidate_reject_count_;
-  }
-  telemetry.deadline_miss_count = qp_shadow_deadline_miss_count_;
-  telemetry.candidate_reject_count = qp_shadow_candidate_reject_count_;
-
-  qp_shadow_telemetry_[qp_shadow_telemetry_cursor_] = telemetry;
-  qp_shadow_telemetry_cursor_ =
-      (qp_shadow_telemetry_cursor_ + 1) % kQpShadowTelemetryCapacity;
-  qp_shadow_telemetry_count_ = std::min(
-      kQpShadowTelemetryCapacity, qp_shadow_telemetry_count_ + 1);
-
-  if (snapshot.cycle_sequence % 16 == 0) {
-    std::array<double, kQpShadowTelemetryCapacity> solve_samples{};
-    std::array<double, kQpShadowTelemetryCapacity> callback_samples{};
-    for (std::size_t index = 0; index < qp_shadow_telemetry_count_; ++index) {
-      solve_samples[index] = qp_shadow_telemetry_[index].solve_time_ms;
-      callback_samples[index] = qp_shadow_telemetry_[index].callback_elapsed_ms;
+  telemetry.collision_gate = safety.collision_free;
+  telemetry.map_gate = safety.map_fresh;
+  if (candidate.valid && !candidate.controls.empty()) {
+    const Control &qp = candidate.controls.front();
+    for (int axis = 0; axis < 3; ++axis) {
+      const std::size_t index = static_cast<std::size_t>(axis);
+      telemetry.qp_first_control[index] = qp(axis);
+      telemetry.first_control_delta[index] = qp(axis) - telemetry.ilqr_first_control[index];
     }
+  }
+}
+
+/**
+ * @brief 完成本控制周期的性能记录并按明确预算累积根因计数。
+ * @details OSQP update/solve 各自以 `qp_time_limit_ms` 复核；iLQR、LTV 构造、candidate
+ *          audit、telemetry、日志与完整 callback 都以运行时 `control_period_ms` 复核。
+ *          同一个周期可有多个根因，因此总数只能作为 root-cause events，绝不能替代分布。
+ */
+void AtsSwerveMpcNode::finalizeControlTelemetry(
+    ControlCycleTelemetrySample telemetry,
+    std::chrono::steady_clock::time_point cycle_start) {
+  const double control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
+
+  ControlCycleTimingDistribution callback_distribution;
+  ControlCycleTimingDistribution qp_solve_distribution;
+  const auto aggregation_start = std::chrono::steady_clock::now();
+  if (telemetry.cycle_sequence % kTelemetrySummaryInterval == 0) {
+    std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
+    callback_distribution = control_telemetry_.distribution(
+        ControlCycleTimingStage::kFullCallback);
+    qp_solve_distribution = control_telemetry_.distribution(
+        ControlCycleTimingStage::kOsqpSolve);
+  }
+  recordTiming(telemetry, ControlCycleTimingStage::kPercentileAggregation,
+               elapsedMilliseconds(aggregation_start, std::chrono::steady_clock::now()));
+
+  const auto telemetry_log_start = std::chrono::steady_clock::now();
+  if (telemetry.cycle_sequence % kTelemetrySummaryInterval == 0) {
     RCLCPP_INFO(
         get_logger(),
-        "QP shadow telemetry cycle=%llu same_snapshot=%s snapshot_digest=%016llx "
-        "status=%s iter=%d "
-        "warm=%s solve=%.3fms update=%.3fms callback=%.3fms "
-        "solve_p50/p95/p99=%.3f/%.3f/%.3f callback_p50/p95/p99=%.3f/%.3f/%.3f "
-        "hard_margin=%.3g slack=%.3g delta=(%.4f,%.4f,%.4f) "
-        "feasible=%s reject_count=%llu deadline_miss=%llu fallback=0",
-        static_cast<unsigned long long>(snapshot.cycle_sequence),
+        "控制周期 telemetry cycle=%llu mode=%s rate=%.1fHz period=%.3fms "
+        "qp_status=%s iter=%d qp_wall(update/solve)=%.3f/%.3fms "
+        "callback_p50/p95/p99=%.3f/%.3f/%.3fms qp_solve_p50/p95/p99=%.3f/%.3f/%.3fms "
+        "same_snapshot=%s feasible=%s reject=%s",
+        static_cast<unsigned long long>(telemetry.cycle_sequence), solver_mode_.c_str(),
+        control_rate_hz_, control_period_ms, ltvQpSolverStatusName(telemetry.status),
+        telemetry.iterations, telemetry.osqp_wall_update_ms, telemetry.osqp_wall_solve_ms,
+        callback_distribution.p50_ms, callback_distribution.p95_ms,
+        callback_distribution.p99_ms, qp_solve_distribution.p50_ms,
+        qp_solve_distribution.p95_ms, qp_solve_distribution.p99_ms,
         telemetry.same_snapshot_identity ? "true" : "false",
-        static_cast<unsigned long long>(telemetry.snapshot_identity_digest),
-        ltvQpSolverStatusName(telemetry.status), telemetry.iterations,
-        telemetry.warm_start_used ? "true" : "false", telemetry.solve_time_ms,
-        telemetry.update_time_ms, telemetry.callback_elapsed_ms,
-        percentile(solve_samples, qp_shadow_telemetry_count_, 0.50),
-        percentile(solve_samples, qp_shadow_telemetry_count_, 0.95),
-        percentile(solve_samples, qp_shadow_telemetry_count_, 0.99),
-        percentile(callback_samples, qp_shadow_telemetry_count_, 0.50),
-        percentile(callback_samples, qp_shadow_telemetry_count_, 0.95),
-        percentile(callback_samples, qp_shadow_telemetry_count_, 0.99),
-        telemetry.hard_constraint_margin, telemetry.slack_maximum,
-        telemetry.first_control_delta[0], telemetry.first_control_delta[1],
-        telemetry.first_control_delta[2],
         telemetry.candidate_feasible ? "true" : "false",
-        static_cast<unsigned long long>(telemetry.candidate_reject_count),
-        static_cast<unsigned long long>(telemetry.deadline_miss_count));
+        telemetry.rejection_reason.data());
   }
+  const std::size_t logging_index = controlCycleTimingStageIndex(
+      ControlCycleTimingStage::kLoggingPublish);
+  const double telemetry_log_ms = elapsedMilliseconds(
+      telemetry_log_start, std::chrono::steady_clock::now());
+  telemetry.stage_ms[logging_index] += telemetry_log_ms;
+  telemetry.stage_recorded[logging_index] = std::isfinite(telemetry.stage_ms[logging_index]) &&
+      telemetry.stage_ms[logging_index] >= 0.0;
+  recordTiming(telemetry, ControlCycleTimingStage::kFullCallback,
+               elapsedMilliseconds(cycle_start, std::chrono::steady_clock::now()));
+
+  const auto exceeded = [&telemetry](ControlCycleTimingStage stage,
+                                     double budget_ms) {
+    const std::size_t index = controlCycleTimingStageIndex(stage);
+    return telemetry.stage_recorded[index] &&
+           telemetry.stage_ms[index] > budget_ms;
+  };
+  const double candidate_audit_ms =
+      telemetry.stage_ms[controlCycleTimingStageIndex(
+          ControlCycleTimingStage::kPrimalReconstructionRollout)] +
+      telemetry.stage_ms[controlCycleTimingStageIndex(
+          ControlCycleTimingStage::kCandidateHardCheck)];
+  const bool candidate_audit_overrun =
+      (telemetry.stage_recorded[controlCycleTimingStageIndex(
+           ControlCycleTimingStage::kPrimalReconstructionRollout)] ||
+       telemetry.stage_recorded[controlCycleTimingStageIndex(
+           ControlCycleTimingStage::kCandidateHardCheck)]) &&
+      candidate_audit_ms > control_period_ms;
+
+  std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
+  if (telemetry.qp_shadow_attempted &&
+      telemetry.status == LtvQpSolverStatus::kTimeLimit) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kOsqpTimeLimitStatus);
+  }
+  if (telemetry.qp_shadow_attempted && exceeded(
+          ControlCycleTimingStage::kOsqpSolve, qp_solver_settings_.time_limit_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kOsqpSolveBudgetOverrun);
+  }
+  if (exceeded(ControlCycleTimingStage::kFullCallback, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kCallbackPeriodOverrun);
+  }
+  if (exceeded(ControlCycleTimingStage::kIlqrSolve, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kIlqrSolveBudgetOverrun);
+  }
+  if (telemetry.qp_shadow_attempted && exceeded(
+          ControlCycleTimingStage::kQpProblemBuild, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kQpProblemBuildBudgetOverrun);
+  }
+  if (telemetry.qp_shadow_attempted && exceeded(
+          ControlCycleTimingStage::kOsqpNumericUpdate, qp_solver_settings_.time_limit_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kQpUpdateBudgetOverrun);
+  }
+  if (telemetry.qp_shadow_attempted && candidate_audit_overrun) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kQpCandidateAuditBudgetOverrun);
+  }
+  if (exceeded(ControlCycleTimingStage::kPercentileAggregation, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kTelemetryAggregationBudgetOverrun);
+  }
+  if (exceeded(ControlCycleTimingStage::kLoggingPublish, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kLoggingPublishBudgetOverrun);
+  }
+  if (exceeded(ControlCycleTimingStage::kTimerInterarrival, control_period_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kTimerInterarrivalOverrun);
+  }
+  control_telemetry_.push(telemetry, cycle_start);
+}
+
+/**
+ * @brief 复制当前固定遥测窗口，序列化为供回归脚本保存的只读 JSON。
+ * @details service 在 ROS executor 中运行；控制 timer 只在短临界区写固定数组。服务不访问
+ *          tracker、求解器、command publisher 或 safety gate，因此不能改变任何控制行为。
+ */
+void AtsSwerveMpcNode::dumpControlTelemetry(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+  (void)request;
+  ControlCycleTelemetryRing snapshot;
+  {
+    std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
+    snapshot = control_telemetry_;
+  }
+  ControlCycleTelemetryMetadata metadata;
+  metadata.solver_mode = solver_mode_;
+  metadata.control_rate_hz = control_rate_hz_;
+  metadata.control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
+  metadata.qp_time_limit_ms = qp_solver_settings_.time_limit_ms;
+  metadata.ros_domain_id = currentRosDomainId();
+  metadata.use_sim_time = get_parameter_or<bool>("use_sim_time", false);
+  response->success = true;
+  response->message = snapshot.toJson(metadata);
 }
 
 /**
