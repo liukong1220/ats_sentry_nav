@@ -15,12 +15,12 @@
 namespace ats_swerve_mpc {
 
 /**
- * @brief Solver-independent LTV-MPC quadratic program description.
+ * @brief 与后端无关的 LTV-MPC 二次规划数值描述。
  *
- * Decision ordering is [delta_x_0 ... delta_x_N, delta_u_0 ... delta_u_N-1].
- * This type deliberately contains no solver status or ROS state.  A later
- * OSQP/HPIPM/qpOASES adapter must validate the hard constraints before its
- * result can reach the existing fail-stop control node.
+ * @details 决策顺序固定为 `[delta_x_0 ... delta_x_N, delta_u_0 ... delta_u_N-1]`。
+ *          本类型只表达由同周期 iLQR 名义轨迹线性化得到的矩阵和值，不携带 ROS
+ *          状态、求解状态或发布权。任何 OSQP/HPIPM/qpOASES 适配器都必须在其
+ *          结果到达既有 fail-stop 节点之前通过独立硬约束复核。
  */
 struct LtvQpProblem {
   bool valid = false;

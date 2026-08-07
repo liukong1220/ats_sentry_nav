@@ -17,6 +17,7 @@
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
+#include "ats_swerve_mpc/qp/control_cycle_snapshot.hpp"
 #include "ats_swerve_mpc/qp/ltv_qp_osqp_solver.hpp"
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
@@ -26,9 +27,14 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
 
-/*节点通过 ROS 2 话题接收 里程计 和 参考轨迹，利用 MPC 求解最优速度指令（vx, vy,
-ω）
-并发布到控制话题。系统包含了轨迹时间有效性、目标收敛检测、紧急停止信号处理、诊断信息发布等*/
+/**
+ * @brief ATS 四驱四转舵轮的 ROS 2 控制链唯一速度发布节点。
+ * @details 节点接收世界系里程计、时间化 reference、ExecutionCommand、急停、定位与
+ *          云台健康输入，在严格的 frame、freshness、lease 与急停门之后调用 iLQR，
+ *          并通过唯一的 `/cmd_vel_mpc` publisher 输出车体系 `[vx,vy,wz]`。当
+ *          `solver_mode=qp_shadow` 时，QP 只读取 iLQR 求解前冻结的快照记录诊断，
+ *          不得改变 tracker、warm start、急停语义或任何 topic ownership。
+ */
 namespace ats_swerve_mpc {
 
 class AtsSwerveMpcNode : public rclcpp::Node {
@@ -63,46 +69,14 @@ private:
   /** @brief 在 trajectory mutex 内校验 gimbal 回执的新鲜性和请求/反馈序列一致性。 */
   bool gimbalExecutionValidLocked(
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
-  /// 发布确定性零速度并复位控制器内部状态（所有失败/退出路径共用）。
+  /** @brief 发布确定性零速度并复位控制器内部状态，供所有失败/退出路径共用。 */
   void publishZeroCommandForFailure(const char * reason_zh);
-  /// 校验里程计时效性与位姿跳变，返回 true 表示状态可用于本周期求解。
+  /** @brief 校验里程计时效性与位姿跳变；仅返回 true 时状态才可进入本周期求解。 */
   bool odometryUsable(State & current);
-  /// 检查动力学参数是否落在实车合理区间，越界时输出中文 ERROR/WARN。
+  /** @brief 检查动力学参数是否落在实车合理区间，并对越界项输出中文 ERROR/WARN。 */
   void validateDynamicsParameters(const Se2MpcConfig & config);
-  /// 输出控制饱和与求解耗时的分级中文日志。
+  /** @brief 输出车体/轮级饱和与 iLQR 求解耗时的分级中文诊断日志。 */
   void reportSolverDiagnostics(const Se2MpcResult & result);
-  /**
-   * @brief 单控制周期的只读输入/身份快照。
-   * @details iLQR 先以该快照的 current/reference/last_control 求解，qp_shadow
-   *          随后只读取同一份副本；它不携带可发布的 QP Twist。
-   */
-  struct ControlCycleSnapshot {
-    std::uint64_t cycle_sequence = 0;
-    std::chrono::steady_clock::time_point steady_start{};
-    State current_state = State::Zero();
-    std::vector<Se2Reference> references;
-    Control last_control_before_solve = Control::Zero();
-    Se2MpcResult ilqr_result;
-
-    std::uint64_t manager_incarnation = 0;
-    std::uint64_t command_sequence = 0;
-    std::uint64_t goal_id = 0;
-    std::uint64_t localization_epoch = 0;
-    std::uint64_t map_generation = 0;
-    std::uint64_t map_publication_sequence = 0;
-    std::string reference_frame;
-    std::int64_t reference_stamp_ns = 0;
-    std::int64_t reference_deadline_ns = 0;
-    bool reference_fresh = false;
-    bool emergency_stop_active = true;
-    bool localization_fresh = false;
-    bool gimbal_valid = false;
-    bool execution_lease_valid = false;
-    // Twist-only 节点尚无独立 map/footprint 健康 producer；接入真实 snapshot 前必须
-    // 保持 false，令 qp_shadow candidate 以 fail-closed 方式拒绝。
-    bool map_fresh = false;
-  };
-
   /**
    * @brief 有界 shadow 诊断槽位。
    * @details 固定容量避免 timer 中累积路径、控制序列或无界日志；fallback 始终为 0，
@@ -110,6 +84,8 @@ private:
    */
   struct QpShadowTelemetry {
     std::uint64_t cycle_sequence = 0;
+    // 固定字节序输入摘要；日志仅暴露该短标识，不输出完整 reference 路径。
+    std::uint64_t snapshot_identity_digest = 0;
     bool same_snapshot_identity = false;
     LtvQpSolverStatus status = LtvQpSolverStatus::kBackendUnavailable;
     int iterations = 0;

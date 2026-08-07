@@ -502,9 +502,8 @@ void AtsSwerveMpcNode::onExecutionCommand(
       return;
     }
     if (message->manager_incarnation > last_execution_command_incarnation_) {
-      // A restarted Goal Manager may reset its per-process sequence. Its first
-      // command must be STOP, so a delayed EXECUTE cannot replace the prior
-      // process's reference.
+      // Goal Manager 重启后其进程内 sequence 可以从头计数。新 incarnation 的首条
+      // 消息必须是 STOP，避免旧进程迟到的 EXECUTE 替换已受保护的 reference。
       if (!stop) {
         stop = true;
         active_execution_command_.reset();
@@ -571,7 +570,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
 void AtsSwerveMpcNode::onEmergencyStop(
     const std_msgs::msg::Bool::SharedPtr message) {
   if (execution_command_enabled_) {
-    // A legacy false cannot release the structured execution stop state.
+    // legacy false 不能解除结构化 ExecutionCommand 建立的停止状态。
     if (message->data) {
       engageFailStop();
     }
@@ -759,7 +758,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   snapshot.emergency_stop_active = fail_stop_engaged_.load() ||
       (emergency_stop_watchdog_enabled_ &&
        emergency_stop_watchdog_.stopRequired());
-  // There is no independent map/footprint health producer in this node.
+  // 节点尚无独立 map/footprint 健康生产者；在真实 snapshot 接入前必须 fail-closed。
   snapshot.map_fresh = false;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
@@ -780,6 +779,12 @@ void AtsSwerveMpcNode::onControlTimer() {
       }
     }
   }
+  // 在 iLQR 求解前冻结 canonical digest。随后 shadow 重新计算该摘要，若任何输入在
+  // 两者之间被改写，就不能宣称它们使用同一控制周期输入。
+  snapshot.identity_digest_valid =
+      controlCycleSnapshotIdentityInputsFinite(snapshot);
+  snapshot.identity_digest = snapshot.identity_digest_valid ?
+      controlCycleSnapshotIdentityDigest(snapshot) : 0;
   const Se2MpcResult result =
       controller_->solve(snapshot.current_state, snapshot.references,
                          snapshot.last_control_before_solve);
@@ -889,11 +894,14 @@ void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
   }
   recordQpShadowTelemetry(snapshot, result, audit,
                           candidate.valid ? &candidate : nullptr);
+  const bool same_snapshot_identity = snapshot.identity_digest_valid &&
+      snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
   RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "QP shadow backend=%s cycle=%llu status=%s iter=%d solve=%.3fms update=%.3fms "
       "prim=%.3g dual=%.3g slack=%.3g hard=%.3g feasible=%s reject=%s "
-      "warm=%s same_snapshot=true collision_gate=hard_reject map_gate=hard_reject",
+      "warm=%s same_snapshot=%s snapshot_digest=%016llx "
+      "collision_gate=hard_reject map_gate=hard_reject",
       backend_available ? qp_solver_->backendName() : "unavailable",
       static_cast<unsigned long long>(snapshot.cycle_sequence),
       ltvQpSolverStatusName(result.status),
@@ -903,7 +911,9 @@ void AtsSwerveMpcNode::runQpShadow(const ControlCycleSnapshot &snapshot) {
                audit.actual_hard_constraint_maximum_violation),
       audit.feasible ? "true" : "false",
       audit.rejection_reason.empty() ? "none" : audit.rejection_reason.c_str(),
-      result.warm_start_used ? "true" : "false");
+      result.warm_start_used ? "true" : "false",
+      same_snapshot_identity ? "true" : "false",
+      static_cast<unsigned long long>(snapshot.identity_digest));
 }
 
 /**
@@ -917,13 +927,9 @@ void AtsSwerveMpcNode::recordQpShadowTelemetry(
     const LtvQpPrimalCandidate *candidate) {
   QpShadowTelemetry telemetry;
   telemetry.cycle_sequence = snapshot.cycle_sequence;
-  telemetry.same_snapshot_identity = snapshot.current_state.allFinite() &&
-      snapshot.references.size() ==
-          static_cast<std::size_t>(controller_->config().horizon + 1) &&
-      snapshot.ilqr_result.controls.size() ==
-          static_cast<std::size_t>(controller_->config().horizon) &&
-      snapshot.ilqr_result.states.size() ==
-          static_cast<std::size_t>(controller_->config().horizon + 1);
+  telemetry.snapshot_identity_digest = snapshot.identity_digest;
+  telemetry.same_snapshot_identity = snapshot.identity_digest_valid &&
+      snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
   telemetry.status = result.status;
   telemetry.iterations = result.iterations;
   telemetry.warm_start_used = result.warm_start_used;
@@ -990,13 +996,15 @@ void AtsSwerveMpcNode::recordQpShadowTelemetry(
     }
     RCLCPP_INFO(
         get_logger(),
-        "QP shadow telemetry cycle=%llu same_snapshot=%s status=%s iter=%d "
+        "QP shadow telemetry cycle=%llu same_snapshot=%s snapshot_digest=%016llx "
+        "status=%s iter=%d "
         "warm=%s solve=%.3fms update=%.3fms callback=%.3fms "
         "solve_p50/p95/p99=%.3f/%.3f/%.3f callback_p50/p95/p99=%.3f/%.3f/%.3f "
         "hard_margin=%.3g slack=%.3g delta=(%.4f,%.4f,%.4f) "
         "feasible=%s reject_count=%llu deadline_miss=%llu fallback=0",
         static_cast<unsigned long long>(snapshot.cycle_sequence),
         telemetry.same_snapshot_identity ? "true" : "false",
+        static_cast<unsigned long long>(telemetry.snapshot_identity_digest),
         ltvQpSolverStatusName(telemetry.status), telemetry.iterations,
         telemetry.warm_start_used ? "true" : "false", telemetry.solve_time_ms,
         telemetry.update_time_ms, telemetry.callback_elapsed_ms,
