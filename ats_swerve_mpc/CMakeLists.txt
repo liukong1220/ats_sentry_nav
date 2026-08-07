@@ -25,6 +25,7 @@ find_package(ats_navigation_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -32,6 +33,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 add_library(${PROJECT_NAME}_lib
   src/ats_swerve_mpc_node.cpp
   src/control_cycle_snapshot.cpp
+  src/control_cycle_telemetry.cpp
   src/se2_model.cpp
   src/se2_mpc_controller.cpp
   src/ltv_qp_problem.cpp
@@ -48,7 +50,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(${PROJECT_NAME}_lib PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 ament_target_dependencies(${PROJECT_NAME}_lib
-  ats_navigation_interfaces geometry_msgs nav_msgs rclcpp std_msgs tf2 tf2_geometry_msgs
+  ats_navigation_interfaces geometry_msgs nav_msgs rclcpp std_srvs std_msgs tf2 tf2_geometry_msgs
 )
 
 add_executable(${PROJECT_NAME}_node src/main.cpp)
@@ -88,8 +90,14 @@ if(BUILD_TESTING)
   ament_add_gtest(test_ltv_qp_osqp_solver test/test_ltv_qp_osqp_solver.cpp)
   target_link_libraries(test_ltv_qp_osqp_solver ${PROJECT_NAME}_lib)
 
+  ament_add_gtest(test_ltv_qp_convergence_fixture test/test_ltv_qp_convergence_fixture.cpp)
+  target_link_libraries(test_ltv_qp_convergence_fixture ${PROJECT_NAME}_lib)
+
   ament_add_gtest(test_control_cycle_snapshot test/test_control_cycle_snapshot.cpp)
   target_link_libraries(test_control_cycle_snapshot ${PROJECT_NAME}_lib)
+
+  ament_add_gtest(test_control_cycle_telemetry test/test_control_cycle_telemetry.cpp)
+  target_link_libraries(test_control_cycle_telemetry ${PROJECT_NAME}_lib)
 
   ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
   target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)

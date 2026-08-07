@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <memory>
 #include <thread>
 
@@ -18,6 +19,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 namespace
 {
@@ -88,6 +90,8 @@ protected:
           std::hypot(message->linear.x, message->linear.y) +
           std::abs(message->angular.z));
       });
+    telemetry_client_ = driver_->create_client<std_srvs::srv::Trigger>(
+      "/ats_swerve_mpc/dump_control_telemetry");
     executor_.add_node(mpc_);
     executor_.add_node(driver_);
     ASSERT_TRUE(
@@ -98,7 +102,8 @@ protected:
           execution_pub_->get_subscription_count() == 1 &&
           stop_pub_->get_subscription_count() == 1 &&
           status_pub_->get_subscription_count() == 1 &&
-          gimbal_status_pub_->get_subscription_count() == 1;
+          gimbal_status_pub_->get_subscription_count() == 1 &&
+          telemetry_client_->service_is_ready();
         },
         2s));
     // Production Goal Manager publishes a transient-local STOP at process
@@ -111,6 +116,7 @@ protected:
     executor_.remove_node(driver_);
     executor_.remove_node(mpc_);
     command_sub_.reset();
+    telemetry_client_.reset();
     status_pub_.reset();
     gimbal_status_pub_.reset();
     stop_pub_.reset();
@@ -270,6 +276,7 @@ protected:
   rclcpp::Publisher<LocalizationStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<GimbalYawStatus>::SharedPtr gimbal_status_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr telemetry_client_;
   std::atomic<double> command_norm_{0.0};
   std::uint64_t execution_sequence_{0};
   std::uint64_t manager_incarnation_{1};
@@ -343,6 +350,33 @@ TEST_F(MpcLocalizationGateTest, QpShadowRetainsTheSingleIlqrCommandPublisher) {
         return command_norm_.load() > 0.02;
       },
       2s));
+  EXPECT_EQ(command_sub_->get_publisher_count(), 1u);
+}
+
+TEST_F(MpcLocalizationGateTest, QpShadowTelemetryDumpIsReadOnlyAndDoesNotAddPublisher) {
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+  ASSERT_TRUE(spinUntil(
+    [this]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      publishExecution(1);
+      return command_norm_.load() > 0.02;
+    },
+    2s));
+
+  const auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  auto result = telemetry_client_->async_send_request(request);
+  ASSERT_TRUE(spinUntil(
+    [&result]() {
+      return result.wait_for(0s) == std::future_status::ready;
+    },
+    1s));
+  const auto response = result.get();
+  ASSERT_TRUE(response->success);
+  EXPECT_NE(response->message.find("\"schema_version\":2"), std::string::npos);
+  EXPECT_NE(response->message.find("\"solver_mode\":\"qp_shadow\""),
+            std::string::npos);
   EXPECT_EQ(command_sub_->get_publisher_count(), 1u);
 }
 
