@@ -87,6 +87,28 @@ void recordQpProblemMetrics(const LtvQpProblem &problem,
   };
   update_row_range(problem.equality_matrix);
   update_row_range(problem.inequality_matrix);
+  telemetry.nonzero_bound_abs_minimum = std::numeric_limits<double>::infinity();
+  telemetry.bound_abs_maximum = 0.0;
+  const auto update_bound_range = [&telemetry](const Eigen::VectorXd &bounds) {
+    for (int index = 0; index < bounds.size(); ++index) {
+      const double magnitude = std::abs(bounds(index));
+      if (!std::isfinite(magnitude)) {
+        continue;
+      }
+      telemetry.bound_abs_maximum = std::max(telemetry.bound_abs_maximum, magnitude);
+      // 忽略 nominal +/- limit 相减留下的机器精度残差，只统计可解释的约束尺度。
+      if (magnitude > 1e-12) {
+        telemetry.nonzero_bound_abs_minimum =
+            std::min(telemetry.nonzero_bound_abs_minimum, magnitude);
+      }
+    }
+  };
+  update_bound_range(problem.equality_lower);
+  update_bound_range(problem.equality_upper);
+  update_bound_range(problem.inequality_lower);
+  update_bound_range(problem.inequality_upper);
+  update_bound_range(problem.lower_bound);
+  update_bound_range(problem.upper_bound);
   telemetry.zero_delta_dynamic_equality_residual = problem.equality_lower.tail(
       problem.equality_lower.size() - 3).cwiseAbs().maxCoeff();
   telemetry.qp_problem_metrics_recorded =
@@ -94,6 +116,8 @@ void recordQpProblemMetrics(const LtvQpProblem &problem,
       std::isfinite(telemetry.hessian_diagonal_maximum) &&
       std::isfinite(telemetry.constraint_row_l2_minimum) &&
       std::isfinite(telemetry.constraint_row_l2_maximum) &&
+      std::isfinite(telemetry.nonzero_bound_abs_minimum) &&
+      std::isfinite(telemetry.bound_abs_maximum) &&
       std::isfinite(telemetry.zero_delta_dynamic_equality_residual);
 }
 
@@ -182,6 +206,16 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       "qp_max_tracking_slack", 0.0);
   qp_solver_settings_.max_hard_constraint_violation = declare_parameter<double>(
       "qp_max_hard_constraint_violation", 1e-7);
+  const int requested_sampling_cycles = declare_parameter<int>(
+      "telemetry_sampling_window_cycles", 0);
+  if (requested_sampling_cycles < 0 ||
+      requested_sampling_cycles > static_cast<int>(ControlCycleTelemetryRing::kCapacity)) {
+    throw std::invalid_argument(
+        "telemetry_sampling_window_cycles must be in [0, 128]");
+  }
+  telemetry_sampling_window_cycles_ =
+      static_cast<std::size_t>(requested_sampling_cycles);
+  control_telemetry_.configureSamplingWindow(telemetry_sampling_window_cycles_);
   const Se2MpcConfig mpc_config = loadConfig();
   validateDynamicsParameters(mpc_config);
   controller_ = std::make_unique<Se2MpcController>(mpc_config);
@@ -854,12 +888,18 @@ void AtsSwerveMpcNode::onControlTimer() {
   ControlCycleTelemetrySample telemetry;
   telemetry.cycle_sequence = snapshot.cycle_sequence;
   telemetry.snapshot_identity_digest = snapshot.identity_digest;
+  telemetry.manager_incarnation = snapshot.manager_incarnation;
   telemetry.command_sequence = snapshot.command_sequence;
   telemetry.goal_id = snapshot.goal_id;
+  telemetry.localization_epoch = snapshot.localization_epoch;
   telemetry.map_generation = snapshot.map_generation;
+  telemetry.map_publication_sequence = snapshot.map_publication_sequence;
   telemetry.reference_stamp_ns = snapshot.reference_stamp_ns;
+  telemetry.reference_deadline_ns = snapshot.reference_deadline_ns;
   std::snprintf(telemetry.reference_frame.data(), telemetry.reference_frame.size(),
                 "%s", snapshot.reference_frame.c_str());
+  telemetry.execution_lease_valid = snapshot.execution_lease_valid;
+  telemetry.reference_fresh = snapshot.reference_fresh;
   if (previous_cycle_start) {
     recordTiming(telemetry, ControlCycleTimingStage::kTimerInterarrival,
                  elapsedMilliseconds(*previous_cycle_start, cycle_start));
@@ -1126,6 +1166,9 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
       candidate_audit_ms > control_period_ms;
 
   std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
+  if (!control_telemetry_.push(telemetry, cycle_start)) {
+    return;
+  }
   if (telemetry.qp_shadow_attempted &&
       telemetry.status == LtvQpSolverStatus::kTimeLimit) {
     control_telemetry_.incrementDeadlineCause(
@@ -1170,7 +1213,6 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kTimerInterarrivalOverrun);
   }
-  control_telemetry_.push(telemetry, cycle_start);
 }
 
 /**
@@ -1191,7 +1233,13 @@ void AtsSwerveMpcNode::dumpControlTelemetry(
   metadata.solver_mode = solver_mode_;
   metadata.control_rate_hz = control_rate_hz_;
   metadata.control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
+  metadata.qp_max_iterations = qp_solver_settings_.max_iterations;
   metadata.qp_time_limit_ms = qp_solver_settings_.time_limit_ms;
+  metadata.qp_max_primal_residual = qp_solver_settings_.max_primal_residual;
+  metadata.qp_max_dual_residual = qp_solver_settings_.max_dual_residual;
+  metadata.qp_max_tracking_slack = qp_solver_settings_.max_tracking_slack;
+  metadata.qp_max_hard_constraint_violation =
+      qp_solver_settings_.max_hard_constraint_violation;
   metadata.ros_domain_id = currentRosDomainId();
   metadata.use_sim_time = get_parameter_or<bool>("use_sim_time", false);
   response->success = true;

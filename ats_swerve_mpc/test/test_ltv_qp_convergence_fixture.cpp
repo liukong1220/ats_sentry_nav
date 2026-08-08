@@ -107,6 +107,27 @@ TEST(LtvQpConvergenceFixture, PreservesOperationalLimitsAndRejectsNonSolvedWarmS
     row_norm_min = std::min(row_norm_min, norm);
     row_norm_max = std::max(row_norm_max, norm);
   }
+  double nonzero_bound_abs_min = std::numeric_limits<double>::infinity();
+  double bound_abs_max = 0.0;
+  const auto inspect_bounds = [&nonzero_bound_abs_min, &bound_abs_max](
+      const Eigen::VectorXd &bounds) {
+    for (int index = 0; index < bounds.size(); ++index) {
+      const double magnitude = std::abs(bounds(index));
+      if (!std::isfinite(magnitude)) {
+        continue;
+      }
+      bound_abs_max = std::max(bound_abs_max, magnitude);
+      if (magnitude > 1e-12) {
+        nonzero_bound_abs_min = std::min(nonzero_bound_abs_min, magnitude);
+      }
+    }
+  };
+  inspect_bounds(problem.equality_lower);
+  inspect_bounds(problem.equality_upper);
+  inspect_bounds(problem.inequality_lower);
+  inspect_bounds(problem.inequality_upper);
+  inspect_bounds(problem.lower_bound);
+  inspect_bounds(problem.upper_bound);
   const Eigen::VectorXd zero = Eigen::VectorXd::Zero(problem.decisionSize());
   const double dynamic_equality_residual = (
       problem.equality_matrix * zero - problem.equality_lower).lpNorm<Eigen::Infinity>();
@@ -114,8 +135,18 @@ TEST(LtvQpConvergenceFixture, PreservesOperationalLimitsAndRejectsNonSolvedWarmS
   ::testing::Test::RecordProperty("hessian_diagonal_max", number(hessian_max));
   ::testing::Test::RecordProperty("constraint_row_l2_min", number(row_norm_min));
   ::testing::Test::RecordProperty("constraint_row_l2_max", number(row_norm_max));
+  ::testing::Test::RecordProperty("nonzero_bound_abs_min", number(nonzero_bound_abs_min));
+  ::testing::Test::RecordProperty("bound_abs_max", number(bound_abs_max));
   ::testing::Test::RecordProperty("zero_delta_dynamic_equality_residual",
                                   number(dynamic_equality_residual));
+  EXPECT_NEAR(hessian_min, 0.66, 1e-12);
+  EXPECT_NEAR(hessian_max, 56.0, 1e-12);
+  EXPECT_NEAR(row_norm_min, 1.0, 1e-12);
+  EXPECT_GE(row_norm_max, std::sqrt(2.0));
+  EXPECT_LT(row_norm_max, 1.42);
+  EXPECT_NEAR(nonzero_bound_abs_min, 0.1, 1e-12);
+  EXPECT_NEAR(bound_abs_max, 2.15, 1e-12);
+  EXPECT_NEAR(dynamic_equality_residual, 0.0, 1e-12);
 
   LtvQpOsqpSolver solver(sparse.decision_size, sparse.constraint_rows, settings);
   ASSERT_TRUE(solver.initialized());

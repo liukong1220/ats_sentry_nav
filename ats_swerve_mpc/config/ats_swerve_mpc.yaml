@@ -53,6 +53,8 @@ ats_swerve_mpc:
     # 当前决策布局没有 slack 列，非零 slack 一律拒绝。
     qp_max_tracking_slack: 0.0
     qp_max_hard_constraint_violation: 1.0e-7
+    # 0 保持滚动 telemetry；QP 对照采样由 MuJoCo launch 显式覆盖为固定周期数。
+    telemetry_sampling_window_cycles: 0
 
     # 从上次进度向后允许重新投影的时间窗口（s），用于吸收小幅定位抖动。
     projection_backward_window: 0.20

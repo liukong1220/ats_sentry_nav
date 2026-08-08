@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -28,6 +29,22 @@ ControlCycleTelemetrySample sample(std::uint64_t sequence, double callback_ms) {
       ControlCycleTimingStage::kFullCallback);
   value.stage_ms[callback_index] = callback_ms;
   value.stage_recorded[callback_index] = true;
+  return value;
+}
+
+ControlCycleTelemetrySample pairedSample(std::uint64_t sequence) {
+  auto value = sample(sequence, 4.0);
+  value.manager_incarnation = 17;
+  value.command_sequence = 29;
+  value.goal_id = 31;
+  value.localization_epoch = 43;
+  value.map_generation = 47;
+  value.map_publication_sequence = 53;
+  value.reference_stamp_ns = 1'000'000;
+  value.reference_deadline_ns = 2'000'000;
+  std::snprintf(value.reference_frame.data(), value.reference_frame.size(), "%s", "odom");
+  value.execution_lease_valid = true;
+  value.reference_fresh = true;
   return value;
 }
 
@@ -91,15 +108,83 @@ TEST(ControlCycleTelemetryRing, JsonContainsRuntimeMetadataControlsAndWallTimes)
   metadata.solver_mode = "qp_shadow";
   metadata.control_rate_hz = 20.0;
   metadata.control_period_ms = 50.0;
+  metadata.qp_max_iterations = 400;
   metadata.qp_time_limit_ms = 10.0;
+  metadata.qp_max_primal_residual = 1e-4;
+  metadata.qp_max_dual_residual = 1e-4;
+  metadata.qp_max_tracking_slack = 0.0;
+  metadata.qp_max_hard_constraint_violation = 1e-7;
   metadata.ros_domain_id = 231;
   const std::string json = ring.toJson(metadata);
-  EXPECT_NE(json.find("\"schema_version\":2"), std::string::npos);
+  EXPECT_NE(json.find("\"schema_version\":3"), std::string::npos);
   EXPECT_NE(json.find("\"control_period_ms\":50"), std::string::npos);
+  EXPECT_NE(json.find("\"qp_max_iterations\":400"), std::string::npos);
+  EXPECT_NE(json.find("\"qp_max_primal_residual\":0.0001"),
+            std::string::npos);
+  EXPECT_NE(json.find("\"qp_max_dual_residual\":0.0001"),
+            std::string::npos);
+  EXPECT_NE(json.find("\"qp_max_hard_constraint_violation\":9.9999999999999995e-08"),
+            std::string::npos);
   EXPECT_NE(json.find("\"osqp_wall_update_ms\":"), std::string::npos);
   EXPECT_NE(json.find("\"qp_first_control\":["), std::string::npos);
   EXPECT_NE(json.find("\"first_control_delta\":["), std::string::npos);
   EXPECT_NE(json.find("\"timer_interarrival_overrun_count\""),
+            std::string::npos);
+}
+
+TEST(ControlCycleTelemetryRing, FreezesExactIdentityWindowAndRejectsLaterCycles) {
+  ControlCycleTelemetryRing ring;
+  ring.configureSamplingWindow(3);
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_TRUE(ring.push(pairedSample(10), started));
+  EXPECT_TRUE(ring.push(pairedSample(11), started));
+  EXPECT_TRUE(ring.push(pairedSample(12), started));
+  EXPECT_FALSE(ring.push(pairedSample(13), started));
+  EXPECT_EQ(ring.size(), 3u);
+  EXPECT_EQ(ring.sampleAt(0).cycle_sequence, 10u);
+  EXPECT_EQ(ring.sampleAt(2).cycle_sequence, 12u);
+
+  const std::string json = ring.toJson(ControlCycleTelemetryMetadata{});
+  EXPECT_NE(json.find("\"requested_cycle_count\":3"), std::string::npos);
+  EXPECT_NE(json.find("\"collected_cycle_count\":3"), std::string::npos);
+  EXPECT_NE(json.find("\"status\":\"complete\""), std::string::npos);
+  EXPECT_NE(json.find("\"manager_incarnation\":17"), std::string::npos);
+  EXPECT_NE(json.find("\"execution_lease_valid\":true"), std::string::npos);
+}
+
+TEST(ControlCycleTelemetryRing, StopsWindowWhenExecuteReferenceOrMapIdentityChanges) {
+  ControlCycleTelemetryRing ring;
+  ring.configureSamplingWindow(3);
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_TRUE(ring.push(pairedSample(10), started));
+  auto changed = pairedSample(11);
+  changed.map_generation += 1;
+  EXPECT_FALSE(ring.push(changed, started));
+  EXPECT_FALSE(ring.push(pairedSample(12), started));
+  EXPECT_EQ(ring.size(), 1u);
+
+  const std::string json = ring.toJson(ControlCycleTelemetryMetadata{});
+  EXPECT_NE(json.find("\"status\":\"identity_changed_before_complete\""),
+            std::string::npos);
+}
+
+TEST(ControlCycleTelemetryRing, WaitsForMeaningfulLocalizationAndMapIdentity) {
+  ControlCycleTelemetryRing ring;
+  ring.configureSamplingWindow(2);
+  const auto started = std::chrono::steady_clock::now();
+  auto invalid = pairedSample(10);
+  invalid.localization_epoch = 0;
+  EXPECT_FALSE(ring.push(invalid, started));
+  invalid = pairedSample(11);
+  invalid.map_generation = 0;
+  EXPECT_FALSE(ring.push(invalid, started));
+  invalid = pairedSample(12);
+  invalid.map_publication_sequence = 0;
+  EXPECT_FALSE(ring.push(invalid, started));
+  EXPECT_TRUE(ring.push(pairedSample(13), started));
+  EXPECT_EQ(ring.size(), 1u);
+  EXPECT_NE(ring.toJson(ControlCycleTelemetryMetadata{}).find(
+                "\"status\":\"collecting\""),
             std::string::npos);
 }
 
