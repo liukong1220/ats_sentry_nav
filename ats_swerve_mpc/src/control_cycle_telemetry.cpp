@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -96,9 +97,80 @@ void ControlCycleTelemetryRing::saturatingIncrement(std::uint64_t &value) {
   }
 }
 
-void ControlCycleTelemetryRing::push(
+bool ControlCycleTelemetryRing::samplingIdentityEligible(
+    const ControlCycleTelemetrySample &sample) {
+  return sample.execution_lease_valid && sample.reference_fresh &&
+         sample.manager_incarnation != 0 && sample.command_sequence != 0 &&
+         sample.goal_id != 0 && sample.localization_epoch != 0 &&
+         sample.map_generation != 0 && sample.map_publication_sequence != 0 &&
+         sample.reference_stamp_ns > 0 &&
+         sample.reference_deadline_ns > sample.reference_stamp_ns &&
+         sample.reference_frame.front() != '\0';
+}
+
+bool ControlCycleTelemetryRing::sameSamplingIdentity(
+    const ControlCycleTelemetrySample &left,
+    const ControlCycleTelemetrySample &right) {
+  return left.manager_incarnation == right.manager_incarnation &&
+         left.goal_id == right.goal_id &&
+         left.localization_epoch == right.localization_epoch &&
+         left.map_generation == right.map_generation &&
+         left.map_publication_sequence == right.map_publication_sequence &&
+         left.reference_stamp_ns == right.reference_stamp_ns &&
+         left.reference_deadline_ns == right.reference_deadline_ns &&
+         left.execution_lease_valid == right.execution_lease_valid &&
+         left.reference_fresh == right.reference_fresh &&
+         std::strncmp(left.reference_frame.data(), right.reference_frame.data(),
+                      left.reference_frame.size()) == 0;
+}
+
+const char *ControlCycleTelemetryRing::samplingWindowStatus() const {
+  if (sampling_window_requested_cycles_ == 0) {
+    return "disabled";
+  }
+  if (sampling_window_identity_changed_) {
+    return "identity_changed_before_complete";
+  }
+  if (!sampling_window_started_) {
+    return "waiting_for_identity";
+  }
+  if (count_ == sampling_window_requested_cycles_) {
+    return "complete";
+  }
+  return "collecting";
+}
+
+void ControlCycleTelemetryRing::configureSamplingWindow(
+    std::size_t requested_cycles) {
+  sampling_window_requested_cycles_ = std::min(requested_cycles, kCapacity);
+  sampling_window_started_ = false;
+  sampling_window_identity_changed_ = requested_cycles > kCapacity;
+  sampling_window_identity_ = ControlCycleTelemetrySample{};
+  samples_.fill(ControlCycleTelemetrySample{});
+  deadline_cause_counts_.fill(0);
+  cursor_ = 0;
+  count_ = 0;
+}
+
+bool ControlCycleTelemetryRing::push(
     ControlCycleTelemetrySample sample,
     std::chrono::steady_clock::time_point cycle_start) {
+  if (sampling_window_requested_cycles_ != 0) {
+    if (sampling_window_identity_changed_ ||
+        count_ == sampling_window_requested_cycles_) {
+      return false;
+    }
+    if (!sampling_window_started_) {
+      if (!samplingIdentityEligible(sample)) {
+        return false;
+      }
+      sampling_window_identity_ = sample;
+      sampling_window_started_ = true;
+    } else if (!sameSamplingIdentity(sample, sampling_window_identity_)) {
+      sampling_window_identity_changed_ = true;
+      return false;
+    }
+  }
   const auto write_start = std::chrono::steady_clock::now();
   samples_[cursor_] = sample;
   const auto write_end = std::chrono::steady_clock::now();
@@ -117,6 +189,7 @@ void ControlCycleTelemetryRing::push(
   }
   cursor_ = (cursor_ + 1) % kCapacity;
   count_ = std::min(kCapacity, count_ + 1);
+  return true;
 }
 
 void ControlCycleTelemetryRing::incrementDeadlineCause(
@@ -161,16 +234,31 @@ std::string ControlCycleTelemetryRing::toJson(
     const ControlCycleTelemetryMetadata &metadata) const {
   std::ostringstream stream;
   stream << std::setprecision(17);
-  stream << "{\"schema_version\":2,\"metadata\":{\"solver_mode\":";
+  stream << "{\"schema_version\":3,\"metadata\":{\"solver_mode\":";
   appendJsonString(stream, metadata.solver_mode);
   stream << ",\"control_rate_hz\":";
   appendDouble(stream, metadata.control_rate_hz);
   stream << ",\"control_period_ms\":";
   appendDouble(stream, metadata.control_period_ms);
+  stream << ",\"qp_max_iterations\":" << metadata.qp_max_iterations;
   stream << ",\"qp_time_limit_ms\":";
   appendDouble(stream, metadata.qp_time_limit_ms);
+  stream << ",\"qp_max_primal_residual\":";
+  appendDouble(stream, metadata.qp_max_primal_residual);
+  stream << ",\"qp_max_dual_residual\":";
+  appendDouble(stream, metadata.qp_max_dual_residual);
+  stream << ",\"qp_max_tracking_slack\":";
+  appendDouble(stream, metadata.qp_max_tracking_slack);
+  stream << ",\"qp_max_hard_constraint_violation\":";
+  appendDouble(stream, metadata.qp_max_hard_constraint_violation);
   stream << ",\"use_sim_time\":" << (metadata.use_sim_time ? "true" : "false")
          << ",\"ros_domain_id\":" << metadata.ros_domain_id << "},";
+  stream << "\"sampling_window\":{\"requested_cycle_count\":"
+         << sampling_window_requested_cycles_
+         << ",\"collected_cycle_count\":" << count_
+         << ",\"status\":";
+  appendJsonString(stream, samplingWindowStatus());
+  stream << "},";
   stream << "\"deadline_counters\":{";
   for (std::size_t index = 0; index < kControlCycleDeadlineCauseCount; ++index) {
     if (index != 0) {
@@ -211,12 +299,21 @@ std::string ControlCycleTelemetryRing::toJson(
            << ",\"snapshot_identity_digest\":" << sample.snapshot_identity_digest
            << ",\"same_snapshot_identity\":"
            << (sample.same_snapshot_identity ? "true" : "false")
+           << ",\"manager_incarnation\":" << sample.manager_incarnation
            << ",\"command_sequence\":" << sample.command_sequence
            << ",\"goal_id\":" << sample.goal_id
+           << ",\"localization_epoch\":" << sample.localization_epoch
            << ",\"map_generation\":" << sample.map_generation
+           << ",\"map_publication_sequence\":"
+           << sample.map_publication_sequence
            << ",\"reference_stamp_ns\":" << sample.reference_stamp_ns
+           << ",\"reference_deadline_ns\":" << sample.reference_deadline_ns
            << ",\"reference_frame\":";
     appendJsonString(stream, sample.reference_frame.data());
+    stream << ",\"execution_lease_valid\":"
+           << (sample.execution_lease_valid ? "true" : "false")
+           << ",\"reference_fresh\":"
+           << (sample.reference_fresh ? "true" : "false");
     stream << ",\"status\":";
     appendJsonString(stream, ltvQpSolverStatusName(sample.status));
     stream << ",\"iterations\":" << sample.iterations
@@ -277,6 +374,10 @@ std::string ControlCycleTelemetryRing::toJson(
       appendDouble(stream, sample.constraint_row_l2_minimum);
       stream << ",\"constraint_row_l2_maximum\":";
       appendDouble(stream, sample.constraint_row_l2_maximum);
+      stream << ",\"nonzero_bound_abs_minimum\":";
+      appendDouble(stream, sample.nonzero_bound_abs_minimum);
+      stream << ",\"bound_abs_maximum\":";
+      appendDouble(stream, sample.bound_abs_maximum);
       stream << ",\"zero_delta_dynamic_equality_residual\":";
       appendDouble(stream, sample.zero_delta_dynamic_equality_residual);
       stream << '}';

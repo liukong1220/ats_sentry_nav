@@ -142,6 +142,8 @@ private:
   LtvQpProblem qp_problem_buffer_;
   LtvQpWarmStart qp_warm_start_;
   bool qp_warm_start_valid_ = false;
+  // 0 保持最近 128 槽诊断；正数时只导出同一 Execute/reference/map 身份的固定窗口。
+  std::size_t telemetry_sampling_window_cycles_ = 0;
   // 计时环同时记录 ilqr baseline 与 qp_shadow，服务导出时复制，控制 timer 不做字符串序列化。
   ControlCycleTelemetryRing control_telemetry_;
   mutable std::mutex control_telemetry_mutex_;

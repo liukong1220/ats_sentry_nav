@@ -50,6 +50,8 @@ ats_swerve_mpc:
     qp_max_dual_residual: 1.0e-4
     qp_max_tracking_slack: 0.0
     qp_max_hard_constraint_violation: 1.0e-7
+    # 实车默认不启用性能采样窗口；仅受控离线/仿真 profile 可以显式覆盖。
+    telemetry_sampling_window_cycles: 0
 
     projection_backward_window: 0.20
     projection_forward_window: 2.00

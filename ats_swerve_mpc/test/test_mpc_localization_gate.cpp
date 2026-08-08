@@ -374,7 +374,7 @@ TEST_F(MpcLocalizationGateTest, QpShadowTelemetryDumpIsReadOnlyAndDoesNotAddPubl
     1s));
   const auto response = result.get();
   ASSERT_TRUE(response->success);
-  EXPECT_NE(response->message.find("\"schema_version\":2"), std::string::npos);
+  EXPECT_NE(response->message.find("\"schema_version\":3"), std::string::npos);
   EXPECT_NE(response->message.find("\"solver_mode\":\"qp_shadow\""),
             std::string::npos);
   EXPECT_EQ(command_sub_->get_publisher_count(), 1u);
