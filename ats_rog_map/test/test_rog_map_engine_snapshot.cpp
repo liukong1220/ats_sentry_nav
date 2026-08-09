@@ -70,6 +70,17 @@ TEST(RogMapEngineSnapshot, ReusesEsdfRebuiltByEveryMapUpdate)
   EXPECT_FALSE(map.update(makeCloud(11.0F), makePose(10.0F), makePose(10.0F, 2.0F)));
   EXPECT_EQ(map.generation(), generation_before_rejected_update);
   EXPECT_TRUE(map.getCurrentEsdfBounds(esdf_min, esdf_max));
+
+  const auto observed_generation = map.generation();
+  map.resetToUnknownForTest();
+  EXPECT_GT(map.generation(), observed_generation);
+  EXPECT_EQ(map.getGridType(rog_map::Vec3f(10.0F, 0.0F, 0.0F)), super_utils::UNKNOWN);
+  EXPECT_TRUE(map.ensureCurrentEsdf());
+
+  const auto reset_generation = map.generation();
+  EXPECT_TRUE(map.update(rog_map::PointCloud{}, makePose(10.0F), makePose(10.0F)));
+  EXPECT_GT(map.generation(), reset_generation);
+  EXPECT_EQ(map.getGridType(rog_map::Vec3f(10.0F, 0.0F, 0.0F)), super_utils::UNKNOWN);
 }
 
 TEST(RogMapCoreParameters, PreservesLegacyConfigDerivations)

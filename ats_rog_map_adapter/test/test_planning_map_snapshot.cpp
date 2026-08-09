@@ -89,4 +89,19 @@ TEST(PlanningMapSnapshot, UnavailableSnapshotNeverClaimsReady)
   EXPECT_EQ(snapshot.publication_sequence, 6U);
 }
 
+TEST(PlanningMapSnapshot, BlockedUnavailableSnapshotRetainsUnknownAuditPayload)
+{
+  auto grid = makeGrid();
+  grid.data.assign(grid.data.size(), -1);
+  const auto snapshot = ats_rog_map_adapter::makeBlockedUnavailablePlanningMapSnapshot(
+    grid, stamp(), 4U, 5U, 6U, true, 50);
+
+  EXPECT_FALSE(snapshot.ready);
+  EXPECT_EQ(snapshot.occupancy, grid.data);
+  ASSERT_EQ(snapshot.signed_distance_m.size(), grid.data.size());
+  EXPECT_TRUE(std::isnan(snapshot.signed_distance_m.front()));
+  EXPECT_TRUE(std::isnan(snapshot.gradient_x.front()));
+  EXPECT_TRUE(std::isnan(snapshot.gradient_y.front()));
+}
+
 }  // namespace

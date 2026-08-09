@@ -187,6 +187,9 @@ public:
       1, static_cast<int>(declare_parameter<int>("debug_qos_depth", 1)));
     input_qos_reliable_ = declare_parameter<bool>("input_qos_reliable", false);
     debug_qos_reliable_ = declare_parameter<bool>("debug_qos_reliable", false);
+    // Test-only edge-triggered source fixture.  It never changes default map
+    // semantics and is intentionally distinct from an input-stale fault.
+    declare_parameter<bool>("test_reset_to_unknown", false);
 
     map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(declareCoreParameters(*this)));
 
@@ -323,6 +326,18 @@ private:
     bool map_updated = false;
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
+      const bool reset_requested = get_parameter("test_reset_to_unknown").as_bool();
+      if (reset_requested && !test_reset_to_unknown_active_) {
+        map_->resetToUnknownForTest();
+        last_map_stamp_ = now();
+        has_map_data_ = true;
+        RCLCPP_WARN(
+          get_logger(),
+          "P2 unknown source reset generation=%llu: numeric projection now requires fresh "
+          "sensor evidence before any cell is known",
+          static_cast<unsigned long long>(map_->generation()));
+      }
+      test_reset_to_unknown_active_ = reset_requested;
       map_updated = map_->update(
         cloud, poseFromTransform(map_from_base), poseFromTransform(map_from_sensor));
       if (map_updated) {
@@ -969,6 +984,7 @@ private:
   int debug_qos_depth_{1};
   bool input_qos_reliable_{false};
   bool debug_qos_reliable_{false};
+  bool test_reset_to_unknown_active_{false};
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

@@ -66,6 +66,26 @@ public:
     return true;
   }
 
+  // Test-only fault fixture.  Clear every map representation together so the
+  // numerical ground projection becomes genuinely unknown without resetting
+  // the externally visible source-generation sequence.
+  void resetToUnknownForTest()
+  {
+    resetLocalMap();
+    if (inf_map_) {
+      inf_map_->resetLocalMap();
+    }
+    if (fcnt_map_) {
+      fcnt_map_->resetLocalMap();
+    }
+    if (esdf_map_) {
+      esdf_map_->resetLocalMap();
+    }
+    map_empty_ = true;
+    ++snapshot_generation_;
+    esdf_generation_ = 0U;
+  }
+
   bool getCurrentEsdfBounds(rog_map::Vec3f & box_min, rog_map::Vec3f & box_max) const
   {
     if (!esdf_map_ || snapshot_generation_ == 0 || esdf_generation_ != snapshot_generation_) {
