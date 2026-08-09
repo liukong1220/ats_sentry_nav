@@ -102,8 +102,10 @@ public:
     robot_frame_ = declare_parameter<std::string>("robot_frame", "gimbal_yaw_odom");
     robot_unknown_clear_radius_ = std::max(
       0.0, declare_parameter<double>("robot_unknown_clear_radius", 0.0));
-    // 仅用于隔离仿真故障注入；默认关闭，不能改变正式融合的 unknown 真值表。
-    declare_parameter<bool>("test_force_all_unknown", false);
+    // Only for an isolated source-unknown fault.  Secondary evidence is
+    // masked before the normal truth table runs; the fused output is never
+    // overwritten after fusion.
+    declare_parameter<bool>("test_mask_secondary_evidence", false);
     // P4 runtime swept-volume injection.  These values are only sampled when
     // explicitly enabled at runtime and never affect the normal map contract.
     declare_parameter<bool>("test_inject_dynamic_obstacle", false);
@@ -340,6 +342,9 @@ private:
     {
       last_blocking_grid_ = response.occupancy_grid;
     }
+    // Keep every ready=false heartbeat tied to the latest numeric response;
+    // unavailable paths must not report an older ROGMap source generation.
+    last_rog_generation_ = response.generation;
     nav_msgs::msg::OccupancyGrid::SharedPtr static_map;
     nav_msgs::msg::OccupancyGrid::SharedPtr traversability;
     nav_msgs::msg::OccupancyGrid::SharedPtr slope;
@@ -385,6 +390,16 @@ private:
       publishUnavailable("ROGMap projection is unavailable or stale");
       return;
     }
+    const bool mask_secondary_evidence =
+      get_parameter("test_mask_secondary_evidence").as_bool();
+    if (mask_secondary_evidence && std::none_of(
+        response.occupancy_grid.data.begin(), response.occupancy_grid.data.end(),
+        [](const std::int8_t value) {return value < 0;}))
+    {
+      publishUnavailable(
+        "test source-unknown fixture refused: ROGMap numeric projection has no unknown cells");
+      return;
+    }
     const bool traversability_fresh = traversability && inputFresh(*traversability);
     const bool slope_fresh = slope && inputFresh(*slope);
     const bool traversability_synchronized = traversability && inputSynchronized(
@@ -405,6 +420,20 @@ private:
         timestamp_delta(slope, response.occupancy_grid.header.stamp));
       publishUnavailable("Terrain inputs are missing, stale, or unsynchronized");
       return;
+    }
+    if (mask_secondary_evidence) {
+      const auto unknown_copy = [](const nav_msgs::msg::OccupancyGrid & source) {
+          auto masked = std::make_shared<nav_msgs::msg::OccupancyGrid>(source);
+          std::fill(masked->data.begin(), masked->data.end(), static_cast<std::int8_t>(-1));
+          return masked;
+        };
+      static_map = unknown_copy(*static_map);
+      traversability = unknown_copy(*traversability);
+      slope = unknown_copy(*slope);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "P2 test fixture masks static/terrain/slope evidence before fusion; "
+        "ROGMap numeric unknown remains the only source evidence");
     }
 
     geometry_msgs::msg::TransformStamped static_from_projection;
@@ -435,15 +464,9 @@ private:
     const std::size_t ego_unknown_cleared = GroundProjectionFusion::clearUnknownCircle(
       fusion, static_from_robot.transform.translation.x, static_from_robot.transform.translation.y,
       robot_unknown_clear_radius_);
-    if (get_parameter("test_force_all_unknown").as_bool()) {
-      // 保持 adapter 对规划栅格的唯一所有权，主动输出 all-unknown blocked grid，
-      // 用于验证目标管理、MPC 与底盘对真实 unknown 规划快照的失效安全链。
-      last_blocking_grid_ = fusion.planning_grid;
-      publishUnavailable("P3 test injected all-unknown planning grid");
-      return;
-    }
+    last_blocking_grid_ = fusion.planning_grid;
     if (fusion.known_free_cells == 0) {
-      publishUnavailable("ROGMap terrain fusion produced no known-free cells");
+      publishUnavailable("ROGMap terrain fusion produced no known-free cells", true);
       return;
     }
     const std::size_t injected_cells = injectDynamicObstacleForTest(fusion.planning_grid);
@@ -582,14 +605,21 @@ private:
     planning_grid_pub_->publish(blocked);
   }
 
-  void publishUnavailable(const char * reason)
+  void publishUnavailable(const char * reason, bool include_blocking_grid = false)
   {
     const auto publication_sequence = map_status_sequence_ + 1U;
     const builtin_interfaces::msg::Time publication_stamp = now();
-    planning_snapshot_pub_->publish(makeUnavailablePlanningMapSnapshot(
-      last_blocking_grid_, publication_stamp, localization_epoch_, last_rog_generation_,
-      publication_sequence, fusion_params_.unknown_is_obstacle,
-      fusion_params_.terrain_obstacle_value_threshold));
+    if (include_blocking_grid) {
+      planning_snapshot_pub_->publish(makeBlockedUnavailablePlanningMapSnapshot(
+        last_blocking_grid_, publication_stamp, localization_epoch_, last_rog_generation_,
+        publication_sequence, fusion_params_.unknown_is_obstacle,
+        fusion_params_.terrain_obstacle_value_threshold));
+    } else {
+      planning_snapshot_pub_->publish(makeUnavailablePlanningMapSnapshot(
+        last_blocking_grid_, publication_stamp, localization_epoch_, last_rog_generation_,
+        publication_sequence, fusion_params_.unknown_is_obstacle,
+        fusion_params_.terrain_obstacle_value_threshold));
+    }
     publishMapStatus(false, last_rog_generation_, reason);
     publishBlockedGrid(last_blocking_grid_);
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "%s", reason);

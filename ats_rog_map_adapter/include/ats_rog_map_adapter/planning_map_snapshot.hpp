@@ -37,6 +37,32 @@ inline ats_navigation_interfaces::msg::PlanningMapSnapshot makeUnavailablePlanni
   return snapshot;
 }
 
+// An unavailable snapshot normally carries only identity and health metadata.
+// The blocked variant additionally preserves a numerically inspectable grid
+// for fault auditing while remaining unconditionally non-executable.
+inline ats_navigation_interfaces::msg::PlanningMapSnapshot makeBlockedUnavailablePlanningMapSnapshot(
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const builtin_interfaces::msg::Time & publication_stamp,
+  std::uint64_t localization_epoch, std::uint64_t source_generation,
+  std::uint64_t publication_sequence, bool unknown_is_obstacle,
+  int occupied_value_threshold)
+{
+  auto snapshot = makeUnavailablePlanningMapSnapshot(
+    grid, publication_stamp, localization_epoch, source_generation,
+    publication_sequence, unknown_is_obstacle, occupied_value_threshold);
+  const auto expected_cells =
+    static_cast<std::size_t>(grid.info.width) * static_cast<std::size_t>(grid.info.height);
+  if (expected_cells == 0U || grid.data.size() != expected_cells) {
+    return snapshot;
+  }
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  snapshot.occupancy = grid.data;
+  snapshot.signed_distance_m.assign(expected_cells, nan);
+  snapshot.gradient_x.assign(expected_cells, nan);
+  snapshot.gradient_y.assign(expected_cells, nan);
+  return snapshot;
+}
+
 inline ats_navigation_interfaces::msg::PlanningMapSnapshot makePlanningMapSnapshot(
   const nav_msgs::msg::OccupancyGrid & grid,
   const std::vector<double> & signed_distance,
