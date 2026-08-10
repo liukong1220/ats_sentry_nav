@@ -16,6 +16,7 @@
 #include "ats_rog_map/debug_viz.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
+#include "ats_rog_map/test_fault_authorization.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -187,9 +188,35 @@ public:
       1, static_cast<int>(declare_parameter<int>("debug_qos_depth", 1)));
     input_qos_reliable_ = declare_parameter<bool>("input_qos_reliable", false);
     debug_qos_reliable_ = declare_parameter<bool>("debug_qos_reliable", false);
+    // Startup-only authorization gate.  It is latched once here and never
+    // re-read, so no live client can raise it.  Default false keeps nominal,
+    // real-vehicle and default-launch runs from ever clearing the map.
+    test_fault_injection_enabled_ =
+      declare_parameter<bool>("enable_test_fault_injection", false);
     // Test-only edge-triggered source fixture.  It never changes default map
     // semantics and is intentionally distinct from an input-stale fault.
     declare_parameter<bool>("test_reset_to_unknown", false);
+    RCLCPP_INFO(
+      get_logger(), "P2 ROGMap test fault injection gate enable_test_fault_injection=%d",
+      test_fault_injection_enabled_ ? 1 : 0);
+    test_fault_parameter_callback_ = add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & parameters) {
+        std::vector<std::string> names;
+        names.reserve(parameters.size());
+        for (const auto & parameter : parameters) {
+          names.push_back(parameter.get_name());
+        }
+        const auto verdict = screenTestFaultParameters(
+          test_fault_injection_enabled_, names, {"test_reset_to_unknown"});
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = verdict.accepted;
+        result.reason = verdict.reason;
+        if (!verdict.accepted) {
+          RCLCPP_ERROR(
+            get_logger(), "P2 ROGMap test fault request rejected: %s", verdict.reason.c_str());
+        }
+        return result;
+      });
 
     map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(declareCoreParameters(*this)));
 
@@ -326,7 +353,10 @@ private:
     bool map_updated = false;
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
-      const bool reset_requested = get_parameter("test_reset_to_unknown").as_bool();
+      // Second, independent enforcement point: even if a value slipped in via a
+      // parameter file, an unauthorized fixture stays ineffective here.
+      const bool reset_requested = test_fault_injection_enabled_ &&
+        get_parameter("test_reset_to_unknown").as_bool();
       if (reset_requested && !test_reset_to_unknown_active_) {
         map_->resetToUnknownForTest();
         last_map_stamp_ = now();
@@ -764,7 +794,24 @@ private:
     double map_lock_wait_ms = 0.0;
     double esdf_refresh_ms = 0.0;
     double sample_ms = 0.0;
+    // sample_ms 内部再拆成两个查询族，用来区分“占用类型查询”与“ESDF 距离查询”
+    // 各自的成本。每个 z 步只额外读取 3 次 steady_clock（约 20 ns/次），在
+    // 数十万次迭代下总开销 <1%，不足以改变归因结论。
+    double grid_type_query_ms = 0.0;
+    double esdf_query_ms = 0.0;
+    std::uint64_t grid_type_queries = 0;
+    std::uint64_t esdf_queries = 0;
     double gradient_ms = 0.0;
+    // serialize_ms 是 response payload 的构建/分配开销（栅格元数据 + occupancy
+    // 与三个数值数组的 assign）。DDS 线上序列化发生在 rclcpp 内部，本节点无法
+    // 直接测量，因此该项只声明为 payload 构建，不冒充线上序列化耗时。
+    double serialize_ms = 0.0;
+    // lock_hold_ms 是持有 map_mutex_ 的时长；与 map_lock_wait_ms 一起区分
+    // "等锁" 与 "占锁"，避免把 contention 与计算混为一谈。锁在整段计算中持续
+    // 持有，故在每个记录点按当前时刻刷新。
+    double lock_hold_ms = 0.0;
+    std::optional<std::chrono::steady_clock::time_point> map_lock_acquired_at;
+    bool map_lock_held = false;
     response->stale = health_at_start.map_update_stale || health_at_start.odom_stale;
     RCLCPP_INFO(
       get_logger(),
@@ -776,6 +823,10 @@ private:
       health_at_start.cloud_age_sec, health_at_start.map_update_stale ? 1 : 0,
       health_at_start.odom_stale ? 1 : 0, health_at_start.raw_cloud_stale ? 1 : 0);
     const auto log_projection_end = [&]() {
+        if (map_lock_held && map_lock_acquired_at.has_value()) {
+          lock_hold_ms = 1000.0 * std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - *map_lock_acquired_at).count();
+        }
         const InputHealth health_at_end = inputHealth();
         const rclcpp::Time projection_end_stamp = now();
         const double projection_ms = 1000.0 * std::chrono::duration<double>(
@@ -784,7 +835,10 @@ private:
           get_logger(),
           "P2 projection end request=%llu start_ns=%lld end_ns=%lld source_generation=%llu "
           "source_stamp_ns=%lld ready=%d stale=%d compute_ms=%.1f "
-          "map_lock_wait_ms=%.1f esdf_refresh_ms=%.1f sample_ms=%.1f gradient_ms=%.1f "
+          "map_lock_wait_ms=%.1f map_lock_hold_ms=%.1f esdf_refresh_ms=%.1f sample_ms=%.1f "
+          "grid_type_query_ms=%.1f esdf_query_ms=%.1f grid_type_queries=%llu esdf_queries=%llu "
+          "gradient_ms=%.1f serialize_ms=%.1f total_ms=%.1f accounted_ms=%.1f "
+          "unaccounted_ms=%.1f "
           "map_age_start=%.3f map_age_end=%.3f odom_age_start=%.3f odom_age_end=%.3f "
           "cloud_age_start=%.3f cloud_age_end=%.3f",
           static_cast<unsigned long long>(request_sequence),
@@ -793,7 +847,14 @@ private:
           static_cast<unsigned long long>(response->generation),
           static_cast<long long>(rclcpp::Time(response->occupancy_grid.header.stamp).nanoseconds()),
           response->ready ? 1 : 0, response->stale ? 1 : 0, projection_ms,
-          map_lock_wait_ms, esdf_refresh_ms, sample_ms, gradient_ms,
+          map_lock_wait_ms, lock_hold_ms, esdf_refresh_ms, sample_ms,
+          grid_type_query_ms, esdf_query_ms,
+          static_cast<unsigned long long>(grid_type_queries),
+          static_cast<unsigned long long>(esdf_queries), gradient_ms,
+          serialize_ms, projection_ms,
+          map_lock_wait_ms + esdf_refresh_ms + sample_ms + gradient_ms + serialize_ms,
+          projection_ms - (map_lock_wait_ms + esdf_refresh_ms + sample_ms + gradient_ms +
+          serialize_ms),
           health_at_start.map_update_age_sec, health_at_end.map_update_age_sec,
           health_at_start.odom_age_sec, health_at_end.odom_age_sec,
           health_at_start.cloud_age_sec, health_at_end.cloud_age_sec);
@@ -801,8 +862,10 @@ private:
 
     const auto map_lock_wait_started = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(map_mutex_);
+    map_lock_acquired_at = std::chrono::steady_clock::now();
+    map_lock_held = true;
     map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - map_lock_wait_started).count();
+      *map_lock_acquired_at - map_lock_wait_started).count();
     response->generation = map_->generation();
     const auto esdf_refresh_started = std::chrono::steady_clock::now();
     response->ready = has_map_data_ && map_->ensureCurrentEsdf();
@@ -840,6 +903,7 @@ private:
       return;
     }
 
+    const auto serialize_started = std::chrono::steady_clock::now();
     auto & grid = response->occupancy_grid;
     grid.header.frame_id = map_frame_;
     grid.header.stamp = last_map_stamp_;
@@ -860,6 +924,8 @@ private:
     response->signed_distance.assign(cell_count, nan);
     response->gradient_x.assign(cell_count, nan);
     response->gradient_y.assign(cell_count, nan);
+    serialize_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - serialize_started).count();
 
     const double z_step = std::max(map_->getResolution(), 0.01);
     const double esdf_distance_limit = (esdf_box_max - esdf_box_min).norm() + resolution;
@@ -884,13 +950,22 @@ private:
           const rog_map::Vec3f point(x, y, static_cast<float>(std::min(z, z_max)));
           // Downstream JPS and footprint gates apply their own metric clearance on this snapshot.
           // Project raw probability occupancy here to avoid double-inflating the robot start cell.
+          const auto grid_type_started = std::chrono::steady_clock::now();
           const rog_map::GridType cell_type = map_->getGridType(point);
+          const auto grid_type_finished = std::chrono::steady_clock::now();
+          grid_type_query_ms += 1000.0 * std::chrono::duration<double>(
+            grid_type_finished - grid_type_started).count();
+          ++grid_type_queries;
           occupied = occupied || cell_type == super_utils::OCCUPIED;
           known_free = known_free || cell_type == super_utils::KNOWN_FREE;
           if (inside_esdf_box(point) &&
             (cell_type == super_utils::OCCUPIED || cell_type == super_utils::KNOWN_FREE))
           {
+            const auto esdf_query_started = std::chrono::steady_clock::now();
             const double distance = map_->getESDFDistance(point);
+            esdf_query_ms += 1000.0 * std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - esdf_query_started).count();
+            ++esdf_queries;
             if (std::isfinite(distance) && std::abs(distance) <= esdf_distance_limit) {
               minimum_distance = std::min(minimum_distance, std::abs(distance));
             }
@@ -985,6 +1060,9 @@ private:
   bool input_qos_reliable_{false};
   bool debug_qos_reliable_{false};
   bool test_reset_to_unknown_active_{false};
+  bool test_fault_injection_enabled_{false};
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+    test_fault_parameter_callback_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

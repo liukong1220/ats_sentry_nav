@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
@@ -50,6 +51,39 @@ struct RogMapEsdfSnapshot
   static RogMapEsdfSnapshot fromResponse(
     const ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response);
 };
+
+/// @brief Structured audit of whether a ROGMap numeric projection is genuinely
+///        all-unknown.  Every counter is filled even when the verdict is false
+///        so the refusal reason can name the disqualifying evidence.
+struct SourceUnknownEvidence
+{
+  bool structurally_valid{false};
+  bool all_unknown{false};
+  std::size_t cell_count{0};
+  std::size_t unknown_cells{0};
+  std::size_t free_cells{0};
+  std::size_t occupied_cells{0};
+  std::size_t out_of_range_cells{0};
+  std::size_t finite_numeric_cells{0};
+  std::uint64_t generation{0};
+  std::string reason;
+};
+
+/// @brief Strict all-unknown predicate for the isolated source-unknown fixture.
+/// @details `all_unknown` is true only when every one of these holds:
+///          - `ready == true` and `stale == false`;
+///          - non-empty `frame_id`, positive header stamp, finite resolution > 0,
+///            `width > 0`, `height > 0`;
+///          - `occupancy.size() == width * height`, and `signed_distance`,
+///            `gradient_x`, `gradient_y` all have the same length;
+///          - every occupancy cell is strictly `== -1` (a single free, occupied
+///            or out-of-range cell disqualifies the fixture);
+///          - every signed-distance and gradient sample is NaN;
+///          - `generation > baseline_generation`.
+///          Mixed unknown/free and mixed unknown/occupied responses are refused
+///          with the offending counters recorded in `reason`.
+SourceUnknownEvidence evaluateSourceUnknownEvidence(
+  const RogMapEsdfSnapshot & snapshot, std::uint64_t baseline_generation);
 
 struct GroundProjectionFusionParams
 {
