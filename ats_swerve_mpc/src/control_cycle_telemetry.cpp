@@ -57,7 +57,13 @@ void appendDouble(std::ostringstream &stream, double value) {
 const char *controlCycleTimingStageName(ControlCycleTimingStage stage) {
   switch (stage) {
     case ControlCycleTimingStage::kStateTrajectorySnapshot: return "state_trajectory_snapshot_ms";
+    case ControlCycleTimingStage::kReferenceExtraction: return "reference_extraction_ms";
     case ControlCycleTimingStage::kIlqrSolve: return "ilqr_solve_ms";
+    case ControlCycleTimingStage::kIlqrWarmStart: return "ilqr_warm_start_ms";
+    case ControlCycleTimingStage::kIlqrRollout: return "ilqr_rollout_ms";
+    case ControlCycleTimingStage::kIlqrBackwardPass: return "ilqr_backward_pass_ms";
+    case ControlCycleTimingStage::kIlqrJacobian: return "ilqr_jacobian_ms";
+    case ControlCycleTimingStage::kIlqrLineSearch: return "ilqr_line_search_ms";
     case ControlCycleTimingStage::kIlqrCommandPublish: return "ilqr_command_publish_ms";
     case ControlCycleTimingStage::kQpProblemBuild: return "qp_problem_build_ms";
     case ControlCycleTimingStage::kOsqpNumericUpdate: return "osqp_numeric_update_ms";

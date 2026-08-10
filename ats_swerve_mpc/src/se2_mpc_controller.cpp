@@ -46,7 +46,11 @@ State Se2MpcController::dynamics(const State &state,
 void Se2MpcController::jacobians(const State &state, const Control &control,
                                  Matrix3 &state_jacobian,
                                  Matrix3 &control_jacobian) const {
+  const auto start_time = std::chrono::steady_clock::now();
   model_.jacobians(state, control, state_jacobian, control_jacobian);
+  jacobian_accumulated_ms_ += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start_time)
+                                  .count();
 }
 
 /**
@@ -236,6 +240,17 @@ double Se2MpcController::cost(const std::vector<State> &states,
                               const std::vector<Control> &controls,
                               const std::vector<Se2Reference> &references,
                               const Control &last_control) const {
+  const auto cost_start_time = std::chrono::steady_clock::now();
+  // 归因累加在所有返回路径上生效，包含下面的非法输入早退。
+  struct CostTimingScope {
+    const std::chrono::steady_clock::time_point &start;
+    double &accumulator;
+    ~CostTimingScope() {
+      accumulator += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+    }
+  } cost_timing_scope{cost_start_time, cost_accumulated_ms_};
   if (states.size() != controls.size() + 1 ||
       references.size() < states.size()) {
     return std::numeric_limits<double>::infinity();
@@ -378,9 +393,25 @@ Se2MpcController::solve(const State &current_state,
   }
   first_step_saturation_ = SaturationReport{};
   first_step_increment_limited_ = false;
+  // 分阶段归因累加器每周期清零；jacobian/cost 由 const 成员在内部累加。
+  jacobian_accumulated_ms_ = 0.0;
+  cost_accumulated_ms_ = 0.0;
+  double rollout_ms = 0.0;
+  double backward_pass_ms = 0.0;
+  double line_search_ms = 0.0;
+  const auto elapsed_ms_since = [](std::chrono::steady_clock::time_point since) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - since)
+        .count();
+  };
+
+  const auto warm_start_start_time = std::chrono::steady_clock::now();
   initializeControls(references, last_control);
+  const double warm_start_ms = elapsed_ms_since(warm_start_start_time);
   std::vector<Control> controls = warm_controls_;
+  const auto initial_rollout_start_time = std::chrono::steady_clock::now();
   std::vector<State> states = rollout(current_state, controls);
+  rollout_ms += elapsed_ms_since(initial_rollout_start_time);
   double current_cost = cost(states, controls, references, last_control);
 
   // 解的数值可信凭据：至少完成一次成功的反向递推（Q_uu 可分解、增益有限）。
@@ -391,8 +422,10 @@ Se2MpcController::solve(const State &current_state,
   // 当作本周期解持续下发，实车表现为"MPC 看似正常但控制已失去反馈"。
   bool solution_certified = false;
   for (int iteration = 0; iteration < config_.max_iterations; ++iteration) {
+    const auto backward_start_time = std::chrono::steady_clock::now();
     const BackwardResult backward =
         backwardPass(states, controls, references, last_control);
+    backward_pass_ms += elapsed_ms_since(backward_start_time);
     if (!backward.success) {
       break;
     }
@@ -402,6 +435,7 @@ Se2MpcController::solve(const State &current_state,
       max_update = std::max(max_update, update.lpNorm<Eigen::Infinity>());
     }
     bool accepted = false;
+    const auto line_search_start_time = std::chrono::steady_clock::now();
     // 线搜索只接受代价下降的候选控制，失败则逐步缩小 iLQR 更新量。
     for (double alpha = 1.0; alpha >= config_.min_line_search_step;
          alpha *= config_.line_search_decay) {
@@ -441,6 +475,7 @@ Se2MpcController::solve(const State &current_state,
         break;
       }
     }
+    line_search_ms += elapsed_ms_since(line_search_start_time);
     result.iterations = iteration + 1;
     if (accepted) {
       ++result.accepted_iterations;
@@ -475,6 +510,12 @@ Se2MpcController::solve(const State &current_state,
   result.solve_time_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - start_time)
                              .count();
+  result.stage_timing.warm_start_ms = warm_start_ms;
+  result.stage_timing.rollout_ms = rollout_ms;
+  result.stage_timing.backward_pass_ms = backward_pass_ms;
+  result.stage_timing.jacobian_ms = jacobian_accumulated_ms_;
+  result.stage_timing.line_search_ms = line_search_ms;
+  result.stage_timing.cost_ms = cost_accumulated_ms_;
   return result;
 }
 
