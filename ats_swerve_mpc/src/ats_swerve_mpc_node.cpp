@@ -796,6 +796,10 @@ void AtsSwerveMpcNode::onControlTimer() {
   TrajectoryProjection projection;
   std::vector<Se2Reference> references;
   bool trajectory_expired = false;
+  // 参考提取（含 trajectory_mutex_ 等待、投影和 horizon 构造）单独计时，
+  // 使其不再隐含在 state_trajectory_snapshot 内无法归因。
+  const auto reference_extraction_start = std::chrono::steady_clock::now();
+  double reference_extraction_ms = 0.0;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     if (trajectory_tracker_.empty()) {
@@ -815,6 +819,8 @@ void AtsSwerveMpcNode::onControlTimer() {
     trajectory_expired =
         trajectory_deadline_.nanoseconds() > 0 && now() > trajectory_deadline_;
   }
+  reference_extraction_ms = elapsedMilliseconds(reference_extraction_start,
+                                                std::chrono::steady_clock::now());
   // 4. 判断是否达到目标或轨迹过期
   const double goal_position_error =
       (goal.head<2>() - current.head<2>()).norm();
@@ -906,6 +912,8 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   recordTiming(telemetry, ControlCycleTimingStage::kStateTrajectorySnapshot,
                elapsedMilliseconds(snapshot_start, std::chrono::steady_clock::now()));
+  recordTiming(telemetry, ControlCycleTimingStage::kReferenceExtraction,
+               reference_extraction_ms);
 
   const auto ilqr_start = std::chrono::steady_clock::now();
   const Se2MpcResult result =
@@ -913,6 +921,18 @@ void AtsSwerveMpcNode::onControlTimer() {
                          snapshot.last_control_before_solve);
   recordTiming(telemetry, ControlCycleTimingStage::kIlqrSolve,
                elapsedMilliseconds(ilqr_start, std::chrono::steady_clock::now()));
+  // iLQR 内部拆分：仅为把 solve 的耗时归属到具体阶段，它们是 kIlqrSolve 的
+  // 子项而非额外串行开销；kIlqrJacobian 又内含于 kIlqrBackwardPass。
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrWarmStart,
+               result.stage_timing.warm_start_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrRollout,
+               result.stage_timing.rollout_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrBackwardPass,
+               result.stage_timing.backward_pass_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrJacobian,
+               result.stage_timing.jacobian_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kIlqrLineSearch,
+               result.stage_timing.line_search_ms);
   if (!result.success || result.controls.empty()) {
     RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,

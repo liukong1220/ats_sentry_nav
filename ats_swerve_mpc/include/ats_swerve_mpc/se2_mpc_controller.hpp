@@ -86,6 +86,30 @@ struct Se2Reference {
  * 注意"线搜索未接受任何候选"不判失败：约束（车体速度/轮速/舵角速率）激活时，
  * 限幅会把候选压回当前序列，代价无法下降但当前序列仍是约束集内的可执行解。
  */
+/**
+ * @brief 单个 iLQR 求解周期内的分阶段单调时钟耗时，单位毫秒。
+ *
+ * 用途仅限实时性归因：把 `solve_time_ms` 拆到具体 owner，避免把整个 solve
+ * 笼统记为"iLQR 慢"。各阶段互不重叠，`jacobian_ms` 是 `backward_pass_ms`
+ * 的内含子项（backward pass 每步都调用 `jacobians`），因此
+ * `warm_start_ms + rollout_ms + backward_pass_ms + line_search_ms` 才与
+ * `solve_time_ms` 可比，累加时不得再叠加 `jacobian_ms`。
+ */
+struct Se2MpcStageTiming {
+  // warm start 构造（initializeControls）耗时。
+  double warm_start_ms = 0.0;
+  // 名义轨迹 rollout 累计耗时（含线搜索候选之外的初始 rollout）。
+  double rollout_ms = 0.0;
+  // 反向递推累计耗时，包含其内部的 jacobians 调用。
+  double backward_pass_ms = 0.0;
+  // backward pass 内部线性化累计耗时；是 backward_pass_ms 的子项。
+  double jacobian_ms = 0.0;
+  // 受约束线搜索累计耗时（候选前向仿真、限幅与代价评估）。
+  double line_search_ms = 0.0;
+  // 代价评估累计耗时；分布在初始 rollout 与线搜索候选中，为交叉子项。
+  double cost_ms = 0.0;
+};
+
 struct Se2MpcResult {
   bool success = false;
   std::vector<Control> controls;
@@ -104,6 +128,8 @@ struct Se2MpcResult {
   // 四舵轮模块级约束是否真正生效；为 false 说明 wheel_base_* 或轮速上限未配置，
   // 此时只有车体级限幅在起作用，属于实车高危配置错误。
   bool module_limits_active = false;
+  // 分阶段耗时；只用于归因，不参与任何 gate 判定。
+  Se2MpcStageTiming stage_timing;
 };
 
 class Se2MpcController {
@@ -200,6 +226,11 @@ private:
   // 不能在求解结束后对已限幅的结果再限幅一次——那样永远得不到命中标志。
   SaturationReport first_step_saturation_;
   bool first_step_increment_limited_ = false;
+  // 归因累加器：`jacobians` 与 `cost` 都在 const 路径上被调用，故用 mutable
+  // 累加。两者在每次 `solve` 入口清零，只在单一控制 timer 线程内使用，不参与
+  // 任何 gate 判定，也不改变求解数值。
+  mutable double jacobian_accumulated_ms_ = 0.0;
+  mutable double cost_accumulated_ms_ = 0.0;
 };
 
 } // namespace ats_swerve_mpc

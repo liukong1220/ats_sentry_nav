@@ -4,6 +4,13 @@ project(ats_swerve_mpc)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 与 ats_rog_map 同因：未指定 CMAKE_BUILD_TYPE 时整包以 -O0 编译。iLQR 的
+# rollout/jacobian/backward pass 全是小矩阵 Eigen 运算，-O0 下没有内联与
+# 向量化。这里只补默认优化等级，不改 20 Hz 控制周期、MPC 约束或任何门禁。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(OSQP_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(OSQP_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
 set(OSQP_BUILD_DEMO_EXE OFF CACHE BOOL "" FORCE)

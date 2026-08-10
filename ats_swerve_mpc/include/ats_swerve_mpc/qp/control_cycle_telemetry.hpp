@@ -16,7 +16,15 @@ namespace ats_swerve_mpc {
 /** @brief 控制 callback 内各阶段的单调时钟测量项，单位统一为毫秒。 */
 enum class ControlCycleTimingStage : std::size_t {
   kStateTrajectorySnapshot = 0,
+  kReferenceExtraction,
   kIlqrSolve,
+  // 以下五项是 kIlqrSolve 的内部拆分，只用于实时性归因，不是新增的串行开销。
+  // kIlqrJacobian 内含于 kIlqrBackwardPass，累加时不得重复计入。
+  kIlqrWarmStart,
+  kIlqrRollout,
+  kIlqrBackwardPass,
+  kIlqrJacobian,
+  kIlqrLineSearch,
   kIlqrCommandPublish,
   kQpProblemBuild,
   kOsqpNumericUpdate,
