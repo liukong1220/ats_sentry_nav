@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
 
 #include "tf2/LinearMath/Transform.h"
 #include "tf2/utils.h"
@@ -184,6 +185,94 @@ RogMapEsdfSnapshot RogMapEsdfSnapshot::fromResponse(
   snapshot.gradient_x = response.gradient_x;
   snapshot.gradient_y = response.gradient_y;
   return snapshot;
+}
+
+SourceUnknownEvidence evaluateSourceUnknownEvidence(
+  const RogMapEsdfSnapshot & snapshot, const std::uint64_t baseline_generation)
+{
+  SourceUnknownEvidence evidence;
+  evidence.generation = snapshot.generation;
+  const std::size_t cell_count = static_cast<std::size_t>(snapshot.info.width) *
+    static_cast<std::size_t>(snapshot.info.height);
+  evidence.cell_count = cell_count;
+
+  if (!snapshot.ready) {
+    evidence.reason = "ROGMap numeric projection is not ready";
+    return evidence;
+  }
+  if (snapshot.stale) {
+    evidence.reason = "ROGMap numeric projection is stale";
+    return evidence;
+  }
+  if (snapshot.header.frame_id.empty()) {
+    evidence.reason = "ROGMap numeric projection has an empty frame_id";
+    return evidence;
+  }
+  if (snapshot.header.stamp.sec <= 0 && snapshot.header.stamp.nanosec == 0U) {
+    evidence.reason = "ROGMap numeric projection has a non-positive stamp";
+    return evidence;
+  }
+  if (!std::isfinite(snapshot.info.resolution) || snapshot.info.resolution <= 0.0F) {
+    evidence.reason = "ROGMap numeric projection resolution is not finite and positive";
+    return evidence;
+  }
+  if (snapshot.info.width == 0 || snapshot.info.height == 0 || cell_count == 0) {
+    evidence.reason = "ROGMap numeric projection grid is empty";
+    return evidence;
+  }
+  if (snapshot.occupancy.size() != cell_count) {
+    evidence.reason = "ROGMap numeric occupancy length does not equal width * height";
+    return evidence;
+  }
+  if (snapshot.signed_distance.size() != cell_count ||
+    snapshot.gradient_x.size() != cell_count || snapshot.gradient_y.size() != cell_count)
+  {
+    evidence.reason = "ROGMap numeric signed-distance or gradient length does not equal cells";
+    return evidence;
+  }
+  evidence.structurally_valid = true;
+
+  for (std::size_t index = 0; index < cell_count; ++index) {
+    const int value = static_cast<int>(snapshot.occupancy[index]);
+    if (value == -1) {
+      ++evidence.unknown_cells;
+    } else if (value == 0) {
+      ++evidence.free_cells;
+    } else if (value > 0 && value <= 100) {
+      ++evidence.occupied_cells;
+    } else {
+      ++evidence.out_of_range_cells;
+    }
+    if (std::isfinite(snapshot.signed_distance[index]) ||
+      std::isfinite(snapshot.gradient_x[index]) || std::isfinite(snapshot.gradient_y[index]))
+    {
+      ++evidence.finite_numeric_cells;
+    }
+  }
+
+  if (evidence.unknown_cells != cell_count) {
+    evidence.reason = "ROGMap numeric occupancy mixes unknown with free=" +
+      std::to_string(evidence.free_cells) + " occupied=" +
+      std::to_string(evidence.occupied_cells) + " out_of_range=" +
+      std::to_string(evidence.out_of_range_cells) + " unknown=" +
+      std::to_string(evidence.unknown_cells) + " of cells=" + std::to_string(cell_count);
+    return evidence;
+  }
+  if (evidence.finite_numeric_cells != 0) {
+    evidence.reason = "ROGMap numeric signed-distance or gradient is finite in " +
+      std::to_string(evidence.finite_numeric_cells) + " unknown cells";
+    return evidence;
+  }
+  if (snapshot.generation <= baseline_generation) {
+    evidence.reason = "ROGMap source generation " + std::to_string(snapshot.generation) +
+      " did not advance past the pre-fault generation " + std::to_string(baseline_generation);
+    return evidence;
+  }
+
+  evidence.all_unknown = true;
+  evidence.reason = "ROGMap numeric projection is strictly all-unknown across " +
+    std::to_string(cell_count) + " cells at generation " + std::to_string(snapshot.generation);
+  return evidence;
 }
 
 bool GroundProjectionFusion::fuse(

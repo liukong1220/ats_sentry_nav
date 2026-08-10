@@ -4,6 +4,14 @@ project(ats_rog_map)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 未指定 CMAKE_BUILD_TYPE 时 colcon 不会传任何 -O，整包以 -O0 编译。本包的
+# getGridType/getESDFDistance 是 Eigen 密集的逐格调用（实测 60000 次/投影），
+# -O0 下无内联、无向量化，投影 p50 达到 1.5 s，远超 cloud_timeout_sec=2.0 s 的
+# 余量。这里只补默认优化等级，不改任何超时、deadline、lease、控制周期或门禁。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -78,6 +86,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_split_robot_sensor_pose ${PROJECT_NAME}_core)
   target_compile_definitions(test_split_robot_sensor_pose PRIVATE
     ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
+
+  ament_add_gtest(test_fault_authorization test/test_fault_authorization_test.cpp)
+  target_include_directories(test_fault_authorization PRIVATE include)
 
   ament_add_gtest(test_rog_map_engine_snapshot test/test_rog_map_engine_snapshot.cpp)
   target_link_libraries(test_rog_map_engine_snapshot ${PROJECT_NAME}_core)
