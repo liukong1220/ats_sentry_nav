@@ -17,6 +17,7 @@
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map/test_fault_authorization.hpp"
+#include "ats_rog_map/unknown_projection_audit.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -867,6 +868,8 @@ private:
     map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
       *map_lock_acquired_at - map_lock_wait_started).count();
     response->generation = map_->generation();
+    const bool publish_unknown_projection_audit = test_fault_injection_enabled_ &&
+      test_reset_to_unknown_active_ && unknown_pub_->get_subscription_count() > 0U;
     const auto esdf_refresh_started = std::chrono::steady_clock::now();
     response->ready = has_map_data_ && map_->ensureCurrentEsdf();
     esdf_refresh_ms = 1000.0 * std::chrono::duration<double>(
@@ -988,6 +991,14 @@ private:
     sample_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - sample_started).count();
 
+    // Implicit unknown cells cannot be enumerated through ProbMap::boxSearch().  During the
+    // explicitly authorized reset fixture, publish an audit-only cloud from the authoritative
+    // numerical response after it has proved strictly all-unknown.  It is never a safety input.
+    rog_map::vec_E<rog_map::Vec3f> unknown_projection_audit;
+    if (publish_unknown_projection_audit) {
+      unknown_projection_audit = makeAllUnknownProjectionAudit(grid);
+    }
+
     const auto index_of = [&grid](std::uint32_t x, std::uint32_t y) {
         return static_cast<std::size_t>(y) * static_cast<std::size_t>(grid.info.width) + x;
       };
@@ -1038,6 +1049,11 @@ private:
       static_cast<unsigned long long>(response->generation), cell_count, projection_ms,
       response->stale ? "true" : "false");
     log_projection_end();
+    lock.unlock();
+    if (!unknown_projection_audit.empty()) {
+      unknown_pub_->publish(
+        makeCloud(unknown_projection_audit, rclcpp::Time(grid.header.stamp, RCL_ROS_TIME)));
+    }
   }
 
   std::string map_frame_;

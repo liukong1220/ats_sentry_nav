@@ -94,6 +94,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_rog_map_engine_snapshot ${PROJECT_NAME}_core)
   target_compile_definitions(test_rog_map_engine_snapshot PRIVATE
     ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
+
+  ament_add_gtest(test_unknown_projection_audit test/test_unknown_projection_audit.cpp)
+  target_link_libraries(test_unknown_projection_audit ${PROJECT_NAME}_core)
 endif()
 
 ament_export_include_directories(include)
