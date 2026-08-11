@@ -52,6 +52,20 @@ struct LtvQpProblem {
   int decisionSize() const {
     return state_dimension * (horizon + 1) + control_dimension * horizon;
   }
+
+  /**
+   * @brief 校验 LTV-QP 稠密缓冲是否仍符合固定的状态、控制和约束行布局。
+   * @details 该检查只验证各矩阵/向量的尺寸，不接受仅凭 `valid` 标志访问 Eigen 缓冲；
+   *          因而可以在 backend 数值拷贝和 candidate 准入前阻止结构损坏导致的越界访问。
+   */
+  bool hasExpectedLayout() const;
+
+  /**
+   * @brief 校验所有双边约束下界不超过上界。
+   * @details 变量上下界允许 OSQP 使用正负无穷，但 NaN 和任一 `lower > upper` 都会失败。
+   *          调用前不需要假定矩阵尺寸正确：本函数会先复核固定布局。
+   */
+  bool hasOrderedBounds() const;
 };
 
 class LtvQpBuilder {

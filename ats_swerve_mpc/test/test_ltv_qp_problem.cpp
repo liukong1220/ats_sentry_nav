@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "ats_swerve_mpc/qp/ltv_qp_problem.hpp"
 
 namespace {
@@ -96,6 +98,44 @@ TEST(LtvQpBuilder, RejectsMalformedNominalHorizon) {
       ats_swerve_mpc::Control::Zero(), config);
   EXPECT_FALSE(problem.valid);
   EXPECT_FALSE(problem.validation_error.empty());
+}
+
+TEST(LtvQpBuilder, RejectsNonConvexWeightsAndNonFiniteLimits) {
+  ats_swerve_mpc::Se2MpcConfig config;
+  config.horizon = 2;
+  config.dt = 0.1;
+  const auto refs = references(config.horizon, config.dt);
+  std::vector<ats_swerve_mpc::Control> controls(
+      static_cast<std::size_t>(config.horizon), refs.front().control);
+  const auto states = ats_swerve_mpc::Se2Model(config.dt).rollout(
+      ats_swerve_mpc::State::Zero(), controls);
+
+  config.state_weight(0) = -1.0;
+  auto problem = ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config);
+  EXPECT_FALSE(problem.valid);
+  EXPECT_EQ(problem.validation_error,
+            "QP weights must be finite and non-negative");
+
+  config = ats_swerve_mpc::Se2MpcConfig();
+  config.horizon = 2;
+  config.dt = 0.1;
+  config.max_vx = std::numeric_limits<double>::infinity();
+  problem = ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config);
+  EXPECT_FALSE(problem.valid);
+  EXPECT_EQ(problem.validation_error,
+            "non-finite or negative dynamics limit");
+}
+
+TEST(LtvQpBuilder, RejectsHorizonThatCannotFitFixedLtvDimensions) {
+  const auto problem = ats_swerve_mpc::LtvQpBuilder::allocate(
+      std::numeric_limits<int>::max());
+  EXPECT_FALSE(problem.valid);
+  EXPECT_EQ(problem.validation_error,
+            "horizon must be positive and fit fixed LTV dimensions");
 }
 
 }  // namespace

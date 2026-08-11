@@ -17,6 +17,11 @@ bool finiteOrInfinity(double value) {
   return !std::isnan(value);
 }
 
+/** @brief 安全门限必须为有限非负值，避免 Inf 上限把约束变成无界执行。 */
+bool finiteNonnegative(double value) {
+  return std::isfinite(value) && value >= 0.0;
+}
+
 /** @brief 检查 CSC 数值数组没有 NaN/Inf，矩阵结构由另一层单独校验。 */
 bool vectorFinite(const std::vector<double> &values) {
   return std::all_of(values.begin(), values.end(),
@@ -33,6 +38,12 @@ bool finiteControls(const std::vector<Control> &controls) {
 bool finiteStates(const std::vector<State> &states) {
   return std::all_of(states.begin(), states.end(),
                      [](const State &state) { return state.allFinite(); });
+}
+
+/** @brief 固定 LTV 约束的总行数：等式、增量不等式和变量 bounds。 */
+int expectedConstraintRows(const LtvQpProblem &problem) {
+  return problem.equality_matrix.rows() + problem.inequality_matrix.rows() +
+         problem.decisionSize();
 }
 
 /** @brief 检查 Eigen 约束向量，允许 OSQP 使用的无穷边界。 */
@@ -266,10 +277,13 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     return audit;
   }
   if (!problem.valid || problem.horizon <= 0 ||
+      !problem.hasExpectedLayout() || !problem.hasOrderedBounds() ||
       problem.decisionSize() <= 0 ||
       result.primal_solution.size() != problem.decisionSize() ||
+      result.dual_solution.size() != expectedConstraintRows(problem) ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
-      config.horizon != problem.horizon || config.dt <= 0.0 ||
+      config.horizon != problem.horizon || !std::isfinite(config.dt) ||
+      config.dt <= 0.0 ||
       !last_control.allFinite()) {
     reject(audit, "invalid_problem_or_candidate_dimensions");
     return audit;
@@ -283,6 +297,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       !eigenVectorFiniteOrInfinity(problem.lower_bound) ||
       !eigenVectorFiniteOrInfinity(problem.upper_bound) ||
       !result.primal_solution.allFinite() ||
+      !result.dual_solution.allFinite() ||
       !std::isfinite(result.solve_time_ms) ||
       !std::isfinite(result.update_time_ms) ||
       !std::isfinite(result.wall_update_time_ms) ||
@@ -292,7 +307,10 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       !std::isfinite(result.slack_maximum) ||
       !std::isfinite(result.hard_constraint_maximum_violation) ||
       result.slack_maximum < 0.0 ||
-      result.hard_constraint_maximum_violation < 0.0) {
+      result.hard_constraint_maximum_violation < 0.0 ||
+      result.solve_time_ms < 0.0 || result.update_time_ms < 0.0 ||
+      result.wall_update_time_ms < 0.0 || result.wall_solve_time_ms < 0.0 ||
+      result.primal_residual < 0.0 || result.dual_residual < 0.0) {
     reject(audit, "non_finite_matrix_or_result");
     return audit;
   }
@@ -300,8 +318,13 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     reject(audit, "solver_status_not_solved");
     return audit;
   }
+  // 后端报告时间只用于归因；准入还必须拒绝 adapter/C API 墙钟超期。
+  // update 与 solve 是 control timer 内独立受限阶段，任一步超期都不可执行。
   if (result.iterations < 0 || result.iterations > settings.max_iterations ||
-      result.solve_time_ms > settings.time_limit_ms) {
+      result.solve_time_ms > settings.time_limit_ms ||
+      result.update_time_ms > settings.time_limit_ms ||
+      result.wall_update_time_ms > settings.time_limit_ms ||
+      result.wall_solve_time_ms > settings.time_limit_ms) {
     reject(audit, "iteration_or_deadline_reject");
     return audit;
   }
@@ -317,11 +340,18 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     reject(audit, "input_health_emergency_or_collision_reject");
     return audit;
   }
-  if (config.max_vx < 0.0 || config.max_vy < 0.0 || config.max_wz < 0.0 ||
-      config.max_ax < 0.0 || config.max_ay < 0.0 || config.max_awz < 0.0 ||
-      config.wheel_base_x <= 0.0 || config.wheel_base_y <= 0.0 ||
-      config.max_wheel_speed <= 0.0 || config.max_wheel_acceleration <= 0.0 ||
-      config.max_steer_rate <= 0.0) {
+  if (!finiteNonnegative(config.max_vx) ||
+      !finiteNonnegative(config.max_vy) ||
+      !finiteNonnegative(config.max_wz) ||
+      !finiteNonnegative(config.max_ax) ||
+      !finiteNonnegative(config.max_ay) ||
+      !finiteNonnegative(config.max_awz) ||
+      !std::isfinite(config.wheel_base_x) || config.wheel_base_x <= 0.0 ||
+      !std::isfinite(config.wheel_base_y) || config.wheel_base_y <= 0.0 ||
+      !std::isfinite(config.max_wheel_speed) || config.max_wheel_speed <= 0.0 ||
+      !std::isfinite(config.max_wheel_acceleration) ||
+      config.max_wheel_acceleration <= 0.0 ||
+      !std::isfinite(config.max_steer_rate) || config.max_steer_rate <= 0.0) {
     reject(audit, "unverifiable_hard_constraint_configuration");
     return audit;
   }
@@ -336,9 +366,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation, std::max(0.0, -slack));
   }
-  // The current LtvQpBuilder allocates no tracking/terminal slack columns.
-  // Rejecting a nonempty vector prevents an adapter from silently softening a
-  // hard constraint before the slack layout and bounds are reviewed.
+  // 当前 LtvQpBuilder 未分配 tracking/terminal slack 决策列。拒绝非空 payload
+  // 可防止 adapter 在 slack 布局、上界和惩罚尚未评审前静默软化任何 hard constraint。
   if (!result.tracking_slacks.empty() ||
       result.slack_maximum > settings.max_tracking_slack ||
       audit.actual_slack_maximum > settings.max_tracking_slack) {
