@@ -4,6 +4,7 @@
 #define ATS_SWERVE_MPC__QP__LTV_QP_PROBLEM_HPP_
 
 #include <array>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,36 @@
 #include "ats_swerve_mpc/zero_speed_guard.hpp"
 
 namespace ats_swerve_mpc {
+
+/**
+ * @brief LTV-QP 的唯一 checked dimension 结果。
+ * @details 所有运行期 dense buffer、CSC setup 和节点 controller 构造都必须消费同一个
+ *          结果。计算只使用 checked size_t 算术，并在转成 Eigen/int 前执行 horizon、整数
+ *          表示范围和 dense payload 上限检查，避免 timer 或启动路径发生巨型分配/有符号溢出。
+ */
+struct LtvQpDimensions {
+  bool valid = false;
+  int horizon = 0;
+  int decision_size = 0;
+  int equality_rows = 0;
+  int inequality_rows = 0;
+  int constraint_rows = 0;
+  std::size_t dense_buffer_bytes = 0;
+  const char *validation_error = "invalid LTV-QP dimensions";
+};
+
+/** @brief 已审计的 dense LTV-QP 资源上限；当前正式配置 horizon=30 不受影响。 */
+constexpr int kLtvQpMaximumHorizon = 64;
+/** @brief 矩阵/向量 double payload 上限，不包含 Eigen/OSQP 小对象元数据。 */
+constexpr std::size_t kLtvQpDenseBufferMaximumBytes = 3U * 1024U * 1024U;
+
+/**
+ * @brief 计算并校验固定 LTV-QP 的所有维度和 dense payload 大小。
+ * @param horizon 预测步数。
+ * @return 失败时 `valid=false` 且不进行任何分配；成功时返回可直接用于 Eigen/OSQP 的
+ *         int 维度。
+ */
+LtvQpDimensions checkedLtvQpDimensions(int horizon);
 
 /**
  * @brief 与后端无关的 LTV-MPC 二次规划数值描述。
@@ -43,14 +74,27 @@ struct LtvQpProblem {
   Eigen::VectorXd upper_bound;
 
   /** @brief 返回第 step 个状态偏差块在固定决策向量中的起始列。 */
-  int stateOffset(int step) const { return state_dimension * step; }
+  int stateOffset(int step) const {
+    const auto dimensions = checkedLtvQpDimensions(horizon);
+    return dimensions.valid && state_dimension == 3 && control_dimension == 3 &&
+                   step >= 0 && step <= horizon
+               ? state_dimension * step
+               : -1;
+  }
   /** @brief 返回第 step 个控制偏差块在固定决策向量中的起始列。 */
   int controlOffset(int step) const {
-    return state_dimension * (horizon + 1) + control_dimension * step;
+    const auto dimensions = checkedLtvQpDimensions(horizon);
+    return dimensions.valid && state_dimension == 3 && control_dimension == 3 &&
+                   step >= 0 && step < horizon
+               ? dimensions.equality_rows + control_dimension * step
+               : -1;
   }
   /** @brief 返回 [delta_x,delta_u] 固定布局的总决策维度。 */
   int decisionSize() const {
-    return state_dimension * (horizon + 1) + control_dimension * horizon;
+    const auto dimensions = checkedLtvQpDimensions(horizon);
+    return dimensions.valid && state_dimension == 3 && control_dimension == 3
+               ? dimensions.decision_size
+               : 0;
   }
 
   /**
@@ -66,6 +110,13 @@ struct LtvQpProblem {
    *          调用前不需要假定矩阵尺寸正确：本函数会先复核固定布局。
    */
   bool hasOrderedBounds() const;
+
+  /**
+   * @brief 校验所有矩阵和向量数值后再允许 backend/reconstructor 索引访问。
+   * @details 系数矩阵、gradient 和等式/不等式 bounds 必须 finite；变量上下界允许
+   *          OSQP 使用 +/-infinity，但 NaN 永远拒绝。该函数不依赖 `valid` 标志。
+   */
+  bool hasFiniteNumerics() const;
 };
 
 class LtvQpBuilder {
@@ -91,8 +142,8 @@ public:
 
   /**
    * @brief 在不改变维度的前提下重填已有的 LTV-QP 数值缓冲。
-   * @details 只有调用方给出错误 horizon 的缓冲时才会分配；节点在构造期已创建匹配缓冲，
-   *          因而正常控制 timer 只写入已有数值存储。
+   * @details 预分配 buffer 的完整 layout 不匹配时直接 fail-closed；控制 timer 不会因
+   *          损坏对象隐式重新分配大型 dense 矩阵。需要新维度时必须在 timer 外显式 allocate。
    */
   static bool build(
       const State &current_state, const std::vector<State> &nominal_states,

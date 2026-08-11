@@ -3,12 +3,37 @@
 #include "ats_swerve_mpc/qp/ltv_qp_problem.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 namespace ats_swerve_mpc {
 namespace {
 
 using Matrix3 = Eigen::Matrix3d;
+
+/** @brief checked size_t 加法，防止 dimension 计算在中间步骤回绕。 */
+bool checkedAdd(std::size_t left, std::size_t right, std::size_t &result) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    return false;
+  }
+  result = left + right;
+  return true;
+}
+
+/** @brief checked size_t 乘法，防止矩阵元素数量计算在中间步骤回绕。 */
+bool checkedMultiply(std::size_t left, std::size_t right,
+                     std::size_t &result) {
+  if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+    return false;
+  }
+  result = left * right;
+  return true;
+}
+
+/** @brief 将 checked size_t 安全收窄到 Eigen/OSQP 使用的 int 维度。 */
+bool fitsInt(std::size_t value) {
+  return value <= static_cast<std::size_t>(std::numeric_limits<int>::max());
+}
 
 /** @brief 允许 OSQP 的无穷边界，但拒绝 NaN 传播到后端。 */
 bool finiteOrInfinity(double value) {
@@ -107,32 +132,93 @@ void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
 
 }  // namespace
 
+LtvQpDimensions checkedLtvQpDimensions(int horizon) {
+  LtvQpDimensions dimensions;
+  if (horizon <= 0) {
+    dimensions.validation_error = "horizon must be positive";
+    return dimensions;
+  }
+  if (horizon > kLtvQpMaximumHorizon) {
+    dimensions.validation_error = "horizon exceeds audited LTV-QP maximum";
+    return dimensions;
+  }
+
+  const std::size_t h = static_cast<std::size_t>(horizon);
+  std::size_t h_plus_one = 0;
+  std::size_t decision = 0;
+  std::size_t equality_rows = 0;
+  std::size_t inequality_rows = 0;
+  if (!checkedAdd(h, 1U, h_plus_one) ||
+      !checkedMultiply(h_plus_one, 3U, equality_rows) ||
+      !checkedMultiply(h, 3U, inequality_rows) ||
+      !checkedMultiply(h, 6U, decision) ||
+      !checkedAdd(decision, 3U, decision) || !fitsInt(decision) ||
+      !fitsInt(equality_rows) || !fitsInt(inequality_rows)) {
+    dimensions.validation_error = "LTV-QP dimensions do not fit int";
+    return dimensions;
+  }
+
+  std::size_t coefficient_elements = 0;
+  std::size_t hessian_elements = 0;
+  std::size_t equality_elements = 0;
+  std::size_t inequality_elements = 0;
+  std::size_t vector_elements = 0;
+  std::size_t dense_elements = 0;
+  std::size_t constraint_coefficient_rows = 0;
+  std::size_t constraint_rows = 0;
+  if (!checkedMultiply(decision, decision, hessian_elements) ||
+      !checkedMultiply(equality_rows, decision, equality_elements) ||
+      !checkedMultiply(inequality_rows, decision, inequality_elements) ||
+      !checkedAdd(equality_elements, inequality_elements,
+                  coefficient_elements) ||
+      !checkedAdd(hessian_elements, coefficient_elements, dense_elements) ||
+      !checkedMultiply(decision, 3U, vector_elements) ||
+      !checkedAdd(dense_elements, vector_elements, dense_elements) ||
+      !checkedAdd(equality_rows, inequality_rows,
+                  constraint_coefficient_rows) ||
+      !checkedMultiply(constraint_coefficient_rows, 2U, vector_elements) ||
+      !checkedAdd(dense_elements, vector_elements, dense_elements) ||
+      !checkedMultiply(dense_elements, sizeof(double),
+                       dimensions.dense_buffer_bytes) ||
+      dimensions.dense_buffer_bytes > kLtvQpDenseBufferMaximumBytes ||
+      !checkedAdd(constraint_coefficient_rows, decision, constraint_rows)) {
+    dimensions.validation_error = "LTV-QP dense buffer exceeds audited resource cap";
+    return dimensions;
+  }
+
+  if (!fitsInt(constraint_rows)) {
+    dimensions.validation_error = "LTV-QP constraint rows do not fit int";
+    return dimensions;
+  }
+  dimensions.valid = true;
+  dimensions.horizon = horizon;
+  dimensions.decision_size = static_cast<int>(decision);
+  dimensions.equality_rows = static_cast<int>(equality_rows);
+  dimensions.inequality_rows = static_cast<int>(inequality_rows);
+  dimensions.constraint_rows = static_cast<int>(constraint_rows);
+  dimensions.validation_error = "valid";
+  return dimensions;
+}
+
 /** @brief 验证预分配 dense QP 缓冲的固定 LTV 维度，防止后端访问错位。 */
 bool LtvQpProblem::hasExpectedLayout() const {
-  constexpr int kStateDimension = 3;
-  constexpr int kControlDimension = 3;
-  if (horizon <= 0 || state_dimension != kStateDimension ||
-      control_dimension != kControlDimension ||
-      horizon > (std::numeric_limits<int>::max() - kStateDimension) /
-                    (kStateDimension + kControlDimension)) {
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  if (!dimensions.valid || state_dimension != 3 || control_dimension != 3) {
     return false;
   }
-  const int decision_size = (kStateDimension + kControlDimension) * horizon +
-                            kStateDimension;
-  const int equality_rows = kStateDimension * (horizon + 1);
-  const int inequality_rows = kControlDimension * horizon;
-  return hessian.rows() == decision_size && hessian.cols() == decision_size &&
-         gradient.size() == decision_size &&
-         equality_matrix.rows() == equality_rows &&
-         equality_matrix.cols() == decision_size &&
-         equality_lower.size() == equality_rows &&
-         equality_upper.size() == equality_rows &&
-         inequality_matrix.rows() == inequality_rows &&
-         inequality_matrix.cols() == decision_size &&
-         inequality_lower.size() == inequality_rows &&
-         inequality_upper.size() == inequality_rows &&
-         lower_bound.size() == decision_size &&
-         upper_bound.size() == decision_size;
+  return hessian.rows() == dimensions.decision_size &&
+         hessian.cols() == dimensions.decision_size &&
+         gradient.size() == dimensions.decision_size &&
+         equality_matrix.rows() == dimensions.equality_rows &&
+         equality_matrix.cols() == dimensions.decision_size &&
+         equality_lower.size() == dimensions.equality_rows &&
+         equality_upper.size() == dimensions.equality_rows &&
+         inequality_matrix.rows() == dimensions.inequality_rows &&
+         inequality_matrix.cols() == dimensions.decision_size &&
+         inequality_lower.size() == dimensions.inequality_rows &&
+         inequality_upper.size() == dimensions.inequality_rows &&
+         lower_bound.size() == dimensions.decision_size &&
+         upper_bound.size() == dimensions.decision_size;
 }
 
 /** @brief 验证 LTV 等式、不等式和变量 bounds 的逐项下界/上界关系。 */
@@ -143,6 +229,15 @@ bool LtvQpProblem::hasOrderedBounds() const {
          boundsOrdered(lower_bound, upper_bound);
 }
 
+bool LtvQpProblem::hasFiniteNumerics() const {
+  return hasExpectedLayout() && hessian.allFinite() && gradient.allFinite() &&
+         equality_matrix.allFinite() && equality_lower.allFinite() &&
+         equality_upper.allFinite() && inequality_matrix.allFinite() &&
+         inequality_lower.allFinite() && inequality_upper.allFinite() &&
+         vectorFiniteOrInfinity(lower_bound) &&
+         vectorFiniteOrInfinity(upper_bound);
+}
+
 /**
  * @brief 在控制 timer 外分配指定 horizon 的 dense LTV-QP 数值缓冲。
  * @details 固定的 decision/row 数和矩阵尺寸是后续 OSQP CSC pattern 一次 setup 的前提。
@@ -150,17 +245,14 @@ bool LtvQpProblem::hasOrderedBounds() const {
 LtvQpProblem LtvQpBuilder::allocate(int horizon) {
   LtvQpProblem problem;
   problem.horizon = horizon;
-  constexpr int kStateDimension = 3;
-  constexpr int kControlDimension = 3;
-  if (horizon <= 0 ||
-      horizon > (std::numeric_limits<int>::max() - kStateDimension) /
-                    (kStateDimension + kControlDimension)) {
-    problem.validation_error = "horizon must be positive and fit fixed LTV dimensions";
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  if (!dimensions.valid) {
+    problem.validation_error = dimensions.validation_error;
     return problem;
   }
-  const int decision_size = problem.decisionSize();
-  const int equality_rows = 3 * (horizon + 1);
-  const int inequality_rows = 3 * horizon;
+  const int decision_size = dimensions.decision_size;
+  const int equality_rows = dimensions.equality_rows;
+  const int inequality_rows = dimensions.inequality_rows;
   const double infinity = std::numeric_limits<double>::infinity();
   problem.hessian = Eigen::MatrixXd::Zero(decision_size, decision_size);
   problem.gradient = Eigen::VectorXd::Zero(decision_size);
@@ -199,22 +291,18 @@ bool LtvQpBuilder::build(
     const std::vector<Se2Reference> &references, const Control &last_control,
     const Se2MpcConfig &config, LtvQpProblem &problem,
     const ZeroSpeedGuardConfig &guard_config) {
-  constexpr int kStateDimension = 3;
-  constexpr int kControlDimension = 3;
-  if (config.horizon <= 0 ||
-      config.horizon >
-          (std::numeric_limits<int>::max() - kStateDimension) /
-              (kStateDimension + kControlDimension) ||
-      !std::isfinite(config.dt) || config.dt <= 0.0) {
+  const auto dimensions = checkedLtvQpDimensions(config.horizon);
+  if (!dimensions.valid || !std::isfinite(config.dt) || config.dt <= 0.0) {
     problem.valid = false;
-    problem.validation_error = "horizon and dt must be positive and representable";
+    problem.validation_error = !dimensions.valid
+                                   ? dimensions.validation_error
+                                   : "dt must be finite and positive";
     return false;
   }
-  if (problem.horizon != config.horizon ||
-      problem.hessian.rows() != 6 * config.horizon + 3 ||
-      problem.equality_matrix.rows() != 3 * (config.horizon + 1) ||
-      problem.inequality_matrix.rows() != 3 * config.horizon) {
-    problem = allocate(config.horizon);
+  if (problem.horizon != config.horizon || !problem.hasExpectedLayout()) {
+    problem.valid = false;
+    problem.validation_error = "preallocated LTV-QP buffer layout mismatch";
+    return false;
   }
   problem.valid = false;
   problem.validation_error.clear();
@@ -363,16 +451,7 @@ bool LtvQpBuilder::build(
     problem.equality_upper.segment<3>(row) = residual;
   }
 
-  problem.valid = problem.hasExpectedLayout() && problem.hasOrderedBounds() &&
-                  problem.hessian.allFinite() && problem.gradient.allFinite() &&
-                  problem.equality_matrix.allFinite() &&
-                  problem.equality_lower.allFinite() &&
-                  problem.equality_upper.allFinite() &&
-                  problem.inequality_matrix.allFinite() &&
-                  problem.inequality_lower.allFinite() &&
-                  problem.inequality_upper.allFinite() &&
-                  vectorFiniteOrInfinity(problem.lower_bound) &&
-                  vectorFiniteOrInfinity(problem.upper_bound);
+  problem.valid = problem.hasOrderedBounds() && problem.hasFiniteNumerics();
   if (!problem.valid) {
     problem.validation_error = "constructed QP contains non-finite values";
   }

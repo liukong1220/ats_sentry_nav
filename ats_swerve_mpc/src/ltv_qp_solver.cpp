@@ -218,7 +218,9 @@ LtvQpPrimalCandidate LtvQpCandidateReconstructor::reconstruct(
     const Se2MpcConfig &config, const LtvQpSolveResult &result) {
   LtvQpPrimalCandidate candidate;
   if (!problem.valid || problem.horizon <= 0 ||
-      problem.decisionSize() <= 0 || !current_state.allFinite() ||
+      !problem.hasExpectedLayout() || !problem.hasOrderedBounds() ||
+      !problem.hasFiniteNumerics() || problem.decisionSize() <= 0 ||
+      !current_state.allFinite() ||
       config.horizon != problem.horizon || !std::isfinite(config.dt) ||
       config.dt <= 0.0 ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
@@ -278,6 +280,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
   }
   if (!problem.valid || problem.horizon <= 0 ||
       !problem.hasExpectedLayout() || !problem.hasOrderedBounds() ||
+      !problem.hasFiniteNumerics() ||
       problem.decisionSize() <= 0 ||
       result.primal_solution.size() != problem.decisionSize() ||
       result.dual_solution.size() != expectedConstraintRows(problem) ||
@@ -302,6 +305,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       !std::isfinite(result.update_time_ms) ||
       !std::isfinite(result.wall_update_time_ms) ||
       !std::isfinite(result.wall_solve_time_ms) ||
+      !std::isfinite(result.wall_qp_phase_time_ms) ||
       !std::isfinite(result.primal_residual) ||
       !std::isfinite(result.dual_residual) ||
       !std::isfinite(result.slack_maximum) ||
@@ -310,6 +314,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       result.hard_constraint_maximum_violation < 0.0 ||
       result.solve_time_ms < 0.0 || result.update_time_ms < 0.0 ||
       result.wall_update_time_ms < 0.0 || result.wall_solve_time_ms < 0.0 ||
+      result.wall_qp_phase_time_ms < 0.0 ||
       result.primal_residual < 0.0 || result.dual_residual < 0.0) {
     reject(audit, "non_finite_matrix_or_result");
     return audit;
@@ -324,7 +329,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       result.solve_time_ms > settings.time_limit_ms ||
       result.update_time_ms > settings.time_limit_ms ||
       result.wall_update_time_ms > settings.time_limit_ms ||
-      result.wall_solve_time_ms > settings.time_limit_ms) {
+      result.wall_solve_time_ms > settings.time_limit_ms ||
+      result.wall_qp_phase_time_ms > settings.time_limit_ms) {
     reject(audit, "iteration_or_deadline_reject");
     return audit;
   }

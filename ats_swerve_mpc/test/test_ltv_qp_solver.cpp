@@ -214,6 +214,11 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
 
   fixture.result.wall_update_time_ms = 1.0;
+  fixture.result.wall_qp_phase_time_ms = 20.0;
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
+
+  fixture.result.wall_qp_phase_time_ms = 1.0;
   fixture.result.primal_residual = 1e-3;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "residual_reject");
@@ -222,6 +227,30 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   fixture.result.status = LtvQpSolverStatus::kSolvedInaccurate;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "solver_status_not_solved");
+}
+
+TEST(LtvQpCandidateValidator, RejectsInvalidCompletePhaseTiming) {
+  CandidateFixture fixture;
+  fixture.result.wall_qp_phase_time_ms =
+      std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "non_finite_matrix_or_result");
+
+  fixture.result.wall_qp_phase_time_ms = -1.0;
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "non_finite_matrix_or_result");
+}
+
+TEST(LtvQpCandidateReconstructor, RejectsCorruptNumericsBeforeSegmentAccess) {
+  CandidateFixture fixture;
+  fixture.problem.valid = true;
+  fixture.problem.gradient(0) = std::numeric_limits<double>::quiet_NaN();
+  const auto candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), fixture.problem, fixture.nominal_controls,
+      fixture.config, fixture.result);
+  EXPECT_FALSE(candidate.valid);
+  EXPECT_EQ(candidate.validation_error,
+            "invalid QP primal reconstruction input");
 }
 
 TEST(LtvQpCandidateValidator, RejectsMissingOrMalformedDualPayload) {
