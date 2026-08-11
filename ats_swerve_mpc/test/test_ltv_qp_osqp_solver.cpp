@@ -15,6 +15,7 @@ using ats_swerve_mpc::LtvQpSolverStatus;
 using ats_swerve_mpc::LtvQpSparseProblem;
 using ats_swerve_mpc::Control;
 using ats_swerve_mpc::LtvQpBuilder;
+using ats_swerve_mpc::LtvQpProblem;
 using ats_swerve_mpc::Se2MpcConfig;
 using ats_swerve_mpc::Se2Reference;
 using ats_swerve_mpc::Se2Model;
@@ -59,6 +60,7 @@ TEST(LtvQpOsqpSolver, SolvesAndReusesFixedWorkspaceWithWarmStart) {
   EXPECT_TRUE(std::isfinite(first.update_time_ms));
   EXPECT_TRUE(std::isfinite(first.wall_solve_time_ms));
   EXPECT_TRUE(std::isfinite(first.wall_update_time_ms));
+  EXPECT_TRUE(std::isfinite(first.wall_qp_phase_time_ms));
   EXPECT_TRUE(std::isfinite(first.primal_residual));
   EXPECT_TRUE(std::isfinite(first.dual_residual));
 
@@ -71,6 +73,7 @@ TEST(LtvQpOsqpSolver, SolvesAndReusesFixedWorkspaceWithWarmStart) {
   EXPECT_TRUE(second.warm_start_used);
   EXPECT_NEAR(second.primal_solution(0), 0.25, 1e-3);
   EXPECT_EQ(solver.setupCount(), 1u);
+  EXPECT_EQ(solver.numericUpdateCallCount(), 2u);
 }
 
 TEST(LtvQpOsqpSolver, RejectsChangedCscPatternWithoutSetup) {
@@ -127,6 +130,60 @@ TEST(LtvQpOsqpSolver, ConvertsLtvBlocksToAStableSparsePattern) {
       << " dual=" << result.dual_residual;
   EXPECT_LE(result.primal_residual, settings().max_primal_residual);
   EXPECT_LE(result.dual_residual, settings().max_dual_residual);
+}
+
+TEST(LtvQpOsqpSolver, RejectsCorruptFinitePayloadBeforeOsqpNumericUpdate) {
+  Se2MpcConfig config;
+  config.horizon = 2;
+  config.dt = 0.1;
+  config.max_vx = config.max_vy = config.max_wz = 1.0;
+  config.max_ax = config.max_ay = config.max_awz = 2.0;
+  config.wheel_base_x = config.wheel_base_y = 0.27;
+  config.max_wheel_speed = 2.0;
+  config.max_wheel_acceleration = 5.0;
+  config.max_steer_rate = 5.0;
+  std::vector<Control> controls(2, Control::Zero());
+  std::vector<State> states(3, State::Zero());
+  std::vector<Se2Reference> references(3);
+  for (auto &reference : references) {
+    reference.control = Control(0.1, 0.0, 0.0);
+  }
+
+  const auto dimensions = ats_swerve_mpc::checkedLtvQpDimensions(config.horizon);
+  ASSERT_TRUE(dimensions.valid);
+  const auto makeProblem = [&]() {
+    return LtvQpBuilder::build(
+        State::Zero(), states, controls, references, Control::Zero(), config);
+  };
+  LtvQpOsqpSolver solver(dimensions, settings());
+  ASSERT_TRUE(solver.initialized());
+
+  const auto expectRejected = [&solver](LtvQpProblem &problem) {
+    ASSERT_TRUE(problem.valid);
+    const std::size_t updates = solver.numericUpdateCallCount();
+    const auto result = solver.solveLtvProblem(problem, settings(), nullptr);
+    EXPECT_EQ(result.status, LtvQpSolverStatus::kInvalidProblem);
+    EXPECT_EQ(solver.numericUpdateCallCount(), updates);
+  };
+
+  auto hessian = makeProblem();
+  hessian.hessian(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  expectRejected(hessian);
+  auto gradient = makeProblem();
+  gradient.gradient(0) = std::numeric_limits<double>::infinity();
+  expectRejected(gradient);
+  auto equality = makeProblem();
+  equality.equality_matrix(0, 0) = std::numeric_limits<double>::quiet_NaN();
+  expectRejected(equality);
+  auto equality_bound = makeProblem();
+  equality_bound.equality_upper(0) = std::numeric_limits<double>::infinity();
+  expectRejected(equality_bound);
+  auto inequality_bound = makeProblem();
+  inequality_bound.inequality_lower(0) = std::numeric_limits<double>::quiet_NaN();
+  expectRejected(inequality_bound);
+  auto variable_bound = makeProblem();
+  variable_bound.lower_bound(0) = std::numeric_limits<double>::quiet_NaN();
+  expectRejected(variable_bound);
 }
 
 }  // namespace

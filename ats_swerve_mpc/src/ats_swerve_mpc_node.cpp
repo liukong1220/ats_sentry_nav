@@ -217,16 +217,26 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       static_cast<std::size_t>(requested_sampling_cycles);
   control_telemetry_.configureSamplingWindow(telemetry_sampling_window_cycles_);
   const Se2MpcConfig mpc_config = loadConfig();
+  // 在创建 Se2MpcController 前统一拒绝无法表示或超过 dense 资源审计上限的 horizon；
+  // 这样 solver_mode=ilqr 也不会因异常参数先分配不可控的预测缓存。
+  const auto ltv_dimensions = checkedLtvQpDimensions(mpc_config.horizon);
+  if (!ltv_dimensions.valid) {
+    throw std::invalid_argument(std::string("invalid LTV-QP dimensions: ") +
+                                ltv_dimensions.validation_error);
+  }
+  if (!std::isfinite(mpc_config.dt) || mpc_config.dt <= 0.0) {
+    throw std::invalid_argument("MPC dt must be finite and positive");
+  }
   validateDynamicsParameters(mpc_config);
   controller_ = std::make_unique<Se2MpcController>(mpc_config);
   if (solver_mode_ == "qp_shadow") {
-    qp_problem_buffer_ = LtvQpBuilder::allocate(mpc_config.horizon);
-    const int decision_size = 3 * (mpc_config.horizon + 1) +
-                              3 * mpc_config.horizon;
-    const int constraint_rows = 3 * (mpc_config.horizon + 1) +
-                                3 * mpc_config.horizon + decision_size;
+    qp_problem_buffer_ = LtvQpBuilder::allocate(ltv_dimensions.horizon);
+    if (!qp_problem_buffer_.hasExpectedLayout()) {
+      throw std::invalid_argument(
+          "LTV-QP buffer allocation did not produce the checked layout");
+    }
     qp_solver_ = std::make_unique<LtvQpOsqpSolver>(
-        decision_size, constraint_rows, qp_solver_settings_);
+        ltv_dimensions, qp_solver_settings_);
     if (!qp_solver_->initialized()) {
       RCLCPP_ERROR(get_logger(),
                    "OSQP v1.0.0 shadow 后端 setup 失败；保持 iLQR 主链，"
@@ -1025,6 +1035,8 @@ void AtsSwerveMpcNode::runQpShadow(
   if (problem_built) {
     recordTiming(telemetry, ControlCycleTimingStage::kOsqpNumericUpdate,
                  result.wall_update_time_ms);
+    recordTiming(telemetry, ControlCycleTimingStage::kQpBackendPhase,
+                 result.wall_qp_phase_time_ms);
     recordTiming(telemetry, ControlCycleTimingStage::kOsqpSolve,
                  result.wall_solve_time_ms);
   }
@@ -1090,6 +1102,7 @@ void AtsSwerveMpcNode::runQpShadow(
   telemetry.osqp_reported_solve_ms = result.solve_time_ms;
   telemetry.osqp_wall_update_ms = result.wall_update_time_ms;
   telemetry.osqp_wall_solve_ms = result.wall_solve_time_ms;
+  telemetry.osqp_wall_qp_phase_ms = result.wall_qp_phase_time_ms;
   telemetry.primal_residual = result.primal_residual;
   telemetry.dual_residual = result.dual_residual;
   telemetry.hard_constraint_margin =
@@ -1127,14 +1140,14 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
   const double control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
 
   ControlCycleTimingDistribution callback_distribution;
-  ControlCycleTimingDistribution qp_solve_distribution;
+  ControlCycleTimingDistribution qp_phase_distribution;
   const auto aggregation_start = std::chrono::steady_clock::now();
   if (telemetry.cycle_sequence % kTelemetrySummaryInterval == 0) {
     std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
     callback_distribution = control_telemetry_.distribution(
         ControlCycleTimingStage::kFullCallback);
-    qp_solve_distribution = control_telemetry_.distribution(
-        ControlCycleTimingStage::kOsqpSolve);
+    qp_phase_distribution = control_telemetry_.distribution(
+        ControlCycleTimingStage::kQpBackendPhase);
   }
   recordTiming(telemetry, ControlCycleTimingStage::kPercentileAggregation,
                elapsedMilliseconds(aggregation_start, std::chrono::steady_clock::now()));
@@ -1144,15 +1157,17 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
     RCLCPP_INFO(
         get_logger(),
         "控制周期 telemetry cycle=%llu mode=%s rate=%.1fHz period=%.3fms "
-        "qp_status=%s iter=%d qp_wall(update/solve)=%.3f/%.3fms "
-        "callback_p50/p95/p99=%.3f/%.3f/%.3fms qp_solve_p50/p95/p99=%.3f/%.3f/%.3fms "
+        "qp_status=%s iter=%d qp_wall(update/solve/phase)=%.3f/%.3f/%.3fms "
+        "callback_p50/p95/p99=%.3f/%.3f/%.3fms "
+        "qp_phase_p50/p95/p99=%.3f/%.3f/%.3fms "
         "same_snapshot=%s feasible=%s reject=%s",
         static_cast<unsigned long long>(telemetry.cycle_sequence), solver_mode_.c_str(),
         control_rate_hz_, control_period_ms, ltvQpSolverStatusName(telemetry.status),
         telemetry.iterations, telemetry.osqp_wall_update_ms, telemetry.osqp_wall_solve_ms,
+        telemetry.osqp_wall_qp_phase_ms,
         callback_distribution.p50_ms, callback_distribution.p95_ms,
-        callback_distribution.p99_ms, qp_solve_distribution.p50_ms,
-        qp_solve_distribution.p95_ms, qp_solve_distribution.p99_ms,
+        callback_distribution.p99_ms, qp_phase_distribution.p50_ms,
+        qp_phase_distribution.p95_ms, qp_phase_distribution.p99_ms,
         telemetry.same_snapshot_identity ? "true" : "false",
         telemetry.candidate_feasible ? "true" : "false",
         telemetry.rejection_reason.data());
@@ -1216,6 +1231,11 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
           ControlCycleTimingStage::kOsqpNumericUpdate, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpUpdateBudgetOverrun);
+  }
+  if (telemetry.qp_shadow_attempted && exceeded(
+          ControlCycleTimingStage::kQpBackendPhase, qp_solver_settings_.time_limit_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kQpPhaseBudgetOverrun);
   }
   if (telemetry.qp_shadow_attempted && candidate_audit_overrun) {
     control_telemetry_.incrementDeadlineCause(

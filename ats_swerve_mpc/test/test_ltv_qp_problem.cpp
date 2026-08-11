@@ -130,12 +130,66 @@ TEST(LtvQpBuilder, RejectsNonConvexWeightsAndNonFiniteLimits) {
             "non-finite or negative dynamics limit");
 }
 
+TEST(LtvQpBuilder, CheckedDimensionsAreSharedAndBounded) {
+  const auto dimensions = ats_swerve_mpc::checkedLtvQpDimensions(30);
+  ASSERT_TRUE(dimensions.valid);
+  EXPECT_EQ(dimensions.decision_size, 183);
+  EXPECT_EQ(dimensions.equality_rows, 93);
+  EXPECT_EQ(dimensions.inequality_rows, 90);
+  EXPECT_EQ(dimensions.constraint_rows, 366);
+  EXPECT_EQ(dimensions.dense_buffer_bytes, 543144U);
+  EXPECT_FALSE(ats_swerve_mpc::checkedLtvQpDimensions(0).valid);
+  EXPECT_FALSE(ats_swerve_mpc::checkedLtvQpDimensions(-1).valid);
+  EXPECT_FALSE(ats_swerve_mpc::checkedLtvQpDimensions(
+      ats_swerve_mpc::kLtvQpMaximumHorizon + 1).valid);
+  EXPECT_FALSE(ats_swerve_mpc::checkedLtvQpDimensions(
+      std::numeric_limits<int>::max()).valid);
+}
+
+TEST(LtvQpBuilder, RejectsMalformedPreallocatedLayoutBeforeAnyWrite) {
+  ats_swerve_mpc::Se2MpcConfig config;
+  config.horizon = 2;
+  config.dt = 0.1;
+  const auto refs = references(config.horizon, config.dt);
+  const std::vector<ats_swerve_mpc::Control> controls(
+      static_cast<std::size_t>(config.horizon), refs.front().control);
+  const auto states = ats_swerve_mpc::Se2Model(config.dt).rollout(
+      ats_swerve_mpc::State::Zero(), controls);
+
+  auto hessian_columns = ats_swerve_mpc::LtvQpBuilder::allocate(config.horizon);
+  const int decision_size = hessian_columns.decisionSize();
+  hessian_columns.hessian.conservativeResize(decision_size, decision_size - 1);
+  EXPECT_FALSE(ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config, hessian_columns));
+  EXPECT_EQ(hessian_columns.hessian.cols(), decision_size - 1);
+
+  auto equality_columns = ats_swerve_mpc::LtvQpBuilder::allocate(config.horizon);
+  equality_columns.equality_matrix.conservativeResize(
+      equality_columns.equality_matrix.rows(),
+      equality_columns.equality_matrix.cols() - 1);
+  EXPECT_FALSE(ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config, equality_columns));
+
+  auto gradient = ats_swerve_mpc::LtvQpBuilder::allocate(config.horizon);
+  gradient.gradient.conservativeResize(gradient.gradient.size() - 1);
+  EXPECT_FALSE(ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config, gradient));
+
+  auto bound = ats_swerve_mpc::LtvQpBuilder::allocate(config.horizon);
+  bound.inequality_upper.conservativeResize(bound.inequality_upper.size() - 1);
+  EXPECT_FALSE(ats_swerve_mpc::LtvQpBuilder::build(
+      ats_swerve_mpc::State::Zero(), states, controls, refs,
+      ats_swerve_mpc::Control::Zero(), config, bound));
+}
+
 TEST(LtvQpBuilder, RejectsHorizonThatCannotFitFixedLtvDimensions) {
   const auto problem = ats_swerve_mpc::LtvQpBuilder::allocate(
       std::numeric_limits<int>::max());
   EXPECT_FALSE(problem.valid);
-  EXPECT_EQ(problem.validation_error,
-            "horizon must be positive and fit fixed LTV dimensions");
+  EXPECT_FALSE(problem.validation_error.empty());
 }
 
 }  // namespace

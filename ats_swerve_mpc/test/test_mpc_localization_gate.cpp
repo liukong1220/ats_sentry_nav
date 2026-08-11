@@ -8,6 +8,8 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
@@ -516,6 +518,31 @@ TEST_F(MpcLocalizationGateTest, RejectsExecutionForDifferentGimbalRequest) {
         return command_norm_.load() > 0.02;
       },
       2s));
+}
+
+TEST(AtsSwerveMpcNodeConstruction, RejectsOversizedHorizonBeforeControllerCreation) {
+  const bool initialized_before = rclcpp::ok();
+  if (!initialized_before) {
+    int argc = 0;
+    rclcpp::init(argc, nullptr);
+  }
+  const auto expectRejected = [](int horizon) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({
+        rclcpp::Parameter("horizon", horizon),
+        rclcpp::Parameter("solver_mode", "ilqr")});
+    EXPECT_THROW(
+        {
+          auto node = std::make_shared<ats_swerve_mpc::AtsSwerveMpcNode>(options);
+          (void)node;
+        },
+        std::invalid_argument);
+  };
+  expectRejected(ats_swerve_mpc::kLtvQpMaximumHorizon + 1);
+  expectRejected(std::numeric_limits<int>::max());
+  if (!initialized_before) {
+    rclcpp::shutdown();
+  }
 }
 
 } // namespace

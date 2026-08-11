@@ -67,6 +67,7 @@ const char *controlCycleTimingStageName(ControlCycleTimingStage stage) {
     case ControlCycleTimingStage::kIlqrCommandPublish: return "ilqr_command_publish_ms";
     case ControlCycleTimingStage::kQpProblemBuild: return "qp_problem_build_ms";
     case ControlCycleTimingStage::kOsqpNumericUpdate: return "osqp_numeric_update_ms";
+    case ControlCycleTimingStage::kQpBackendPhase: return "qp_backend_phase_ms";
     case ControlCycleTimingStage::kOsqpSolve: return "osqp_solve_ms";
     case ControlCycleTimingStage::kPrimalReconstructionRollout: return "primal_reconstruction_rollout_ms";
     case ControlCycleTimingStage::kCandidateHardCheck: return "candidate_hard_check_ms";
@@ -88,6 +89,7 @@ const char *controlCycleDeadlineCauseName(ControlCycleDeadlineCause cause) {
     case ControlCycleDeadlineCause::kIlqrSolveBudgetOverrun: return "ilqr_solve_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpProblemBuildBudgetOverrun: return "qp_problem_build_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpUpdateBudgetOverrun: return "qp_update_budget_overrun_count";
+    case ControlCycleDeadlineCause::kQpPhaseBudgetOverrun: return "qp_phase_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpCandidateAuditBudgetOverrun: return "qp_candidate_audit_budget_overrun_count";
     case ControlCycleDeadlineCause::kTelemetryAggregationBudgetOverrun: return "telemetry_aggregation_budget_overrun_count";
     case ControlCycleDeadlineCause::kLoggingPublishBudgetOverrun: return "logging_publish_budget_overrun_count";
@@ -333,6 +335,8 @@ std::string ControlCycleTelemetryRing::toJson(
     appendDouble(stream, sample.osqp_wall_update_ms);
     stream << ",\"osqp_wall_solve_ms\":";
     appendDouble(stream, sample.osqp_wall_solve_ms);
+    stream << ",\"osqp_wall_qp_phase_ms\":";
+    appendDouble(stream, sample.osqp_wall_qp_phase_ms);
     stream << ",\"primal_residual\":";
     appendDouble(stream, sample.primal_residual);
     stream << ",\"dual_residual\":";

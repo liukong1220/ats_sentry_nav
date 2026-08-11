@@ -12,18 +12,35 @@
 namespace ats_swerve_mpc {
 namespace {
 
-/** @brief 反解 [delta_x,delta_u] 固定布局对应的 horizon；非 LTV 尺寸返回 -1。 */
-int ltvHorizonForDecisionSize(int decision_size) {
+/** @brief 从编码后的 decision size 反解候选 horizon；不在此放宽资源准入。 */
+int encodedLtvHorizonForDecisionSize(int decision_size) {
   if (decision_size < 9 || (decision_size - 3) % 6 != 0) {
     return -1;
   }
   return (decision_size - 3) / 6;
 }
 
+/** @brief 反解并通过共享 dimension helper 复核的 LTV horizon；非准入尺寸返回 -1。 */
+int ltvHorizonForDecisionSize(int decision_size) {
+  const int horizon = encodedLtvHorizonForDecisionSize(decision_size);
+  if (horizon <= 0) {
+    return -1;
+  }
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  return dimensions.valid && dimensions.decision_size == decision_size
+             ? horizon
+             : -1;
+}
+
 /** @brief 判断 rows 是否与 ATS 动力学、增量和 identity bounds 的固定数量匹配。 */
 bool isLtvDimensions(int decision_size, int constraint_rows) {
   const int horizon = ltvHorizonForDecisionSize(decision_size);
-  return horizon > 0 && constraint_rows == 12 * horizon + 6;
+  if (horizon <= 0) {
+    return false;
+  }
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  return dimensions.valid && dimensions.decision_size == decision_size &&
+         dimensions.constraint_rows == constraint_rows;
 }
 
 /** @brief 以固定行堆叠顺序读取 dense LTV 值，避免每周期重建 CSC 索引。 */
@@ -49,7 +66,8 @@ double ltvConstraintValue(const LtvQpProblem &problem, int row, int column) {
 LtvQpSparseProblem makeLtvQpSparseProblem(const LtvQpProblem &problem) {
   LtvQpSparseProblem sparse;
   if (!problem.valid || !problem.hasExpectedLayout() ||
-      !problem.hasOrderedBounds() || problem.decisionSize() <= 0 ||
+      !problem.hasOrderedBounds() || !problem.hasFiniteNumerics() ||
+      problem.decisionSize() <= 0 ||
       problem.hessian.rows() != problem.decisionSize() ||
       problem.hessian.cols() != problem.decisionSize()) {
     return sparse;
@@ -152,7 +170,8 @@ LtvQpSparseStructure LtvQpOsqpSolver::ltvHessianPattern(
   pattern.columns = decision_size;
   pattern.column_offsets.reserve(static_cast<std::size_t>(decision_size + 1));
   pattern.column_offsets.push_back(0);
-  const int control_start = 3 * (horizon + 1);
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  const int control_start = dimensions.equality_rows;
   for (int column = 0; column < decision_size; ++column) {
     if (column >= control_start && column >= control_start + 3) {
       pattern.row_indices.push_back(column - 3);
@@ -175,8 +194,9 @@ LtvQpSparseStructure LtvQpOsqpSolver::ltvConstraintPattern(
     return densePattern(constraint_rows, decision_size);
   }
   const int horizon = ltvHorizonForDecisionSize(decision_size);
-  const int equality_rows = 3 * (horizon + 1);
-  const int inequality_rows = 3 * horizon;
+  const auto dimensions = checkedLtvQpDimensions(horizon);
+  const int equality_rows = dimensions.equality_rows;
+  const int inequality_rows = dimensions.inequality_rows;
   const int control_start = equality_rows;
   std::vector<std::vector<int>> rows_by_column(
       static_cast<std::size_t>(decision_size));
@@ -247,6 +267,16 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(
   if (decision_size_ <= 0 || constraint_rows_ <= 0 || !setup_settings.valid()) {
     return;
   }
+  // 生产 LTV setup 必须通过同一 checked helper。保留 1x1 等通用输入只为 adapter 单测，
+  // 任何看似 LTV 的尺寸都不能绕过 horizon/resource/constraint-row 契约进入分配。
+  const int encoded_horizon = encodedLtvHorizonForDecisionSize(decision_size_);
+  if (encoded_horizon > 0) {
+    const auto dimensions = checkedLtvQpDimensions(encoded_horizon);
+    if (!dimensions.valid || dimensions.decision_size != decision_size_ ||
+        dimensions.constraint_rows != constraint_rows_) {
+      return;
+    }
+  }
   hessian_structure_ = ltvHessianPattern(decision_size_);
   constraint_structure_ = ltvConstraintPattern(decision_size_, constraint_rows_);
   hessian_values_.assign(hessian_structure_.row_indices.size(), 0.0);
@@ -296,6 +326,14 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(
     setup_count_ = 1;
   }
 }
+
+LtvQpOsqpSolver::LtvQpOsqpSolver(
+    const LtvQpDimensions &dimensions,
+    const LtvQpSolverSettings &setup_settings)
+    : LtvQpOsqpSolver(
+          dimensions.valid ? dimensions.decision_size : 0,
+          dimensions.valid ? dimensions.constraint_rows : 0,
+          setup_settings) {}
 
 /** @brief RAII 析构；实际资源回收由 OsqpDeleter 调用官方 API。 */
 LtvQpOsqpSolver::~LtvQpOsqpSolver() = default;
@@ -390,7 +428,8 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
  */
 bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
   if (!problem.valid || !problem.hasExpectedLayout() ||
-      !problem.hasOrderedBounds() || problem.decisionSize() != decision_size_ ||
+      !problem.hasOrderedBounds() || !problem.hasFiniteNumerics() ||
+      problem.decisionSize() != decision_size_ ||
       !isLtvDimensions(decision_size_, constraint_rows_) ||
       problem.equality_matrix.rows() + problem.inequality_matrix.rows() +
           decision_size_ != constraint_rows_) {
@@ -459,6 +498,11 @@ LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
 LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
     const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start) {
   LtvQpSolveResult result;
+  const auto phase_start = std::chrono::steady_clock::now();
+  const auto elapsedPhaseMs = [&phase_start]() {
+    return 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - phase_start).count();
+  };
   if (solver_->settings != nullptr) {
     OSQPSettings updated = *solver_->settings;
     updated.max_iter = static_cast<OSQPInt>(settings.max_iterations);
@@ -467,11 +511,14 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
                                settings.max_dual_residual);
     updated.eps_rel = 1e-6;
     if (osqp_update_settings(solver_.get(), &updated) != 0) {
+      result.wall_update_time_ms = elapsedPhaseMs();
+      result.wall_qp_phase_time_ms = result.wall_update_time_ms;
       result.status = LtvQpSolverStatus::kNumericalFailure;
       return result;
     }
   }
-  const auto update_start = std::chrono::steady_clock::now();
+  const auto update_start = phase_start;
+  ++numeric_update_call_count_;
   if (osqp_update_data_vec(solver_.get(), gradient_.data(), lower_.data(),
                            upper_.data()) != 0 ||
       osqp_update_data_mat(solver_.get(), hessian_values_.data(), nullptr,
@@ -480,21 +527,25 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
                            static_cast<OSQPInt>(constraint_values_.size())) != 0) {
     result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - update_start).count();
+    result.wall_qp_phase_time_ms = result.wall_update_time_ms;
     result.status = LtvQpSolverStatus::kNumericalFailure;
     return result;
   }
-  result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - update_start).count();
   if (warm_start != nullptr &&
       warm_start->validFor(decision_size_, constraint_rows_)) {
     result.warm_start_used =
         osqp_warm_start(solver_.get(), warm_start->primal.data(),
                         warm_start->dual.data()) == 0;
   }
+  // 完整 update 口径必须包含 settings、q/l/u/P/A 与可选 primal/dual warm-start；
+  // 不能把 warm-start 夹在 update 和 solve 的未计时空档中。
+  result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - update_start).count();
   const auto solve_start = std::chrono::steady_clock::now();
   const OSQPInt solve_result = osqp_solve(solver_.get());
   result.wall_solve_time_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - solve_start).count();
+  result.wall_qp_phase_time_ms = elapsedPhaseMs();
   if (solver_->info == nullptr) {
     result.status = solve_result == 0 ? LtvQpSolverStatus::kNumericalFailure
                                       : LtvQpSolverStatus::kBackendUnavailable;

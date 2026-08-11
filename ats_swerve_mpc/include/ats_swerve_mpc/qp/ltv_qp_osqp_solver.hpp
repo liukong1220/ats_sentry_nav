@@ -33,6 +33,13 @@ public:
    */
   LtvQpOsqpSolver(int decision_size, int constraint_rows,
                   const LtvQpSolverSettings &setup_settings);
+  /**
+   * @brief 使用 checked LTV dimensions 创建生产 OSQP workspace。
+   * @details 无效 dimensions 直接保持 backend unavailable；节点必须在 controller/workspace
+   *          创建前拒绝启动，避免再次独立计算 decision/constraint rows。
+   */
+  LtvQpOsqpSolver(const LtvQpDimensions &dimensions,
+                  const LtvQpSolverSettings &setup_settings);
   /** @brief 释放 OSQP workspace；该析构不承担任何控制发布责任。 */
   ~LtvQpOsqpSolver() override;
 
@@ -60,6 +67,8 @@ public:
   bool initialized() const { return solver_ != nullptr; }
   /** @brief 暴露 setup 次数以锁定“控制 timer 不重建 workspace”的测试契约。 */
   std::size_t setupCount() const { return setup_count_; }
+  /** @brief 返回真正调用 OSQP 数值 update 的次数，锁定 invalid input 不触碰 backend。 */
+  std::size_t numericUpdateCallCount() const { return numeric_update_call_count_; }
   /** @brief 返回 setup 时冻结的 Hessian CSC pattern。 */
   const LtvQpSparseStructure &hessianStructure() const {
     return hessian_structure_;
@@ -114,6 +123,7 @@ private:
   };
   std::unique_ptr<OSQPSolver, OsqpDeleter> solver_;
   std::size_t setup_count_ = 0;
+  std::size_t numeric_update_call_count_ = 0;
 };
 
 }  // namespace ats_swerve_mpc
