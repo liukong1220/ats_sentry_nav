@@ -48,7 +48,8 @@ double ltvConstraintValue(const LtvQpProblem &problem, int row, int column) {
  */
 LtvQpSparseProblem makeLtvQpSparseProblem(const LtvQpProblem &problem) {
   LtvQpSparseProblem sparse;
-  if (!problem.valid || problem.decisionSize() <= 0 ||
+  if (!problem.valid || !problem.hasExpectedLayout() ||
+      !problem.hasOrderedBounds() || problem.decisionSize() <= 0 ||
       problem.hessian.rows() != problem.decisionSize() ||
       problem.hessian.cols() != problem.decisionSize()) {
     return sparse;
@@ -388,7 +389,8 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
  * @details 只覆盖 P/A/q/l/u 的值，保留构造期的 CSC 索引和 vector capacity。
  */
 bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
-  if (!problem.valid || problem.decisionSize() != decision_size_ ||
+  if (!problem.valid || !problem.hasExpectedLayout() ||
+      !problem.hasOrderedBounds() || problem.decisionSize() != decision_size_ ||
       !isLtvDimensions(decision_size_, constraint_rows_) ||
       problem.equality_matrix.rows() + problem.inequality_matrix.rows() +
           decision_size_ != constraint_rows_) {

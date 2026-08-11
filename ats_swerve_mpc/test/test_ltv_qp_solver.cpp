@@ -108,6 +108,9 @@ struct CandidateFixture {
     result.slack_maximum = 0.0;
     result.hard_constraint_maximum_violation = 0.0;
     result.primal_solution = Eigen::VectorXd::Zero(problem.decisionSize());
+    result.dual_solution = Eigen::VectorXd::Zero(
+        problem.equality_matrix.rows() + problem.inequality_matrix.rows() +
+        problem.decisionSize());
   }
 
   LtvQpCandidateAudit audit() const {
@@ -201,6 +204,16 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
 
   fixture.result.solve_time_ms = 1.0;
+  fixture.result.wall_solve_time_ms = 20.0;
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
+
+  fixture.result.wall_solve_time_ms = 1.0;
+  fixture.result.wall_update_time_ms = 20.0;
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
+
+  fixture.result.wall_update_time_ms = 1.0;
   fixture.result.primal_residual = 1e-3;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "residual_reject");
@@ -209,6 +222,40 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   fixture.result.status = LtvQpSolverStatus::kSolvedInaccurate;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "solver_status_not_solved");
+}
+
+TEST(LtvQpCandidateValidator, RejectsMissingOrMalformedDualPayload) {
+  CandidateFixture fixture;
+  fixture.result.dual_solution.resize(0);
+  auto audit = fixture.audit();
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "invalid_problem_or_candidate_dimensions");
+
+  fixture.result.dual_solution = Eigen::VectorXd::Zero(
+      fixture.problem.equality_matrix.rows() +
+      fixture.problem.inequality_matrix.rows() + fixture.problem.decisionSize());
+  fixture.result.dual_solution(0) = std::numeric_limits<double>::quiet_NaN();
+  audit = fixture.audit();
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "non_finite_matrix_or_result");
+}
+
+TEST(LtvQpCandidateValidator, RejectsMalformedDenseLayoutAndBounds) {
+  CandidateFixture fixture;
+  fixture.problem.inequality_upper.conservativeResize(
+      fixture.problem.inequality_upper.size() - 1);
+  auto audit = fixture.audit();
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason,
+            "invalid_problem_or_candidate_dimensions");
+
+  CandidateFixture reversed_bounds_fixture;
+  reversed_bounds_fixture.problem.lower_bound(0) = 1.0;
+  reversed_bounds_fixture.problem.upper_bound(0) = -1.0;
+  audit = reversed_bounds_fixture.audit();
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason,
+            "invalid_problem_or_candidate_dimensions");
 }
 
 TEST(LtvQpCandidateValidator, RejectsEveryNonSolvedBackendStatus) {

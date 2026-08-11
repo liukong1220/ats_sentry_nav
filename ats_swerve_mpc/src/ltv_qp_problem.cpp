@@ -10,6 +10,37 @@ namespace {
 
 using Matrix3 = Eigen::Matrix3d;
 
+/** @brief 允许 OSQP 的无穷边界，但拒绝 NaN 传播到后端。 */
+bool finiteOrInfinity(double value) {
+  return !std::isnan(value);
+}
+
+/** @brief 校验边界向量中的每个元素；仅变量 bounds 可以合法使用无穷。 */
+bool vectorFiniteOrInfinity(const Eigen::VectorXd &values) {
+  for (int index = 0; index < values.size(); ++index) {
+    if (!finiteOrInfinity(values(index))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** @brief 权重必须有限且非负，确保送入 OSQP 的 Hessian 保持凸性。 */
+bool validWeight(const Eigen::Vector3d &weight) {
+  return weight.allFinite() && (weight.array() >= 0.0).all();
+}
+
+/** @brief 动力学上限允许为零以表达禁用轴，但不得为 NaN/Inf 或负数。 */
+bool validNonnegativeLimit(double value) {
+  return std::isfinite(value) && value >= 0.0;
+}
+
+/** @brief 在同维向量上逐项检查双边约束，NaN 比较会自然 fail-closed。 */
+bool boundsOrdered(const Eigen::VectorXd &lower, const Eigen::VectorXd &upper) {
+  return lower.size() == upper.size() &&
+         (lower.array() <= upper.array()).all();
+}
+
 /** @brief 检查名义状态序列是否全部有限，防止 NaN 进入矩阵线性化。 */
 bool finiteStates(const std::vector<State> &states) {
   for (const auto &state : states) {
@@ -76,6 +107,42 @@ void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
 
 }  // namespace
 
+/** @brief 验证预分配 dense QP 缓冲的固定 LTV 维度，防止后端访问错位。 */
+bool LtvQpProblem::hasExpectedLayout() const {
+  constexpr int kStateDimension = 3;
+  constexpr int kControlDimension = 3;
+  if (horizon <= 0 || state_dimension != kStateDimension ||
+      control_dimension != kControlDimension ||
+      horizon > (std::numeric_limits<int>::max() - kStateDimension) /
+                    (kStateDimension + kControlDimension)) {
+    return false;
+  }
+  const int decision_size = (kStateDimension + kControlDimension) * horizon +
+                            kStateDimension;
+  const int equality_rows = kStateDimension * (horizon + 1);
+  const int inequality_rows = kControlDimension * horizon;
+  return hessian.rows() == decision_size && hessian.cols() == decision_size &&
+         gradient.size() == decision_size &&
+         equality_matrix.rows() == equality_rows &&
+         equality_matrix.cols() == decision_size &&
+         equality_lower.size() == equality_rows &&
+         equality_upper.size() == equality_rows &&
+         inequality_matrix.rows() == inequality_rows &&
+         inequality_matrix.cols() == decision_size &&
+         inequality_lower.size() == inequality_rows &&
+         inequality_upper.size() == inequality_rows &&
+         lower_bound.size() == decision_size &&
+         upper_bound.size() == decision_size;
+}
+
+/** @brief 验证 LTV 等式、不等式和变量 bounds 的逐项下界/上界关系。 */
+bool LtvQpProblem::hasOrderedBounds() const {
+  return hasExpectedLayout() &&
+         boundsOrdered(equality_lower, equality_upper) &&
+         boundsOrdered(inequality_lower, inequality_upper) &&
+         boundsOrdered(lower_bound, upper_bound);
+}
+
 /**
  * @brief 在控制 timer 外分配指定 horizon 的 dense LTV-QP 数值缓冲。
  * @details 固定的 decision/row 数和矩阵尺寸是后续 OSQP CSC pattern 一次 setup 的前提。
@@ -83,8 +150,12 @@ void addDeltaQuadratic(LtvQpProblem &problem, int current_offset,
 LtvQpProblem LtvQpBuilder::allocate(int horizon) {
   LtvQpProblem problem;
   problem.horizon = horizon;
-  if (horizon <= 0) {
-    problem.validation_error = "horizon must be positive";
+  constexpr int kStateDimension = 3;
+  constexpr int kControlDimension = 3;
+  if (horizon <= 0 ||
+      horizon > (std::numeric_limits<int>::max() - kStateDimension) /
+                    (kStateDimension + kControlDimension)) {
+    problem.validation_error = "horizon must be positive and fit fixed LTV dimensions";
     return problem;
   }
   const int decision_size = problem.decisionSize();
@@ -128,6 +199,17 @@ bool LtvQpBuilder::build(
     const std::vector<Se2Reference> &references, const Control &last_control,
     const Se2MpcConfig &config, LtvQpProblem &problem,
     const ZeroSpeedGuardConfig &guard_config) {
+  constexpr int kStateDimension = 3;
+  constexpr int kControlDimension = 3;
+  if (config.horizon <= 0 ||
+      config.horizon >
+          (std::numeric_limits<int>::max() - kStateDimension) /
+              (kStateDimension + kControlDimension) ||
+      !std::isfinite(config.dt) || config.dt <= 0.0) {
+    problem.valid = false;
+    problem.validation_error = "horizon and dt must be positive and representable";
+    return false;
+  }
   if (problem.horizon != config.horizon ||
       problem.hessian.rows() != 6 * config.horizon + 3 ||
       problem.equality_matrix.rows() != 3 * (config.horizon + 1) ||
@@ -138,10 +220,6 @@ bool LtvQpBuilder::build(
   problem.validation_error.clear();
   problem.zero_speed_guard_active = false;
   problem.angle_rate_linearization_valid.fill(false);
-  if (config.horizon <= 0 || config.dt <= 0.0) {
-    problem.validation_error = "horizon and dt must be positive";
-    return false;
-  }
   const std::size_t horizon = static_cast<std::size_t>(config.horizon);
   if (nominal_states.size() != horizon + 1 ||
       nominal_controls.size() != horizon || references.size() < horizon + 1) {
@@ -153,10 +231,25 @@ bool LtvQpBuilder::build(
     problem.validation_error = "non-finite state or control input";
     return false;
   }
-  if ((config.max_vx < 0.0) || (config.max_vy < 0.0) ||
-      (config.max_wz < 0.0) || (config.max_ax < 0.0) ||
-      (config.max_ay < 0.0) || (config.max_awz < 0.0)) {
-    problem.validation_error = "negative body limit";
+  if (!validNonnegativeLimit(config.max_vx) ||
+      !validNonnegativeLimit(config.max_vy) ||
+      !validNonnegativeLimit(config.max_wz) ||
+      !validNonnegativeLimit(config.max_ax) ||
+      !validNonnegativeLimit(config.max_ay) ||
+      !validNonnegativeLimit(config.max_awz) ||
+      !validNonnegativeLimit(config.wheel_base_x) ||
+      !validNonnegativeLimit(config.wheel_base_y) ||
+      !validNonnegativeLimit(config.max_wheel_speed) ||
+      !validNonnegativeLimit(config.max_wheel_acceleration) ||
+      !validNonnegativeLimit(config.max_steer_rate)) {
+    problem.validation_error = "non-finite or negative dynamics limit";
+    return false;
+  }
+  if (!validWeight(config.state_weight) ||
+      !validWeight(config.control_weight) ||
+      !validWeight(config.control_delta_weight) ||
+      !validWeight(config.terminal_weight)) {
+    problem.validation_error = "QP weights must be finite and non-negative";
     return false;
   }
 
@@ -270,9 +363,16 @@ bool LtvQpBuilder::build(
     problem.equality_upper.segment<3>(row) = residual;
   }
 
-  problem.valid = problem.hessian.allFinite() && problem.gradient.allFinite() &&
+  problem.valid = problem.hasExpectedLayout() && problem.hasOrderedBounds() &&
+                  problem.hessian.allFinite() && problem.gradient.allFinite() &&
                   problem.equality_matrix.allFinite() &&
-                  problem.inequality_matrix.allFinite();
+                  problem.equality_lower.allFinite() &&
+                  problem.equality_upper.allFinite() &&
+                  problem.inequality_matrix.allFinite() &&
+                  problem.inequality_lower.allFinite() &&
+                  problem.inequality_upper.allFinite() &&
+                  vectorFiniteOrInfinity(problem.lower_bound) &&
+                  vectorFiniteOrInfinity(problem.upper_bound);
   if (!problem.valid) {
     problem.validation_error = "constructed QP contains non-finite values";
   }
