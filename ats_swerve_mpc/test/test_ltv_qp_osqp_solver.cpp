@@ -186,4 +186,49 @@ TEST(LtvQpOsqpSolver, RejectsCorruptFinitePayloadBeforeOsqpNumericUpdate) {
   expectRejected(variable_bound);
 }
 
+TEST(LtvQpOsqpSolver, LtvCompletePhaseCoversDenseCopyThroughSolve) {
+  Se2MpcConfig config;
+  config.horizon = 2;
+  config.dt = 0.1;
+  config.max_vx = config.max_vy = config.max_wz = 1.0;
+  config.max_ax = config.max_ay = config.max_awz = 2.0;
+  config.wheel_base_x = config.wheel_base_y = 0.27;
+  config.max_wheel_speed = 2.0;
+  config.max_wheel_acceleration = 5.0;
+  config.max_steer_rate = 5.0;
+  std::vector<Control> controls(2, Control::Zero());
+  std::vector<State> states(3, State::Zero());
+  std::vector<Se2Reference> references(3);
+  for (auto &reference : references) {
+    reference.control = Control(0.1, 0.0, 0.0);
+  }
+  const auto problem = LtvQpBuilder::build(
+      State::Zero(), states, controls, references, Control::Zero(), config);
+  ASSERT_TRUE(problem.valid) << problem.validation_error;
+  const auto dimensions = ats_swerve_mpc::checkedLtvQpDimensions(config.horizon);
+  ASSERT_TRUE(dimensions.valid);
+  LtvQpOsqpSolver solver(dimensions, settings());
+  ASSERT_TRUE(solver.initialized());
+
+  const auto first = solver.solveLtvProblem(problem, settings(), nullptr);
+  EXPECT_TRUE(first.status == LtvQpSolverStatus::kSolved ||
+              first.status == LtvQpSolverStatus::kMaxIterations)
+      << ats_swerve_mpc::ltvQpSolverStatusName(first.status);
+  EXPECT_TRUE(std::isfinite(first.wall_qp_phase_time_ms));
+  EXPECT_TRUE(std::isfinite(first.wall_complete_qp_phase_time_ms));
+  EXPECT_GE(first.wall_complete_qp_phase_time_ms, first.wall_qp_phase_time_ms);
+
+  ats_swerve_mpc::LtvQpWarmStart warm_start;
+  warm_start.primal = first.primal_solution;
+  warm_start.dual = first.dual_solution;
+  const auto second = solver.solveLtvProblem(problem, settings(), &warm_start);
+  EXPECT_TRUE(second.status == LtvQpSolverStatus::kSolved ||
+              second.status == LtvQpSolverStatus::kMaxIterations)
+      << ats_swerve_mpc::ltvQpSolverStatusName(second.status);
+  EXPECT_TRUE(std::isfinite(second.wall_complete_qp_phase_time_ms));
+  EXPECT_GE(second.wall_complete_qp_phase_time_ms,
+            second.wall_qp_phase_time_ms);
+  EXPECT_TRUE(second.warm_start_used);
+}
+
 }  // namespace

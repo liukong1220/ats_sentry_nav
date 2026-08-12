@@ -29,6 +29,7 @@ enum class ControlCycleTimingStage : std::size_t {
   kQpProblemBuild,
   kOsqpNumericUpdate,
   kQpBackendPhase,
+  kQpCompletePhase,
   kOsqpSolve,
   kPrimalReconstructionRollout,
   kCandidateHardCheck,
@@ -58,6 +59,7 @@ enum class ControlCycleDeadlineCause : std::size_t {
   kQpProblemBuildBudgetOverrun,
   kQpUpdateBudgetOverrun,
   kQpPhaseBudgetOverrun,
+  kQpCompletePhaseBudgetOverrun,
   kQpCandidateAuditBudgetOverrun,
   kTelemetryAggregationBudgetOverrun,
   kLoggingPublishBudgetOverrun,
@@ -111,6 +113,9 @@ struct ControlCycleTelemetrySample {
   // OSQPInfo 的内部计时与 C API 墙钟分别保留，避免把前者误作完整 adapter 开销。
   double osqp_wall_update_ms = 0.0;
   double osqp_wall_solve_ms = 0.0;
+  // 连续覆盖 dense-to-CSC copy、settings/data update、warm-start 与 solve；不含 build/reconstruction/audit。
+  double qp_complete_phase_ms = 0.0;
+  // backend-only 子阶段，严格从 settings update 到 osqp_solve 返回。
   double osqp_wall_qp_phase_ms = 0.0;
   double primal_residual = 0.0;
   double dual_residual = 0.0;
