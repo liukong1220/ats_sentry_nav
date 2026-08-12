@@ -219,6 +219,11 @@ TEST(LtvQpCandidateValidator, RejectsDeadlineResidualAndUnapprovedStatus) {
   EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
 
   fixture.result.wall_qp_phase_time_ms = 1.0;
+  fixture.result.wall_complete_qp_phase_time_ms = 20.0;
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "iteration_or_deadline_reject");
+
+  fixture.result.wall_complete_qp_phase_time_ms = 1.0;
   fixture.result.primal_residual = 1e-3;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "residual_reject");
@@ -239,6 +244,141 @@ TEST(LtvQpCandidateValidator, RejectsInvalidCompletePhaseTiming) {
   fixture.result.wall_qp_phase_time_ms = -1.0;
   EXPECT_FALSE(fixture.audit().feasible);
   EXPECT_EQ(fixture.audit().rejection_reason, "non_finite_matrix_or_result");
+
+  fixture.result.wall_qp_phase_time_ms = 1.0;
+  fixture.result.wall_complete_qp_phase_time_ms =
+      std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(fixture.audit().feasible);
+  EXPECT_EQ(fixture.audit().rejection_reason, "non_finite_matrix_or_result");
+}
+
+TEST(LtvQpCandidateValidator,
+     ReconstructedCandidateRejectsCorruptedButValidProblemBeforeIndexing) {
+  // state/control dimension corruption makes controlOffset() invalid; the overload
+  // must reject before it can pass that offset to Eigen::segment().
+  CandidateFixture state_dimension_fixture;
+  const auto state_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), state_dimension_fixture.problem,
+      state_dimension_fixture.nominal_controls, state_dimension_fixture.config,
+      state_dimension_fixture.result);
+  ASSERT_TRUE(state_candidate.valid) << state_candidate.validation_error;
+  state_dimension_fixture.problem.valid = true;
+  state_dimension_fixture.problem.state_dimension = 2;
+  auto audit = LtvQpCandidateValidator::validate(
+      state_dimension_fixture.problem, state_dimension_fixture.nominal_controls,
+      Control::Zero(), state_dimension_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), state_dimension_fixture.result,
+      state_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "invalid_problem_or_candidate_dimensions");
+
+  CandidateFixture control_dimension_fixture;
+  const auto control_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), control_dimension_fixture.problem,
+      control_dimension_fixture.nominal_controls, control_dimension_fixture.config,
+      control_dimension_fixture.result);
+  ASSERT_TRUE(control_candidate.valid) << control_candidate.validation_error;
+  control_dimension_fixture.problem.valid = true;
+  control_dimension_fixture.problem.control_dimension = 2;
+  audit = LtvQpCandidateValidator::validate(
+      control_dimension_fixture.problem, control_dimension_fixture.nominal_controls,
+      Control::Zero(), control_dimension_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), control_dimension_fixture.result,
+      control_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "invalid_problem_or_candidate_dimensions");
+
+  CandidateFixture matrix_layout_fixture;
+  const auto matrix_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), matrix_layout_fixture.problem,
+      matrix_layout_fixture.nominal_controls, matrix_layout_fixture.config,
+      matrix_layout_fixture.result);
+  ASSERT_TRUE(matrix_candidate.valid) << matrix_candidate.validation_error;
+  matrix_layout_fixture.problem.valid = true;
+  matrix_layout_fixture.problem.equality_matrix.conservativeResize(
+      matrix_layout_fixture.problem.equality_matrix.rows(),
+      matrix_layout_fixture.problem.equality_matrix.cols() - 1);
+  audit = LtvQpCandidateValidator::validate(
+      matrix_layout_fixture.problem, matrix_layout_fixture.nominal_controls,
+      Control::Zero(), matrix_layout_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), matrix_layout_fixture.result,
+      matrix_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "invalid_problem_or_candidate_dimensions");
+
+  CandidateFixture vector_layout_fixture;
+  const auto vector_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), vector_layout_fixture.problem,
+      vector_layout_fixture.nominal_controls, vector_layout_fixture.config,
+      vector_layout_fixture.result);
+  ASSERT_TRUE(vector_candidate.valid) << vector_candidate.validation_error;
+  vector_layout_fixture.problem.valid = true;
+  vector_layout_fixture.problem.inequality_upper.conservativeResize(
+      vector_layout_fixture.problem.inequality_upper.size() - 1);
+  audit = LtvQpCandidateValidator::validate(
+      vector_layout_fixture.problem, vector_layout_fixture.nominal_controls,
+      Control::Zero(), vector_layout_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), vector_layout_fixture.result,
+      vector_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "invalid_problem_or_candidate_dimensions");
+
+  CandidateFixture nan_fixture;
+  const auto nan_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), nan_fixture.problem, nan_fixture.nominal_controls,
+      nan_fixture.config, nan_fixture.result);
+  ASSERT_TRUE(nan_candidate.valid) << nan_candidate.validation_error;
+  nan_fixture.problem.valid = true;
+  nan_fixture.problem.gradient(0) = std::numeric_limits<double>::quiet_NaN();
+  audit = LtvQpCandidateValidator::validate(
+      nan_fixture.problem, nan_fixture.nominal_controls, Control::Zero(),
+      nan_fixture.config, ZeroSpeedGuardConfig(), validSettings(), healthySafety(),
+      nan_fixture.result, nan_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "non_finite_matrix_or_result");
+
+  CandidateFixture infinity_fixture;
+  const auto infinity_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), infinity_fixture.problem, infinity_fixture.nominal_controls,
+      infinity_fixture.config, infinity_fixture.result);
+  ASSERT_TRUE(infinity_candidate.valid) << infinity_candidate.validation_error;
+  infinity_fixture.problem.valid = true;
+  infinity_fixture.problem.equality_upper(0) =
+      std::numeric_limits<double>::infinity();
+  audit = LtvQpCandidateValidator::validate(
+      infinity_fixture.problem, infinity_fixture.nominal_controls, Control::Zero(),
+      infinity_fixture.config, ZeroSpeedGuardConfig(), validSettings(), healthySafety(),
+      infinity_fixture.result, infinity_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "non_finite_matrix_or_result");
+
+  CandidateFixture malformed_result_fixture;
+  const auto valid_candidate = ats_swerve_mpc::LtvQpCandidateReconstructor::reconstruct(
+      State::Zero(), malformed_result_fixture.problem,
+      malformed_result_fixture.nominal_controls, malformed_result_fixture.config,
+      malformed_result_fixture.result);
+  ASSERT_TRUE(valid_candidate.valid) << valid_candidate.validation_error;
+  malformed_result_fixture.result.primal_solution.conservativeResize(
+      malformed_result_fixture.result.primal_solution.size() - 1);
+  audit = LtvQpCandidateValidator::validate(
+      malformed_result_fixture.problem, malformed_result_fixture.nominal_controls,
+      Control::Zero(), malformed_result_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), malformed_result_fixture.result,
+      valid_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "nonlinear_rollout_reconstruction_reject");
+
+  malformed_result_fixture.result.primal_solution =
+      Eigen::VectorXd::Zero(malformed_result_fixture.problem.decisionSize());
+  malformed_result_fixture.result.dual_solution.conservativeResize(
+      malformed_result_fixture.result.dual_solution.size() - 1);
+  audit = LtvQpCandidateValidator::validate(
+      malformed_result_fixture.problem, malformed_result_fixture.nominal_controls,
+      Control::Zero(), malformed_result_fixture.config, ZeroSpeedGuardConfig(),
+      validSettings(), healthySafety(), malformed_result_fixture.result,
+      valid_candidate);
+  EXPECT_FALSE(audit.feasible);
+  EXPECT_EQ(audit.rejection_reason, "nonlinear_rollout_reconstruction_reject");
 }
 
 TEST(LtvQpCandidateReconstructor, RejectsCorruptNumericsBeforeSegmentAccess) {

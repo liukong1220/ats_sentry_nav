@@ -306,6 +306,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       !std::isfinite(result.wall_update_time_ms) ||
       !std::isfinite(result.wall_solve_time_ms) ||
       !std::isfinite(result.wall_qp_phase_time_ms) ||
+      !std::isfinite(result.wall_complete_qp_phase_time_ms) ||
       !std::isfinite(result.primal_residual) ||
       !std::isfinite(result.dual_residual) ||
       !std::isfinite(result.slack_maximum) ||
@@ -315,6 +316,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       result.solve_time_ms < 0.0 || result.update_time_ms < 0.0 ||
       result.wall_update_time_ms < 0.0 || result.wall_solve_time_ms < 0.0 ||
       result.wall_qp_phase_time_ms < 0.0 ||
+      result.wall_complete_qp_phase_time_ms < 0.0 ||
       result.primal_residual < 0.0 || result.dual_residual < 0.0) {
     reject(audit, "non_finite_matrix_or_result");
     return audit;
@@ -330,7 +332,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       result.update_time_ms > settings.time_limit_ms ||
       result.wall_update_time_ms > settings.time_limit_ms ||
       result.wall_solve_time_ms > settings.time_limit_ms ||
-      result.wall_qp_phase_time_ms > settings.time_limit_ms) {
+      result.wall_qp_phase_time_ms > settings.time_limit_ms ||
+      result.wall_complete_qp_phase_time_ms > settings.time_limit_ms) {
     reject(audit, "iteration_or_deadline_reject");
     return audit;
   }
@@ -477,8 +480,30 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     const LtvQpSolveResult &result,
     const LtvQpPrimalCandidate &candidate) {
   LtvQpCandidateAudit audit;
+  // 该 overload 会在委托基础 hard-check 前读取 control offset 和 primal segment。
+  // 先完整复核公开输入，不能依赖 qp_shadow 当前只传 builder 成功 buffer 的调用约定。
   if (!problem.valid || problem.horizon <= 0 ||
-      result.primal_solution.size() != problem.decisionSize() ||
+      !problem.hasExpectedLayout() || !problem.hasOrderedBounds()) {
+    reject(audit, "invalid_problem_or_candidate_dimensions");
+    return audit;
+  }
+  if (!problem.hasFiniteNumerics()) {
+    reject(audit, "non_finite_matrix_or_result");
+    return audit;
+  }
+  const int decision_size = problem.decisionSize();
+  if (!settings.valid()) {
+    reject(audit, "invalid_solver_settings");
+    return audit;
+  }
+  if (decision_size <= 0 ||
+      config.horizon != problem.horizon || !std::isfinite(config.dt) ||
+      config.dt <= 0.0 || !last_control.allFinite() ||
+      result.primal_solution.size() != decision_size ||
+      result.dual_solution.size() != expectedConstraintRows(problem) ||
+      !result.primal_solution.allFinite() ||
+      !result.dual_solution.allFinite() ||
+      !finiteControls(nominal_controls) ||
       !candidate.valid ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
       candidate.controls.size() != static_cast<std::size_t>(problem.horizon) ||
@@ -488,8 +513,13 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     return audit;
   }
   for (int step = 0; step < problem.horizon; ++step) {
+    const int control_offset = problem.controlOffset(step);
+    if (control_offset < 0 || control_offset > decision_size - 3) {
+      reject(audit, "invalid_problem_or_candidate_dimensions");
+      return audit;
+    }
     const Control reconstructed = nominal_controls[static_cast<std::size_t>(step)] +
-        result.primal_solution.segment<3>(problem.controlOffset(step));
+        result.primal_solution.segment<3>(control_offset);
     if (!reconstructed.allFinite() ||
         (candidate.controls[static_cast<std::size_t>(step)] - reconstructed)
                 .lpNorm<Eigen::Infinity>() > 1e-9) {

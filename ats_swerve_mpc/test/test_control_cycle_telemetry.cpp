@@ -95,9 +95,14 @@ TEST(ControlCycleTelemetryRing, DeadlineCountersSaturateAndNamesStayStable) {
       "callback_period_overrun_count");
   EXPECT_STREQ(ats_swerve_mpc::controlCycleTimingStageName(
       ControlCycleTimingStage::kQpBackendPhase), "qp_backend_phase_ms");
+  EXPECT_STREQ(ats_swerve_mpc::controlCycleTimingStageName(
+      ControlCycleTimingStage::kQpCompletePhase), "qp_complete_phase_ms");
   EXPECT_STREQ(ats_swerve_mpc::controlCycleDeadlineCauseName(
       ControlCycleDeadlineCause::kQpPhaseBudgetOverrun),
       "qp_phase_budget_overrun_count");
+  EXPECT_STREQ(ats_swerve_mpc::controlCycleDeadlineCauseName(
+      ControlCycleDeadlineCause::kQpCompletePhaseBudgetOverrun),
+      "qp_complete_phase_budget_overrun_count");
 }
 
 TEST(ControlCycleTelemetryRing, JsonContainsRuntimeMetadataControlsAndWallTimes) {
@@ -108,6 +113,7 @@ TEST(ControlCycleTelemetryRing, JsonContainsRuntimeMetadataControlsAndWallTimes)
   value.osqp_wall_update_ms = 0.3;
   value.osqp_wall_solve_ms = 1.3;
   value.osqp_wall_qp_phase_ms = 1.5;
+  value.qp_complete_phase_ms = 1.7;
   ring.push(value, std::chrono::steady_clock::now());
 
   ControlCycleTelemetryMetadata metadata;
@@ -122,7 +128,7 @@ TEST(ControlCycleTelemetryRing, JsonContainsRuntimeMetadataControlsAndWallTimes)
   metadata.qp_max_hard_constraint_violation = 1e-7;
   metadata.ros_domain_id = 231;
   const std::string json = ring.toJson(metadata);
-  EXPECT_NE(json.find("\"schema_version\":3"), std::string::npos);
+  EXPECT_NE(json.find("\"schema_version\":4"), std::string::npos);
   EXPECT_NE(json.find("\"control_period_ms\":50"), std::string::npos);
   EXPECT_NE(json.find("\"qp_max_iterations\":400"), std::string::npos);
   EXPECT_NE(json.find("\"qp_max_primal_residual\":0.0001"),
@@ -131,7 +137,11 @@ TEST(ControlCycleTelemetryRing, JsonContainsRuntimeMetadataControlsAndWallTimes)
             std::string::npos);
   EXPECT_NE(json.find("\"osqp_wall_qp_phase_ms\":1.5"),
             std::string::npos);
+  EXPECT_NE(json.find("\"qp_complete_phase_ms\":1.7"),
+            std::string::npos);
   EXPECT_NE(json.find("\"qp_backend_phase_ms\""), std::string::npos);
+  EXPECT_NE(json.find("\"qp_complete_phase_budget_overrun_count\""),
+            std::string::npos);
   EXPECT_NE(json.find("\"qp_max_hard_constraint_violation\":9.9999999999999995e-08"),
             std::string::npos);
   EXPECT_NE(json.find("\"osqp_wall_update_ms\":"), std::string::npos);

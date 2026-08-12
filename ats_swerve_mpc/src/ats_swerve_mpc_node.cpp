@@ -1037,6 +1037,8 @@ void AtsSwerveMpcNode::runQpShadow(
                  result.wall_update_time_ms);
     recordTiming(telemetry, ControlCycleTimingStage::kQpBackendPhase,
                  result.wall_qp_phase_time_ms);
+    recordTiming(telemetry, ControlCycleTimingStage::kQpCompletePhase,
+                 result.wall_complete_qp_phase_time_ms);
     recordTiming(telemetry, ControlCycleTimingStage::kOsqpSolve,
                  result.wall_solve_time_ms);
   }
@@ -1102,6 +1104,7 @@ void AtsSwerveMpcNode::runQpShadow(
   telemetry.osqp_reported_solve_ms = result.solve_time_ms;
   telemetry.osqp_wall_update_ms = result.wall_update_time_ms;
   telemetry.osqp_wall_solve_ms = result.wall_solve_time_ms;
+  telemetry.qp_complete_phase_ms = result.wall_complete_qp_phase_time_ms;
   telemetry.osqp_wall_qp_phase_ms = result.wall_qp_phase_time_ms;
   telemetry.primal_residual = result.primal_residual;
   telemetry.dual_residual = result.dual_residual;
@@ -1140,14 +1143,17 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
   const double control_period_ms = 1000.0 / std::max(1.0, control_rate_hz_);
 
   ControlCycleTimingDistribution callback_distribution;
-  ControlCycleTimingDistribution qp_phase_distribution;
+  ControlCycleTimingDistribution qp_backend_phase_distribution;
+  ControlCycleTimingDistribution qp_complete_phase_distribution;
   const auto aggregation_start = std::chrono::steady_clock::now();
   if (telemetry.cycle_sequence % kTelemetrySummaryInterval == 0) {
     std::lock_guard<std::mutex> lock(control_telemetry_mutex_);
     callback_distribution = control_telemetry_.distribution(
         ControlCycleTimingStage::kFullCallback);
-    qp_phase_distribution = control_telemetry_.distribution(
+    qp_backend_phase_distribution = control_telemetry_.distribution(
         ControlCycleTimingStage::kQpBackendPhase);
+    qp_complete_phase_distribution = control_telemetry_.distribution(
+        ControlCycleTimingStage::kQpCompletePhase);
   }
   recordTiming(telemetry, ControlCycleTimingStage::kPercentileAggregation,
                elapsedMilliseconds(aggregation_start, std::chrono::steady_clock::now()));
@@ -1157,17 +1163,20 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
     RCLCPP_INFO(
         get_logger(),
         "控制周期 telemetry cycle=%llu mode=%s rate=%.1fHz period=%.3fms "
-        "qp_status=%s iter=%d qp_wall(update/solve/phase)=%.3f/%.3f/%.3fms "
+        "qp_status=%s iter=%d qp_wall(update/solve/backend/complete)=%.3f/%.3f/%.3f/%.3fms "
         "callback_p50/p95/p99=%.3f/%.3f/%.3fms "
-        "qp_phase_p50/p95/p99=%.3f/%.3f/%.3fms "
+        "qp_backend_p50/p95/p99=%.3f/%.3f/%.3fms "
+        "qp_complete_p50/p95/p99=%.3f/%.3f/%.3fms "
         "same_snapshot=%s feasible=%s reject=%s",
         static_cast<unsigned long long>(telemetry.cycle_sequence), solver_mode_.c_str(),
         control_rate_hz_, control_period_ms, ltvQpSolverStatusName(telemetry.status),
         telemetry.iterations, telemetry.osqp_wall_update_ms, telemetry.osqp_wall_solve_ms,
-        telemetry.osqp_wall_qp_phase_ms,
+        telemetry.osqp_wall_qp_phase_ms, telemetry.qp_complete_phase_ms,
         callback_distribution.p50_ms, callback_distribution.p95_ms,
-        callback_distribution.p99_ms, qp_phase_distribution.p50_ms,
-        qp_phase_distribution.p95_ms, qp_phase_distribution.p99_ms,
+        callback_distribution.p99_ms, qp_backend_phase_distribution.p50_ms,
+        qp_backend_phase_distribution.p95_ms, qp_backend_phase_distribution.p99_ms,
+        qp_complete_phase_distribution.p50_ms, qp_complete_phase_distribution.p95_ms,
+        qp_complete_phase_distribution.p99_ms,
         telemetry.same_snapshot_identity ? "true" : "false",
         telemetry.candidate_feasible ? "true" : "false",
         telemetry.rejection_reason.data());
@@ -1236,6 +1245,11 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
           ControlCycleTimingStage::kQpBackendPhase, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpPhaseBudgetOverrun);
+  }
+  if (telemetry.qp_shadow_attempted && exceeded(
+          ControlCycleTimingStage::kQpCompletePhase, qp_solver_settings_.time_limit_ms)) {
+    control_telemetry_.incrementDeadlineCause(
+        ControlCycleDeadlineCause::kQpCompletePhaseBudgetOverrun);
   }
   if (telemetry.qp_shadow_attempted && candidate_audit_overrun) {
     control_telemetry_.incrementDeadlineCause(

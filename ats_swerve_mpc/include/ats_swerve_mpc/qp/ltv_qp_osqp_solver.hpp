@@ -3,6 +3,7 @@
 #ifndef ATS_SWERVE_MPC__QP__LTV_QP_OSQP_SOLVER_HPP_
 #define ATS_SWERVE_MPC__QP__LTV_QP_OSQP_SOLVER_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -99,8 +100,9 @@ private:
   /** @brief 将 ATS dense LTV 各约束块按固定列序更新进 OSQP 数值缓冲。 */
   bool copyLtvNumericalValues(const LtvQpProblem &problem);
   /** @brief 更新 q/l/u/P/A、可选 warm-start 并采集 OSQP 原始诊断。 */
-  LtvQpSolveResult solvePrepared(const LtvQpSolverSettings &settings,
-                                 const LtvQpWarmStart *warm_start);
+  LtvQpSolveResult solvePrepared(
+      const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start,
+      std::chrono::steady_clock::time_point complete_phase_start);
   /** @brief 把 OSQP 终止码映射到 ATS 审计状态；solved_inaccurate 不放行。 */
   static LtvQpSolverStatus mapStatus(int status);
 

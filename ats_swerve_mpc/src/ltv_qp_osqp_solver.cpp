@@ -414,12 +414,15 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
                                        : LtvQpSolverStatus::kInvalidProblem;
     return result;
   }
+  const auto complete_phase_start = std::chrono::steady_clock::now();
   if (!copyNumericalValues(problem, hessian_values_, constraint_values_, gradient_,
                            lower_, upper_)) {
     result.status = LtvQpSolverStatus::kInvalidProblem;
+    result.wall_complete_qp_phase_time_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - complete_phase_start).count();
     return result;
   }
-  return solvePrepared(settings, warm_start);
+  return solvePrepared(settings, warm_start, complete_phase_start);
 }
 
 /**
@@ -482,12 +485,21 @@ LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
     const LtvQpProblem &problem, const LtvQpSolverSettings &settings,
     const LtvQpWarmStart *warm_start) {
   LtvQpSolveResult result;
-  if (solver_ == nullptr || !settings.valid() || !copyLtvNumericalValues(problem)) {
+  if (solver_ == nullptr || !settings.valid()) {
     result.status = solver_ == nullptr ? LtvQpSolverStatus::kBackendUnavailable
                                        : LtvQpSolverStatus::kInvalidProblem;
     return result;
   }
-  return solvePrepared(settings, warm_start);
+  // Complete phase starts immediately before the dense LTV -> fixed CSC copy.
+  // Solver/settings rejection is not part of this per-cycle adapter+backend budget.
+  const auto complete_phase_start = std::chrono::steady_clock::now();
+  if (!copyLtvNumericalValues(problem)) {
+    result.status = LtvQpSolverStatus::kInvalidProblem;
+    result.wall_complete_qp_phase_time_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - complete_phase_start).count();
+    return result;
+  }
+  return solvePrepared(settings, warm_start, complete_phase_start);
 }
 
 /**
@@ -496,12 +508,22 @@ LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
  *          不在固定决策布局中，故报告 0 而不将其误写为已实现软约束。
  */
 LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
-    const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start) {
+    const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start,
+    std::chrono::steady_clock::time_point complete_phase_start) {
   LtvQpSolveResult result;
-  const auto phase_start = std::chrono::steady_clock::now();
-  const auto elapsedPhaseMs = [&phase_start]() {
+  const auto backend_phase_start = std::chrono::steady_clock::now();
+  const auto elapsedBackendPhaseMs = [&backend_phase_start]() {
     return 1000.0 * std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - phase_start).count();
+        std::chrono::steady_clock::now() - backend_phase_start).count();
+  };
+  const auto elapsedCompletePhaseMs = [&complete_phase_start]() {
+    return 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - complete_phase_start).count();
+  };
+  const auto finalizePhaseTimes = [&result, &elapsedBackendPhaseMs,
+                                   &elapsedCompletePhaseMs]() {
+    result.wall_qp_phase_time_ms = elapsedBackendPhaseMs();
+    result.wall_complete_qp_phase_time_ms = elapsedCompletePhaseMs();
   };
   if (solver_->settings != nullptr) {
     OSQPSettings updated = *solver_->settings;
@@ -511,13 +533,13 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
                                settings.max_dual_residual);
     updated.eps_rel = 1e-6;
     if (osqp_update_settings(solver_.get(), &updated) != 0) {
-      result.wall_update_time_ms = elapsedPhaseMs();
-      result.wall_qp_phase_time_ms = result.wall_update_time_ms;
+      result.wall_update_time_ms = elapsedBackendPhaseMs();
+      finalizePhaseTimes();
       result.status = LtvQpSolverStatus::kNumericalFailure;
       return result;
     }
   }
-  const auto update_start = phase_start;
+  const auto update_start = backend_phase_start;
   ++numeric_update_call_count_;
   if (osqp_update_data_vec(solver_.get(), gradient_.data(), lower_.data(),
                            upper_.data()) != 0 ||
@@ -527,7 +549,7 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
                            static_cast<OSQPInt>(constraint_values_.size())) != 0) {
     result.wall_update_time_ms = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - update_start).count();
-    result.wall_qp_phase_time_ms = result.wall_update_time_ms;
+    finalizePhaseTimes();
     result.status = LtvQpSolverStatus::kNumericalFailure;
     return result;
   }
@@ -545,7 +567,7 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
   const OSQPInt solve_result = osqp_solve(solver_.get());
   result.wall_solve_time_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - solve_start).count();
-  result.wall_qp_phase_time_ms = elapsedPhaseMs();
+  finalizePhaseTimes();
   if (solver_->info == nullptr) {
     result.status = solve_result == 0 ? LtvQpSolverStatus::kNumericalFailure
                                       : LtvQpSolverStatus::kBackendUnavailable;
