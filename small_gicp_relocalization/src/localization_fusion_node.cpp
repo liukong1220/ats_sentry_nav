@@ -21,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
@@ -30,6 +31,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "small_gicp_relocalization/localization_fusion_core.hpp"
+#include "tf2/LinearMath/Quaternion.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 
@@ -99,6 +101,13 @@ public:
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "gimbal_yaw_odom");
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     allow_initial_identity_ = declare_parameter<bool>("allow_initial_identity", false);
+    use_initial_map_to_odom_ = declare_parameter<bool>("use_initial_map_to_odom", false);
+    initial_map_to_odom_x_ = declare_parameter<double>("initial_map_to_odom_x", 0.0);
+    initial_map_to_odom_y_ = declare_parameter<double>("initial_map_to_odom_y", 0.0);
+    initial_map_to_odom_z_ = declare_parameter<double>("initial_map_to_odom_z", 0.0);
+    initial_map_to_odom_roll_ = declare_parameter<double>("initial_map_to_odom_roll", 0.0);
+    initial_map_to_odom_pitch_ = declare_parameter<double>("initial_map_to_odom_pitch", 0.0);
+    initial_map_to_odom_yaw_ = declare_parameter<double>("initial_map_to_odom_yaw", 0.0);
     odom_timeout_s_ = std::max(0.05, declare_parameter<double>("odom_timeout_s", 0.5));
     observation_degraded_timeout_s_ =
       std::max(0.0, declare_parameter<double>("observation_timeout_s", 3.0));
@@ -141,7 +150,31 @@ public:
     status_timer_ = create_wall_timer(
       std::chrono::milliseconds(100), std::bind(&LocalizationFusionNode::onStatusTimer, this));
 
-    if (allow_initial_identity_) {
+    const std::array<double, 6> initial_map_to_odom{
+      initial_map_to_odom_x_,    initial_map_to_odom_y_,     initial_map_to_odom_z_,
+      initial_map_to_odom_roll_, initial_map_to_odom_pitch_, initial_map_to_odom_yaw_};
+    if (std::any_of(initial_map_to_odom.begin(), initial_map_to_odom.end(), [](double value) {
+          return !std::isfinite(value);
+        })) {
+      throw std::invalid_argument("initial map->odom parameter contains a non-finite value");
+    }
+    if (use_initial_map_to_odom_ && allow_initial_identity_) {
+      throw std::invalid_argument(
+        "use_initial_map_to_odom and allow_initial_identity are mutually exclusive");
+    }
+    if (use_initial_map_to_odom_) {
+      tf2::Quaternion rotation;
+      rotation.setRPY(
+        initial_map_to_odom_roll_, initial_map_to_odom_pitch_, initial_map_to_odom_yaw_);
+      rotation.normalize();
+      std::lock_guard<std::mutex> lock(mutex_);
+      map_to_odom_.setOrigin(
+        tf2::Vector3(initial_map_to_odom_x_, initial_map_to_odom_y_, initial_map_to_odom_z_));
+      map_to_odom_.setRotation(rotation);
+      has_map_to_odom_ = true;
+      epoch_ = 1;
+      status_message_ = "map->odom initialized by explicit parameter";
+    } else if (allow_initial_identity_) {
       std::lock_guard<std::mutex> lock(mutex_);
       map_to_odom_.setIdentity();
       has_map_to_odom_ = true;
@@ -428,6 +461,13 @@ private:
   std::string robot_base_frame_;
   bool publish_tf_{true};
   bool allow_initial_identity_{false};
+  bool use_initial_map_to_odom_{false};
+  double initial_map_to_odom_x_{0.0};
+  double initial_map_to_odom_y_{0.0};
+  double initial_map_to_odom_z_{0.0};
+  double initial_map_to_odom_roll_{0.0};
+  double initial_map_to_odom_pitch_{0.0};
+  double initial_map_to_odom_yaw_{0.0};
   double odom_timeout_s_{0.5};
   double observation_degraded_timeout_s_{3.0};
   double observation_lost_timeout_s_{10.0};

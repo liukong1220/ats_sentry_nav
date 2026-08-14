@@ -629,7 +629,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
     } else if (message->mode !=
         ats_navigation_interfaces::msg::ExecutionCommand::MODE_EXECUTE ||
       message->goal_id == 0 || message->reference.poses.size() < 2 ||
-      message->gimbal_request_sequence == 0 ||
+      (require_gimbal_status_ && message->gimbal_request_sequence == 0) ||
       (message->yaw_authority !=
         ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
        message->yaw_authority !=

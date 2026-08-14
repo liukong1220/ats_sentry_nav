@@ -487,7 +487,12 @@ private:
              message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF ||
              (active_goal_->recovering &&
               message->failure_reason ==
-                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED));
+                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED) ||
+             (message->failure_reason ==
+                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED &&
+              (!mapReadyLocked() ||
+               !planningSnapshotUsableLocked(
+                 message->map_publication_sequence, active_goal_->localization_epoch))));
         if (transient_failure) {
           active_goal_->recovering = true;
           map_ready_signal_ = false;
@@ -602,7 +607,12 @@ private:
       // map status 与 grid/TF 更新跨 topic，不具备原子顺序。先急停并进入有界等待；
       // 恢复后重规划，持续超时才由 tick 返回 MAP_UNREADY。
       suspendActiveGoal(*suspend_goal_id);
+      return;
     }
+    // The adapter publishes the immutable snapshot and its heartbeat on two
+    // DDS topics.  A candidate can arrive between them, so retry the exact
+    // sequence gate once the status side of that pair is visible.
+    tryCommitReference();
   }
 
   void onPlanningSnapshot(const PlanningMapSnapshot::SharedPtr message) {
@@ -756,17 +766,19 @@ private:
     std::uint64_t current_publication_sequence = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      // A zero or future publication sequence is malformed.  A lower sequence
-      // is allowed because a heartbeat may advance while MINCO is planning;
-      // the latest snapshot still has to pass the final safety gate below.
+      // A candidate may see its immutable snapshot before the corresponding
+      // status callback.  Wait for that status rather than treating the
+      // half-pair as a failure.  Once a newer status is installed, an older
+      // candidate must never regain authority over the latest map snapshot.
       if (active_goal_ && candidate_reference_ && planner_ready_status_ &&
           planner_ready_status_->goal_id == active_goal_->id &&
           planner_ready_status_->localization_epoch == active_goal_->localization_epoch &&
           planner_ready_status_->plan_request_sequence ==
             active_goal_->expected_plan_request_sequence &&
           (planner_ready_status_->map_publication_sequence == 0U ||
-           planner_ready_status_->map_publication_sequence >
-             map_status_publication_sequence_)) {
+           (map_status_publication_sequence_ != 0U &&
+            planner_ready_status_->map_publication_sequence <
+              map_status_publication_sequence_))) {
         stale_candidate_goal = active_goal_->id;
         candidate_publication_sequence =
           planner_ready_status_->map_publication_sequence;
@@ -795,13 +807,13 @@ private:
             active_goal_->expected_plan_request_sequence ||
         (localization_epoch_ &&
          planner_ready_status_->localization_epoch != *localization_epoch_) ||
-        (planner_ready_status_->map_publication_sequence == 0U ||
-         planner_ready_status_->map_publication_sequence >
-           map_status_publication_sequence_) ||
+        planner_ready_status_->map_publication_sequence == 0U ||
+        planner_ready_status_->map_publication_sequence !=
+          map_status_publication_sequence_ ||
         (require_planning_snapshot_ &&
          !planningSnapshotUsableLocked(
            planner_ready_status_->map_publication_sequence,
-           planner_ready_status_->localization_epoch, true)) ||
+           planner_ready_status_->localization_epoch)) ||
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
@@ -814,12 +826,18 @@ private:
       fail_stop_ = true;
       return;
     }
-    // Every reference, including GIMBAL_COMPENSATED, is bound to a fresh
+    // With a serial gimbal enabled, every reference is bound to a fresh
     // request/ack.  A default mode status with request_sequence=0 is not an
-    // authorization for this goal/snapshot.
+    // authorization for that profile; the Gazebo profile deliberately uses
+    // zero because its chassis adapter consumes simulated joint state instead.
     requestYawAuthorityLocked(*planner_ready_status_);
-    if (!pending_yaw_authority_request_ ||
-        !gimbalStatusSatisfiesLocked(yaw_authority, requires_gimbal_lock, 0)) {
+    // The Gazebo profile has no serial gimbal-status producer.  In that
+    // explicitly selected profile the chassis adapter owns the yaw transform,
+    // so a zero request sequence is the deliberate "no gimbal lease"
+    // representation.  Real-vehicle profiles keep the request/ack gate.
+    if (require_gimbal_status_ &&
+        (!pending_yaw_authority_request_ ||
+         !gimbalStatusSatisfiesLocked(yaw_authority, requires_gimbal_lock, 0))) {
       fail_stop_ = true;
       return;
     }
@@ -843,7 +861,8 @@ private:
     command.failure_reason = PlannerStatus::FAILURE_NONE;
     command.yaw_authority = yaw_authority;
     command.requires_gimbal_lock = requires_gimbal_lock;
-    command.gimbal_request_sequence = pending_yaw_authority_request_->request_sequence;
+    command.gimbal_request_sequence = pending_yaw_authority_request_ ?
+      pending_yaw_authority_request_->request_sequence : 0;
     command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
     fail_stop_ = false;
