@@ -498,19 +498,53 @@ private:
         "ROGMap numeric unknown remains the only source evidence");
     }
 
+    const auto lookupAtProjectionStamp = [this](
+      const std::string & target_frame, const std::string & source_frame,
+      const builtin_interfaces::msg::Time & requested_stamp,
+      geometry_msgs::msg::TransformStamped & transform) {
+        try {
+          transform = tf_buffer_.lookupTransform(
+            target_frame, source_frame, rclcpp::Time(requested_stamp),
+            rclcpp::Duration::from_seconds(0.1));
+          return true;
+        } catch (const tf2::TransformException & exception) {
+          // Gazebo can publish a complete sensor slot just before the next
+          // localization TF slot. Preserve the existing 0.1 s contract: a
+          // latest-TF fallback is allowed only when it is older than the
+          // requested sample by at most that same bound.
+          try {
+            const auto latest = tf_buffer_.lookupTransform(
+              target_frame, source_frame, tf2::TimePointZero,
+              tf2::durationFromSec(0.0));
+            const double skew =
+              (rclcpp::Time(requested_stamp) - rclcpp::Time(latest.header.stamp)).seconds();
+            if (skew >= 0.0 && skew <= 0.1) {
+              transform = latest;
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Using latest %s <- %s TF %.3f s behind projection stamp after bounded "
+                "future extrapolation: %s",
+                target_frame.c_str(), source_frame.c_str(), skew, exception.what());
+              return true;
+            }
+          } catch (const tf2::TransformException &) {
+            // Keep the original failure below; no usable latest transform exists.
+          }
+          return false;
+        }
+      };
+
     geometry_msgs::msg::TransformStamped static_from_projection;
     geometry_msgs::msg::TransformStamped static_from_robot;
-    try {
-      static_from_projection = tf_buffer_.lookupTransform(
+    if (!lookupAtProjectionStamp(
         static_map->header.frame_id, response.occupancy_grid.header.frame_id,
-        rclcpp::Time(response.occupancy_grid.header.stamp), rclcpp::Duration::from_seconds(0.1));
-      static_from_robot = tf_buffer_.lookupTransform(
-        static_map->header.frame_id, robot_frame_,
-        rclcpp::Time(response.occupancy_grid.header.stamp), rclcpp::Duration::from_seconds(0.1));
-    } catch (const tf2::TransformException & exception) {
+        response.occupancy_grid.header.stamp, static_from_projection) ||
+      !lookupAtProjectionStamp(
+        static_map->header.frame_id, robot_frame_, response.occupancy_grid.header.stamp,
+        static_from_robot)) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000, "ROGMap adapter waits for static-map TF: %s",
-        exception.what());
+        get_logger(), *get_clock(), 2000,
+        "ROGMap adapter waits for static-map TF at the projection stamp");
       publishUnavailable("ROGMap projection transform is unavailable");
       return;
     }

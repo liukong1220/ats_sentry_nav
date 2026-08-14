@@ -331,6 +331,30 @@ private:
       return;
     }
 
+    // The isolated all-unknown fixture keeps sensor/TF cadence healthy while
+    // withholding every numeric occupancy observation.  It is an explicit
+    // substitute for MuJoCo's zero-return LiDAR fixture; normal profiles can
+    // never enter this branch because the startup authorization gate is false.
+    const bool hold_all_unknown = test_fault_injection_enabled_ &&
+      get_parameter("test_reset_to_unknown").as_bool();
+    if (hold_all_unknown) {
+      {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        map_->resetToUnknownForTest();
+        last_map_stamp_ = now();
+        has_map_data_ = true;
+        test_reset_to_unknown_active_ = true;
+      }
+      {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        last_map_update_time_ = std::chrono::steady_clock::now();
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "P2 all-unknown fixture holds numeric occupancy unknown while cloud and TF remain fresh.");
+      return;
+    }
+
     rog_map::PointCloud input_cloud;
     pcl::fromROSMsg(*msg, input_cloud);
     rog_map::PointCloud cloud;
@@ -356,19 +380,7 @@ private:
       std::lock_guard<std::mutex> lock(map_mutex_);
       // Second, independent enforcement point: even if a value slipped in via a
       // parameter file, an unauthorized fixture stays ineffective here.
-      const bool reset_requested = test_fault_injection_enabled_ &&
-        get_parameter("test_reset_to_unknown").as_bool();
-      if (reset_requested && !test_reset_to_unknown_active_) {
-        map_->resetToUnknownForTest();
-        last_map_stamp_ = now();
-        has_map_data_ = true;
-        RCLCPP_WARN(
-          get_logger(),
-          "P2 unknown source reset generation=%llu: numeric projection now requires fresh "
-          "sensor evidence before any cell is known",
-          static_cast<unsigned long long>(map_->generation()));
-      }
-      test_reset_to_unknown_active_ = reset_requested;
+      test_reset_to_unknown_active_ = false;
       map_updated = map_->update(
         cloud, poseFromTransform(map_from_base), poseFromTransform(map_from_sensor));
       if (map_updated) {

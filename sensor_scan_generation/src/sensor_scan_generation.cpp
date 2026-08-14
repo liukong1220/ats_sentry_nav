@@ -62,9 +62,21 @@ void SensorScanGenerationNode::odometryHandler(
   tf2::Transform tf_lidar_to_robot_base;
 
   tf2::fromMsg(odometry_msg->pose.pose, tf_odom_to_lidar);
+  if (!lookupTransform(
+        lidar_frame_, robot_base_frame_, odometry_msg->header.stamp, tf_lidar_to_robot_base)) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "Skipping odometry publish because required lidar->robot_base TF is unavailable.");
+    return;
+  }
+
+  // An empty base_frame declares "this profile has no chassis-footprint
+  // consumer". The lidar->base_frame edge is an input this node does not
+  // produce, so requiring it unconditionally turns a frame that nobody reads
+  // into a hard gate on /odometry, and with it on the whole localization chain.
+  const bool publish_chassis_frame = !base_frame_.empty();
   if (
-    !lookupTransform(
-      lidar_frame_, robot_base_frame_, odometry_msg->header.stamp, tf_lidar_to_robot_base) ||
+    publish_chassis_frame &&
     !lookupTransform(lidar_frame_, base_frame_, odometry_msg->header.stamp, tf_lidar_to_chassis)) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 1000,
@@ -74,11 +86,15 @@ void SensorScanGenerationNode::odometryHandler(
 
   tf_lidar_to_robot_base_ = tf_lidar_to_robot_base;
   tf_odom_to_robot_base_ = tf_odom_to_lidar * tf_lidar_to_robot_base_;
-  tf_odom_to_chassis_ = tf_odom_to_lidar * tf_lidar_to_chassis;
+  if (publish_chassis_frame) {
+    tf_odom_to_chassis_ = tf_odom_to_lidar * tf_lidar_to_chassis;
+  }
   has_robot_base_pose_ = true;
 
   if (publish_tf_) {
-    publishTransform(tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
+    if (publish_chassis_frame) {
+      publishTransform(tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
+    }
     publishTransform(
       tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
   }
