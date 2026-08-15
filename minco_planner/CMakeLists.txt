@@ -19,7 +19,10 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/planning/grid_jps.cpp
   src/safety/footprint_safety_checker.cpp
   src/safety/local_collision_repair.cpp
+  src/trajectory/minco_time_allocator.cpp
   src/trajectory/minco_trajectory_optimizer.cpp
+  src/trajectory/path_geometry_preprocessor.cpp
+  src/trajectory/trajectory_quality_evaluator.cpp
   src/trajectory/yaw_spline_planner.cpp
 )
 
@@ -74,6 +77,21 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_footprint_swept_safety test/test_footprint_swept_safety.cpp)
   target_link_libraries(test_footprint_swept_safety ${PROJECT_NAME})
+
+  ament_add_gtest(
+    test_path_geometry_preprocessor
+    test/test_path_geometry_preprocessor.cpp
+  )
+  target_link_libraries(test_path_geometry_preprocessor ${PROJECT_NAME})
+
+  ament_add_gtest(test_minco_time_allocator test/test_minco_time_allocator.cpp)
+  target_link_libraries(test_minco_time_allocator ${PROJECT_NAME})
+
+  ament_add_gtest(
+    test_trajectory_quality_evaluator
+    test/test_trajectory_quality_evaluator.cpp
+  )
+  target_link_libraries(test_trajectory_quality_evaluator ${PROJECT_NAME})
 endif()
 
 ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)
