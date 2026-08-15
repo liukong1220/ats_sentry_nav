@@ -3,7 +3,9 @@
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Core>
@@ -20,49 +22,32 @@ namespace
 
 using Point = Eigen::Vector2d;
 
-std::vector<Point> extractWaypoints(const nav_msgs::msg::Path & path)
+MincoTimeAllocator makeTimeAllocator(const MincoTrajectoryOptimizerParams & params)
 {
-  std::vector<Point> points;
-  points.reserve(path.poses.size());
-  for (const auto & pose : path.poses) {
-    const Point point(pose.pose.position.x, pose.pose.position.y);
-    if (points.empty() || (point - points.back()).norm() > 1e-6) {
-      points.push_back(point);
-    }
-  }
-  if (points.size() <= 2) {
-    return points;
-  }
-
-  std::vector<Point> simplified;
-  simplified.reserve(points.size());
-  simplified.push_back(points.front());
-  for (std::size_t i = 1; i + 1 < points.size(); ++i) {
-    const Point incoming = points[i] - simplified.back();
-    const Point outgoing = points[i + 1] - points[i];
-    const double cross = incoming.x() * outgoing.y() - incoming.y() * outgoing.x();
-    const double scale = std::max(1e-9, incoming.norm() * outgoing.norm());
-    if (std::abs(cross) / scale > 1e-3 || incoming.dot(outgoing) <= 0.0) {
-      simplified.push_back(points[i]);
-    }
-  }
-  simplified.push_back(points.back());
-  return simplified;
+  MincoTimeAllocatorParams allocator_params;
+  allocator_params.reference_speed = params.reference_speed;
+  allocator_params.max_velocity = params.max_velocity;
+  allocator_params.max_acceleration = params.max_acceleration;
+  allocator_params.max_lateral_acceleration = params.max_lateral_acceleration;
+  allocator_params.min_segment_time = params.min_segment_time;
+  return MincoTimeAllocator(allocator_params);
 }
 
-Eigen::VectorXd allocateDurations(
-  const std::vector<Point> & waypoints,
-  double reference_speed,
-  double min_segment_time)
+nav_msgs::msg::Path makeGuidePath(
+  const std_msgs::msg::Header & header, const std::vector<Point> & points)
 {
-  Eigen::VectorXd durations(static_cast<int>(waypoints.size()) - 1);
-  for (int i = 0; i < durations.size(); ++i) {
-    durations(i) = std::max(
-      min_segment_time,
-      (waypoints[static_cast<std::size_t>(i + 1)] -
-      waypoints[static_cast<std::size_t>(i)]).norm() / reference_speed);
+  nav_msgs::msg::Path path;
+  path.header = header;
+  path.poses.reserve(points.size());
+  for (const Point & point : points) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = header;
+    pose.pose.position.x = point.x();
+    pose.pose.position.y = point.y();
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
   }
-  return durations;
+  return path;
 }
 
 /**
@@ -225,6 +210,44 @@ bool queryFootprintEsdf(
   return found;
 }
 
+double minimumSampleClearance(
+  const MincoS3 & minco,
+  double sample_dt,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf,
+  bool footprint_aware,
+  const ReferenceTrajectory * footprint_orientation,
+  const std::vector<Point> & footprint_samples)
+{
+  double minimum = std::numeric_limits<double>::infinity();
+  double elapsed_duration = 0.0;
+  const double total_duration = std::max(1e-6, [&minco]() {
+      double total = 0.0;
+      for (int piece = 0; piece < minco.pieceCount(); ++piece) {
+        total += minco.pieceDuration(piece);
+      }
+      return total;
+    }());
+  for (int piece = 0; piece < minco.pieceCount(); ++piece) {
+    const double duration = minco.pieceDuration(piece);
+    const int steps = std::max(2, static_cast<int>(std::ceil(duration / sample_dt)));
+    for (int step = 0; step <= steps; ++step) {
+      const double local_time = duration * static_cast<double>(step) / steps;
+      const MincoSample sample = minco.sample(piece, local_time);
+      ats_rc_esdf::EsdfQueryResult query;
+      const bool query_ok = footprint_aware ? queryFootprintEsdf(
+        esdf, sample.position, interpolateReferenceYaw(
+          *footprint_orientation, (elapsed_duration + local_time) / total_duration),
+        footprint_samples, query) : esdf.query(sample.position.x(), sample.position.y(), query);
+      if (!query_ok || !std::isfinite(query.distance)) {
+        return -std::numeric_limits<double>::infinity();
+      }
+      minimum = std::min(minimum, query.distance);
+    }
+    elapsed_duration += duration;
+  }
+  return minimum;
+}
+
 std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
@@ -239,20 +262,33 @@ std::vector<Point> refineWaypointsWithEsdf(
   // 有 yaw 参考时查询旋转后的矩形采样点；否则保持兼容的质心 ESDF 修正。
   const bool footprint_aware = params.esdf_footprint_optimization_enabled &&
     footprint_orientation && !footprint_orientation->empty();
-  const double minimum_clearance = std::max(0.0, params.esdf_obstacle_clearance);
-  const double footprint_clearance = std::max(0.0, params.esdf_footprint_clearance);
+  const double compatibility_clearance = std::max(0.0, footprint_aware ?
+    params.esdf_footprint_clearance : params.esdf_obstacle_clearance);
+  const double configured_trigger = footprint_aware ?
+    params.esdf_footprint_trigger_clearance : params.esdf_obstacle_trigger_clearance;
+  const double configured_target = footprint_aware ?
+    params.esdf_footprint_target_clearance : params.esdf_obstacle_target_clearance;
+  const double target_clearance = configured_target > 0.0 ?
+    configured_target : compatibility_clearance;
+  const double trigger_clearance = configured_trigger > 0.0 ?
+    std::min(configured_trigger, target_clearance) : target_clearance;
   const double maximum_step = std::max(0.0, params.esdf_obstacle_max_step);
+  const double trust_region = std::max(0.0, params.esdf_obstacle_trust_region);
   const double maximum_deviation = std::max(0.0, params.esdf_obstacle_max_deviation);
-  const double required_clearance = footprint_aware ? footprint_clearance : minimum_clearance;
-  if (input_waypoints.size() < 2 || required_clearance <= 0.0 || maximum_step <= 0.0) {
+  if (input_waypoints.size() < 2 || target_clearance <= 0.0 || maximum_step <= 0.0) {
     return input_waypoints;
   }
 
-  const std::vector<Point> original_waypoints = densifyWaypoints(
-    input_waypoints, std::max(0.05, params.esdf_obstacle_control_point_spacing));
+  // Sample the continuous MINCO curve first.  Sampling itself must not turn a
+  // free-space straight line into a sequence of hard interpolation constraints.
+  // Internal controls are inserted only after a real clearance trigger needs
+  // geometric freedom to move an otherwise endpoint-only segment.
+  std::vector<Point> original_waypoints = input_waypoints;
   std::vector<Point> waypoints = original_waypoints;
+  bool inserted_clearance_controls = false;
   const double reference_speed = std::max(0.05, params.reference_speed);
   const double sample_dt = std::max(0.02, params.sample_spacing * 0.5) / reference_speed;
+  const MincoTimeAllocator time_allocator = makeTimeAllocator(params);
   const std::vector<Point> footprint_samples = footprint_aware ?
     makeRectangularFootprintSamples(
     params.footprint_length, params.footprint_width, params.footprint_safety_margin,
@@ -262,8 +298,11 @@ std::vector<Point> refineWaypointsWithEsdf(
   for (int iteration = 0; iteration < std::max(0, params.esdf_obstacle_max_iterations);
     ++iteration)
   {
-    const Eigen::VectorXd durations = allocateDurations(
-      waypoints, reference_speed, std::max(0.01, params.min_segment_time));
+    const MincoTimeAllocation allocation = time_allocator.allocate(waypoints, head_state.col(1).norm());
+    if (!allocation.valid) {
+      break;
+    }
+    const Eigen::VectorXd durations = allocation.durations;
     MincoS3 minco;
     // 净空修正必须在与最终轨迹相同的首端边界下评估：带初速时首段形状会外扩，
     // 若这里仍按零初速求解，修正量就落在一条实际不会被执行的曲线上。
@@ -289,14 +328,24 @@ std::vector<Point> refineWaypointsWithEsdf(
           (elapsed_duration + duration * fraction) / total_duration),
           footprint_samples, query) :
           esdf->query(sample.position.x(), sample.position.y(), query);
-        if (!query_ok || query.distance >= required_clearance ||
+        if (!query_ok || query.distance >= trigger_clearance ||
           query.gradient.squaredNorm() < 1e-10)
         {
           continue;
         }
 
-        const Point correction = query.gradient.normalized() * std::min(
-          maximum_step, 0.5 * (required_clearance - query.distance));
+        Point correction_direction = query.gradient.normalized();
+        if (sample.velocity.squaredNorm() > 1e-10) {
+          const Point tangent = sample.velocity.normalized();
+          const Point normal = correction_direction - tangent * correction_direction.dot(tangent);
+          if (normal.squaredNorm() > 1e-10) {
+            correction_direction = normal.normalized();
+          }
+        }
+        const double bounded_step = std::min(
+          maximum_step, trust_region > 0.0 ? trust_region : maximum_step);
+        const Point correction = correction_direction * std::min(
+          bounded_step, 0.5 * (target_clearance - query.distance));
         const std::size_t start_index = static_cast<std::size_t>(piece);
         const std::size_t end_index = start_index + 1U;
         corrections[start_index] += (1.0 - fraction) * correction;
@@ -311,22 +360,83 @@ std::vector<Point> refineWaypointsWithEsdf(
       break;
     }
 
-    bool changed = false;
+    if (!inserted_clearance_controls && waypoints.size() == 2U) {
+      const std::vector<Point> densified = densifyWaypoints(
+        input_waypoints, std::max(0.05, params.esdf_obstacle_control_point_spacing));
+      if (densified.size() > waypoints.size()) {
+        original_waypoints = densified;
+        waypoints = densified;
+        inserted_clearance_controls = true;
+        continue;
+      }
+    }
+
+    std::vector<Point> smoothed_corrections = corrections;
+    const double smoothing_weight = std::max(0.0, std::min(0.5, params.esdf_obstacle_smoothing_weight));
+    // First- and second-neighbour smoothing makes independently measured ESDF
+    // normals a compact deformation rather than a point-wise zig-zag.
+    for (std::size_t index = 1; index + 1 < corrections.size(); ++index) {
+      if (weights[index] <= 1e-9) {
+        continue;
+      }
+      Point previous = Point::Zero();
+      if (weights[index - 1U] > 1e-9) {
+        previous = corrections[index - 1U] / weights[index - 1U];
+      }
+      const Point current = corrections[index] / weights[index];
+      Point next = Point::Zero();
+      if (weights[index + 1U] > 1e-9) {
+        next = corrections[index + 1U] / weights[index + 1U];
+      }
+      smoothed_corrections[index] = weights[index] * (
+        (1.0 - 2.0 * smoothing_weight) * current + smoothing_weight * (previous + next));
+    }
+
+    std::vector<Point> proposed = waypoints;
+    bool proposed_change = false;
     // 首尾点锁定为任务起终点，只允许移动内部点，并限制相对 JPS 引导线的偏离。
     for (std::size_t index = 1; index + 1 < waypoints.size(); ++index) {
       if (weights[index] <= 1e-9) {
         continue;
       }
-      const Point step = limitNorm(corrections[index] / weights[index], maximum_step);
+      const Point step = limitNorm(smoothed_corrections[index] / weights[index], maximum_step);
       Point candidate = waypoints[index] + step;
       candidate = original_waypoints[index] + limitNorm(
         candidate - original_waypoints[index], maximum_deviation);
       if ((candidate - waypoints[index]).norm() > 1e-6) {
-        waypoints[index] = candidate;
-        changed = true;
+        proposed[index] = candidate;
+        proposed_change = true;
       }
     }
-    if (!changed) {
+    if (!proposed_change) {
+      break;
+    }
+    const double current_minimum = minimumSampleClearance(
+      minco, sample_dt, *esdf, footprint_aware, footprint_orientation, footprint_samples);
+    bool accepted = false;
+    for (int backtrack = 0; backtrack <= std::max(0, params.esdf_obstacle_backtracking_steps);
+      ++backtrack)
+    {
+      const double scale = std::ldexp(1.0, -backtrack);
+      std::vector<Point> trial = waypoints;
+      for (std::size_t index = 1; index + 1 < trial.size(); ++index) {
+        trial[index] += scale * (proposed[index] - waypoints[index]);
+      }
+      const MincoTimeAllocation trial_allocation = time_allocator.allocate(
+        trial, head_state.col(1).norm());
+      MincoS3 trial_minco;
+      if (!trial_allocation.valid || !solveMinco(trial, trial_allocation.durations, trial_minco, head_state)) {
+        continue;
+      }
+      const double trial_minimum = minimumSampleClearance(
+        trial_minco, sample_dt, *esdf, footprint_aware, footprint_orientation, footprint_samples);
+      if (trial_minimum + 1e-6 >= current_minimum) {
+        waypoints = std::move(trial);
+        accepted = true;
+        break;
+      }
+    }
+    if (!accepted) {
       break;
     }
   }
@@ -338,10 +448,18 @@ void findDynamicExtrema(
   double sample_spacing,
   double reference_speed,
   double & max_velocity,
-  double & max_acceleration)
+  double & max_acceleration,
+  double & max_jerk,
+  std::vector<double> & segment_peak_velocities,
+  std::vector<double> & segment_peak_accelerations,
+  std::vector<double> & segment_peak_jerks)
 {
   max_velocity = 0.0;
   max_acceleration = 0.0;
+  max_jerk = 0.0;
+  segment_peak_velocities.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
+  segment_peak_accelerations.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
+  segment_peak_jerks.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
   const double sample_dt = sample_spacing / std::max(0.05, reference_speed);
   for (int piece = 0; piece < minco.pieceCount(); ++piece) {
     const int steps = std::max(
@@ -351,6 +469,13 @@ void findDynamicExtrema(
         piece, minco.pieceDuration(piece) * static_cast<double>(step) / steps);
       max_velocity = std::max(max_velocity, sample.velocity.norm());
       max_acceleration = std::max(max_acceleration, sample.acceleration.norm());
+      max_jerk = std::max(max_jerk, sample.jerk.norm());
+      segment_peak_velocities[static_cast<std::size_t>(piece)] = std::max(
+        segment_peak_velocities[static_cast<std::size_t>(piece)], sample.velocity.norm());
+      segment_peak_accelerations[static_cast<std::size_t>(piece)] = std::max(
+        segment_peak_accelerations[static_cast<std::size_t>(piece)], sample.acceleration.norm());
+      segment_peak_jerks[static_cast<std::size_t>(piece)] = std::max(
+        segment_peak_jerks[static_cast<std::size_t>(piece)], sample.jerk.norm());
     }
   }
 }
@@ -381,12 +506,49 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const nav_msgs::msg::Path & raw_path,
   const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
   const ReferenceTrajectory * footprint_orientation,
-  const InitialKinematicState * initial_state) const
+  const InitialKinematicState * initial_state,
+  const nav_msgs::msg::OccupancyGrid * planning_grid,
+  const FootprintSafetyChecker * safety_checker,
+  MincoOptimizationTrace * trace) const
 {
   ReferenceTrajectory trajectory;
+  const auto optimization_started = std::chrono::steady_clock::now();
   trajectory.header = raw_path.header;
-  std::vector<Point> waypoints = extractWaypoints(raw_path);
+  if (trace) {
+    *trace = MincoOptimizationTrace();
+  }
+  const auto finishTrace = [trace, optimization_started](const std::string & failure_reason) {
+      if (!trace) {
+        return;
+      }
+      trace->failure_reason = failure_reason;
+      trace->solver_wall_time_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - optimization_started).count();
+    };
+  const auto recordDynamicTrace = [trace](
+      const Eigen::VectorXd & durations, double peak_velocity, double peak_acceleration,
+      double peak_jerk) {
+      if (!trace) {
+        return;
+      }
+      trace->segment_durations.clear();
+      trace->segment_durations.reserve(static_cast<std::size_t>(durations.size()));
+      for (int index = 0; index < durations.size(); ++index) {
+        trace->segment_durations.push_back(durations(index));
+      }
+      trace->peak_velocity = peak_velocity;
+      trace->peak_acceleration = peak_acceleration;
+      trace->peak_jerk = peak_jerk;
+    };
+  PathGeometryPreprocessor preprocessor(params_.geometry_preprocessor);
+  const PathGeometryResult preprocessing = preprocessor.preprocess(
+    raw_path, planning_grid, safety_checker);
+  std::vector<Point> waypoints = preprocessing.waypoints;
+  if (trace) {
+    trace->preprocessed_guide = preprocessing.guide_path;
+  }
   if (waypoints.empty()) {
+    finishTrace("geometry_preprocess_empty");
     return trajectory;
   }
   if (waypoints.size() == 1) {
@@ -394,49 +556,91 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     point.x = waypoints.front().x();
     point.y = waypoints.front().y();
     trajectory.points.push_back(point);
+    finishTrace("");
     return trajectory;
   }
 
   const double reference_speed = std::max(0.05, params_.reference_speed);
   const double sample_spacing = std::max(0.02, params_.sample_spacing);
   const Eigen::Matrix<double, 2, 3> head_state = makeHeadState(initial_state, params_);
-  waypoints = refineWaypointsWithEsdf(
-    waypoints, params_, esdf, footprint_orientation, head_state);
-  Eigen::VectorXd durations = allocateDurations(
-    waypoints, reference_speed, std::max(0.01, params_.min_segment_time));
+  const std::vector<Point> pre_refinement_waypoints = waypoints;
+  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation, head_state);
+  if (trace) {
+    trace->esdf_refined_guide = makeGuidePath(raw_path.header, waypoints);
+    trace->esdf_geometry_refined = waypoints.size() == pre_refinement_waypoints.size() &&
+      !std::equal(waypoints.begin(), waypoints.end(), pre_refinement_waypoints.begin(),
+      [](const Point & first, const Point & second) {return (first - second).norm() <= 1e-6;});
+  }
+  const MincoTimeAllocator time_allocator = makeTimeAllocator(params_);
+  const MincoTimeAllocation initial_allocation = time_allocator.allocate(
+    waypoints, head_state.col(1).norm());
+  if (!initial_allocation.valid) {
+    finishTrace("time_allocation_invalid");
+    return trajectory;
+  }
+  Eigen::VectorXd durations = initial_allocation.durations;
   MincoS3 minco;
   if (!solveMinco(waypoints, durations, minco, head_state)) {
+    finishTrace("minco_s3_initial_solve_failed");
     return trajectory;
   }
 
-  // 若速度或加速度超限，只整体拉长各段时间，不改变已经通过安全检查的几何形状。
-  for (int iteration = 0; iteration < std::max(0, params_.max_time_scaling_iterations);
+  bool dynamic_limits_satisfied = false;
+  bool local_time_scaled = false;
+  // Segment-wise scaling keeps a high-curvature corner slow without globally
+  // stretching unrelated straight segments.  MINCO is re-solved each round.
+  const int maximum_scaling_iterations = std::max(0, params_.max_time_scaling_iterations);
+  for (int iteration = 0; iteration <= maximum_scaling_iterations;
     ++iteration)
   {
     double peak_velocity = 0.0;
     double peak_acceleration = 0.0;
+    double peak_jerk = 0.0;
+    std::vector<double> segment_peak_velocities;
+    std::vector<double> segment_peak_accelerations;
+    std::vector<double> segment_peak_jerks;
     findDynamicExtrema(
-      minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration);
+      minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
+      segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks);
+    recordDynamicTrace(durations, peak_velocity, peak_acceleration, peak_jerk);
     const bool velocity_ok = params_.max_velocity <= 0.0 ||
       peak_velocity <= params_.max_velocity + 1e-6;
     const bool acceleration_ok = params_.max_acceleration <= 0.0 ||
       peak_acceleration <= params_.max_acceleration + 1e-6;
-    if (velocity_ok && acceleration_ok) {
+    const bool jerk_ok = params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6;
+    if (velocity_ok && acceleration_ok && jerk_ok) {
+      dynamic_limits_satisfied = true;
       break;
     }
-    double scale = std::max(1.01, params_.time_scaling_factor);
-    if (!velocity_ok) {
-      scale = std::max(scale, peak_velocity / params_.max_velocity);
+    if (iteration == maximum_scaling_iterations) {
+      finishTrace("dynamic_limits_unsatisfied");
+      break;
     }
-    if (!acceleration_ok) {
-      scale = std::max(scale, std::sqrt(peak_acceleration / params_.max_acceleration));
+    if (!time_allocator.applyLocalDynamicScaling(
+        durations, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
+        params_.max_velocity, params_.max_acceleration, params_.max_jerk))
+    {
+      finishTrace("local_time_scaling_no_progress");
+      break;
     }
-    durations *= scale;
+    local_time_scaled = true;
     if (!solveMinco(waypoints, durations, minco, head_state)) {
       trajectory.points.clear();
+      finishTrace("minco_s3_scaled_solve_failed");
       return trajectory;
     }
   }
+  if (!dynamic_limits_satisfied) {
+    if (trace && trace->failure_reason.empty()) {
+      finishTrace("dynamic_limits_unsatisfied");
+    }
+    return trajectory;
+  }
+  if (trace) {
+    trace->local_time_scaled = local_time_scaled;
+    trace->failure_reason.clear();
+  }
+  finishTrace("");
 
   double accumulated_time = 0.0;
   double accumulated_distance = 0.0;

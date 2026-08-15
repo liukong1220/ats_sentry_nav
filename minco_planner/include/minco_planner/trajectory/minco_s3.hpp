@@ -111,6 +111,7 @@ struct MincoSample
   Eigen::Vector2d position = Eigen::Vector2d::Zero();
   Eigen::Vector2d velocity = Eigen::Vector2d::Zero();
   Eigen::Vector2d acceleration = Eigen::Vector2d::Zero();
+  Eigen::Vector2d jerk = Eigen::Vector2d::Zero();
 };
 
 class MincoS3
@@ -232,6 +233,12 @@ public:
     for (int order = 2; order <= 5; ++order) {
       sample.acceleration +=
         static_cast<double>(order * (order - 1)) * power * block.row(order).transpose();
+      power *= t;
+    }
+    power = 1.0;
+    for (int order = 3; order <= 5; ++order) {
+      sample.jerk += static_cast<double>(order * (order - 1) * (order - 2)) *
+        power * block.row(order).transpose();
       power *= t;
     }
     return sample;

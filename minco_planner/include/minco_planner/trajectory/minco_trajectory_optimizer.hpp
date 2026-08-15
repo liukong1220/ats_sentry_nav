@@ -3,9 +3,15 @@
 #ifndef MINCO_PLANNER__MINCO_TRAJECTORY_OPTIMIZER_HPP_
 #define MINCO_PLANNER__MINCO_TRAJECTORY_OPTIMIZER_HPP_
 
+#include <string>
+
 #include <Eigen/Core>
 
+#include "minco_planner/safety/footprint_safety_checker.hpp"
+#include "minco_planner/trajectory/minco_time_allocator.hpp"
+#include "minco_planner/trajectory/path_geometry_preprocessor.hpp"
 #include "minco_planner/trajectory/reference_trajectory.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 
 namespace ats_rc_esdf
@@ -23,23 +29,38 @@ struct MincoTrajectoryOptimizerParams
   double sample_spacing = 0.12;
   double max_velocity = 2.0;
   double max_acceleration = 2.5;
+  // A non-positive value keeps compatibility for library users which have not
+  // configured a vehicle jerk limit. The executed ATS profile sets it.
+  double max_jerk = 0.0;
+  double max_lateral_acceleration = 1.5;
   int max_time_scaling_iterations = 5;
   double time_scaling_factor = 1.25;
+
+  PathGeometryPreprocessorParams geometry_preprocessor;
 
   // Keep MINCO's interpolation from cutting into obstacles between JPS nodes.
   // The correction moves only inner control points and re-solves MINCO after
   // each update; endpoints and the JPS route topology remain fixed.
   bool esdf_obstacle_optimization_enabled = true;
   double esdf_obstacle_clearance = 0.45;
+  // Zero preserves the historical esdf_obstacle_clearance contract for
+  // library callers. Deployed profiles set an explicit trigger/target pair.
+  double esdf_obstacle_trigger_clearance = 0.0;
+  double esdf_obstacle_target_clearance = 0.0;
   int esdf_obstacle_max_iterations = 6;
   double esdf_obstacle_control_point_spacing = 0.30;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
+  double esdf_obstacle_trust_region = 0.10;
+  int esdf_obstacle_backtracking_steps = 4;
+  double esdf_obstacle_smoothing_weight = 0.25;
 
   // A second ESDF pass uses a yaw reference and the same rectangular samples as
   // the final footprint gate. It changes translation only; yaw remains independent.
   bool esdf_footprint_optimization_enabled = true;
   double esdf_footprint_clearance = 0.10;
+  double esdf_footprint_trigger_clearance = 0.0;
+  double esdf_footprint_target_clearance = 0.0;
   double esdf_footprint_sample_spacing = 0.10;
   double footprint_length = 0.70;
   double footprint_width = 0.55;
@@ -72,6 +93,22 @@ struct InitialKinematicState
   Eigen::Vector2d acceleration{0.0, 0.0};
 };
 
+struct MincoOptimizationTrace
+{
+  nav_msgs::msg::Path preprocessed_guide;
+  nav_msgs::msg::Path esdf_refined_guide;
+  std::vector<double> segment_durations;
+  bool esdf_geometry_refined = false;
+  bool local_time_scaled = false;
+  // Diagnostics only. A rejected candidate never reaches the control reference
+  // publisher, but its stage boundary must remain observable in the same map snapshot.
+  std::string failure_reason;
+  double peak_velocity = 0.0;
+  double peak_acceleration = 0.0;
+  double peak_jerk = 0.0;
+  double solver_wall_time_ms = 0.0;
+};
+
 class MincoTrajectoryOptimizer
 {
 public:
@@ -89,6 +126,10 @@ public:
    * @param footprint_orientation 可选 yaw 参考轨迹；非空时按旋转后的矩形采样查询 ESDF。
    * @param initial_state        可选重规划初值；valid=true 时把当前车速/加速度写入
    *                             MINCO 首端边界条件，避免重规划瞬间速度阶跃。
+   * @param planning_grid        Optional immutable grid used only for a fail-closed,
+   *                             footprint-aware guide shortcut.
+   * @param safety_checker       Must refer to the same semantics as the final gate.
+   * @param trace                Optional observability output; it never changes planning.
    * @return 参考轨迹；求解失败时返回 points 为空的对象（调用方必须按失败处理）。
    * @note 每次 planGoal 及其候选轨迹重优化时调用；函数为 const，不持有任何运行期状态。
    */
@@ -96,7 +137,10 @@ public:
     const nav_msgs::msg::Path & raw_path,
     const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf = nullptr,
     const ReferenceTrajectory * footprint_orientation = nullptr,
-    const InitialKinematicState * initial_state = nullptr) const;
+    const InitialKinematicState * initial_state = nullptr,
+    const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
+    const FootprintSafetyChecker * safety_checker = nullptr,
+    MincoOptimizationTrace * trace = nullptr) const;
 
 private:
   MincoTrajectoryOptimizerParams params_;

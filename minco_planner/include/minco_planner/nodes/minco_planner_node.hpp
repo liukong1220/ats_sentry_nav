@@ -22,6 +22,7 @@
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/safety/local_collision_repair.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
+#include "minco_planner/trajectory/trajectory_quality_evaluator.hpp"
 #include "minco_planner/trajectory/yaw_authority_policy.hpp"
 #include "minco_planner/trajectory/yaw_spline_planner.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -95,6 +96,8 @@ private:
   std::string raw_path_topic_ = "minco/raw_path";
   std::string reference_path_topic_ = "minco/reference_path";
   std::string candidate_reference_path_topic_;
+  std::string preprocessed_guide_topic_ = "/minco/preprocessed_guide";
+  std::string esdf_refined_guide_topic_ = "/minco/esdf_refined_guide";
   std::string debug_marker_topic_ = "minco/debug_markers";
   std::string map_ready_topic_;
   std::string emergency_stop_topic_ = "/planner/emergency_stop";
@@ -123,6 +126,7 @@ private:
   FootprintSafetyChecker safety_checker_;
   LocalCollisionRepair collision_repair_;
   PlannerDebugVisualizer visualizer_;
+  TrajectoryQualityEvaluator quality_evaluator_;
 
   std::mutex map_mutex_;
   std::shared_ptr<const PlanningMapSnapshot> latest_map_snapshot_;
@@ -150,6 +154,8 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raw_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr candidate_reference_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr preprocessed_guide_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr esdf_refined_guide_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr planner_status_pub_;

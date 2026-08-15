@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
 
 #include "minco_planner/trajectory/reference_path_timing.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -45,6 +46,10 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       std::bind(&MincoPlannerNode::onPlannerGoal, this, std::placeholders::_1), planning_options);
   }
   raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
+  preprocessed_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
+    preprocessed_guide_topic_, rclcpp::QoS(1).reliable());
+  esdf_refined_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
+    esdf_refined_guide_topic_, rclcpp::QoS(1).reliable());
   if (planner_manages_emergency_stop_) {
     reference_path_pub_ =
       create_publisher<nav_msgs::msg::Path>(reference_path_topic_, rclcpp::QoS(1));
@@ -92,6 +97,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("raw_path_topic", raw_path_topic_);
   declare_parameter<std::string>("reference_path_topic", reference_path_topic_);
   declare_parameter<std::string>("candidate_reference_path_topic", candidate_reference_path_topic_);
+  declare_parameter<std::string>("preprocessed_guide_topic", preprocessed_guide_topic_);
+  declare_parameter<std::string>("esdf_refined_guide_topic", esdf_refined_guide_topic_);
   declare_parameter<std::string>("debug_marker_topic", debug_marker_topic_);
   declare_parameter<std::string>("map_ready_topic", map_ready_topic_);
   declare_parameter<std::string>("emergency_stop_topic", emergency_stop_topic_);
@@ -123,12 +130,18 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("sample_spacing", optimizer_params.sample_spacing);
   declare_parameter<double>("max_velocity", optimizer_params.max_velocity);
   declare_parameter<double>("max_acceleration", optimizer_params.max_acceleration);
+  declare_parameter<double>("max_jerk", optimizer_params.max_jerk);
+  declare_parameter<double>("max_lateral_acceleration", optimizer_params.max_lateral_acceleration);
   declare_parameter<int>(
     "max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   declare_parameter<double>("time_scaling_factor", optimizer_params.time_scaling_factor);
   declare_parameter<bool>(
     "esdf_obstacle_optimization_enabled", optimizer_params.esdf_obstacle_optimization_enabled);
   declare_parameter<double>("esdf_obstacle_clearance", optimizer_params.esdf_obstacle_clearance);
+  declare_parameter<double>(
+    "esdf_obstacle_trigger_clearance", optimizer_params.esdf_obstacle_trigger_clearance);
+  declare_parameter<double>(
+    "esdf_obstacle_target_clearance", optimizer_params.esdf_obstacle_target_clearance);
   declare_parameter<int>(
     "esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
   declare_parameter<double>(
@@ -136,11 +149,34 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
+  declare_parameter<double>(
+    "esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);
+  declare_parameter<int>(
+    "esdf_obstacle_backtracking_steps", optimizer_params.esdf_obstacle_backtracking_steps);
+  declare_parameter<double>(
+    "esdf_obstacle_smoothing_weight", optimizer_params.esdf_obstacle_smoothing_weight);
   declare_parameter<bool>(
     "esdf_footprint_optimization_enabled", optimizer_params.esdf_footprint_optimization_enabled);
   declare_parameter<double>("esdf_footprint_clearance", optimizer_params.esdf_footprint_clearance);
   declare_parameter<double>(
+    "esdf_footprint_trigger_clearance", optimizer_params.esdf_footprint_trigger_clearance);
+  declare_parameter<double>(
+    "esdf_footprint_target_clearance", optimizer_params.esdf_footprint_target_clearance);
+  declare_parameter<double>(
     "esdf_footprint_sample_spacing", optimizer_params.esdf_footprint_sample_spacing);
+  declare_parameter<double>(
+    "path_duplicate_epsilon", optimizer_params.geometry_preprocessor.duplicate_epsilon);
+  declare_parameter<double>(
+    "path_collinear_lateral_tolerance",
+    optimizer_params.geometry_preprocessor.collinear_lateral_tolerance);
+  declare_parameter<double>(
+    "path_short_segment_length", optimizer_params.geometry_preprocessor.short_segment_length);
+  declare_parameter<double>(
+    "path_corner_angle_threshold_rad",
+    optimizer_params.geometry_preprocessor.corner_angle_threshold_rad);
+  declare_parameter<bool>(
+    "path_footprint_aware_shortcut_enabled",
+    optimizer_params.geometry_preprocessor.footprint_aware_shortcut_enabled);
 
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
@@ -169,6 +205,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("raw_path_topic", raw_path_topic_);
   get_parameter("reference_path_topic", reference_path_topic_);
   get_parameter("candidate_reference_path_topic", candidate_reference_path_topic_);
+  get_parameter("preprocessed_guide_topic", preprocessed_guide_topic_);
+  get_parameter("esdf_refined_guide_topic", esdf_refined_guide_topic_);
   get_parameter("debug_marker_topic", debug_marker_topic_);
   get_parameter("map_ready_topic", map_ready_topic_);
   get_parameter("emergency_stop_topic", emergency_stop_topic_);
@@ -202,20 +240,47 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("sample_spacing", optimizer_params.sample_spacing);
   get_parameter("max_velocity", optimizer_params.max_velocity);
   get_parameter("max_acceleration", optimizer_params.max_acceleration);
+  get_parameter("max_jerk", optimizer_params.max_jerk);
+  get_parameter("max_lateral_acceleration", optimizer_params.max_lateral_acceleration);
   get_parameter("max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   get_parameter("time_scaling_factor", optimizer_params.time_scaling_factor);
   get_parameter(
     "esdf_obstacle_optimization_enabled", optimizer_params.esdf_obstacle_optimization_enabled);
   get_parameter("esdf_obstacle_clearance", optimizer_params.esdf_obstacle_clearance);
+  get_parameter(
+    "esdf_obstacle_trigger_clearance", optimizer_params.esdf_obstacle_trigger_clearance);
+  get_parameter(
+    "esdf_obstacle_target_clearance", optimizer_params.esdf_obstacle_target_clearance);
   get_parameter("esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
   get_parameter(
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
+  get_parameter("esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);
+  get_parameter(
+    "esdf_obstacle_backtracking_steps", optimizer_params.esdf_obstacle_backtracking_steps);
+  get_parameter(
+    "esdf_obstacle_smoothing_weight", optimizer_params.esdf_obstacle_smoothing_weight);
   get_parameter(
     "esdf_footprint_optimization_enabled", optimizer_params.esdf_footprint_optimization_enabled);
   get_parameter("esdf_footprint_clearance", optimizer_params.esdf_footprint_clearance);
+  get_parameter(
+    "esdf_footprint_trigger_clearance", optimizer_params.esdf_footprint_trigger_clearance);
+  get_parameter(
+    "esdf_footprint_target_clearance", optimizer_params.esdf_footprint_target_clearance);
   get_parameter("esdf_footprint_sample_spacing", optimizer_params.esdf_footprint_sample_spacing);
+  get_parameter("path_duplicate_epsilon", optimizer_params.geometry_preprocessor.duplicate_epsilon);
+  get_parameter(
+    "path_collinear_lateral_tolerance",
+    optimizer_params.geometry_preprocessor.collinear_lateral_tolerance);
+  get_parameter(
+    "path_short_segment_length", optimizer_params.geometry_preprocessor.short_segment_length);
+  get_parameter(
+    "path_corner_angle_threshold_rad",
+    optimizer_params.geometry_preprocessor.corner_angle_threshold_rad);
+  get_parameter(
+    "path_footprint_aware_shortcut_enabled",
+    optimizer_params.geometry_preprocessor.footprint_aware_shortcut_enabled);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
@@ -526,10 +591,45 @@ void MincoPlannerNode::planGoal(
     return;
   }
 
-  // 先生成质心 ESDF 候选，再以独立 yaw 的矩形足迹进行第二阶段内点修正。
-  ReferenceTrajectory center_reference = optimizer_.optimize(search_result.path, clearance_esdf.get());
+  // The raw JPS route, guide stages and final candidate all come from this
+  // immutable snapshot.  The guide shortcut delegates collision semantics to
+  // the exact oriented footprint/swept checker used by the final gate.
+  // These are diagnostic-only products. They deliberately publish before the
+  // candidate gate so a fail-closed rejection can still be attributed to a
+  // geometry, ESDF, time-allocation, or dynamic-limit stage.
+  raw_path_pub_->publish(search_result.path);
+  MincoOptimizationTrace selected_trace;
+  ReferenceTrajectory center_reference = optimizer_.optimize(
+    search_result.path, clearance_esdf.get(), nullptr, nullptr, &planning_grid,
+    &safety_checker_, &selected_trace);
+  if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
+    preprocessed_guide_pub_->publish(selected_trace.preprocessed_guide);
+  }
+  if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
+    esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
+  }
   if (!center_reference.valid()) {
-    RCLCPP_ERROR(get_logger(), "MINCO returned an invalid center trajectory.");
+    std::ostringstream durations;
+    durations.setf(std::ios::fixed);
+    durations.precision(3);
+    for (std::size_t index = 0; index < selected_trace.segment_durations.size(); ++index) {
+      if (index > 0U) {
+        durations << ',';
+      }
+      durations << selected_trace.segment_durations[index];
+    }
+    RCLCPP_ERROR(
+      get_logger(),
+      "MINCO candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
+      "raw_points=%zu preprocessed_points=%zu esdf_refined_points=%zu peak_v=%.3f "
+      "peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f segment_durations=[%s]",
+      static_cast<unsigned long long>(map_snapshot->generation),
+      static_cast<unsigned long long>(map_publication_sequence),
+      selected_trace.failure_reason.empty() ? "unknown" : selected_trace.failure_reason.c_str(),
+      search_result.path.poses.size(), selected_trace.preprocessed_guide.poses.size(),
+      selected_trace.esdf_refined_guide.poses.size(), selected_trace.peak_velocity,
+      selected_trace.peak_acceleration, selected_trace.peak_jerk,
+      selected_trace.solver_wall_time_ms, durations.str().c_str());
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
       map_snapshot->generation);
     return;
@@ -543,8 +643,10 @@ void MincoPlannerNode::planGoal(
   ReferenceTrajectory reference = center_reference;
   FootprintSafetyResult safety = center_safety;
   if (optimizer_.esdfFootprintOptimizationEnabled()) {
+    MincoOptimizationTrace footprint_trace;
     ReferenceTrajectory footprint_reference = optimizer_.optimize(
-      search_result.path, clearance_esdf.get(), &center_reference);
+      search_result.path, clearance_esdf.get(), &center_reference, nullptr, &planning_grid,
+      &safety_checker_, &footprint_trace);
     if (footprint_reference.valid()) {
       footprint_reference.header.stamp = now();
       yaw_planner_.apply(footprint_reference, start_yaw, goal_yaw);
@@ -554,6 +656,7 @@ void MincoPlannerNode::planGoal(
       if (footprint_safety.safe || !center_safety.safe) {
         reference = std::move(footprint_reference);
         safety = std::move(footprint_safety);
+        selected_trace = std::move(footprint_trace);
       } else {
         RCLCPP_WARN(
           get_logger(),
@@ -564,7 +667,10 @@ void MincoPlannerNode::planGoal(
   }
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
     // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
-    ReferenceTrajectory fallback_reference = optimizer_.optimize(search_result.path);
+    MincoOptimizationTrace fallback_trace;
+    ReferenceTrajectory fallback_reference = optimizer_.optimize(
+      search_result.path, nullptr, nullptr, nullptr, &planning_grid, &safety_checker_,
+      &fallback_trace);
     if (fallback_reference.valid()) {
       fallback_reference.header.stamp = now();
       yaw_planner_.apply(fallback_reference, start_yaw, goal_yaw);
@@ -578,12 +684,16 @@ void MincoPlannerNode::planGoal(
           safety.collisions.size());
         reference = std::move(fallback_reference);
         safety = fallback_safety;
+        selected_trace = std::move(fallback_trace);
       }
     }
   }
   if (!safety.safe && collision_repair_.repair(reference, safety, planning_grid)) {
     // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
-    reference = optimizer_.optimize(toPath(reference), clearance_esdf.get(), &reference);
+    MincoOptimizationTrace repair_trace;
+    reference = optimizer_.optimize(
+      toPath(reference), clearance_esdf.get(), &reference, nullptr, &planning_grid,
+      &safety_checker_, &repair_trace);
     if (!reference.valid()) {
       RCLCPP_ERROR(get_logger(), "Local collision repair produced an invalid MINCO trajectory.");
       fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REPAIR,
@@ -594,9 +704,15 @@ void MincoPlannerNode::planGoal(
     yaw_planner_.apply(reference, start_yaw, goal_yaw);
     annotateClearance(reference, *map_snapshot);
     safety = safety_checker_.check(reference, planning_grid);
+    selected_trace = std::move(repair_trace);
   }
 
-  raw_path_pub_->publish(search_result.path);
+  if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
+    preprocessed_guide_pub_->publish(selected_trace.preprocessed_guide);
+  }
+  if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
+    esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
+  }
   marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
   if (!reference.valid()) {
     RCLCPP_ERROR(get_logger(), "Rejecting an invalid MINCO reference trajectory.");
@@ -616,6 +732,23 @@ void MincoPlannerNode::planGoal(
         first_collision.x, first_collision.y);
     }
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_FOOTPRINT,
+      map_snapshot->generation);
+    return;
+  }
+  TrajectoryQualityMetrics quality = quality_evaluator_.evaluate(
+    reference, clearance_esdf.get(), footprintSamples(planning_grid),
+    selected_trace.segment_durations);
+  for (const CollisionSample & collision : safety.collisions) {
+    if (collision.swept) {
+      ++quality.swept_collision_count;
+    } else {
+      ++quality.footprint_collision_count;
+    }
+  }
+  if (!quality.finite || !quality.strictly_monotonic_time) {
+    RCLCPP_ERROR(
+      get_logger(), "Rejecting MINCO trajectory with non-finite derivatives or non-monotonic time.");
+    fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
       map_snapshot->generation);
     return;
   }
@@ -641,20 +774,34 @@ void MincoPlannerNode::planGoal(
     return;
   }
 
-  double minimum_clearance = std::numeric_limits<double>::infinity();
-  for (const auto & point : reference.points) {
-    if (std::isfinite(point.clearance)) {
-      minimum_clearance = std::min(minimum_clearance, point.clearance);
+  std::ostringstream durations;
+  durations.setf(std::ios::fixed);
+  durations.precision(3);
+  for (std::size_t index = 0; index < quality.segment_durations.size(); ++index) {
+    if (index > 0U) {
+      durations << ',';
     }
+    durations << quality.segment_durations[index];
   }
   RCLCPP_INFO(
     get_logger(),
-    "planned generation=%llu raw_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
-    "expanded=%d yaw_authority=%u minimum_clearance=%.3f",
+    "planned generation=%llu snapshot_publication=%llu raw_points=%zu preprocessed_points=%zu "
+    "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
+    "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
+    "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
+    "curvature_tv=%.3f curvature_sign_changes=%zu peak_v=%.3f peak_a=%.3f peak_j=%.3f "
+    "solver_wall_ms=%.3f segment_durations=[%s]",
     static_cast<unsigned long long>(map_snapshot->generation),
-    search_result.path.poses.size(), reference.points.size(), reference.totalLength(),
-    reference.totalTime(), safety.collisions.size(), search_result.expanded_nodes,
-    static_cast<unsigned int>(yaw_authority), minimum_clearance);
+    static_cast<unsigned long long>(map_publication_sequence), search_result.path.poses.size(),
+    selected_trace.preprocessed_guide.poses.size(), selected_trace.esdf_refined_guide.poses.size(),
+    reference.points.size(), reference.totalLength(), reference.totalTime(), safety.collisions.size(),
+    search_result.expanded_nodes, static_cast<unsigned int>(yaw_authority),
+    quality.minimum_center_clearance, quality.minimum_footprint_clearance, quality.length_ratio,
+    quality.max_lateral_deviation, quality.max_geometric_curvature,
+    quality.p95_geometric_curvature, quality.total_turning_angle,
+    quality.curvature_total_variation, quality.curvature_sign_changes, quality.peak_velocity,
+    quality.peak_acceleration, quality.peak_jerk, selected_trace.solver_wall_time_ms,
+    durations.str().c_str());
 }
 
 void MincoPlannerNode::annotateClearance(
