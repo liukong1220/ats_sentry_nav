@@ -464,13 +464,24 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
     active_safety_reference_.reset();
     safety_state_.plan_safe = false;
   }
+  const bool has_collision = !safety.collisions.empty();
+  const std::size_t collision_index = has_collision ?
+    std::min(safety.collisions.front().trajectory_index, remaining.points.size() - 1U) : 0U;
+  const ReferencePoint & collision_reference = remaining.points[collision_index];
   RCLCPP_ERROR(
     get_logger(),
-    "Runtime swept footprint rejected goal=%llu current_generation=%llu collisions=%zu "
-    "discrete_samples=%zu swept_samples=%zu.",
+    "Runtime swept footprint rejected goal=%llu candidate_generation=%llu "
+    "current_generation=%llu collisions=%zu discrete_samples=%zu swept_samples=%zu "
+    "first_index=%zu first_swept=%d first_collision=(%.3f,%.3f) "
+    "reference_center=(%.3f,%.3f,%.3f).",
     static_cast<unsigned long long>(active_reference->goal_id),
+    static_cast<unsigned long long>(active_reference->map_generation),
     static_cast<unsigned long long>(snapshot->generation), safety.collisions.size(),
-    safety.discrete_samples_checked, safety.swept_samples_checked);
+    safety.discrete_samples_checked, safety.swept_samples_checked, collision_index,
+    has_collision && safety.collisions.front().swept ? 1 : 0,
+    has_collision ? safety.collisions.front().x : 0.0,
+    has_collision ? safety.collisions.front().y : 0.0,
+    collision_reference.x, collision_reference.y, collision_reference.yaw);
   publishPlannerStatus(
     active_reference->goal_id, active_reference->localization_epoch,
     active_reference->plan_request_sequence, snapshot->generation,
@@ -789,8 +800,8 @@ void MincoPlannerNode::planGoal(
     "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
     "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
     "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
-    "curvature_tv=%.3f curvature_sign_changes=%zu peak_v=%.3f peak_a=%.3f peak_j=%.3f "
-    "solver_wall_ms=%.3f segment_durations=[%s]",
+    "curvature_tv=%.3f curvature_sign_changes=%zu local_scaled=%d uniform_scaled=%d "
+    "peak_v=%.3f peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f segment_durations=[%s]",
     static_cast<unsigned long long>(map_snapshot->generation),
     static_cast<unsigned long long>(map_publication_sequence), search_result.path.poses.size(),
     selected_trace.preprocessed_guide.poses.size(), selected_trace.esdf_refined_guide.poses.size(),
@@ -799,9 +810,10 @@ void MincoPlannerNode::planGoal(
     quality.minimum_center_clearance, quality.minimum_footprint_clearance, quality.length_ratio,
     quality.max_lateral_deviation, quality.max_geometric_curvature,
     quality.p95_geometric_curvature, quality.total_turning_angle,
-    quality.curvature_total_variation, quality.curvature_sign_changes, quality.peak_velocity,
-    quality.peak_acceleration, quality.peak_jerk, selected_trace.solver_wall_time_ms,
-    durations.str().c_str());
+    quality.curvature_total_variation, quality.curvature_sign_changes,
+    selected_trace.local_time_scaled ? 1 : 0, selected_trace.uniform_time_scaled ? 1 : 0,
+    quality.peak_velocity, quality.peak_acceleration, quality.peak_jerk,
+    selected_trace.solver_wall_time_ms, durations.str().c_str());
 }
 
 void MincoPlannerNode::annotateClearance(

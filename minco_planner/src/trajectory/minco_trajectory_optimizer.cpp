@@ -587,18 +587,22 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
 
   bool dynamic_limits_satisfied = false;
   bool local_time_scaled = false;
+  bool uniform_time_scaled = false;
+  double peak_velocity = 0.0;
+  double peak_acceleration = 0.0;
+  double peak_jerk = 0.0;
+  std::vector<double> segment_peak_velocities;
+  std::vector<double> segment_peak_accelerations;
+  std::vector<double> segment_peak_jerks;
   // Segment-wise scaling keeps a high-curvature corner slow without globally
   // stretching unrelated straight segments.  MINCO is re-solved each round.
   const int maximum_scaling_iterations = std::max(0, params_.max_time_scaling_iterations);
   for (int iteration = 0; iteration <= maximum_scaling_iterations;
     ++iteration)
   {
-    double peak_velocity = 0.0;
-    double peak_acceleration = 0.0;
-    double peak_jerk = 0.0;
-    std::vector<double> segment_peak_velocities;
-    std::vector<double> segment_peak_accelerations;
-    std::vector<double> segment_peak_jerks;
+    peak_velocity = 0.0;
+    peak_acceleration = 0.0;
+    peak_jerk = 0.0;
     findDynamicExtrema(
       minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
       segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks);
@@ -613,14 +617,12 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       break;
     }
     if (iteration == maximum_scaling_iterations) {
-      finishTrace("dynamic_limits_unsatisfied");
       break;
     }
     if (!time_allocator.applyLocalDynamicScaling(
         durations, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
         params_.max_velocity, params_.max_acceleration, params_.max_jerk))
     {
-      finishTrace("local_time_scaling_no_progress");
       break;
     }
     local_time_scaled = true;
@@ -631,13 +633,46 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     }
   }
   if (!dynamic_limits_satisfied) {
-    if (trace && trace->failure_reason.empty()) {
-      finishTrace("dynamic_limits_unsatisfied");
+    double required_scale = 1.0;
+    if (params_.max_velocity > 0.0) {
+      required_scale = std::max(required_scale, peak_velocity / params_.max_velocity);
     }
+    if (params_.max_acceleration > 0.0) {
+      required_scale = std::max(
+        required_scale, std::sqrt(peak_acceleration / params_.max_acceleration));
+    }
+    if (params_.max_jerk > 0.0) {
+      required_scale = std::max(
+        required_scale, std::cbrt(peak_jerk / params_.max_jerk));
+    }
+    const double uniform_scale = std::max(
+      std::max(1.01, params_.time_scaling_factor), 1.01 * required_scale);
+    durations *= uniform_scale;
+    if (!solveMinco(waypoints, durations, minco, head_state)) {
+      finishTrace("minco_s3_uniform_scaled_solve_failed");
+      return trajectory;
+    }
+    peak_velocity = 0.0;
+    peak_acceleration = 0.0;
+    peak_jerk = 0.0;
+    findDynamicExtrema(
+      minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
+      segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks);
+    recordDynamicTrace(durations, peak_velocity, peak_acceleration, peak_jerk);
+    dynamic_limits_satisfied =
+      (params_.max_velocity <= 0.0 || peak_velocity <= params_.max_velocity + 1e-6) &&
+      (params_.max_acceleration <= 0.0 ||
+      peak_acceleration <= params_.max_acceleration + 1e-6) &&
+      (params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6);
+    uniform_time_scaled = true;
+  }
+  if (!dynamic_limits_satisfied) {
+    finishTrace("dynamic_limits_unsatisfied");
     return trajectory;
   }
   if (trace) {
     trace->local_time_scaled = local_time_scaled;
+    trace->uniform_time_scaled = uniform_time_scaled;
     trace->failure_reason.clear();
   }
   finishTrace("");
