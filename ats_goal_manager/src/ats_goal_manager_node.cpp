@@ -202,6 +202,7 @@ private:
     std::uint64_t expected_plan_request_sequence{0};
     std::optional<std::chrono::steady_clock::time_point> waiting_since;
     bool recovering{false};
+    std::uint64_t wait_for_publication_after{0};
   };
 
   void loadParameters() {
@@ -375,7 +376,8 @@ private:
                                 0,
                                 0,
                                 std::nullopt,
-                                false};
+                                false,
+                                0};
       progress_watchdog_.resetGoal(id);
       localization_epoch = localization_epoch_.value_or(0);
       map_publication_sequence = map_status_publication_sequence_;
@@ -441,7 +443,8 @@ private:
 
   void suspendActiveGoal(
       std::uint64_t id,
-      std::optional<std::chrono::steady_clock::time_point> waiting_since = std::nullopt) {
+      std::optional<std::chrono::steady_clock::time_point> waiting_since = std::nullopt,
+      std::uint64_t wait_for_publication_after = 0) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!active_goal_ || active_goal_->id != id) {
@@ -461,6 +464,8 @@ private:
           already_waiting && previous_waiting_since
               ? *previous_waiting_since
               : std::chrono::steady_clock::now());
+      active_goal_->wait_for_publication_after = std::max(
+        active_goal_->wait_for_publication_after, wait_for_publication_after);
     }
     publishEmergencyStop(true);
     publishExecutionStop(id, 0, PlannerStatus::FAILURE_NONE, 0, 0);
@@ -470,6 +475,7 @@ private:
     if (message->state == PlannerStatus::STATE_FAILED) {
       bool matches = false;
       bool transient_failure = false;
+      std::uint64_t wait_for_publication_after = 0;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         matches =
@@ -481,6 +487,7 @@ private:
             matches &&
             (message->failure_reason == PlannerStatus::FAILURE_MAP_UNREADY ||
              message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
+             message->failure_reason == PlannerStatus::FAILURE_FOOTPRINT ||
              message->failure_reason == PlannerStatus::FAILURE_SNAPSHOT_CHANGED ||
              message->failure_reason == PlannerStatus::FAILURE_START_TF ||
              message->failure_reason == PlannerStatus::FAILURE_GOAL_TF ||
@@ -497,13 +504,19 @@ private:
           active_goal_->recovering = true;
           map_ready_signal_ = false;
           map_status_ready_ = false;
+          if (message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
+            message->failure_reason == PlannerStatus::FAILURE_FOOTPRINT)
+          {
+            wait_for_publication_after = message->map_publication_sequence;
+          }
         }
       }
       if (matches) {
         if (transient_failure) {
           // planning grid 与 ready/status 是独立 topic，跨 topic 不具备原子顺序。
           // 恢复期 snapshot 尚未安装或仍是 blocked grid 时等待下一次 map status。
-          suspendActiveGoal(message->goal_id);
+          suspendActiveGoal(
+            message->goal_id, std::nullopt, wait_for_publication_after);
         } else {
           finishActive(NavigateToPose::Result::RESULT_PLANNING_FAILED,
                        plannerFailureMessage(message->failure_reason),
@@ -588,10 +601,6 @@ private:
       if (active_goal_ && current_epoch && !message->ready) {
         active_goal_->recovering = true;
         suspend_goal_id = active_goal_->id;
-      }
-      if (active_goal_ && message->ready && current_epoch &&
-          lifecycle_.state() == GoalLifecycleState::kWaitingForMap) {
-        active_goal_->waiting_since.reset();
       }
     }
     RCLCPP_INFO(
@@ -867,6 +876,7 @@ private:
     command.reference = committed;
     fail_stop_ = false;
     active_goal_->recovering = false;
+    active_goal_->wait_for_publication_after = 0;
     active_execution_command_ = command;
     PlanProgressIdentity progress_identity;
     progress_identity.goal_id = active_goal_->id;
@@ -922,6 +932,7 @@ private:
     std::uint32_t progress_replan_count = 0;
     std::optional<std::string> progress_failure;
     std::optional<std::uint64_t> progress_suspend_goal_id;
+    std::uint64_t progress_suspend_after_publication = 0;
     std::optional<std::uint64_t> gimbal_recovery_goal_id;
     double distance = std::numeric_limits<double>::infinity();
     std::uint64_t dispatch_epoch = 0;
@@ -952,6 +963,8 @@ private:
         timeout = elapsed >= active_goal_->timeout;
         const bool map_ready = mapReadyLocked();
         const bool localization_ready = localizationHealthyLocked();
+        const bool recovery_snapshot_ready =
+          recoverySnapshotReadyLocked(*active_goal_);
         if (!localization_ready &&
             lifecycle_.state() != GoalLifecycleState::kWaitingForMap) {
           candidate_reference_.reset();
@@ -964,7 +977,7 @@ private:
           localization_suspended = true;
         }
         if (lifecycle_.mapReady(active_goal_->id) && map_ready &&
-            localization_ready) {
+            localization_ready && recovery_snapshot_ready) {
           dispatch = lifecycle_.mapBecameReady(active_goal_->id);
           active_goal_->waiting_since.reset();
           dispatch_epoch = active_goal_->localization_epoch;
@@ -1000,7 +1013,8 @@ private:
             std::chrono::steady_clock::now() - *active_goal_->waiting_since >=
                 secondsToDuration(map_wait_timeout_sec_);
         localization_wait_timeout = wait_expired && !localization_ready;
-        map_wait_timeout = wait_expired && localization_ready && !map_ready;
+        map_wait_timeout = wait_expired && localization_ready &&
+          (!map_ready || !recovery_snapshot_ready);
         if (lifecycle_.state() == GoalLifecycleState::kTracking &&
             has_current_pose_) {
           distance = std::hypot(active_goal_->target.pose.position.x -
@@ -1028,9 +1042,12 @@ private:
           }
           if (require_planning_snapshot_ && !pose_converged) {
             PlanningSnapshotSafetyResult snapshot_safety;
-            const bool snapshot_matches_status = planning_snapshot_ &&
-              planning_snapshot_->publication_sequence == map_status_publication_sequence_;
-            const bool snapshot_usable = snapshot_matches_status &&
+            // Status and snapshot are separate DDS samples.  A newer ready
+            // heartbeat can be observed just before its matching snapshot;
+            // keep checking against the last coherent snapshot while its
+            // lease is valid.  Candidate commit still requires an exact
+            // publication sequence in tryCommitReference().
+            const bool snapshot_usable = planning_snapshot_ &&
               planningSnapshotUsableLocked(
                 planning_snapshot_->publication_sequence,
                 active_goal_->localization_epoch);
@@ -1104,15 +1121,19 @@ private:
                 current_pose_.header.frame_id.c_str(),
                 snapshot_pose ? snapshot_pose->position.x : std::numeric_limits<double>::quiet_NaN(),
                 snapshot_pose ? snapshot_pose->position.y : std::numeric_limits<double>::quiet_NaN());
-              if (!gate.map_fresh || !gate.localization_fresh || !gate.tf_healthy) {
-                // A missing lease or transform is recoverable.  Stop and use
-                // the existing map-wait path; only healthy static evidence may
-                // turn a task-level watchdog result into a terminal failure.
-                active_goal_->recovering = true;
-                progress_suspend_goal_id = active_goal_->id;
-              } else {
-                progress_failure =
-                  "progress watchdog rejected outside-map, occupied, or unsafe footprint";
+              // The current command is no longer safe, but one coherent map
+              // sample must not make the task terminal. Stop immediately and
+              // keep the goal bounded by its normal action/map-wait deadlines.
+              // A healthy unsafe snapshot requires a strictly newer
+              // publication before replanning, so it cannot spin on the same
+              // occupied start state or revive the previous reference.
+              active_goal_->recovering = true;
+              progress_suspend_goal_id = active_goal_->id;
+              if (gate.map_fresh && gate.localization_fresh && gate.tf_healthy &&
+                planning_snapshot_)
+              {
+                progress_suspend_after_publication =
+                  planning_snapshot_->publication_sequence;
               }
             }
           }
@@ -1147,7 +1168,9 @@ private:
       suspendActiveGoal(*gimbal_recovery_goal_id);
     }
     if (progress_suspend_goal_id && !progress_replan && !gimbal_recovery_goal_id) {
-      suspendActiveGoal(*progress_suspend_goal_id);
+      suspendActiveGoal(
+        *progress_suspend_goal_id, std::nullopt,
+        progress_suspend_after_publication);
     }
     if (localization_suspended) {
       publishEmergencyStop(true);
@@ -1313,6 +1336,15 @@ private:
     return std::chrono::duration<double>(
       std::chrono::steady_clock::now() - *last_planning_snapshot_signal_).count() <=
       planning_snapshot_timeout_sec_;
+  }
+
+  bool recoverySnapshotReadyLocked(const ActiveGoal & goal) const {
+    if (goal.wait_for_publication_after == 0U) {
+      return true;
+    }
+    return map_status_publication_sequence_ > goal.wait_for_publication_after &&
+      planningSnapshotUsableLocked(
+        map_status_publication_sequence_, goal.localization_epoch);
   }
 
   bool localizationHealthyLocked() const {

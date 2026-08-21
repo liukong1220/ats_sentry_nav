@@ -193,7 +193,9 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         cls.tf_broadcaster.sendTransform(transform)
 
     @classmethod
-    def publish_health(cls, epoch, map_to_odom_x):
+    def publish_health(
+        cls, epoch, map_to_odom_x, publication_sequence=None, occupied=False
+    ):
         if map_to_odom_x is not None:
             cls.publish_tf(map_to_odom_x)
         odometry = Odometry()
@@ -213,10 +215,11 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         map_status.header.frame_id = "map"
         map_status.ready = True
         map_status.localization_epoch = epoch
-        map_status.rog_generation = epoch
-        map_status.publication_sequence = epoch
+        sequence = epoch if publication_sequence is None else publication_sequence
+        map_status.rog_generation = sequence
+        map_status.publication_sequence = sequence
         cls.map_status_pub.publish(map_status)
-        cls.publish_planning_snapshot(epoch)
+        cls.publish_planning_snapshot(epoch, sequence, occupied)
         request = (
             cls.yaw_authority_requests[-1]
             if cls.yaw_authority_requests
@@ -231,7 +234,9 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
 
     @classmethod
-    def publish_planning_snapshot(cls, epoch):
+    def publish_planning_snapshot(
+        cls, epoch, publication_sequence=None, occupied=False
+    ):
         snapshot = PlanningMapSnapshot()
         stamp = cls.node.get_clock().now().to_msg()
         snapshot.header.stamp = stamp
@@ -241,8 +246,9 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         snapshot.unknown_is_obstacle = True
         snapshot.occupied_value_threshold = 50
         snapshot.localization_epoch = epoch
-        snapshot.source_generation = epoch
-        snapshot.publication_sequence = epoch
+        sequence = epoch if publication_sequence is None else publication_sequence
+        snapshot.source_generation = sequence
+        snapshot.publication_sequence = sequence
         snapshot.info.resolution = 1.0
         snapshot.info.width = 50
         snapshot.info.height = 50
@@ -254,6 +260,10 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         snapshot.signed_distance_m = [1.0] * count
         snapshot.gradient_x = [0.0] * count
         snapshot.gradient_y = [0.0] * count
+        if occupied:
+            center_index = 20 * snapshot.info.width + 20
+            snapshot.occupancy[center_index] = 100
+            snapshot.signed_distance_m[center_index] = -0.1
         cls.planning_snapshot_pub.publish(snapshot)
 
     @classmethod
@@ -603,6 +613,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
                 periodic=lambda: self.publish_health(2, 2.0),
             )
         )
+
         self.assertEqual(self.stop_states.count(False), false_count)
 
         request_count = len(self.yaw_authority_requests)
@@ -639,5 +650,106 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
                 lambda: len(self.references) > reference_count,
                 timeout=0.4,
                 periodic=lambda: self.publish_health(2, 2.0),
+            )
+        )
+
+        # Status and snapshot are separate DDS topics. A newer ready heartbeat
+        # must not revoke the still-fresh previous snapshot during the brief
+        # interval before the matching numeric snapshot arrives.
+        stop_event_count = len(self.stop_states)
+        command_count = len(self.execution_commands)
+        next_status = PlanningMapStatus()
+        next_status.header.stamp = self.node.get_clock().now().to_msg()
+        next_status.header.frame_id = "odom"
+        next_status.ready = True
+        next_status.localization_epoch = 2
+        next_status.rog_generation = 3
+        next_status.publication_sequence = 3
+        self.map_status_pub.publish(next_status)
+        self.assertFalse(
+            self.spin_until(
+                lambda: True in self.stop_states[stop_event_count:], timeout=0.4,
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        self.assertFalse(
+            any(
+                command.mode == ExecutionCommand.MODE_STOP
+                for command in self.execution_commands[command_count:]
+            )
+        )
+
+        # A coherent map update can invalidate the footprint currently being
+        # executed. The manager must stop immediately without terminating the
+        # active task or retrying forever against that same unsafe snapshot.
+        goal_count = len(self.planner_goals)
+        reference_count = len(self.references)
+        self.publish_planning_snapshot(2, 3, occupied=True)
+        self.assertTrue(
+            self.spin_until(
+                lambda: True in self.stop_states[stop_event_count:],
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        command_count = len(self.execution_commands)
+        false_count = self.stop_states.count(False)
+        self.assertFalse(
+            self.spin_until(
+                lambda: len(self.planner_goals) > goal_count,
+                timeout=0.4,
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        self.assertEqual(self.stop_states.count(False), false_count)
+        self.assertFalse(
+            any(
+                command.mode == ExecutionCommand.MODE_EXECUTE
+                for command in self.execution_commands[command_count:]
+            )
+        )
+
+        # Only a newer coherent free snapshot may dispatch the same goal. No
+        # pre-stop reference is republished while that new request is pending.
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.planner_goals) > goal_count,
+                periodic=lambda: self.publish_health(2, 2.0, 4),
+            )
+        )
+        recovered_goal = self.planner_goals[-1]
+        self.assertEqual(recovered_goal.goal_id, second_goal.goal_id)
+        self.assertEqual(recovered_goal.localization_epoch, 2)
+        self.assertEqual(recovered_goal.map_publication_sequence, 4)
+        self.assertGreater(
+            recovered_goal.plan_request_sequence,
+            second_goal.plan_request_sequence,
+        )
+        self.assertEqual(len(self.references), reference_count)
+        self.assertEqual(self.stop_states.count(False), false_count)
+
+        request_count = len(self.yaw_authority_requests)
+        self.publish_candidate(recovered_goal, 2, publication_sequence=4)
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.yaw_authority_requests) > request_count,
+                periodic=lambda: self.publish_health(2, 2.0, 4),
+            )
+        )
+        request = self.yaw_authority_requests[-1]
+        self.publish_gimbal_status(
+            request.request_sequence,
+            request.yaw_authority,
+            request.require_gimbal_lock,
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.references) == reference_count + 1,
+                periodic=lambda: self.publish_health(2, 2.0, 4),
+            )
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: self.stop_states.count(False) > false_count,
+                periodic=lambda: self.publish_health(2, 2.0, 4),
             )
         )
