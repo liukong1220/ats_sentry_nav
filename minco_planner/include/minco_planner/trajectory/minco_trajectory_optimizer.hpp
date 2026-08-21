@@ -100,6 +100,7 @@ struct MincoOptimizationTrace
   std::vector<double> segment_durations;
   bool esdf_geometry_refined = false;
   bool local_time_scaled = false;
+  bool uniform_time_scaled = false;
   // Diagnostics only. A rejected candidate never reaches the control reference
   // publisher, but its stage boundary must remain observable in the same map snapshot.
   std::string failure_reason;
