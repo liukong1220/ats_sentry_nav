@@ -10,6 +10,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>fake_vel_transform</depend>
+  <depend>ats_cmd_vel_arbiter</depend>
   <depend>loam_interface</depend>
   <depend>sensor_scan_generation</depend>
   <depend>ats_rc_esdf</depend>

@@ -277,7 +277,7 @@ double Se2MpcController::cost(const std::vector<State> &states,
 
 /**
  * @brief 构造或移动 iLQR warm start，并逐步投影到真实四轮执行器可达集合。
- * @details 首步单独记录饱和/增量回退，因为只有它会进入 `/cmd_vel_mpc`。
+ * @details 首步单独记录饱和/增量回退，因为只有它会进入 `/cmd_vel/autonomy_raw`。
  */
 void Se2MpcController::initializeControls(
     const std::vector<Se2Reference> &references, const Control &last_control) {

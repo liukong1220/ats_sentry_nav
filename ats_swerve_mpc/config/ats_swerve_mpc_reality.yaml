@@ -25,9 +25,9 @@ ats_swerve_mpc:
     # 实车默认要求真实云台 ack；受控抬轮 HIL 才可由 launch 覆盖为 false。
     require_gimbal_status: true
     gimbal_status_timeout: 0.5
-    # Real hardware defaults to fake-yaw/chassis compatibility. The chassis
-    # transform remains the only /cmd_vel publisher consumed by the serial base.
-    command_topic: /cmd_vel_mpc
+    # Real hardware applies fake-yaw/chassis compatibility after this raw
+    # autonomy topic; cmd_vel_arbiter is the only selected-velocity publisher.
+    command_topic: /cmd_vel/autonomy_raw
     emergency_stop_topic: /planner/emergency_stop
     localization_status_topic: /localization/status
     require_localization_status: true
@@ -40,7 +40,7 @@ ats_swerve_mpc:
     goal_yaw_tolerance: 0.15
     publish_debug_paths: true
 
-    # 默认保持 iLQR 唯一 `/cmd_vel_mpc` owner。qp_shadow 仅记录 OSQP 诊断；
+    # 默认保持 iLQR 唯一 `/cmd_vel/autonomy_raw` owner。qp_shadow 仅记录 OSQP 诊断；
     # qp 控制发布尚未实现，传入 solver_mode:=qp 会拒绝启动。
     solver_mode: ilqr
     # OSQP v1.0.0 固定 CSC workspace 限制，尚非 HIL/实车实时性测量值。

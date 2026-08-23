@@ -128,7 +128,7 @@ constexpr std::uint64_t kTelemetrySummaryInterval = 16;
 /**
  * @brief 初始化 ATS iLQR 主链、输入订阅、唯一速度发布者和可选 OSQP shadow。
  * @details `solver_mode=ilqr` 是默认；`qp_shadow` 仅预分配后端和缓冲，`qp` 显式拒绝，
- *          因而构造过程不会改变 `/cmd_vel_mpc`、急停或底盘所有权。
+ *          因而构造过程不会改变 `/cmd_vel/autonomy_raw`、急停或底盘所有权。
  */
 AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
     : Node("ats_swerve_mpc", options) {
@@ -138,7 +138,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   execution_command_topic_ = declare_parameter<std::string>(
       "execution_command_topic", "/planner/execution_command");
   command_topic_ = declare_parameter<std::string>("command_topic",
-                                                  "/cmd_vel_gimbal_yaw_odom");
+                                                  "/cmd_vel/autonomy_raw");
   emergency_stop_topic_ = declare_parameter<std::string>(
       "emergency_stop_topic", "/planner/emergency_stop");
   localization_status_topic_ = declare_parameter<std::string>(

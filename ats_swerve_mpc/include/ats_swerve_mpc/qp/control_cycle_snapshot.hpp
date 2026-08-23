@@ -18,7 +18,7 @@ namespace ats_swerve_mpc {
  * @details 控制定时器在调用 iLQR 前复制当前状态、reference、上一控制和执行授权身份。
  *          iLQR 只能读取此副本求解，随后 qp_shadow 也只能读取同一副本，禁止在二者之间
  *          重新读取 ROS 状态、tracker 或 ExecutionCommand。该类型没有可发布 Twist，因而
- *          不能改变 `/cmd_vel_mpc` 的 iLQR 唯一所有权。
+ *          不能改变 `/cmd_vel/autonomy_raw` 的 iLQR 唯一所有权。
  */
 struct ControlCycleSnapshot {
   std::uint64_t cycle_sequence = 0;

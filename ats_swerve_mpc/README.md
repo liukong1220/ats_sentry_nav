@@ -18,13 +18,14 @@ deadline publish zero velocity.
 MuJoCo opt-in launch:
 
 ```bash
-ros2 launch ats_mujoco_sim rmuc_2026_mujoco.launch.py \
+ros2 launch ats_mujoco_sim rmuc_2025_mujoco.launch.py \
   launch_swerve_mpc:=true
 ```
 
-When enabled, the launch disables `fake_vel_transform`, routes MPC output through
-`/cmd_vel_mpc`, and makes `twist_to_motion_ctrl` the single subscriber that feeds
-MuJoCo `/motion_control`. The default launch remains the Nav2 MPPI baseline.
+The MuJoCo launch disables `fake_vel_transform`, routes MPC output to
+`/cmd_vel/autonomy_raw`, and makes `cmd_vel_arbiter` the sole publisher of
+`/cmd_vel/selected`; `twist_to_motion_ctrl` is its single subscriber and feeds MuJoCo
+`/motion_control`. The default ATS launch remains the Nav2-free pipeline.
 
 ## LTV-QP migration status
 

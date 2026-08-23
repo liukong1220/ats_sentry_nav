@@ -93,7 +93,7 @@ MINCO local snapshot generation 是三个不同编号域，当前不会把它们
 正式速度链只有一个 owner：
 
 ```text
-ats_swerve_mpc -> /cmd_vel_mpc -> velocity bridge -> chassis input
+ats_swerve_mpc -> /cmd_vel/autonomy_raw -> cmd_vel_arbiter -> /cmd_vel/selected -> chassis input
 ```
 
 失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度。
@@ -121,7 +121,7 @@ P3 运行链已经使用该授权；P4 的 candidate digest 关联字段已定�
 | `ats_rc_esdf` | 中立二维 signed distance、unknown、gradient、静态图融合算法 | planner 数值地图后端 |
 | `minco_planner` | JPS、MINCO S3、yaw、footprint、repair | 规划候选 producer |
 | `ats_goal_manager` | ATS action、目标状态机、提交复核、急停、执行授权 | 导航 action server |
-| `ats_swerve_mpc` | 全向 SE2 MPC、授权/急停/定位 watchdog | `/cmd_vel_mpc` 唯一 producer |
+| `ats_swerve_mpc` | 全向 SE2 MPC、授权/急停/定位 watchdog | `/cmd_vel/autonomy_raw` 唯一 producer |
 | `ats_navigation_interfaces` | action、状态、授权及 P4 原子 schema | 跨模块接口权威 |
 | `ats_nav_bringup` | 定位与导航子系统 launch、地图及 RViz 资源 | 被根 bringup 编排 |
 
@@ -259,8 +259,9 @@ ros2 action send_goal --feedback \
 | `/minco/reference_path_candidate` | `nav_msgs/msg/Path` | MINCO -> Goal Manager | 未提交候选 reference |
 | `/minco/reference_path` | `nav_msgs/msg/Path` | Goal Manager -> MPC/RViz | 已提交、统一重定时的 reference |
 | `/planner/emergency_stop` | `std_msgs/msg/Bool` | Goal Manager -> MPC/底盘安全链 | RELIABLE + TRANSIENT_LOCAL，带 heartbeat |
-| `/planner/execution_command` | `ats_navigation_interfaces/msg/ExecutionCommand` | Goal Manager -> MPC/serial | RELIABLE + TRANSIENT_LOCAL；唯一执行授权 |
-| `/cmd_vel_mpc` | `geometry_msgs/msg/Twist` | MPC -> 唯一速度 bridge | 车体系 `[vx, vy, wz]` |
+| `/planner/execution_command` | `ats_navigation_interfaces/msg/ExecutionCommand` | Goal Manager -> MPC/arbiter | RELIABLE + TRANSIENT_LOCAL；自动源唯一执行授权 |
+| `/cmd_vel/autonomy_raw` | `geometry_msgs/msg/Twist` | MPC -> velocity transform 或 arbiter | 车体系 `[vx, vy, wz]` |
+| `/cmd_vel/selected` | `geometry_msgs/msg/Twist` | arbiter -> 唯一最终 velocity bridge | 手动优先、自动源需新鲜 lease |
 
 ### 数值地图服务
 
@@ -333,12 +334,15 @@ flowchart LR
     Manager --> Exec["ExecutionCommand + committed reference"]
     Exec --> MPC["omnidirectional SE2 MPC"]
     Odom --> MPC
-    MPC --> Cmd["/cmd_vel_mpc"]
+    MPC --> Raw["/cmd_vel/autonomy_raw"]
+    Raw --> Arbiter["cmd_vel arbiter"]
+    Arbiter --> Cmd["/cmd_vel/selected"]
     Cmd --> Bridge["unique velocity bridge"]
     Bridge --> Chassis["swerve chassis"]
 ```
 
-运行图必须满足：planning grid、`/cmd_vel_mpc`、底盘最终输入、关键 TF 和急停各有唯一权威。
+运行图必须满足：planning grid、`/cmd_vel/autonomy_raw`、`/cmd_vel/selected`、底盘最终输入、关键 TF
+和急停各有唯一权威。
 
 ## RViz 可视化
 
@@ -382,7 +386,7 @@ colcon test-result --test-result-base build --verbose
 - 两次均观测到 south/north 非零 `vy`、唯一 `/cmd_vel_mpc` 与底盘输入 owner、
   MINCO 离散 collision sample `0`、最终命令/RPM `0`、
   `contact_violation_count=0`；
-- 9 项 P2/P3 独立故障用例曾验证
+- 上述 `/cmd_vel_mpc` 话题均属于速度仲裁迁移前的历史记录，不能证明当前 selected 链；9 项 P2/P3 独立故障用例曾验证
   `emergency_stop=true -> /cmd_vel_mpc=0 -> /motion_control=0`。
 
 `contact_violation_count=0` 只表示现有 MuJoCo evaluator 未报告接触，不等价于实车物理
