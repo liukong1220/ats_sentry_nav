@@ -16,6 +16,9 @@ def generate_launch_description():
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
     chassis_vel_input_topic = LaunchConfiguration("chassis_vel_input_topic")
     mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
+    chassis_vel_output_topic = LaunchConfiguration("chassis_vel_output_topic")
+    launch_cmd_vel_arbiter = LaunchConfiguration("launch_cmd_vel_arbiter")
+    require_serial_link = LaunchConfiguration("require_serial_link")
     require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
 
@@ -30,22 +33,31 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "fake_vel_output_topic",
             default_value=IfElseSubstitution(
-                launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"
+                launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"
             ),
         ),
         DeclareLaunchArgument(
             "chassis_vel_input_topic",
             default_value=IfElseSubstitution(
-                launch_fake_vel_transform, "cmd_vel_gimbal_yaw_odom", mpc_cmd_vel_topic
+                launch_fake_vel_transform, "/cmd_vel/autonomy_gimbal", mpc_cmd_vel_topic
             ),
         ),
         DeclareLaunchArgument(
             "mpc_cmd_vel_topic",
             default_value=IfElseSubstitution(
                 launch_fake_vel_transform,
-                "/cmd_vel_mpc",
-                IfElseSubstitution(launch_chassis_vel_transform, "cmd_vel_gimbal_yaw_odom", "/cmd_vel"),
+                "/cmd_vel/autonomy_raw",
+                IfElseSubstitution(launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"),
             ),
+        ),
+        DeclareLaunchArgument(
+            "chassis_vel_output_topic",
+            default_value="/cmd_vel/autonomy",
+        ),
+        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value="True"),
+        DeclareLaunchArgument(
+            "require_serial_link",
+            default_value=IfElseSubstitution(use_robot_state_pub, "False", "True"),
         ),
         DeclareLaunchArgument("require_gimbal_status", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -101,7 +113,18 @@ def generate_launch_description():
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
             "input_cmd_vel_topic": chassis_vel_input_topic,
+            "output_cmd_vel_topic": chassis_vel_output_topic,
         }], arguments=["--ros-args", "--log-level", log_level],
+    )
+    cmd_vel_arbiter = Node(
+        package="ats_cmd_vel_arbiter", executable="cmd_vel_arbiter_node", name="cmd_vel_arbiter",
+        namespace=namespace, condition=IfCondition(launch_cmd_vel_arbiter), output="screen",
+        respawn=use_respawn, respawn_delay=2.0,
+        parameters=[params_file, {
+            "use_sim_time": use_sim_time,
+            "require_serial_link": require_serial_link,
+        }],
+        arguments=["--ros-args", "--log-level", log_level],
     )
     minco = Node(
         package="minco_planner", executable="minco_planner_node", name="minco_planner",
@@ -134,6 +157,6 @@ def generate_launch_description():
     for declaration in declarations:
         ld.add_action(declaration)
     for action in (base_link_tf, fake_yaw_tf, terrain, terrain_ext, loam, scan_generation,
-                   fake_transform, chassis_transform, minco, goal_manager, mpc):
+                   fake_transform, chassis_transform, cmd_vel_arbiter, minco, goal_manager, mpc):
         ld.add_action(action)
     return ld

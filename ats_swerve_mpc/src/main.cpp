@@ -6,7 +6,7 @@
 
 /**
  * @brief 启动 ATS Swerve MPC ROS 进程。
- * @details 节点内只有一个 `/cmd_vel_mpc` 发布者；QP shadow 若启用也只作为该节点内的
+ * @details 节点内只有一个 `/cmd_vel/autonomy_raw` 发布者；QP shadow 若启用也只作为该节点内的
  *          诊断计算，进程入口不创建额外控制器或命令所有者。
  */
 int main(int argc, char ** argv)

@@ -33,7 +33,7 @@
  * @brief ATS 四驱四转舵轮的 ROS 2 控制链唯一速度发布节点。
  * @details 节点接收世界系里程计、时间化 reference、ExecutionCommand、急停、定位与
  *          云台健康输入，在严格的 frame、freshness、lease 与急停门之后调用 iLQR，
- *          并通过唯一的 `/cmd_vel_mpc` publisher 输出车体系 `[vx,vy,wz]`。当
+ *          并通过唯一的 `/cmd_vel/autonomy_raw` publisher 输出车体系 `[vx,vy,wz]`。当
  *          `solver_mode=qp_shadow` 时，QP 只读取 iLQR 求解前冻结的快照记录诊断，
  *          不得改变 tracker、warm start、急停语义或任何 topic ownership。
  */
