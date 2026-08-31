@@ -54,6 +54,31 @@ GridAstarResult GridJps::plan(
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal) const
 {
+  return planWithClearance(grid, start, goal, -1.0);
+}
+
+GridOccupancyPolicy GridJps::occupancyPolicy() const
+{
+  GridOccupancyPolicy policy;
+  policy.obstacle_value_threshold = params_.obstacle_value_threshold;
+  policy.unknown_is_obstacle = params_.unknown_is_obstacle;
+  return policy;
+}
+
+GridAstarResult GridJps::planWithClearance(
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  double clearance_override) const
+{
+  if (clearance_override >= 0.0 &&
+    std::abs(clearance_override - params_.safe_distance) > 1e-9)
+  {
+    GridJpsParams relaxed = params_;
+    relaxed.safe_distance = clearance_override;
+    return GridJps(relaxed).planWithClearance(grid, start, goal, -1.0);
+  }
+
   GridAstarResult result;
   result.path.header = grid.header;
   const std::size_t cell_count =
@@ -75,11 +100,30 @@ GridAstarResult GridJps::plan(
     result.reason = "goal outside grid";
     return result;
   }
-  if (!isTraversable(grid, start_index.x, start_index.y)) {
+  // The robot already stands on the start cell, so a fail-closed rejection here
+  // deadlocks: the only thing that could move it is the planner that refuses to
+  // run. The yaw-aware footprint gate and local repair stay authoritative.
+  if (!params_.assume_start_traversable && !isTraversable(grid, start_index.x, start_index.y)) {
     result.reason = "start occupied";
     return result;
   }
   if (!isTraversable(grid, goal_index.x, goal_index.y)) {
+    const double goal_clearance = params_.relax_endpoint_clearance
+      ? measureGridClearance(
+      grid, goal_index.x, goal_index.y, params_.safe_distance, occupancyPolicy())
+      : 0.0;
+    if (!(goal_clearance > 0.0) || goal_clearance + 1e-9 < params_.min_safe_distance) {
+      result.reason = "goal occupied";
+      return result;
+    }
+    GridJpsParams relaxed = params_;
+    relaxed.safe_distance = goal_clearance;
+    relaxed.relax_endpoint_clearance = false;
+    GridAstarResult relaxed_result =
+      GridJps(relaxed).planWithClearance(grid, start, goal, -1.0);
+    if (relaxed_result.success) {
+      return relaxed_result;
+    }
     result.reason = "goal occupied";
     return result;
   }
@@ -232,42 +276,14 @@ geometry_msgs::msg::PoseStamped GridJps::gridToPose(
   return pose;
 }
 
-bool GridJps::isTraversable(
-  const nav_msgs::msg::OccupancyGrid & grid,
-  int x,
-  int y) const
+bool GridJps::isTraversable(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const
 {
-  if (!isCellFree(grid, x, y)) {
-    return false;
-  }
-  const int radius = static_cast<int>(std::ceil(
-    std::max(0.0, params_.safe_distance) / grid.info.resolution));
-  const double radius_squared = std::pow(params_.safe_distance / grid.info.resolution, 2.0);
-  for (int offset_y = -radius; offset_y <= radius; ++offset_y) {
-    for (int offset_x = -radius; offset_x <= radius; ++offset_x) {
-      if (offset_x * offset_x + offset_y * offset_y > radius_squared) {
-        continue;
-      }
-      if (!isCellFree(grid, x + offset_x, y + offset_y)) {
-        return false;
-      }
-    }
-  }
-  return true;
+  return hasGridClearance(grid, x, y, params_.safe_distance, occupancyPolicy());
 }
 
-bool GridJps::isCellFree(
-  const nav_msgs::msg::OccupancyGrid & grid,
-  int x,
-  int y) const
+bool GridJps::isCellFree(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const
 {
-  if (x < 0 || y < 0 || x >= static_cast<int>(grid.info.width) ||
-    y >= static_cast<int>(grid.info.height))
-  {
-    return false;
-  }
-  const int8_t value = grid.data[linearIndex(grid, x, y)];
-  return value < 0 ? !params_.unknown_is_obstacle : value < params_.obstacle_value_threshold;
+  return isGridCellFree(grid, x, y, occupancyPolicy());
 }
 
 std::size_t GridJps::linearIndex(

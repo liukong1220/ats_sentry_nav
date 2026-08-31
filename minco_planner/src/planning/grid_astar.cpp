@@ -46,6 +46,31 @@ GridAstarResult GridAstar::plan(
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal) const
 {
+  return planWithClearance(grid, start, goal, -1.0);
+}
+
+GridOccupancyPolicy GridAstar::occupancyPolicy() const
+{
+  GridOccupancyPolicy policy;
+  policy.obstacle_value_threshold = params_.obstacle_value_threshold;
+  policy.unknown_is_obstacle = params_.unknown_is_obstacle;
+  return policy;
+}
+
+GridAstarResult GridAstar::planWithClearance(
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  double clearance_override) const
+{
+  if (clearance_override >= 0.0 &&
+    std::abs(clearance_override - params_.safe_distance) > 1e-9)
+  {
+    GridAstarParams relaxed = params_;
+    relaxed.safe_distance = clearance_override;
+    return GridAstar(relaxed).planWithClearance(grid, start, goal, -1.0);
+  }
+
   GridAstarResult result;
   result.path.header = grid.header;
 
@@ -66,11 +91,29 @@ GridAstarResult GridAstar::plan(
     result.reason = "goal is outside grid";
     return result;
   }
-  if (!isTraversable(grid, start_idx)) {
+  const GridOccupancyPolicy policy = occupancyPolicy();
+  // The robot already stands on the start cell. Rejecting it cannot move the
+  // robot, so the only outcome of a fail-closed rejection here is a livelock.
+  if (!params_.assume_start_traversable && !isTraversable(grid, start_idx)) {
     result.reason = "start is occupied";
     return result;
   }
   if (!isTraversable(grid, goal_idx)) {
+    const double goal_clearance = params_.relax_endpoint_clearance
+      ? measureGridClearance(grid, goal_idx.x, goal_idx.y, params_.safe_distance, policy)
+      : 0.0;
+    if (!(goal_clearance > 0.0) || goal_clearance + 1e-9 < params_.min_safe_distance) {
+      result.reason = "goal is occupied";
+      return result;
+    }
+    GridAstarParams relaxed = params_;
+    relaxed.safe_distance = goal_clearance;
+    relaxed.relax_endpoint_clearance = false;
+    GridAstarResult relaxed_result =
+      GridAstar(relaxed).planWithClearance(grid, start, goal, -1.0);
+    if (relaxed_result.success) {
+      return relaxed_result;
+    }
     result.reason = "goal is occupied";
     return result;
   }
@@ -246,18 +289,7 @@ bool GridAstar::isTraversable(
   const nav_msgs::msg::OccupancyGrid & grid,
   const GridIndex & index) const
 {
-  if (index.x < 0 || index.y < 0 ||
-    index.x >= static_cast<int>(grid.info.width) ||
-    index.y >= static_cast<int>(grid.info.height))
-  {
-    return false;
-  }
-
-  const int8_t value = grid.data[linearIndex(grid, index)];
-  if (value < 0) {
-    return !params_.unknown_is_obstacle;
-  }
-  return value < params_.obstacle_value_threshold;
+  return hasGridClearance(grid, index.x, index.y, params_.safe_distance, occupancyPolicy());
 }
 
 std::size_t GridAstar::linearIndex(

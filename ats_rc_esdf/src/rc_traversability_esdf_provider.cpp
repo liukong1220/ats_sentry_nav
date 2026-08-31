@@ -229,6 +229,14 @@ void RcTraversabilityEsdfProvider::updateGrid(
   const int safe_threshold = std::max(0, std::min(100, obstacle_value_threshold));
   const int lethal_threshold =
     std::max(safe_threshold, std::min(100, lethal_value_threshold));
+  // 语义细化分数必须和调用方声明的风险阈值同源。原实现写死 0.5，等于在
+  // obstacle_value_threshold 之外再插入一个固定阈值 50：当 RMUC profile 声明阈值
+  // 100（`0..99` 为连续风险、只有 `100` 是硬障碍）时，`50..99` 整个风险带会被提升为
+  // 硬 ESDF 障碍。结果是同一张栅格上离散 footprint gate 判定通过、RC-ESDF 却给出负
+  // clearance（domain 141 goal 4：`collisions=0` 而 `footprint_clearance=-0.317`），
+  // MINCO 的 ESDF 代价与 Local Collision Repair 因此被幻影障碍推离可行走廊。
+  // 按 safe_threshold 归一化后，threshold=50 的既有调用点行为完全不变。
+  const double semantic_obstacle_score = static_cast<double>(safe_threshold) / 100.0;
 
   for (unsigned int my = 0; my < height_; ++my) {
     for (unsigned int mx = 0; mx < width_; ++mx) {
@@ -251,8 +259,12 @@ void RcTraversabilityEsdfProvider::updateGrid(
           ground_values.empty() ? semantic_score : ground_values[idx]);
       }
 
+      // semantic_score 对 unknown 返回 -1.0，因此这里显式排除负分：unknown 只由
+      // unknown_is_obstacle 决定，不被语义项二次提升。
+      const bool is_semantic_obstacle =
+        semantic_score >= 0.0 && semantic_score >= semantic_obstacle_score;
       const bool is_obstacle =
-        is_lethal_obstacle || is_risk_obstacle || semantic_score >= 0.5;
+        is_lethal_obstacle || is_risk_obstacle || is_semantic_obstacle;
       if (is_obstacle) {
         obstacle_mask[idx] = 1;
       } else {

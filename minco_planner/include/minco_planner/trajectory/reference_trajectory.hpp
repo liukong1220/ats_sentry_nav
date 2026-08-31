@@ -25,7 +25,10 @@ struct ReferencePoint
   double ax = 0.0;
   double ay = 0.0;
   double yaw_rate = 0.0;
-  double clearance = 0.0;
+  // 未标注的净空是"未知"，不是"实测为 0"。默认 0.0 是有限值，会让窄通道判据
+  // 把没标注过的轨迹当成贴着障碍，从而无条件进入窄通道分支。所有读取方都已
+  // 用 isfinite 守卫，因此这里用 NaN 表达未知。
+  double clearance = std::numeric_limits<double>::quiet_NaN();
   double slope = 0.0;
 };
 

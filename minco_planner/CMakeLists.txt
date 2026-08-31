@@ -19,9 +19,11 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/planning/grid_jps.cpp
   src/safety/footprint_safety_checker.cpp
   src/safety/local_collision_repair.cpp
+  src/safety/goal_pose_admission.cpp
   src/trajectory/minco_time_allocator.cpp
   src/trajectory/minco_trajectory_optimizer.cpp
   src/trajectory/path_geometry_preprocessor.cpp
+  src/trajectory/terminal_yaw_relocation.cpp
   src/trajectory/trajectory_quality_evaluator.cpp
   src/trajectory/yaw_spline_planner.cpp
 )
@@ -54,6 +56,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_grid_jps test/test_grid_jps.cpp)
   target_link_libraries(test_grid_jps ${PROJECT_NAME})
 
+  ament_add_gtest(test_grid_search_clearance test/test_grid_search_clearance.cpp)
+  target_link_libraries(test_grid_search_clearance ${PROJECT_NAME})
+
   ament_add_gtest(
     test_minco_trajectory_optimizer
     test/test_minco_trajectory_optimizer.cpp
@@ -77,6 +82,24 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_footprint_swept_safety test/test_footprint_swept_safety.cpp)
   target_link_libraries(test_footprint_swept_safety ${PROJECT_NAME})
+
+  ament_add_gtest(test_local_collision_repair test/test_local_collision_repair.cpp)
+  target_link_libraries(test_local_collision_repair ${PROJECT_NAME})
+
+  ament_add_gtest(test_terminal_yaw_relocation test/test_terminal_yaw_relocation.cpp)
+  target_link_libraries(test_terminal_yaw_relocation ${PROJECT_NAME})
+
+  ament_add_gtest(test_goal_pose_admission test/test_goal_pose_admission.cpp)
+  target_link_libraries(test_goal_pose_admission ${PROJECT_NAME})
+
+  ament_add_gtest(test_escape_prefix test/test_escape_prefix.cpp)
+  target_link_libraries(test_escape_prefix ${PROJECT_NAME})
+
+  ament_add_gtest(test_clearance_ladder test/test_clearance_ladder.cpp)
+  target_link_libraries(test_clearance_ladder ${PROJECT_NAME})
+
+  ament_add_gtest(test_graph_search_failure test/test_graph_search_failure.cpp)
+  target_link_libraries(test_graph_search_failure ${PROJECT_NAME})
 
   ament_add_gtest(
     test_path_geometry_preprocessor

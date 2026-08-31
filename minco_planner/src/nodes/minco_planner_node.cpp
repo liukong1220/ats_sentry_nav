@@ -2,10 +2,14 @@
 
 #include "minco_planner/nodes/minco_planner_node.hpp"
 
+#include "minco_planner/planning/graph_search_failure.hpp"
+#include "minco_planner/planning/clearance_ladder.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <string>
 
 #include "minco_planner/trajectory/reference_path_timing.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -14,6 +18,64 @@
 
 namespace minco_planner
 {
+
+namespace
+{
+
+// 把拒绝点周围的规划栅格原样打成一行,用于区分
+// "车自身格子被占"与"外侧存在成片障碍"。只在 footprint
+// 拒绝分支调用,窗口为 ±radius_m,行序从北到南。
+std::string describeGridWindow(
+  const nav_msgs::msg::OccupancyGrid & grid, double center_x, double center_y,
+  double radius_m, int obstacle_value_threshold, bool unknown_is_obstacle)
+{
+  if (grid.info.resolution <= 0.0 || grid.info.width == 0U || grid.info.height == 0U) {
+    return std::string("<invalid grid>");
+  }
+  const double resolution = grid.info.resolution;
+  const int span = std::max(1, static_cast<int>(std::lround(radius_m / resolution)));
+  const int center_mx = static_cast<int>(
+    std::floor((center_x - grid.info.origin.position.x) / resolution));
+  const int center_my = static_cast<int>(
+    std::floor((center_y - grid.info.origin.position.y) / resolution));
+  std::ostringstream stream;
+  stream << "res=" << resolution << " center_cell=(" << center_mx << ", " << center_my
+         << ") span=" << span << " rows_north_to_south=[";
+  for (int dy = span; dy >= -span; --dy) {
+    const int my = center_my + dy;
+    for (int dx = -span; dx <= span; ++dx) {
+      const int mx = center_mx + dx;
+      if (mx < 0 || my < 0 || mx >= static_cast<int>(grid.info.width) ||
+        my >= static_cast<int>(grid.info.height))
+      {
+        // 越界在 footprint 判据里等价于占据,这里用独立
+      // 符号标出来,避免与真实障碍混淆。
+        stream << 'X';
+        continue;
+      }
+      const int value = grid.data[
+        static_cast<std::size_t>(my) * static_cast<std::size_t>(grid.info.width) +
+        static_cast<std::size_t>(mx)];
+      if (value < 0) {
+        stream << (unknown_is_obstacle ? 'U' : 'u');
+      } else if (value >= obstacle_value_threshold) {
+        stream << '#';
+      } else if (value == 0) {
+        stream << '.';
+      } else {
+        // 连续风险 1..threshold-1 保留量级,便于判断是否贴着 terrain 风险带走。
+        stream << static_cast<char>('0' + std::min(9, value / 10));
+      }
+    }
+    if (dy != -span) {
+      stream << '/';
+    }
+  }
+  stream << ']';
+  return stream.str();
+}
+
+}  // namespace
 
 MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
 : Node("minco_planner", options),
@@ -114,6 +176,35 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("search_algorithm", search_algorithm_);
   declare_parameter<bool>("astar_fallback", astar_fallback_);
   declare_parameter<bool>("publish_unsafe_trajectory", publish_unsafe_trajectory_);
+  declare_parameter<bool>(
+    "escape_from_contact_enabled", escape_prefix_params_.enabled);
+  declare_parameter<double>(
+    "escape_from_contact_max_head_offset", escape_prefix_params_.max_head_offset_m);
+  declare_parameter<double>(
+    "escape_from_contact_max_prefix_length", escape_prefix_params_.max_prefix_length_m);
+  declare_parameter<double>(
+    "escape_from_contact_max_prefix_yaw_sweep",
+    escape_prefix_params_.max_prefix_yaw_sweep_rad);
+  declare_parameter<int>(
+    "escape_from_contact_max_prefix_points",
+    static_cast<int>(escape_prefix_params_.max_prefix_points));
+  declare_parameter<bool>(
+    "goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
+  declare_parameter<double>(
+    "goal_admission_position_tolerance", goal_pose_admission_params_.position_tolerance_m);
+  declare_parameter<double>(
+    "goal_admission_yaw_tolerance", goal_pose_admission_params_.yaw_tolerance_rad);
+  declare_parameter<double>(
+    "goal_admission_position_shrink", goal_pose_admission_params_.position_shrink);
+  declare_parameter<double>(
+    "goal_admission_yaw_shrink", goal_pose_admission_params_.yaw_shrink);
+  declare_parameter<double>(
+    "goal_admission_extra_margin", goal_pose_admission_params_.preferred_extra_margin_m);
+  declare_parameter<double>(
+    "goal_admission_position_step", goal_pose_admission_params_.position_step_m);
+  declare_parameter<int>(
+    "goal_admission_yaw_samples",
+    static_cast<int>(goal_pose_admission_params_.yaw_samples));
   declare_parameter<bool>("planner_manages_emergency_stop", planner_manages_emergency_stop_);
 
   GridAstarParams astar_params;
@@ -123,6 +214,10 @@ void MincoPlannerNode::declareAndLoadParams()
   GridJpsParams jps_params;
   declare_parameter<int>("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
   declare_parameter<double>("jps_safe_distance", jps_params.safe_distance);
+  declare_parameter<bool>("clearance_relaxation_enabled", clearance_relaxation_enabled_);
+  declare_parameter<bool>(
+    "endpoint_clearance_relaxation_enabled", endpoint_clearance_relaxation_enabled_);
+  declare_parameter<double>("search_clearance_floor", -1.0);
 
   MincoTrajectoryOptimizerParams optimizer_params;
   declare_parameter<double>("reference_speed", optimizer_params.reference_speed);
@@ -185,6 +280,13 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
   declare_parameter<double>(
     "terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
+  declare_parameter<bool>(
+    "terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
+  declare_parameter<int>(
+    "terminal_yaw_relocation_max_candidates", terminal_yaw_relocation_max_candidates_);
+  declare_parameter<double>(
+    "terminal_yaw_relocation_window_length",
+    terminal_yaw_relocation_params_.terminal_window_length);
 
   FootprintSafetyParams footprint_params;
   declare_parameter<double>("footprint_length", footprint_params.length);
@@ -227,6 +329,36 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("search_algorithm", search_algorithm_);
   get_parameter("astar_fallback", astar_fallback_);
   get_parameter("publish_unsafe_trajectory", publish_unsafe_trajectory_);
+  get_parameter("escape_from_contact_enabled", escape_prefix_params_.enabled);
+  get_parameter("escape_from_contact_max_head_offset", escape_prefix_params_.max_head_offset_m);
+  get_parameter(
+    "escape_from_contact_max_prefix_length", escape_prefix_params_.max_prefix_length_m);
+  get_parameter(
+    "escape_from_contact_max_prefix_yaw_sweep",
+    escape_prefix_params_.max_prefix_yaw_sweep_rad);
+  {
+    int escape_max_prefix_points =
+      static_cast<int>(escape_prefix_params_.max_prefix_points);
+    get_parameter("escape_from_contact_max_prefix_points", escape_max_prefix_points);
+    escape_prefix_params_.max_prefix_points =
+      static_cast<std::size_t>(std::max(0, escape_max_prefix_points));
+  }
+  get_parameter("goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
+  get_parameter(
+    "goal_admission_position_tolerance", goal_pose_admission_params_.position_tolerance_m);
+  get_parameter("goal_admission_yaw_tolerance", goal_pose_admission_params_.yaw_tolerance_rad);
+  get_parameter("goal_admission_position_shrink", goal_pose_admission_params_.position_shrink);
+  get_parameter("goal_admission_yaw_shrink", goal_pose_admission_params_.yaw_shrink);
+  get_parameter("goal_admission_extra_margin",
+    goal_pose_admission_params_.preferred_extra_margin_m);
+  get_parameter("goal_admission_position_step", goal_pose_admission_params_.position_step_m);
+  {
+    int goal_admission_yaw_samples =
+      static_cast<int>(goal_pose_admission_params_.yaw_samples);
+    get_parameter("goal_admission_yaw_samples", goal_admission_yaw_samples);
+    goal_pose_admission_params_.yaw_samples =
+      static_cast<std::size_t>(std::max(1, goal_admission_yaw_samples));
+  }
   get_parameter("planner_manages_emergency_stop", planner_manages_emergency_stop_);
   get_parameter("obstacle_value_threshold", obstacle_value_threshold_);
   get_parameter("unknown_is_obstacle", unknown_is_obstacle_);
@@ -286,6 +418,18 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
   get_parameter("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
+  get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
+  get_parameter(
+    "terminal_yaw_relocation_max_candidates", terminal_yaw_relocation_max_candidates_);
+  terminal_yaw_relocation_max_candidates_ = std::max(
+    1, terminal_yaw_relocation_max_candidates_);
+  // 重定位必须与 yaw 规划用同一组转向参数,否则两条路径生成的原地转向时长
+  // 不一致,MPC 侧会看到两种不同的终端时间预算。
+  terminal_yaw_relocation_params_.yaw_rate_limit = yaw_params.yaw_rate_limit;
+  terminal_yaw_relocation_params_.sample_period = yaw_params.terminal_yaw_sample_period;
+  get_parameter(
+    "terminal_yaw_relocation_window_length",
+    terminal_yaw_relocation_params_.terminal_window_length);
   get_parameter("footprint_length", footprint_params.length);
   get_parameter("footprint_width", footprint_params.width);
   get_parameter("footprint_safety_margin", footprint_params.safety_margin);
@@ -305,10 +449,45 @@ void MincoPlannerNode::declareAndLoadParams()
   if (jps_params.safe_distance + 1e-6 < all_yaw_footprint_radius) {
     RCLCPP_WARN(
       get_logger(),
-      "Raising JPS clearance from %.3f m to rectangular all-yaw footprint radius %.3f m.",
+      "Raising preferred graph-search clearance from %.3f m to rectangular all-yaw footprint "
+      "radius %.3f m.",
       jps_params.safe_distance, all_yaw_footprint_radius);
     jps_params.safe_distance = all_yaw_footprint_radius;
   }
+  // The all-yaw radius is the circumscribed disc: it demands room to spin in
+  // place at every cell. A rectangular body aligned with a corridor only needs
+  // the inscribed half-width, so refusing to search below the circumscribed
+  // radius makes tight-but-passable corridors permanently unreachable. The
+  // ladder keeps the circumscribed radius as the preferred level and only falls
+  // back to the inscribed one when nothing is reachable, leaving the yaw-aware
+  // footprint gate and local collision repair as the authoritative safety check.
+  const double inscribed_footprint_radius =
+    0.5 * std::max(0.0, std::min(footprint_length_, footprint_width_)) +
+    footprint_safety_margin_;
+  preferred_search_clearance_ = jps_params.safe_distance;
+  get_parameter("clearance_relaxation_enabled", clearance_relaxation_enabled_);
+  get_parameter(
+    "endpoint_clearance_relaxation_enabled", endpoint_clearance_relaxation_enabled_);
+  double configured_floor = -1.0;
+  get_parameter("search_clearance_floor", configured_floor);
+  inscribed_footprint_radius_ = inscribed_footprint_radius;
+  search_clearance_floor_configured_ = configured_floor >= 0.0;
+  // 这里还不知道规划栅格分辨率,所以自动下限先记成内切半宽;真正与 footprint gate
+  // 一致的下限在 runGraphSearch 里按当次 snapshot 的分辨率补上半个格对角线。
+  search_clearance_floor_ = configured_floor < 0.0
+    ? std::min(inscribed_footprint_radius, preferred_search_clearance_)
+    : std::min(std::max(0.0, configured_floor), preferred_search_clearance_);
+  // 自动下限依赖当次 snapshot 的栅格分辨率,启动时还取不到,所以这里明确标注下限是
+  // "按 snapshot 解析"的,不要让这行 INFO 被当成实际生效值。
+  RCLCPP_INFO(
+    get_logger(),
+    "Graph-search clearance ladder: preferred=%.3f m floor=%.3f m (%s) relaxation=%s",
+    preferred_search_clearance_, search_clearance_floor_,
+    search_clearance_floor_configured_
+      ? "configured" : "inscribed radius; grid allowance added per snapshot",
+    clearance_relaxation_enabled_ ? "on" : "off");
+  astar_params.safe_distance = jps_params.safe_distance;
+  astar_params.min_safe_distance = search_clearance_floor_;
   get_parameter("local_repair_enabled", repair_params.enabled);
   get_parameter("local_repair_max_iterations", repair_params.max_iterations);
   get_parameter("local_repair_search_radius", repair_params.search_radius);
@@ -317,14 +496,142 @@ void MincoPlannerNode::declareAndLoadParams()
   footprint_params.unknown_is_obstacle = astar_params.unknown_is_obstacle;
   repair_params.obstacle_value_threshold = astar_params.obstacle_value_threshold;
   repair_params.unknown_is_obstacle = astar_params.unknown_is_obstacle;
+  // 拒绝轨迹的是 yaw 相关矩形足迹门禁,所以修复必须按同一
+  // 套几何挑格子:候选格中心周围一个外接圆半径内全空,矩形
+  // 在任意 yaw 下都放得下。只按"该格空闲"会挑回原地,domain
+  // 193 目标 8 就是这样每 2 s 拒同一条轨迹。找不到合格候选时
+  // 返回 false,行为与今天完全一致(拒绝),方向是 fail-closed。
+  repair_params.required_clearance_m = all_yaw_footprint_radius;
+  // 严格档在实机栅格上常是空集(domain 169 目标 9 连续 89 次拒绝、domain 171
+  // 目标 8 同样,一次都没挑出候选格)。第二档按内切半宽推 footprint 一致下限,
+  // 与图搜索梯子共用几何;最终安全性仍由重解 MINCO 后的矩形足迹门禁裁定。
+  repair_params.inscribed_radius_m = inscribed_footprint_radius_;
+  if (repair_params.enabled &&
+    repair_params.search_radius + 1e-6 < repair_params.inscribed_radius_m)
+  {
+    // 连第二档都够不到时修复必然是空集。这里显式告警而不是悄悄放宽搜索窗口:
+    // search_radius 是用户对引导点位移的上界,由配置负责,不由代码覆盖。
+    RCLCPP_WARN(
+      get_logger(),
+      "local_repair_search_radius=%.3f m is below the footprint-consistent clearance floor "
+      "(inscribed=%.3f m): local collision repair cannot select any candidate cell and will "
+      "never change a rejected trajectory.",
+      repair_params.search_radius, repair_params.inscribed_radius_m);
+  }
 
   astar_.setParams(astar_params);
   static_cast<GridAstarParams &>(jps_params) = astar_params;
   jps_.setParams(jps_params);
+  // 终点净空放宽档在 const 方法里构造临时搜索器,需要一份参数副本。
+  astar_params_cache_ = astar_params;
+  jps_params_cache_ = jps_params;
   optimizer_.setParams(optimizer_params);
   yaw_planner_.setParams(yaw_params);
+  // 缓存一份给目标位姿准入用，保证两者的矩形几何完全一致。
+  footprint_params_ = footprint_params;
   safety_checker_.setParams(footprint_params);
   collision_repair_.setParams(repair_params);
+}
+
+GridAstarResult MincoPlannerNode::runGraphSearch(
+  const nav_msgs::msg::OccupancyGrid & planning_grid,
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  bool goal_pose_footprint_verified,
+  double & used_clearance) const
+{
+  // 显式配置的下限按用户意图使用;自动下限必须补上栅格量化余量,否则梯子会稳定产出
+  // footprint gate 必然拒绝的路径,把"窄通道不可通行"表现成目标超时。
+  const double effective_floor = search_clearance_floor_configured_
+    ? search_clearance_floor_
+    : footprintConsistentClearanceFloor(
+      inscribed_footprint_radius_, planning_grid.info.resolution,
+      preferred_search_clearance_);
+  RCLCPP_INFO_ONCE(
+    get_logger(),
+    "Graph-search clearance floor resolved to %.3f m (inscribed=%.3f m grid_resolution=%.3f m "
+    "quantization_allowance=%.3f m): a path admitted below this cannot pass the rectangular "
+    "footprint gate on this grid.",
+    effective_floor, inscribed_footprint_radius_, planning_grid.info.resolution,
+    gridQuantizationAllowance(planning_grid.info.resolution));
+  std::vector<double> ladder {preferred_search_clearance_};
+  if (clearance_relaxation_enabled_ && effective_floor + 1e-6 < preferred_search_clearance_) {
+    ladder.push_back(effective_floor);
+  }
+
+  GridAstarResult last_result;
+  for (const double clearance : ladder) {
+    GridAstarResult attempt;
+    if (search_algorithm_ == "jps") {
+      attempt = jps_.planWithClearance(planning_grid, start, goal, clearance);
+      if (!attempt.success && astar_fallback_) {
+        RCLCPP_WARN(
+          get_logger(), "JPS failed at clearance %.3f m (%s); falling back to A*.",
+          clearance, attempt.reason.c_str());
+        attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
+      }
+    } else {
+      attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
+    }
+    if (attempt.success) {
+      used_clearance = clearance;
+      if (clearance + 1e-6 < preferred_search_clearance_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Graph search succeeded only after relaxing clearance %.3f m -> %.3f m; the yaw-aware "
+          "footprint gate remains authoritative.",
+          preferred_search_clearance_, clearance);
+      }
+      return attempt;
+    }
+    last_result = attempt;
+  }
+
+  // 最后一档:目标格净空低于 footprint 一致下限,但目标位姿本身已通过同一套矩形
+  // 足迹门禁。目标格净空是各向同性代理量,矩形门禁是精确判定;此时继续用代理量
+  // 否决精确判定,结果是一条路径都产不出来(domain 187 目标 9:目标格净空约 0.26 m
+  // 对下限 0.341 m,图搜索报 goal occupied,7 个规划周期零可执行计划直到看门狗耗尽)。
+  // 放宽只作用于"目标格是否可作为终点",搜索器随后按实测目标净空重规划整条路径,
+  // 安全性仍由重解 MINCO 之后的矩形足迹门禁与局部修复裁定,不是靠放宽判据换成功。
+  const double relaxed_endpoint_min = gridQuantizationAllowance(planning_grid.info.resolution);
+  if (goal_pose_footprint_verified && endpoint_clearance_relaxation_enabled_ &&
+    !last_result.success && relaxed_endpoint_min + 1e-6 < effective_floor)
+  {
+    GridAstarResult attempt;
+    if (search_algorithm_ == "jps") {
+      GridJpsParams relaxed = jps_params_cache_;
+      relaxed.min_safe_distance = relaxed_endpoint_min;
+      relaxed.relax_endpoint_clearance = true;
+      attempt = GridJps(relaxed).planWithClearance(planning_grid, start, goal, effective_floor);
+      if (!attempt.success && astar_fallback_) {
+        GridAstarParams relaxed_astar = astar_params_cache_;
+        relaxed_astar.min_safe_distance = relaxed_endpoint_min;
+        relaxed_astar.relax_endpoint_clearance = true;
+        attempt =
+          GridAstar(relaxed_astar).planWithClearance(planning_grid, start, goal, effective_floor);
+      }
+    } else {
+      GridAstarParams relaxed_astar = astar_params_cache_;
+      relaxed_astar.min_safe_distance = relaxed_endpoint_min;
+      relaxed_astar.relax_endpoint_clearance = true;
+      attempt =
+        GridAstar(relaxed_astar).planWithClearance(planning_grid, start, goal, effective_floor);
+    }
+    if (attempt.success) {
+      used_clearance = effective_floor;
+      RCLCPP_WARN(
+        get_logger(),
+        "Graph search succeeded only after relaxing the endpoint clearance floor %.3f m -> %.3f m; "
+        "the goal pose already passed the rectangular footprint gate and that gate remains "
+        "authoritative for the trajectory.",
+        effective_floor, relaxed_endpoint_min);
+      return attempt;
+    }
+    last_result = attempt;
+  }
+
+  used_clearance = ladder.back();
+  return last_result;
 }
 
 void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -450,6 +757,21 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   }
   const FootprintSafetyResult safety = safety_checker_.check(remaining, snapshot->grid);
   if (safety.safe) {
+    return;
+  }
+  // remaining.points[0] 是车当前跟踪到的位姿，所以这道运行期门和提交门面对同一个边界：
+  // 因"车现在所在的位姿被占据"而撤销轨迹，会立刻把正在执行的逃逸动作掐掉，车留在接触
+  // 里不动。判据与提交门同源——只有冲突紧贴 remaining 起点、且有界前缀之后不再有冲突时
+  // 才放行；车一旦沿轨迹驶离，head_offset 增大，这个放行自然停止生效。
+  const EscapePrefixDecision runtime_escape =
+    evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
+  if (runtime_escape.allowed) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Keeping an escape-from-contact reference under the runtime swept gate: collisions=%zu "
+      "head_offset=%.3f m prefix_end=%zu prefix_length=%.3f m.",
+      runtime_escape.collision_count, runtime_escape.head_offset_m,
+      runtime_escape.prefix_end, runtime_escape.prefix_length_m);
     return;
   }
 
@@ -578,26 +900,60 @@ void MincoPlannerNode::planGoal(
   }
   goal = goal_in_grid;
 
-  // 起点来自 TF、终点来自 goal_topic，因此此分支不依赖 Smac 的路径几何。
-  GridAstarResult search_result;
-  if (search_algorithm_ == "jps") {
-    search_result = jps_.plan(planning_grid, start, goal);
-    if (!search_result.success && astar_fallback_) {
-      RCLCPP_WARN(
-        get_logger(), "JPS failed (%s); falling back to A*.", search_result.reason.c_str());
-      search_result = astar_.plan(planning_grid, start, goal);
+  // 目标位姿准入。action 的成功判据是一个容差域，而不是一个点：目标点足迹与栅格墙面
+  // 重叠几毫米时，容差域内往往仍有大量完全可行的位姿。此前规划器只认那个点，于是提交门
+  // 正确拒绝每一条轨迹，goal manager 反复重试直到预算耗尽（domain 175 目标 8 实测：
+  // 车已停在目标 0.16 m 处，只差一个可行的终点标注）。这里在容差域内挑一个可行终点，
+  // 候选过的是与提交门完全相同的足迹判定，偏移严格小于容差，所以 SUCCEEDED 依然由原目标
+  // 的判据给出，不是靠放宽判据换来的。找不到可行位姿时保持原目标不变，走既有失败路径。
+  // 终点净空放宽档只有在目标位姿确实过了矩形足迹门禁时才允许启用;准入关闭时
+  // 保持 false,行为与今天完全一致。
+  bool goal_pose_footprint_verified = false;
+  if (goal_pose_admission_params_.enabled) {
+    const double commanded_goal_yaw = tf2::getYaw(goal.pose.orientation);
+    const GoalPoseAdmissionResult admission = admitGoalPose(
+      goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
+      planning_grid, footprint_params_, goal_pose_admission_params_);
+    if (!admission.feasible) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Goal pose admission found no feasible pose inside the success tolerance: "
+        "goal=(%.3f, %.3f, yaw=%.3f) candidates=%zu; keeping the commanded goal.",
+        goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
+        admission.candidates_checked);
     }
-  } else {
-    search_result = astar_.plan(planning_grid, start, goal);
+    goal_pose_footprint_verified = admission.feasible;
+    if (admission.feasible && admission.relocated) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Goal pose admitted inside tolerance: commanded=(%.3f, %.3f, yaw=%.3f) "
+        "admitted=(%.3f, %.3f, yaw=%.3f) position_deviation=%.3f m yaw_deviation=%.3f rad "
+        "extra_margin=%d candidates=%zu.",
+        goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
+        admission.x, admission.y, admission.yaw, admission.position_deviation_m,
+        admission.yaw_deviation_rad, admission.used_preferred_margin ? 1 : 0,
+        admission.candidates_checked);
+      goal.pose.position.x = admission.x;
+      goal.pose.position.y = admission.y;
+      goal.pose.orientation.x = 0.0;
+      goal.pose.orientation.y = 0.0;
+      goal.pose.orientation.z = std::sin(admission.yaw * 0.5);
+      goal.pose.orientation.w = std::cos(admission.yaw * 0.5);
+    }
   }
+
+  // 起点来自 TF、终点来自 goal_topic，因此此分支不依赖 Smac 的路径几何。
+  double used_clearance = preferred_search_clearance_;
+  const GridAstarResult search_result =
+    runGraphSearch(
+    planning_grid, start, goal, goal_pose_footprint_verified, used_clearance);
   if (!search_result.success) {
     RCLCPP_WARN(
-      get_logger(), "%s failed: %s expanded=%d", search_algorithm_.c_str(),
-      search_result.reason.c_str(), search_result.expanded_nodes);
+      get_logger(), "%s failed: %s expanded=%d clearance=%.3f m",
+      search_algorithm_.c_str(), search_result.reason.c_str(),
+      search_result.expanded_nodes, used_clearance);
     const std::uint8_t failure_reason =
-      search_result.reason.find("occupied") != std::string::npos
-      ? ats_navigation_interfaces::msg::PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED
-      : ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NO_PATH;
+      classifyGraphSearchFailure(search_result.reason, search_result.expanded_nodes);
     fail(failure_reason, map_snapshot->generation);
     return;
   }
@@ -648,8 +1004,7 @@ void MincoPlannerNode::planGoal(
   center_reference.header.stamp = now();
   const double start_yaw = tf2::getYaw(start.pose.orientation);
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
-  yaw_planner_.apply(center_reference, start_yaw, goal_yaw);
-  annotateClearance(center_reference, *map_snapshot);
+  planYaw(center_reference, *map_snapshot, start_yaw, goal_yaw);
   FootprintSafetyResult center_safety = safety_checker_.check(center_reference, planning_grid);
   ReferenceTrajectory reference = center_reference;
   FootprintSafetyResult safety = center_safety;
@@ -660,8 +1015,7 @@ void MincoPlannerNode::planGoal(
       &safety_checker_, &footprint_trace);
     if (footprint_reference.valid()) {
       footprint_reference.header.stamp = now();
-      yaw_planner_.apply(footprint_reference, start_yaw, goal_yaw);
-      annotateClearance(footprint_reference, *map_snapshot);
+      planYaw(footprint_reference, *map_snapshot, start_yaw, goal_yaw);
       FootprintSafetyResult footprint_safety = safety_checker_.check(
         footprint_reference, planning_grid);
       if (footprint_safety.safe || !center_safety.safe) {
@@ -684,8 +1038,7 @@ void MincoPlannerNode::planGoal(
       &fallback_trace);
     if (fallback_reference.valid()) {
       fallback_reference.header.stamp = now();
-      yaw_planner_.apply(fallback_reference, start_yaw, goal_yaw);
-      annotateClearance(fallback_reference, *map_snapshot);
+      planYaw(fallback_reference, *map_snapshot, start_yaw, goal_yaw);
       const FootprintSafetyResult fallback_safety = safety_checker_.check(
         fallback_reference, planning_grid);
       if (fallback_safety.safe) {
@@ -699,23 +1052,112 @@ void MincoPlannerNode::planGoal(
       }
     }
   }
-  if (!safety.safe && collision_repair_.repair(reference, safety, planning_grid)) {
+  LocalCollisionRepairStats repair_stats;
+  // repair() 就地改引导点,所以要先留一份修复前的轨迹:重解 MINCO 失败时
+  // 必须能退回原状。以前这条路走不到(严格档恒为空集),现在会真的走到,
+  // 而 FAILURE_REPAIR 在 goal manager 里不是瞬时故障,会立刻判死目标。
+  // 保证"尝试修复"永远不比"不尝试"更差。
+  ReferenceTrajectory pre_repair_reference;
+  if (!safety.safe) {
+    pre_repair_reference = reference;
+  }
+  const bool repair_changed = !safety.safe &&
+    collision_repair_.repair(reference, safety, planning_grid, &repair_stats);
+  if (!safety.safe) {
+    // repair() 自身没有 logger。没有这一行时无法区分"没尝试""挑不出候选格"
+    // 和"挑出来但位移可忽略",domain 169 的 89 次连续拒绝就完全没有痕迹。
+    RCLCPP_WARN(
+      get_logger(),
+      "Local collision repair: changed=%d points=%zu strict=%zu fallback=%zu "
+      "no_candidate=%zu negligible=%zu endpoint_protected=%zu strict_clearance=%.3f "
+      "fallback_clearance=%.3f search_radius=%.3f m.",
+      repair_changed ? 1 : 0, repair_stats.collision_points,
+      repair_stats.strict_repaired, repair_stats.fallback_repaired,
+      repair_stats.no_candidate, repair_stats.negligible_shift,
+      repair_stats.endpoint_protected,
+      repair_stats.strict_clearance_m, repair_stats.fallback_clearance_m,
+      repair_stats.effective_search_radius_m);
+  }
+  if (repair_changed) {
     // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
     MincoOptimizationTrace repair_trace;
-    reference = optimizer_.optimize(
+    ReferenceTrajectory repaired = optimizer_.optimize(
       toPath(reference), clearance_esdf.get(), &reference, nullptr, &planning_grid,
       &safety_checker_, &repair_trace);
-    if (!reference.valid()) {
-      RCLCPP_ERROR(get_logger(), "Local collision repair produced an invalid MINCO trajectory.");
-      fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REPAIR,
-        map_snapshot->generation);
-      return;
+    if (!repaired.valid()) {
+      // 退回修复前轨迹,交给下面既有的 footprint 拒绝路径。那条路径报
+      // FAILURE_FOOTPRINT(瞬时,等下一次 snapshot 重规划),而 FAILURE_REPAIR
+      // 会让目标直接失败——修复只是一次尝试,失败不该比没尝试更严重。
+      RCLCPP_WARN(
+        get_logger(),
+        "Local collision repair produced an invalid MINCO trajectory; keeping the pre-repair "
+        "trajectory and falling back to the existing footprint rejection path.");
+      reference = std::move(pre_repair_reference);
+    } else {
+      reference = std::move(repaired);
+      reference.header.stamp = now();
+      planYaw(reference, *map_snapshot, start_yaw, goal_yaw);
+      safety = safety_checker_.check(reference, planning_grid);
+      selected_trace = std::move(repair_trace);
     }
-    reference.header.stamp = now();
-    yaw_planner_.apply(reference, start_yaw, goal_yaw);
-    annotateClearance(reference, *map_snapshot);
-    safety = safety_checker_.check(reference, planning_grid);
-    selected_trace = std::move(repair_trace);
+  }
+
+  // 终端原地转向重定位。冲突全部落在终点原地转向段时,换一个更早的转向位置:
+  // 先在路径上某点把 yaw 拧到 goal_yaw,再保持 goal_yaw 平移进入目标。
+  // 候选族的最晚一个(尾段起点)与现状完全等价,所以这是现状的超集;每个候选都
+  // 要过同一套矩形足迹门禁,不安全就继续走既有拒绝路径。因此既不会放过不安全
+  // 轨迹,也不会比不做更差。目标位姿本身不被修改,只改到达目标的 yaw 时序。
+  // 触发条件用"终端近域窗口"而不是"与末点严格重合的原地转向段":domain 189
+  // 目标 9 的冲突落在最后 6 个采样点,其中前几个仍在以通道切线 yaw 平移,坐标
+  // 与末点差 0.014 m,旧判据因此返回 false,重定位一次都没试过。窗口之外只要
+  // 有一个冲突仍然返回 false,中途不可行照旧交回既有拒绝路径。
+  if (!safety.safe && terminal_yaw_relocation_enabled_ &&
+    collisionsConfinedToTerminalApproach(
+      reference, safety, terminal_yaw_relocation_params_.terminal_window_length))
+  {
+    const std::size_t tail_start = terminalCoincidentTailStart(reference);
+    const std::size_t window_start = std::min(
+      tail_start,
+      terminalApproachWindowStart(
+        reference, terminal_yaw_relocation_params_.terminal_window_length));
+    const std::size_t original_collisions = safety.collisions.size();
+    const std::vector<std::size_t> candidates = terminalYawRelocationCandidates(
+      reference, static_cast<std::size_t>(terminal_yaw_relocation_max_candidates_));
+    std::size_t built = 0;
+    for (const std::size_t rotation_index : candidates) {
+      ReferenceTrajectory candidate;
+      if (!relocateTerminalYawRotation(
+          reference, goal_yaw, rotation_index, terminal_yaw_relocation_params_, &candidate))
+      {
+        continue;
+      }
+      ++built;
+      candidate.header.stamp = now();
+      // 只补净空标注,绝不调用 planYaw:planYaw 会在末点再追加一段原地转向,
+      // 把刚刚移开的问题原样搬回来。
+      annotateClearance(candidate, *map_snapshot);
+      const FootprintSafetyResult candidate_safety = safety_checker_.check(
+        candidate, planning_grid);
+      if (!candidate_safety.safe) {
+        continue;
+      }
+      RCLCPP_WARN(
+        get_logger(),
+        "Terminal yaw relocation accepted: rotation_index=%zu tail_start=%zu "
+        "window_start=%zu candidates=%zu built=%zu cleared_collisions=%zu points=%zu.",
+        rotation_index, tail_start, window_start, candidates.size(), built, original_collisions,
+        candidate.points.size());
+      reference = std::move(candidate);
+      safety = candidate_safety;
+      break;
+    }
+    if (!safety.safe) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Terminal yaw relocation exhausted: tail_start=%zu window_start=%zu candidates=%zu "
+        "built=%zu collisions=%zu; keeping the existing footprint rejection path.",
+        tail_start, window_start, candidates.size(), built, original_collisions);
+    }
   }
 
   if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
@@ -731,16 +1173,77 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
-  if (!safety.safe && !publish_unsafe_trajectory_) {
+  const EscapePrefixDecision escape_decision = safety.safe ?
+    EscapePrefixDecision{} :
+    evaluateEscapePrefix(reference.points, safety.collisions, escape_prefix_params_);
+  if (!safety.safe && !publish_unsafe_trajectory_ && escape_decision.allowed) {
+    // 车此刻就压在冲突区里，冲突集证明这条轨迹在有界前缀内驶出障碍并且不再驶回。
+    // 继续拒绝只会让唯一能挪走车的执行器拿不到轨迹，参见 escape_prefix.hpp 的说明。
+    RCLCPP_WARN(
+      get_logger(),
+      "Committing an escape-from-contact MINCO trajectory: collisions=%zu head_offset=%.3f m "
+      "prefix_end=%zu prefix_length=%.3f m prefix_yaw_sweep=%.3f rad.",
+      escape_decision.collision_count, escape_decision.head_offset_m,
+      escape_decision.prefix_end, escape_decision.prefix_length_m,
+      escape_decision.prefix_yaw_sweep_rad);
+  } else if (!safety.safe && !publish_unsafe_trajectory_) {
     if (safety.collisions.empty()) {
       RCLCPP_ERROR(get_logger(), "Rejecting MINCO trajectory because safety validation failed.");
     } else {
       const CollisionSample & first_collision = safety.collisions.front();
+      // 只报冲突数和一个 footprint 采样坐标无法区分三种完全不同的失败:车此刻就压在
+      // 障碍上、轨迹先走一段再撞墙、以及轨迹整条贴着障碍蹭行。这三种的修复位置分别在
+      // 逃逸放行、图搜索净空和栅格量化一致性上,所以这里把判据本身打全:冲突的离散/
+      // 扫掠构成、首末冲突下标、首个冲突点的轨迹中心位姿(注意 first_collision 的坐标
+      // 是矩形上的采样点,不是中心),以及逃逸判据为什么没有放行。
+      std::size_t discrete_collisions = 0;
+      std::size_t swept_collisions = 0;
+      std::size_t last_collision_index = 0;
+      for (const CollisionSample & collision : safety.collisions) {
+        if (collision.swept) {
+          ++swept_collisions;
+        } else {
+          ++discrete_collisions;
+        }
+        last_collision_index = std::max(last_collision_index, collision.trajectory_index);
+      }
+      const ReferencePoint & first_center =
+        reference.points[std::min(first_collision.trajectory_index, reference.points.size() - 1U)];
       RCLCPP_ERROR(
         get_logger(),
-        "Rejecting unsafe MINCO trajectory with %zu footprint collisions; first index=%zu at (%.3f, %.3f).",
-        safety.collisions.size(), first_collision.trajectory_index,
-        first_collision.x, first_collision.y);
+        "Rejecting unsafe MINCO trajectory with %zu footprint collisions "
+        "(discrete=%zu swept=%zu) first_index=%zu last_index=%zu points=%zu "
+        "first_sample=(%.3f, %.3f) first_center=(%.3f, %.3f, yaw=%.3f) "
+        "start=(%.3f, %.3f, yaw=%.3f) raw_points=%zu escape_allowed=%d "
+        "escape_head_offset=%.3f m escape_prefix_end=%zu escape_candidate_prefix_end=%zu "
+        "escape_prefix_length=%.3f m escape_prefix_yaw_sweep=%.3f rad.",
+        safety.collisions.size(), discrete_collisions, swept_collisions,
+        first_collision.trajectory_index, last_collision_index, reference.points.size(),
+        first_collision.x, first_collision.y,
+        first_center.x, first_center.y, first_center.yaw,
+        reference.points.front().x, reference.points.front().y, reference.points.front().yaw,
+        search_result.path.poses.size(), static_cast<int>(escape_decision.allowed),
+        escape_decision.head_offset_m, escape_decision.prefix_end,
+        escape_decision.candidate_prefix_end,
+        escape_decision.prefix_length_m, escape_decision.prefix_yaw_sweep_rad);
+      // 上面的数字只说明整条轨迹都不安全,不说明是哪
+      // 一层把格子打成了障碍。静态层已离线排除:停车位
+      // 姿到最近静态占据格心约 0.61 m,大于 0.4187 m 的
+      // 全 yaw 半径。所以必须把实际栅格打出来,否则无法
+      // 区分 ROG 投影、terrain 硬障碍与 slope 障碍。两个
+      // 窗口分别覆盖轨迹起点和首个冲突点。
+      RCLCPP_ERROR(
+        get_logger(), "Rejection grid window at start: %s",
+        describeGridWindow(
+          planning_grid, reference.points.front().x, reference.points.front().y, 0.6,
+          obstacle_value_threshold_, unknown_is_obstacle_).c_str());
+      if (first_collision.trajectory_index != 0U) {
+        RCLCPP_ERROR(
+          get_logger(), "Rejection grid window at first collision: %s",
+          describeGridWindow(
+            planning_grid, first_center.x, first_center.y, 0.6,
+            obstacle_value_threshold_, unknown_is_obstacle_).c_str());
+      }
     }
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_FOOTPRINT,
       map_snapshot->generation);
@@ -798,6 +1301,7 @@ void MincoPlannerNode::planGoal(
     get_logger(),
     "planned generation=%llu snapshot_publication=%llu raw_points=%zu preprocessed_points=%zu "
     "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
+    "escape_prefix_end=%zu "
     "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
     "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
     "curvature_tv=%.3f curvature_sign_changes=%zu local_scaled=%d uniform_scaled=%d "
@@ -806,6 +1310,7 @@ void MincoPlannerNode::planGoal(
     static_cast<unsigned long long>(map_publication_sequence), search_result.path.poses.size(),
     selected_trace.preprocessed_guide.poses.size(), selected_trace.esdf_refined_guide.poses.size(),
     reference.points.size(), reference.totalLength(), reference.totalTime(), safety.collisions.size(),
+    escape_decision.prefix_end,
     search_result.expanded_nodes, static_cast<unsigned int>(yaw_authority),
     quality.minimum_center_clearance, quality.minimum_footprint_clearance, quality.length_ratio,
     quality.max_lateral_deviation, quality.max_geometric_curvature,
@@ -814,6 +1319,31 @@ void MincoPlannerNode::planGoal(
     selected_trace.local_time_scaled ? 1 : 0, selected_trace.uniform_time_scaled ? 1 : 0,
     quality.peak_velocity, quality.peak_acceleration, quality.peak_jerk,
     selected_trace.solver_wall_time_ms, durations.str().c_str());
+}
+
+void MincoPlannerNode::annotatePositionClearance(
+  ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const
+{
+  const bool available = snapshot.clearance_esdf && snapshot.clearance_esdf->available();
+  for (auto & point : trajectory.points) {
+    point.clearance = available ?
+      snapshot.clearance_esdf->getDistance(point.x, point.y) :
+      std::numeric_limits<double>::quiet_NaN();
+  }
+}
+
+void MincoPlannerNode::planYaw(
+  ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot,
+  double start_yaw, double goal_yaw) const
+{
+  // 这三步的顺序就是这段逻辑的全部内容,所以收进一个函数,避免四个调用点各自写错。
+  // 窄通道判据必须用与 yaw 无关的位置净空:yaw 正是这一步要决定的量,拿 yaw 相关的
+  // footprint 净空当输入构成循环依赖,而 annotateClearance 恰好是 yaw 相关的。
+  annotatePositionClearance(trajectory, snapshot);
+  yaw_planner_.apply(trajectory, start_yaw, goal_yaw);
+  // 下游(yaw authority、轨迹质量评估、planned 记录)读的是 yaw 相关的 footprint 净空,
+  // 所以 yaw 定下来之后再覆盖回 footprint 净空,对外语义不变。
+  annotateClearance(trajectory, snapshot);
 }
 
 void MincoPlannerNode::annotateClearance(

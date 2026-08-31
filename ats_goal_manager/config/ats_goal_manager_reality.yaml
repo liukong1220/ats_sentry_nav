@@ -51,6 +51,15 @@ ats_goal_manager:
     replan_stall_timeout_sec: 4.0
     replan_min_interval_sec: 2.0
     max_consecutive_replans: 2
+    # 缺少与地图快照绑定的结构化逃逸授权时，当前位姿被判占据后继续保持急停。
+    ego_blocked_escape_enabled: false
+    # 目标已激活、基础设施健康却始终没有"可执行计划"时的有界等待。0 表示立即失败。
+    # 覆盖两种表现:从未拿到参考,以及参考还在但急停一直压着不放。上面的 stall/replan
+    # 预算只在拿到参考且急停解除之后才开始计费,所以这一项是"规划器一直拒绝提交"
+    # 这类目标唯一的内部结束条件。
+    # 同一预算也覆盖 kWaitingForMap:瞬时故障反复挂起时每轮重派都会清掉
+    # waiting_since,map_wait_timeout_sec 因此永不到期(domain 168/169)。
+    no_executable_plan_timeout_sec: 30.0
     footprint_length: 0.70
     footprint_width: 0.55
     footprint_safety_margin: 0.05
