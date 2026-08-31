@@ -66,6 +66,8 @@ const char *plannerFailureMessage(std::uint8_t failure_reason) {
     return "start or goal is occupied";
   case PlannerStatus::FAILURE_NO_PATH:
     return "planner found no path";
+  case PlannerStatus::FAILURE_START_ENCLOSED:
+    return "robot start cell is enclosed";
   case PlannerStatus::FAILURE_OPTIMIZER:
   case PlannerStatus::FAILURE_REPAIR:
     return "trajectory optimization failed";
@@ -271,6 +273,12 @@ private:
       0.01, declare_parameter<double>("replan_stall_timeout_sec", 4.0));
     progress_params.replan_min_interval_sec = std::max(
       0.0, declare_parameter<double>("replan_min_interval_sec", 2.0));
+    progress_params.ego_blocked_escape_enabled =
+      declare_parameter<bool>("ego_blocked_escape_enabled", false);
+    progress_params.ego_blocked_escape_timeout_sec = std::max(
+      0.0, declare_parameter<double>("ego_blocked_escape_timeout_sec", 3.0));
+    progress_params.no_executable_plan_timeout_sec = std::max(
+      0.0, declare_parameter<double>("no_executable_plan_timeout_sec", 30.0));
     const auto max_consecutive_replans = declare_parameter<int>("max_consecutive_replans", 2);
     progress_params.max_consecutive_replans = max_consecutive_replans > 0
       ? static_cast<std::uint32_t>(max_consecutive_replans)
@@ -489,6 +497,12 @@ private:
              message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
              message->failure_reason == PlannerStatus::FAILURE_FOOTPRINT ||
              message->failure_reason == PlannerStatus::FAILURE_SNAPSHOT_CHANGED ||
+             // 起点被围住由实时 LiDAR 栅格决定，一次地图刷新或一次成功的
+             // 脱离动作就可能解除，所以按瞬时故障等待下一次 snapshot
+             // 发布再重规划。上界由 onTick 里挂起态的
+             // no_executable_plan 预算给出，不再只依赖外部目标超时。
+             // 目标真正不可达仍是 FAILURE_NO_PATH，保持立即失败。
+             message->failure_reason == PlannerStatus::FAILURE_START_ENCLOSED ||
              message->failure_reason == PlannerStatus::FAILURE_START_TF ||
              message->failure_reason == PlannerStatus::FAILURE_GOAL_TF ||
              message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF ||
@@ -576,6 +590,9 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       map_ready_signal_ = message->data;
+      // 与 map_ready_signal_ 分开保存,理由同 map_status_heartbeat_ready_:
+      // 前者会被瞬时故障就地清掉,不能用来判断地图源是否还活着。
+      map_ready_heartbeat_value_ = message->data;
       last_map_ready_signal_ = std::chrono::steady_clock::now();
       fail_active = !require_map_status_ && active_goal_ && !message->data;
     }
@@ -591,6 +608,9 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       map_status_ready_ = message->ready;
+      // 与 map_status_ready_ 分开保存：后者会被瞬时故障和定位挂起就地清掉，
+      // 这个只记录 adapter 最后一次心跳自报的 ready，用于判断地图源存活。
+      map_status_heartbeat_ready_ = message->ready;
       map_status_localization_epoch_ = message->localization_epoch;
       map_status_generation_ = message->rog_generation;
       map_status_publication_sequence_ = message->publication_sequence;
@@ -1015,6 +1035,36 @@ private:
         localization_wait_timeout = wait_expired && !localization_ready;
         map_wait_timeout = wait_expired && localization_ready &&
           (!map_ready || !recovery_snapshot_ready);
+        // 上面两条都要求"某处不健康"。基础设施全健康、只是规划器反复
+        // 报瞬时故障时,两条都不成立;而 evaluate() 只在 kTracking 调用,
+        // 所以这类目标在 goal manager 内部没有上界,只能等外部目标超时。
+        // 补上第三条:同一个 no_executable_plan 预算跨挂起/重派 churn 累计。
+        if (lifecycle_.state() == GoalLifecycleState::kWaitingForMap) {
+          SuspendedPlanGate suspended_gate;
+          suspended_gate.goal_active = true;
+          suspended_gate.cancel_or_preempt = cancel;
+          suspended_gate.map_source_alive = mapSourceAliveLocked();
+          suspended_gate.localization_fresh = localization_ready;
+          suspended_gate.identity.goal_id = active_goal_->id;
+          suspended_gate.identity.localization_epoch =
+            active_goal_->localization_epoch;
+          if (progress_watchdog_.evaluateSuspended(suspended_gate) ==
+            PlanProgressDecision::kNoExecutablePlan)
+          {
+            RCLCPP_ERROR(
+              get_logger(),
+              "Progress watchdog suspended no-executable-plan budget exhausted: "
+              "goal=%llu planner_failure=%u map_source_alive=%d map_ready=%d "
+              "localization=%d recovery_snapshot=%d",
+              static_cast<unsigned long long>(active_goal_->id),
+              planner_ready_status_ ?
+                static_cast<unsigned>(planner_ready_status_->failure_reason) : 0U,
+              suspended_gate.map_source_alive ? 1 : 0, map_ready ? 1 : 0,
+              localization_ready ? 1 : 0, recovery_snapshot_ready ? 1 : 0);
+            progress_failure =
+              "progress watchdog exhausted the bounded suspended-replan wait";
+          }
+        }
         if (lifecycle_.state() == GoalLifecycleState::kTracking &&
             has_current_pose_) {
           distance = std::hypot(active_goal_->target.pose.position.x -
@@ -1092,6 +1142,23 @@ private:
               gate.identity.source_generation = planning_snapshot_->source_generation;
             }
             const PlanProgressDecision decision = progress_watchdog_.evaluate(gate);
+            if (progress_watchdog_.egoEscapeActive()) {
+              // 自身位姿仍被占据，但有界等待已用尽。这里放行的是
+              // "让执行器把车挪出去"，不是放弃 footprint 语义：
+              // 地图/定位/TF 仍必须健康，而且
+              // 后续仍受 stall/replan 预算与目标超时约束。artifact 需要能区分
+              // 这一段与正常推进。
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Progress watchdog ego-blocked escape: cell_free=%d footprint=%d "
+                "decision=%d replans=%u pose=(%.3f, %.3f)",
+                gate.robot_cell_free, gate.footprint_safe,
+                static_cast<int>(decision), progress_watchdog_.consecutiveReplans(),
+                snapshot_pose ? snapshot_pose->position.x :
+                  std::numeric_limits<double>::quiet_NaN(),
+                snapshot_pose ? snapshot_pose->position.y :
+                  std::numeric_limits<double>::quiet_NaN());
+            }
             if (decision == PlanProgressDecision::kReplan && planning_snapshot_) {
               progress_replan = *active_goal_;
               progress_replan_snapshot_sequence = planning_snapshot_->publication_sequence;
@@ -1107,7 +1174,51 @@ private:
               active_goal_->waiting_since.reset();
               snapshot = active_goal_;
             } else if (decision == PlanProgressDecision::kExhausted) {
+              // 这条分支原先只把原因写进 action result,不落任何日志,于是
+              // "有界重规划预算耗尽"在 launch 日志里不可观测:domain 228 的
+              // freeze 用例同时出现 replan=1/2 与 result message
+              // "progress watchdog exhausted bounded replans",但日志侧零命中,
+              // 外部只能误判为看门狗没有触发。与相邻的 kNoExecutablePlan /
+              // kUnsafe 对齐,终止决策必须自证。
+              // 日志文本用 progress_failure 自身拼装,而不是另写一份措辞:
+              // action result 与 launch 日志因此不可能漂移,外部判据只需匹配
+              // 这一个字符串。
               progress_failure = "progress watchdog exhausted bounded replans";
+              RCLCPP_ERROR(
+                get_logger(),
+                "P2 goal terminal decision: %s goal=%llu replans=%u "
+                "emergency_stop=%d cell_free=%d footprint=%d distance=%.3f "
+                "pose=(%.3f, %.3f)",
+                progress_failure->c_str(),
+                static_cast<unsigned long long>(gate.identity.goal_id),
+                progress_watchdog_.consecutiveReplans(),
+                gate.emergency_stop ? 1 : 0, gate.robot_cell_free ? 1 : 0,
+                gate.footprint_safe ? 1 : 0, gate.distance_to_goal_m,
+                snapshot_pose ? snapshot_pose->position.x :
+                  std::numeric_limits<double>::quiet_NaN(),
+                snapshot_pose ? snapshot_pose->position.y :
+                  std::numeric_limits<double>::quiet_NaN());
+            } else if (decision == PlanProgressDecision::kNoExecutablePlan) {
+              // 基础设施健康却始终没有可执行计划:或是从未拿到参考,
+              // 或是参考还在但急停一直压着。继续等下去只会等到外部
+              // 超时,而超时不携带任何原因;这里干净失败并把最后一次
+              // 规划器失败原因写进 artifact,
+              // 便于区分"规划器拒绝提交"与"目标本身不可达"。
+              RCLCPP_ERROR(
+                get_logger(),
+                "Progress watchdog no-executable-plan budget exhausted: goal=%lu "
+                "planner_failure=%u emergency_stop=%d cell_free=%d footprint=%d "
+                "pose=(%.3f, %.3f)",
+                static_cast<unsigned long>(gate.identity.goal_id),
+                planner_ready_status_ ?
+                  static_cast<unsigned>(planner_ready_status_->failure_reason) : 0U,
+                gate.emergency_stop, gate.robot_cell_free, gate.footprint_safe,
+                snapshot_pose ? snapshot_pose->position.x :
+                  std::numeric_limits<double>::quiet_NaN(),
+                snapshot_pose ? snapshot_pose->position.y :
+                  std::numeric_limits<double>::quiet_NaN());
+              progress_failure =
+                "progress watchdog exhausted the bounded no-executable-plan wait";
             } else if (decision == PlanProgressDecision::kUnsafe) {
               RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 1000,
@@ -1318,6 +1429,28 @@ private:
     return map_ready_signal_ && last_map_ready_signal_ &&
            std::chrono::steady_clock::now() - *last_map_ready_signal_ <=
                secondsToDuration(map_ready_timeout_sec_);
+  }
+
+  // 地图源存活判定：心跳租约未过期，且最后一次心跳自报 ready。
+  // 与 mapReadyLocked() 的差别是不看 map_status_ready_——瞬时规划失败会
+  // 就地把那个标志清成 false（见 onPlannerStatus），而那次清零正是要
+  // 度量的 churn。用它做预算的健康条件会让预算每个心跳周期归零，于是
+  // 预算永远到不了期。注入 adapter_lease 时租约过期，注入 service_timeout
+  // 或 unknown 时心跳自报 ready=0，两者都仍让等待保持无界。
+  bool mapSourceAliveLocked() const {
+    if (!require_map_status_) {
+      return map_ready_heartbeat_value_ && last_map_ready_signal_ &&
+             std::chrono::steady_clock::now() - *last_map_ready_signal_ <=
+                 secondsToDuration(map_ready_timeout_sec_);
+    }
+    const bool lease_ok =
+        last_map_status_signal_ &&
+        std::chrono::steady_clock::now() - *last_map_status_signal_ <=
+            secondsToDuration(map_ready_timeout_sec_);
+    const std::uint64_t expected_epoch =
+        require_localization_status_ ? localization_epoch_.value_or(0) : 0;
+    return lease_ok && map_status_heartbeat_ready_ &&
+           map_status_localization_epoch_ == expected_epoch;
   }
 
   bool planningSnapshotUsableLocked(
@@ -1612,6 +1745,8 @@ private:
   std::optional<GimbalYawStatus> gimbal_status_;
   bool map_ready_signal_{false};
   bool map_status_ready_{false};
+  bool map_status_heartbeat_ready_{false};
+  bool map_ready_heartbeat_value_{false};
   bool fail_stop_{true};
   std::optional<bool> last_emergency_stop_published_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;

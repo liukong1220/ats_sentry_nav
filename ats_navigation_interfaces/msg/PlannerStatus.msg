@@ -27,6 +27,7 @@ uint8 FAILURE_REPAIR=9
 uint8 FAILURE_REFERENCE_TF=10
 uint8 FAILURE_SNAPSHOT_CHANGED=11
 uint8 FAILURE_RUNTIME_UNSAFE=12
+uint8 FAILURE_START_ENCLOSED=13
 uint8 failure_reason
 # Planner-selected yaw policy associated with this candidate reference.
 uint8 YAW_AUTHORITY_HOLD_SAFE_STOP=0

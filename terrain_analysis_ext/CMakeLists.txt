@@ -31,6 +31,8 @@ find_package(message_filters REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 
+include_directories(include)
+
 add_executable(terrainAnalysisExt src/terrainAnalysisExt.cpp)
 ament_target_dependencies(
   terrainAnalysisExt
@@ -50,9 +52,17 @@ install(TARGETS terrainAnalysisExt DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
+install(DIRECTORY include/ DESTINATION include)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_planar_lattice test/test_planar_lattice.cpp)
+  if(TARGET test_planar_lattice)
+    target_include_directories(test_planar_lattice PRIVATE include)
+  endif()
 endif()
 
 ament_package()

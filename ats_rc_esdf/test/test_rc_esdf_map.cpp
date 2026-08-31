@@ -44,6 +44,44 @@ TEST(RcTraversabilityEsdfProvider, ProducesExactSignedEuclideanDistances)
   EXPECT_NEAR(provider.getDistance(3.5, 3.5), std::sqrt(2.0), 1e-9);
 }
 
+// RMUC terrain 契约：`0..99` 是连续风险，只有 `100` 是硬障碍。调用方用
+// obstacle_value_threshold 声明这条边界，RC-ESDF 的障碍集必须与之一致，否则同一张
+// 栅格上离散 footprint gate 与 ESDF clearance 会给出互相矛盾的结论。
+TEST(RcTraversabilityEsdfProvider, RiskBandBelowDeclaredThresholdIsNotAnEsdfObstacle)
+{
+  auto grid = makeGrid(5, 5);
+  grid.data[1U * grid.info.width + 1U] = 60;   // 连续风险，不是硬障碍
+  grid.data[3U * grid.info.width + 3U] = 100;  // 硬障碍
+
+  ats_rc_esdf::RcTraversabilityEsdfProvider strict;
+  strict.updateGrid(grid, 100, false, 100);
+  ASSERT_TRUE(strict.available());
+  // 风险格自身必须是正 clearance，且只由 (3,3) 的硬障碍决定距离。
+  EXPECT_NEAR(strict.getDistance(1.5, 1.5), std::sqrt(8.0), 1e-9);
+  EXPECT_NEAR(strict.getDistance(3.5, 3.5), -1.0, 1e-9);
+
+  // threshold=50 的既有调用点行为不变：60 仍然是障碍。
+  ats_rc_esdf::RcTraversabilityEsdfProvider permissive;
+  permissive.updateGrid(grid, 50, false, 50);
+  ASSERT_TRUE(permissive.available());
+  EXPECT_NEAR(permissive.getDistance(1.5, 1.5), -1.0, 1e-9);
+}
+
+// unknown 的归属只由 unknown_is_obstacle 决定。语义分对 unknown 返回 -1.0，阈值降到
+// 0 时不能让这个负分反过来把 unknown 判成障碍。
+TEST(RcTraversabilityEsdfProvider, UnknownIsNotPromotedBySemanticTermAtZeroThreshold)
+{
+  auto grid = makeGrid(5, 5);
+  grid.data.assign(grid.data.size(), -1);
+  grid.data[2U * grid.info.width + 2U] = 0;
+
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+  provider.updateGrid(grid, 0, false, 0);
+  ASSERT_TRUE(provider.available());
+  EXPECT_NEAR(provider.getDistance(2.5, 2.5), -1.0, 1e-9);
+  EXPECT_NEAR(provider.getDistance(3.5, 2.5), 1.0, 1e-9);
+}
+
 TEST(StaticMapFusion, StaticWallsAndUnknownCellsCannotBeErased)
 {
   auto local = makeGrid(5, 3);

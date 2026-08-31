@@ -184,10 +184,21 @@ TEST(FootprintSweptSafety, HonorsTranslatedRotatedNonIntegralGridGeometry)
 
 TEST(FootprintSweptSafety, RechecksRepairOutputWithSweptGeometry)
 {
+  // 修复带端点保护(起点是机器人当前位姿,末点是 action 目标位姿),所以待修复
+  // 点必须是内部引导点。障碍取三格竖墙、起终点分居两侧:无论修复把点挪到墙的
+  // 哪一侧,连线都必须穿墙,于是"离散点修好了不等于扫掠安全"这一条仍被覆盖。
   auto grid = makeGrid();
+  setCell(grid, 8, 1, 100);
   setCell(grid, 8, 2, 100);
+  setCell(grid, 8, 3, 100);
   const auto checker = makeChecker();
-  auto trajectory = makeTrajectory(0.425, 0.125, 0.0, 0.625, 0.125, 0.0);
+  ReferenceTrajectory trajectory = makeTrajectory(0.225, 0.125, 0.0, 0.625, 0.125, 0.0);
+  ReferencePoint interior = trajectory.points.front();
+  interior.x = 0.425;
+  interior.t = 0.5;
+  interior.s = 0.2;
+  trajectory.points.insert(trajectory.points.begin() + 1, interior);
+  ASSERT_TRUE(trajectory.valid());
   const auto initial = checker.check(trajectory, grid);
   ASSERT_FALSE(initial.safe);
 

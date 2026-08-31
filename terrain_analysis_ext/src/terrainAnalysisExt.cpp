@@ -1,9 +1,12 @@
  
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <math.h>
+#include <memory>
 #include <queue>
+#include <vector>
 
 #include "geometry_msgs/msg/pose.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -19,6 +22,8 @@
 #include "std_msgs/msg/float32.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/transform_broadcaster.h"
+
+#include "terrain_analysis_ext/planar_lattice.hpp"
 
 double scanVoxelSize = 0.1;
 double decayTime = 10.0;
@@ -65,11 +70,15 @@ const int terrainVoxelWidth = 41;
 int terrainVoxelHalfWidth = (terrainVoxelWidth - 1) / 2;
 constexpr int kTerrainVoxelNum = terrainVoxelWidth * terrainVoxelWidth;
 
-// planar voxel parameters
+// Planar voxel parameters. The planar grid is the resolution at which the
+// traversability and slope grids are published, so it also bounds how much a
+// single coarse verdict can over-report against finer downstream layers. Both
+// values are runtime parameters; the defaults reproduce the historical
+// compile-time 0.4 m / 101-cell lattice exactly.
 float planarVoxelSize = 0.4;
-const int planarVoxelWidth = 101;
+int planarVoxelWidth = 101;
 int planarVoxelHalfWidth = (planarVoxelWidth - 1) / 2;
-constexpr int kPlanarVoxelNum = planarVoxelWidth * planarVoxelWidth;
+int planarVoxelNum = planarVoxelWidth * planarVoxelWidth;
 
 pcl::PointCloud<pcl::PointXYZI>::Ptr
     laserCloud(new pcl::PointCloud<pcl::PointXYZI>());
@@ -87,19 +96,38 @@ pcl::PointCloud<pcl::PointXYZI>::Ptr terrainVoxelCloud[kTerrainVoxelNum];
 
 int terrainVoxelUpdateNum[kTerrainVoxelNum] = {0};
 float terrainVoxelUpdateTime[kTerrainVoxelNum] = {0};
-float planarVoxelElev[kPlanarVoxelNum] = {0};
-int planarVoxelConn[kPlanarVoxelNum] = {0};
-float planarVoxelMaxRelHeight[kPlanarVoxelNum] = {0};
-float planarVoxelMinZ[kPlanarVoxelNum] = {0};
-float planarVoxelMaxZ[kPlanarVoxelNum] = {0};
-float planarVoxelHeightDiff[kPlanarVoxelNum] = {0};
-float planarVoxelOccupancyRatio[kPlanarVoxelNum] = {0};
-float planarVoxelGroundConfidence[kPlanarVoxelNum] = {0};
-float planarVoxelSlopeDeg[kPlanarVoxelNum] = {0};
-float planarVoxelSlopeBand[kPlanarVoxelNum] = {0};
-int planarVoxelPointCount[kPlanarVoxelNum] = {0};
-std::vector<float> planarPointElev[kPlanarVoxelNum];
+std::vector<float> planarVoxelElev;
+std::vector<int> planarVoxelConn;
+std::vector<float> planarVoxelMaxRelHeight;
+std::vector<float> planarVoxelMinZ;
+std::vector<float> planarVoxelMaxZ;
+std::vector<float> planarVoxelHeightDiff;
+std::vector<float> planarVoxelOccupancyRatio;
+std::vector<float> planarVoxelGroundConfidence;
+std::vector<float> planarVoxelSlopeDeg;
+std::vector<float> planarVoxelSlopeBand;
+std::vector<int> planarVoxelPointCount;
+std::vector<std::vector<float>> planarPointElev;
 std::queue<int> planarVoxelQueue;
+
+// Size every planar buffer from the resolved lattice. Called once before the
+// first scan is processed; the per-cycle reset loop still clears the contents.
+void resizePlanarVoxelBuffers() {
+  planarVoxelHalfWidth = (planarVoxelWidth - 1) / 2;
+  planarVoxelNum = planarVoxelWidth * planarVoxelWidth;
+  planarVoxelElev.assign(planarVoxelNum, 0.0f);
+  planarVoxelConn.assign(planarVoxelNum, 0);
+  planarVoxelMaxRelHeight.assign(planarVoxelNum, 0.0f);
+  planarVoxelMinZ.assign(planarVoxelNum, 0.0f);
+  planarVoxelMaxZ.assign(planarVoxelNum, 0.0f);
+  planarVoxelHeightDiff.assign(planarVoxelNum, 0.0f);
+  planarVoxelOccupancyRatio.assign(planarVoxelNum, 0.0f);
+  planarVoxelGroundConfidence.assign(planarVoxelNum, 0.0f);
+  planarVoxelSlopeDeg.assign(planarVoxelNum, 0.0f);
+  planarVoxelSlopeBand.assign(planarVoxelNum, 0.0f);
+  planarVoxelPointCount.assign(planarVoxelNum, 0);
+  planarPointElev.assign(planarVoxelNum, std::vector<float>());
+}
 
 double laserCloudTime = 0;
 bool newlaserCloud = false;
@@ -109,6 +137,16 @@ bool systemInited = false;
 
 float vehicleRoll = 0, vehiclePitch = 0, vehicleYaw = 0;
 float vehicleX = 0, vehicleY = 0, vehicleZ = 0;
+
+// 平面体素栅格的锚点，相位规则见 planar_lattice.hpp。
+float planarAnchorX = 0, planarAnchorY = 0;
+
+inline void updatePlanarAnchor() {
+  planarAnchorX =
+      terrain_analysis_ext::snapToVoxelCenter(vehicleX, planarVoxelSize);
+  planarAnchorY =
+      terrain_analysis_ext::snapToVoxelCenter(vehicleY, planarVoxelSize);
+}
 
 pcl::VoxelGrid<pcl::PointXYZI> downSizeFilter;
 pcl::KdTreeFLANN<pcl::PointXYZI> kdtree;
@@ -313,12 +351,12 @@ nav_msgs::msg::OccupancyGrid makePlanarGridMessage(const rclcpp::Time &stamp) {
   grid.info.width = planarVoxelWidth;
   grid.info.height = planarVoxelWidth;
   grid.info.origin.position.x =
-      vehicleX - (planarVoxelHalfWidth + 0.5) * planarVoxelSize;
+      planarAnchorX - (planarVoxelHalfWidth + 0.5) * planarVoxelSize;
   grid.info.origin.position.y =
-      vehicleY - (planarVoxelHalfWidth + 0.5) * planarVoxelSize;
+      planarAnchorY - (planarVoxelHalfWidth + 0.5) * planarVoxelSize;
   grid.info.origin.position.z = 0.0;
   grid.info.origin.orientation.w = 1.0;
-  grid.data.assign(kPlanarVoxelNum, -1);
+  grid.data.assign(planarVoxelNum, -1);
   return grid;
 }
 
@@ -332,13 +370,14 @@ std::size_t planarIndexToOccupancyGridIndex(int planar_ind) {
 
 void publishScalarGrid(
     const rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr &publisher,
-    const rclcpp::Time &stamp, const float *values, double scale_limit) {
+    const rclcpp::Time &stamp, const std::vector<float> &values,
+    double scale_limit) {
   if (!publisher || scale_limit <= 0.0) {
     return;
   }
 
   nav_msgs::msg::OccupancyGrid grid = makePlanarGridMessage(stamp);
-  for (int i = 0; i < kPlanarVoxelNum; ++i) {
+  for (int i = 0; i < planarVoxelNum; ++i) {
     const bool has_points = planarVoxelPointCount[i] >= traversabilityMinPointCount;
     if (!has_points) {
       continue;
@@ -372,7 +411,7 @@ void publishTraversabilityGrid(
                    traversabilityGroundWeight,
                1e-6);
 
-  for (int i = 0; i < kPlanarVoxelNum; ++i) {
+  for (int i = 0; i < planarVoxelNum; ++i) {
     const std::size_t grid_ind = planarIndexToOccupancyGridIndex(i);
     const bool has_points = planarVoxelPointCount[i] >= traversabilityMinPointCount;
     const bool is_connected = !checkTerrainConn || planarVoxelConn[i] == 2;
@@ -441,6 +480,40 @@ void publishTraversabilityGrid(
   }
 }
 
+// Read the planar lattice parameters, clamp them to a usable centred lattice and
+// size every planar buffer from the result. Kept out of main() so the entry point
+// stays inside the readability/fn_size budget.
+void resolvePlanarVoxelLattice(const std::shared_ptr<rclcpp::Node> & nh) {
+  double planar_voxel_size = planarVoxelSize;
+  int planar_voxel_width = planarVoxelWidth;
+  nh->get_parameter("planarVoxelSize", planar_voxel_size);
+  nh->get_parameter("planarVoxelWidth", planar_voxel_width);
+  if (!(planar_voxel_size > 0.0) || !std::isfinite(planar_voxel_size)) {
+    RCLCPP_WARN(nh->get_logger(),
+                "planarVoxelSize %.3f is not positive; keeping %.3f m",
+                planar_voxel_size, static_cast<double>(planarVoxelSize));
+    planar_voxel_size = planarVoxelSize;
+  }
+  // The lattice is centred on the vehicle cell, so an odd width is required.
+  if (planar_voxel_width < 3) {
+    planar_voxel_width = 3;
+  }
+  if (planar_voxel_width > 601) {
+    planar_voxel_width = 601;
+  }
+  if (planar_voxel_width % 2 == 0) {
+    ++planar_voxel_width;
+  }
+  planarVoxelSize = static_cast<float>(planar_voxel_size);
+  planarVoxelWidth = planar_voxel_width;
+  resizePlanarVoxelBuffers();
+  RCLCPP_INFO(nh->get_logger(),
+              "planar grid: %d x %d cells at %.3f m (extent %.2f m)",
+              planarVoxelWidth, planarVoxelWidth,
+              static_cast<double>(planarVoxelSize),
+              static_cast<double>(planarVoxelWidth) * planarVoxelSize);
+}
+
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   auto nh = rclcpp::Node::make_shared("terrainAnalysisExt");
@@ -492,6 +565,8 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("slopeSteepDegThre", slopeSteepDegThre);
   nh->declare_parameter<bool>("useSlopeAsObstacle", useSlopeAsObstacle);
   nh->declare_parameter<double>("slopeObstacleDegThre", slopeObstacleDegThre);
+  nh->declare_parameter<double>("planarVoxelSize", planarVoxelSize);
+  nh->declare_parameter<int>("planarVoxelWidth", planarVoxelWidth);
 
   nh->get_parameter("scanVoxelSize", scanVoxelSize);
   nh->get_parameter("decayTime", decayTime);
@@ -537,6 +612,8 @@ int main(int argc, char **argv) {
   nh->get_parameter("slopeSteepDegThre", slopeSteepDegThre);
   nh->get_parameter("useSlopeAsObstacle", useSlopeAsObstacle);
   nh->get_parameter("slopeObstacleDegThre", slopeObstacleDegThre);
+
+  resolvePlanarVoxelLattice(nh);
 
   auto subOdometry = nh->create_subscription<nav_msgs::msg::Odometry>(
       "lidar_odometry", 5, odometryHandler);
@@ -730,9 +807,13 @@ int main(int argc, char **argv) {
         }
       }
 
+      // Snap the lattice phase before any point is binned, so binning and the
+      // published origin agree within this cycle.
+      updatePlanarAnchor();
+
       // Reset all per-cell semantic statistics, then rebuild them from the
       // latest aggregated terrain cloud.
-      for (int i = 0; i < kPlanarVoxelNum; i++) {
+      for (int i = 0; i < planarVoxelNum; i++) {
         planarVoxelElev[i] = 0;
         planarVoxelConn[i] = 0;
         planarVoxelMaxRelHeight[i] = 0.0f;
@@ -754,19 +835,10 @@ int main(int argc, char **argv) {
                          (point.y - vehicleY) * (point.y - vehicleY));
         if (point.z - vehicleZ > lowerBoundZ - disRatioZ * dis &&
             point.z - vehicleZ < upperBoundZ + disRatioZ * dis) {
-          int indX =
-              static_cast<int>((point.x - vehicleX + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-          int indY =
-              static_cast<int>((point.y - vehicleY + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-
-          if (point.x - vehicleX + planarVoxelSize / 2 < 0)
-            indX--;
-          if (point.y - vehicleY + planarVoxelSize / 2 < 0)
-            indY--;
+          int indX = terrain_analysis_ext::planarVoxelIndex1D(
+              point.x, planarAnchorX, planarVoxelSize, planarVoxelHalfWidth);
+          int indY = terrain_analysis_ext::planarVoxelIndex1D(
+              point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
 
           for (int dX = -1; dX <= 1; dX++) {
             for (int dY = -1; dY <= 1; dY++) {
@@ -783,7 +855,7 @@ int main(int argc, char **argv) {
       // Estimate ground elevation by a low quantile so sparse obstacle tops do
       // not easily drag the local ground plane upward.
       if (useSorting) {
-        for (int i = 0; i < kPlanarVoxelNum; i++) {
+        for (int i = 0; i < planarVoxelNum; i++) {
           int planarPointElevSize = planarPointElev[i].size();
           if (planarPointElevSize > 0) {
             sort(planarPointElev[i].begin(), planarPointElev[i].end());
@@ -798,7 +870,7 @@ int main(int argc, char **argv) {
           }
         }
       } else {
-        for (int i = 0; i < kPlanarVoxelNum; i++) {
+        for (int i = 0; i < planarVoxelNum; i++) {
           int planarPointElevSize = planarPointElev[i].size();
           if (planarPointElevSize > 0) {
             float minZ = 1000.0;
@@ -824,19 +896,10 @@ int main(int argc, char **argv) {
                          (point.y - vehicleY) * (point.y - vehicleY));
         if (point.z - vehicleZ > lowerBoundZ - disRatioZ * dis &&
             point.z - vehicleZ < upperBoundZ + disRatioZ * dis) {
-          int indX =
-              static_cast<int>((point.x - vehicleX + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-          int indY =
-              static_cast<int>((point.y - vehicleY + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-
-          if (point.x - vehicleX + planarVoxelSize / 2 < 0)
-            indX--;
-          if (point.y - vehicleY + planarVoxelSize / 2 < 0)
-            indY--;
+          int indX = terrain_analysis_ext::planarVoxelIndex1D(
+              point.x, planarAnchorX, planarVoxelSize, planarVoxelHalfWidth);
+          int indY = terrain_analysis_ext::planarVoxelIndex1D(
+              point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
 
           if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
               indY < planarVoxelWidth) {
@@ -855,7 +918,7 @@ int main(int argc, char **argv) {
 
       // Convert raw point count and vertical spread into a simple occupancy
       // ratio. This is still a 2D cost input, not a full 3D occupancy model.
-      for (int i = 0; i < kPlanarVoxelNum; ++i) {
+      for (int i = 0; i < planarVoxelNum; ++i) {
         if (planarVoxelPointCount[i] <= 0 ||
             !std::isfinite(planarVoxelMinZ[i]) ||
             !std::isfinite(planarVoxelMaxZ[i])) {
@@ -935,19 +998,10 @@ int main(int argc, char **argv) {
         if (point.z - vehicleZ > lowerBoundZ - disRatioZ * dis &&
             point.z - vehicleZ < upperBoundZ + disRatioZ * dis &&
             dis > localTerrainMapRadius) {
-          int indX =
-              static_cast<int>((point.x - vehicleX + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-          int indY =
-              static_cast<int>((point.y - vehicleY + planarVoxelSize / 2) /
-                               planarVoxelSize) +
-              planarVoxelHalfWidth;
-
-          if (point.x - vehicleX + planarVoxelSize / 2 < 0)
-            indX--;
-          if (point.y - vehicleY + planarVoxelSize / 2 < 0)
-            indY--;
+          int indX = terrain_analysis_ext::planarVoxelIndex1D(
+              point.x, planarAnchorX, planarVoxelSize, planarVoxelHalfWidth);
+          int indY = terrain_analysis_ext::planarVoxelIndex1D(
+              point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
 
           if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
               indY < planarVoxelWidth) {
