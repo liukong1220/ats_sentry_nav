@@ -40,6 +40,17 @@
 namespace minco_planner
 {
 
+struct PlannerCommitTelemetry
+{
+  std::string grid_topic;
+  std::string validation_frame;
+  std::uint32_t gate_collision_count{0};
+  std::string gate_collision_indices;
+  std::string occupancy_digest;
+  std::string content_digest;
+  std::uint32_t reference_point_count{0};
+};
+
 class MincoPlannerNode : public rclcpp::Node
 {
 public:
@@ -67,9 +78,15 @@ private:
                 std::uint64_t goal_id, std::uint64_t localization_epoch,
                 std::uint64_t plan_request_sequence,
                 std::uint64_t map_publication_sequence,
-                bool report_status);
+                bool report_status,
+                const geometry_msgs::msg::PoseStamped * frozen_start = nullptr,
+                const InitialKinematicState * initial_state = nullptr);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
+  bool resolveStartPose(
+    const nav_msgs::msg::OccupancyGrid & grid,
+    const geometry_msgs::msg::PoseStamped * frozen_start,
+    geometry_msgs::msg::PoseStamped & start) const;
   bool transformGoalToGrid(
     const nav_msgs::msg::OccupancyGrid & grid,
     const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const;
@@ -94,7 +111,8 @@ private:
       std::uint64_t plan_request_sequence,
       std::uint64_t map_publication_sequence,
       std::uint8_t yaw_authority,
-      bool report_status);
+      bool report_status,
+      const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
   void onRuntimeSafetyRecheck();
   void publishEmergencyStop(bool stop);
   void
@@ -106,7 +124,8 @@ private:
                        const builtin_interfaces::msg::Time &reference_stamp =
                            builtin_interfaces::msg::Time(),
                        std::uint8_t yaw_authority = 0,
-                       bool requires_gimbal_lock = false);
+                       bool requires_gimbal_lock = false,
+                       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";

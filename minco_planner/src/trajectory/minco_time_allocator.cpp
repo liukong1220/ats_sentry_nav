@@ -77,10 +77,30 @@ MincoTimeAllocation MincoTimeAllocator::allocate(
       result.waypoint_speeds[index] = std::min(
         result.waypoint_speeds[index], std::sqrt(lateral_acceleration / curvature));
     }
+    const Eigen::Vector2d incoming = waypoints[index] - waypoints[index - 1U];
+    const Eigen::Vector2d outgoing = waypoints[index + 1U] - waypoints[index];
+    const double incoming_length = incoming.norm();
+    const double outgoing_length = outgoing.norm();
+    if (incoming_length > 1e-9 && outgoing_length > 1e-9) {
+      const double turn = std::abs(std::atan2(
+        incoming.x() * outgoing.y() - incoming.y() * outgoing.x(), incoming.dot(outgoing)));
+      if (turn > 0.35) {
+        const double tan_half = std::tan(0.5 * turn);
+        const double inscribed_radius = tan_half > 1e-9 ?
+          0.45 * std::min(incoming_length, outgoing_length) / tan_half : 0.0;
+        const double corner_radius = std::max(0.20, inscribed_radius);
+        result.waypoint_speeds[index] = std::min(
+          result.waypoint_speeds[index], std::sqrt(lateral_acceleration * corner_radius));
+      }
+    }
   }
   const double bounded_initial_speed = std::isfinite(initial_speed) ?
     std::max(0.0, initial_speed) : 0.0;
-  result.waypoint_speeds.front() = std::min(result.waypoint_speeds.front(), bounded_initial_speed);
+  const double min_duration_speed = std::max(0.20, 0.25 * reference_speed);
+  if (bounded_initial_speed >= min_duration_speed) {
+    result.waypoint_speeds.front() = std::min(
+      result.waypoint_speeds.front(), bounded_initial_speed);
+  }
   result.waypoint_speeds.back() = 0.0;
 
   for (std::size_t index = 0; index + 1U < count; ++index) {

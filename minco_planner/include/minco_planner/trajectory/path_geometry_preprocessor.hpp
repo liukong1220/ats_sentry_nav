@@ -21,6 +21,10 @@ struct PathGeometryPreprocessorParams
   double short_segment_length = 0.05;
   double corner_angle_threshold_rad = 0.20;
   bool footprint_aware_shortcut_enabled = true;
+  // Zero keeps historical sharp JPS corners. Deployed profiles set a positive
+  // radius so MINCO interpolates an inner arc instead of the vertex.
+  double fillet_radius = 0.0;
+  int fillet_arc_samples = 1;
 };
 
 struct PathGeometryResult
@@ -52,6 +56,10 @@ public:
 private:
   bool shortcutSafe(
     const Eigen::Vector2d & start, const Eigen::Vector2d & end,
+    const nav_msgs::msg::OccupancyGrid * planning_grid,
+    const FootprintSafetyChecker * safety_checker) const;
+  std::vector<Eigen::Vector2d> insertInnerCornerFillets(
+    const std::vector<Eigen::Vector2d> & waypoints,
     const nav_msgs::msg::OccupancyGrid * planning_grid,
     const FootprintSafetyChecker * safety_checker) const;
   static nav_msgs::msg::Path makePath(

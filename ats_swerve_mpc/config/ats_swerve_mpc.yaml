@@ -65,7 +65,7 @@ ats_swerve_mpc:
     # 横向误差达到该值（m）时降到最小参考进度倍率。
     cross_track_slowdown_end: 0.60
     # 偏离路径严重时仍保留的最小参考进度/前馈速度比例，范围为 0 到 1。
-    min_reference_progress_scale: 0.25
+    min_reference_progress_scale: 0.10
     # 预测域起点补偿的命令传输延迟（s）。
     command_latency_compensation: 0.01
 
@@ -88,7 +88,7 @@ ats_swerve_mpc:
     convergence_tolerance: 1.0e-3
 
     # 状态误差权重，对应世界系 [x, y, yaw]。
-    state_weight: [18.0, 18.0, 4.0]
+    state_weight: [18.0, 18.0, 10.0]
     # 预测末端状态误差权重，通常大于过程权重以保证收敛到目标。
     terminal_weight: [28.0, 28.0, 8.0]
     # 控制偏离参考的权重，对应车体系 [vx, vy, wz]。

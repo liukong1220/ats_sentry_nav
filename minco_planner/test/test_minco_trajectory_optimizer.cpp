@@ -2,13 +2,14 @@
 
 #include <gtest/gtest.h>
 
+#include <Eigen/Core>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 #include "minco_planner/safety/footprint_samples.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
-#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace
 {
@@ -281,7 +282,142 @@ TEST(MincoTrajectoryOptimizer, UsesYawAwareFootprintToIncreaseEdgeClearance)
       params.footprint_safety_margin, params.esdf_footprint_sample_spacing),
     minimumFootprintDistance(
       center_reference, esdf, params.footprint_length, params.footprint_width,
-      params.footprint_safety_margin, params.esdf_footprint_sample_spacing) + 0.05);
+       params.footprint_safety_margin, params.esdf_footprint_sample_spacing) + 0.05);
+}
+
+TEST(MincoTrajectoryOptimizer, NonFiniteInitialStateFailsClosed)
+{
+  minco_planner::MincoTrajectoryOptimizer optimizer;
+  minco_planner::InitialKinematicState initial_state;
+  initial_state.valid = true;
+  initial_state.velocity = Eigen::Vector2d(
+    std::numeric_limits<double>::quiet_NaN(), 0.0);
+  minco_planner::MincoOptimizationTrace trace;
+  const auto trajectory = optimizer.optimize(
+    makePath(), nullptr, nullptr, &initial_state, nullptr, nullptr, &trace);
+  EXPECT_TRUE(trajectory.empty());
+  EXPECT_EQ(trace.failure_reason, "non_finite_initial_state");
+}
+
+TEST(MincoTrajectoryOptimizer, SharedFrozenInitialStateSeedsEveryPass)
+{
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.reference_speed = 1.0;
+  params.max_velocity = 3.0;
+  params.max_acceleration = 10.0;
+  params.esdf_obstacle_optimization_enabled = false;
+  minco_planner::MincoTrajectoryOptimizer optimizer(params);
+  minco_planner::InitialKinematicState initial_state;
+  initial_state.valid = true;
+  initial_state.velocity = Eigen::Vector2d(0.25, 0.05);
+  const auto center = optimizer.optimize(makePath(), nullptr, nullptr, &initial_state);
+  const auto fallback = optimizer.optimize(makePath(), nullptr, nullptr, &initial_state);
+  ASSERT_FALSE(center.empty());
+  ASSERT_FALSE(fallback.empty());
+  EXPECT_NEAR(center.points.front().vx, 0.25, 1e-6);
+  EXPECT_NEAR(center.points.front().vy, 0.05, 1e-6);
+  EXPECT_NEAR(fallback.points.front().vx, 0.25, 1e-6);
+  EXPECT_NEAR(fallback.points.front().vy, 0.05, 1e-6);
+}
+
+
+TEST(MincoTrajectoryOptimizer, TinySeedOnTwoWaypointsKeepsBoundedDuration)
+{
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.reference_speed = 1.5;
+  params.sample_spacing = 0.12;
+  params.max_velocity = 2.0;
+  params.max_acceleration = 2.5;
+  params.esdf_obstacle_optimization_enabled = false;
+  minco_planner::MincoTrajectoryOptimizer optimizer(params);
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const auto & xy : {std::pair<double, double>{0.0, 0.0}, {2.5, 0.0}}) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = xy.first;
+    pose.pose.position.y = xy.second;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  minco_planner::InitialKinematicState initial_state;
+  initial_state.valid = true;
+  initial_state.velocity = Eigen::Vector2d(0.008, 0.0);
+  const auto trajectory = optimizer.optimize(path, nullptr, nullptr, &initial_state);
+  ASSERT_FALSE(trajectory.empty());
+  EXPECT_LT(trajectory.totalTime(), 20.0);
+  EXPECT_LT(trajectory.points.size(), 400U);
+}
+
+nav_msgs::msg::Path makeLPath()
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const auto & xy :
+    {std::pair<double, double> {0.0, 0.0}, {3.0, 0.0}, {3.0, 3.0}})
+  {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = xy.first;
+    pose.pose.position.y = xy.second;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  return path;
+}
+
+double distanceToSegment(
+  double x, double y, const Eigen::Vector2d & start, const Eigen::Vector2d & end)
+{
+  const Eigen::Vector2d delta = end - start;
+  const Eigen::Vector2d offset(x - start.x(), y - start.y());
+  const double length2 = delta.squaredNorm();
+  const double blend = length2 > 1e-12 ?
+    std::max(0.0, std::min(1.0, offset.dot(delta) / length2)) : 0.0;
+  const Eigen::Vector2d projection = start + blend * delta;
+  return (Eigen::Vector2d(x, y) - projection).norm();
+}
+
+double maxPolylineDeviation(const minco_planner::ReferenceTrajectory & trajectory)
+{
+  const Eigen::Vector2d start(0.0, 0.0);
+  const Eigen::Vector2d corner(3.0, 0.0);
+  const Eigen::Vector2d goal(3.0, 3.0);
+  double peak = 0.0;
+  for (const auto & point : trajectory.points) {
+    peak = std::max(
+      peak,
+      std::min(
+        distanceToSegment(point.x, point.y, start, corner),
+        distanceToSegment(point.x, point.y, corner, goal)));
+  }
+  return peak;
+}
+
+TEST(MincoTrajectoryOptimizer, GuideDensifyBoundsLCornerCut)
+{
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.reference_speed = 1.5;
+  params.sample_spacing = 0.05;
+  params.max_velocity = 2.0;
+  params.max_acceleration = 2.5;
+  params.max_jerk = 12.0;
+  params.esdf_obstacle_optimization_enabled = false;
+  params.geometry_preprocessor.footprint_aware_shortcut_enabled = false;
+  params.geometry_preprocessor.fillet_radius = 0.0;
+
+  minco_planner::MincoTrajectoryOptimizer sparse(params);
+  const auto sparse_trajectory = sparse.optimize(makeLPath());
+  params.guide_control_point_spacing = 0.30;
+  minco_planner::MincoTrajectoryOptimizer dense(params);
+  const auto dense_trajectory = dense.optimize(makeLPath());
+
+  ASSERT_FALSE(sparse_trajectory.empty());
+  ASSERT_FALSE(dense_trajectory.empty());
+  const double sparse_dev = maxPolylineDeviation(sparse_trajectory);
+  const double dense_dev = maxPolylineDeviation(dense_trajectory);
+  EXPECT_LT(dense_dev, 0.08);
+  EXPECT_LE(dense_dev, sparse_dev + 1e-6);
 }
 
 }  // namespace

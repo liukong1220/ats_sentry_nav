@@ -2,6 +2,7 @@
 """Node-level regression for map-canonical goals across localization epochs."""
 
 import time
+import math
 import signal
 import subprocess
 import unittest
@@ -355,6 +356,10 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
         )
         self.assertEqual(first_goal.goal_pose.header.frame_id, "odom")
         self.assertAlmostEqual(first_goal.goal_pose.pose.position.x, 3.0, places=3)
+        self.assertEqual(first_goal.start_pose.header.frame_id, "map")
+        self.assertTrue(math.isfinite(first_goal.start_twist.linear.x))
+        self.assertTrue(math.isfinite(first_goal.start_twist.linear.y))
+        self.assertTrue(math.isfinite(first_goal.start_twist.angular.z))
 
         goal_count = len(self.planner_goals)
         transient_failure = PlannerStatus()

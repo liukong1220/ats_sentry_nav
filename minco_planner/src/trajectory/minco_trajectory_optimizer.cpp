@@ -119,16 +119,17 @@ Point limitNorm(const Point & value, double maximum_norm)
  *       误差，非有限值或异常大的值会让首段多项式直接冲出速度可行域，
  *       进而被时间缩放整体拉长（表现为"重规划后全程变慢"）。
  */
-Eigen::Matrix<double, 2, 3> makeHeadState(
+bool makeHeadState(
   const InitialKinematicState * initial_state,
-  const MincoTrajectoryOptimizerParams & params)
+  const MincoTrajectoryOptimizerParams & params,
+  Eigen::Matrix<double, 2, 3> & head)
 {
-  Eigen::Matrix<double, 2, 3> head = Eigen::Matrix<double, 2, 3>::Zero();
+  head = Eigen::Matrix<double, 2, 3>::Zero();
   if (initial_state == nullptr || !initial_state->valid) {
-    return head;
+    return true;
   }
   if (!initial_state->velocity.allFinite() || !initial_state->acceleration.allFinite()) {
-    return head;
+    return false;
   }
   // 播种量同时受"初值保护上限"和"轨迹动力学上限"约束：若首端速度本身就超过
   // max_velocity，时间缩放永远无法把峰值压回可行域（缩放不改变边界条件），
@@ -143,7 +144,7 @@ Eigen::Matrix<double, 2, 3> makeHeadState(
   }
   head.col(1) = limitNorm(initial_state->velocity, speed_limit);
   head.col(2) = limitNorm(initial_state->acceleration, acceleration_limit);
-  return head;
+  return true;
 }
 
 double normalizeAngle(double angle)
@@ -360,9 +361,9 @@ std::vector<Point> refineWaypointsWithEsdf(
       break;
     }
 
-    if (!inserted_clearance_controls && waypoints.size() == 2U) {
+    if (!inserted_clearance_controls) {
       const std::vector<Point> densified = densifyWaypoints(
-        input_waypoints, std::max(0.05, params.esdf_obstacle_control_point_spacing));
+        waypoints, std::max(0.05, params.esdf_obstacle_control_point_spacing));
       if (densified.size() > waypoints.size()) {
         original_waypoints = densified;
         waypoints = densified;
@@ -450,16 +451,20 @@ void findDynamicExtrema(
   double & max_velocity,
   double & max_acceleration,
   double & max_jerk,
+  double & max_lateral_acceleration,
   std::vector<double> & segment_peak_velocities,
   std::vector<double> & segment_peak_accelerations,
-  std::vector<double> & segment_peak_jerks)
+  std::vector<double> & segment_peak_jerks,
+  std::vector<double> & segment_peak_laterals)
 {
   max_velocity = 0.0;
   max_acceleration = 0.0;
   max_jerk = 0.0;
+  max_lateral_acceleration = 0.0;
   segment_peak_velocities.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
   segment_peak_accelerations.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
   segment_peak_jerks.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
+  segment_peak_laterals.assign(static_cast<std::size_t>(minco.pieceCount()), 0.0);
   const double sample_dt = sample_spacing / std::max(0.05, reference_speed);
   for (int piece = 0; piece < minco.pieceCount(); ++piece) {
     const int steps = std::max(
@@ -467,15 +472,27 @@ void findDynamicExtrema(
     for (int step = 0; step <= steps; ++step) {
       const auto sample = minco.sample(
         piece, minco.pieceDuration(piece) * static_cast<double>(step) / steps);
-      max_velocity = std::max(max_velocity, sample.velocity.norm());
-      max_acceleration = std::max(max_acceleration, sample.acceleration.norm());
-      max_jerk = std::max(max_jerk, sample.jerk.norm());
+      const double speed = sample.velocity.norm();
+      const double acceleration = sample.acceleration.norm();
+      const double jerk = sample.jerk.norm();
+      double lateral = 0.0;
+      if (speed > 0.05) {
+        lateral = std::abs(
+          sample.velocity.x() * sample.acceleration.y() -
+          sample.velocity.y() * sample.acceleration.x()) / speed;
+      }
+      max_velocity = std::max(max_velocity, speed);
+      max_acceleration = std::max(max_acceleration, acceleration);
+      max_jerk = std::max(max_jerk, jerk);
+      max_lateral_acceleration = std::max(max_lateral_acceleration, lateral);
       segment_peak_velocities[static_cast<std::size_t>(piece)] = std::max(
-        segment_peak_velocities[static_cast<std::size_t>(piece)], sample.velocity.norm());
+        segment_peak_velocities[static_cast<std::size_t>(piece)], speed);
       segment_peak_accelerations[static_cast<std::size_t>(piece)] = std::max(
-        segment_peak_accelerations[static_cast<std::size_t>(piece)], sample.acceleration.norm());
+        segment_peak_accelerations[static_cast<std::size_t>(piece)], acceleration);
       segment_peak_jerks[static_cast<std::size_t>(piece)] = std::max(
-        segment_peak_jerks[static_cast<std::size_t>(piece)], sample.jerk.norm());
+        segment_peak_jerks[static_cast<std::size_t>(piece)], jerk);
+      segment_peak_laterals[static_cast<std::size_t>(piece)] = std::max(
+        segment_peak_laterals[static_cast<std::size_t>(piece)], lateral);
     }
   }
 }
@@ -562,9 +579,31 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
 
   const double reference_speed = std::max(0.05, params_.reference_speed);
   const double sample_spacing = std::max(0.02, params_.sample_spacing);
-  const Eigen::Matrix<double, 2, 3> head_state = makeHeadState(initial_state, params_);
+  Eigen::Matrix<double, 2, 3> head_state = Eigen::Matrix<double, 2, 3>::Zero();
+  if (!makeHeadState(initial_state, params_, head_state)) {
+    finishTrace("non_finite_initial_state");
+    return trajectory;
+  }
+  const double guide_spacing = std::max(0.0, params_.guide_control_point_spacing);
+  if (guide_spacing > 1e-6) {
+    waypoints = densifyWaypoints(waypoints, guide_spacing);
+  }
   const std::vector<Point> pre_refinement_waypoints = waypoints;
   waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation, head_state);
+  if (guide_spacing > 1e-6) {
+    waypoints = densifyWaypoints(waypoints, guide_spacing);
+  }
+  if (waypoints.size() >= 2U) {
+    Point direction = waypoints[1] - waypoints.front();
+    const double length = direction.norm();
+    if (length > 1e-6) {
+      direction /= length;
+      const double along = head_state.col(1).dot(direction);
+      if (along < 0.0) {
+        head_state.col(1) -= direction * along;
+      }
+    }
+  }
   if (trace) {
     trace->esdf_refined_guide = makeGuidePath(raw_path.header, waypoints);
     trace->esdf_geometry_refined = waypoints.size() == pre_refinement_waypoints.size() &&
@@ -591,9 +630,22 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   double peak_velocity = 0.0;
   double peak_acceleration = 0.0;
   double peak_jerk = 0.0;
+  double peak_lateral = 0.0;
   std::vector<double> segment_peak_velocities;
   std::vector<double> segment_peak_accelerations;
   std::vector<double> segment_peak_jerks;
+  std::vector<double> segment_peak_laterals;
+  const auto effectiveAccelerations = [&](const std::vector<double> & laterals) {
+      std::vector<double> scaled = segment_peak_accelerations;
+      if (params_.max_lateral_acceleration > 0.0 && params_.max_acceleration > 0.0) {
+        for (std::size_t index = 0; index < scaled.size() && index < laterals.size(); ++index) {
+          scaled[index] = std::max(
+            scaled[index],
+            laterals[index] * params_.max_acceleration / params_.max_lateral_acceleration);
+        }
+      }
+      return scaled;
+    };
   // Segment-wise scaling keeps a high-curvature corner slow without globally
   // stretching unrelated straight segments.  MINCO is re-solved each round.
   const int maximum_scaling_iterations = std::max(0, params_.max_time_scaling_iterations);
@@ -603,16 +655,20 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     peak_velocity = 0.0;
     peak_acceleration = 0.0;
     peak_jerk = 0.0;
+    peak_lateral = 0.0;
     findDynamicExtrema(
       minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
-      segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks);
+      peak_lateral, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
+      segment_peak_laterals);
     recordDynamicTrace(durations, peak_velocity, peak_acceleration, peak_jerk);
     const bool velocity_ok = params_.max_velocity <= 0.0 ||
       peak_velocity <= params_.max_velocity + 1e-6;
     const bool acceleration_ok = params_.max_acceleration <= 0.0 ||
       peak_acceleration <= params_.max_acceleration + 1e-6;
     const bool jerk_ok = params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6;
-    if (velocity_ok && acceleration_ok && jerk_ok) {
+    const bool lateral_ok = params_.max_lateral_acceleration <= 0.0 ||
+      peak_lateral <= params_.max_lateral_acceleration + 1e-6;
+    if (velocity_ok && acceleration_ok && jerk_ok && lateral_ok) {
       dynamic_limits_satisfied = true;
       break;
     }
@@ -620,7 +676,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       break;
     }
     if (!time_allocator.applyLocalDynamicScaling(
-        durations, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
+        durations, segment_peak_velocities, effectiveAccelerations(segment_peak_laterals),
+        segment_peak_jerks,
         params_.max_velocity, params_.max_acceleration, params_.max_jerk))
     {
       break;
@@ -645,6 +702,10 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       required_scale = std::max(
         required_scale, std::cbrt(peak_jerk / params_.max_jerk));
     }
+    if (params_.max_lateral_acceleration > 0.0) {
+      required_scale = std::max(
+        required_scale, std::sqrt(peak_lateral / params_.max_lateral_acceleration));
+    }
     const double uniform_scale = std::max(
       std::max(1.01, params_.time_scaling_factor), 1.01 * required_scale);
     durations *= uniform_scale;
@@ -655,15 +716,19 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     peak_velocity = 0.0;
     peak_acceleration = 0.0;
     peak_jerk = 0.0;
+    peak_lateral = 0.0;
     findDynamicExtrema(
       minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
-      segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks);
+      peak_lateral, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
+      segment_peak_laterals);
     recordDynamicTrace(durations, peak_velocity, peak_acceleration, peak_jerk);
     dynamic_limits_satisfied =
       (params_.max_velocity <= 0.0 || peak_velocity <= params_.max_velocity + 1e-6) &&
       (params_.max_acceleration <= 0.0 ||
       peak_acceleration <= params_.max_acceleration + 1e-6) &&
-      (params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6);
+      (params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6) &&
+      (params_.max_lateral_acceleration <= 0.0 ||
+      peak_lateral <= params_.max_lateral_acceleration + 1e-6);
     uniform_time_scaled = true;
   }
   if (!dynamic_limits_satisfied) {

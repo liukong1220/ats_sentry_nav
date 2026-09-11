@@ -35,3 +35,11 @@ uint8 YAW_AUTHORITY_GIMBAL_COMPENSATED=1
 uint8 YAW_AUTHORITY_BODY_YAW_FOLLOW=2
 uint8 yaw_authority
 bool requires_gimbal_lock
+# Commit-site pairing fields. Goal Manager logs these with the published path digest.
+string grid_topic
+string validation_frame
+uint32 gate_collision_count
+string gate_collision_indices
+string occupancy_digest
+string content_digest
+uint32 reference_point_count

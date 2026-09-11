@@ -1,10 +1,14 @@
 // Copyright 2026
 
+#include <cstdint>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "ats_navigation_interfaces/msg/planner_candidate.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "minco_planner/nodes/atomic_planning_contract.hpp"
+#include "minco_planner/nodes/planning_digest.hpp"
 #include "gtest/gtest.h"
 
 namespace {
@@ -114,6 +118,16 @@ TEST(AtomicPlanningContract, RejectedCandidateCannotLookLikeAReferenceLease) {
 
   candidate.failure_reason = candidate.FAILURE_NONE;
   EXPECT_FALSE(minco_planner::validPlannerCandidate(candidate));
+}
+
+TEST(AtomicPlanningContract, OccupancyDigestMatchesRecorderTruncation) {
+  const std::vector<int8_t> occupancy = {0, 100, -1, 0};
+  const std::string first = minco_planner::planning_digest::occupancyDigest(occupancy);
+  const std::string second = minco_planner::planning_digest::occupancyDigest(occupancy);
+  EXPECT_EQ(first.size(), 32U);
+  EXPECT_EQ(first, second);
+  const std::vector<int8_t> other = {0, 100, -1, 1};
+  EXPECT_NE(first, minco_planner::planning_digest::occupancyDigest(other));
 }
 
 } // namespace

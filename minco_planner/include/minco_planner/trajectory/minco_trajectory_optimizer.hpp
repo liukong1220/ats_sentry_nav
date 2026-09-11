@@ -49,6 +49,9 @@ struct MincoTrajectoryOptimizerParams
   double esdf_obstacle_target_clearance = 0.0;
   int esdf_obstacle_max_iterations = 6;
   double esdf_obstacle_control_point_spacing = 0.30;
+  // Zero keeps the historical sparse-waypoint MINCO interpolation. Deployed
+  // profiles densify the guide so S3 pieces cannot cut an L-corner into a wall.
+  double guide_control_point_spacing = 0.0;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
   double esdf_obstacle_trust_region = 0.10;
