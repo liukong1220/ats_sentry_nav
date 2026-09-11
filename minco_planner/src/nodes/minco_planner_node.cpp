@@ -4,12 +4,14 @@
 
 #include "minco_planner/planning/graph_search_failure.hpp"
 #include "minco_planner/planning/clearance_ladder.hpp"
+#include "minco_planner/nodes/planning_digest.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "minco_planner/trajectory/reference_path_timing.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -21,6 +23,30 @@ namespace minco_planner
 
 namespace
 {
+
+bool finitePose(const geometry_msgs::msg::Pose & pose)
+{
+  return std::isfinite(pose.position.x) && std::isfinite(pose.position.y) &&
+    std::isfinite(pose.position.z) && std::isfinite(pose.orientation.x) &&
+    std::isfinite(pose.orientation.y) && std::isfinite(pose.orientation.z) &&
+    std::isfinite(pose.orientation.w);
+}
+
+std::string formatCollisionIndices(const std::vector<CollisionSample> & collisions)
+{
+  std::ostringstream out;
+  const std::size_t cap = std::min<std::size_t>(16U, collisions.size());
+  for (std::size_t i = 0; i < cap; ++i) {
+    if (i != 0U) {
+      out << ',';
+    }
+    out << collisions[i].trajectory_index;
+  }
+  if (collisions.size() > cap) {
+    out << ",...";
+  }
+  return out.str();
+}
 
 // 把拒绝点周围的规划栅格原样打成一行,用于区分
 // "车自身格子被占"与"外侧存在成片障碍"。只在 footprint
@@ -107,11 +133,17 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       goal_request_topic_, rclcpp::QoS(10).reliable(),
       std::bind(&MincoPlannerNode::onPlannerGoal, this, std::placeholders::_1), planning_options);
   }
-  raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
-  preprocessed_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
-    preprocessed_guide_topic_, rclcpp::QoS(1).reliable());
-  esdf_refined_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
-    esdf_refined_guide_topic_, rclcpp::QoS(1).reliable());
+  if (!raw_path_topic_.empty()) {
+    raw_path_pub_ = create_publisher<nav_msgs::msg::Path>(raw_path_topic_, rclcpp::QoS(1));
+  }
+  if (!preprocessed_guide_topic_.empty()) {
+    preprocessed_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
+      preprocessed_guide_topic_, rclcpp::QoS(1).reliable());
+  }
+  if (!esdf_refined_guide_topic_.empty()) {
+    esdf_refined_guide_pub_ = create_publisher<nav_msgs::msg::Path>(
+      esdf_refined_guide_topic_, rclcpp::QoS(1).reliable());
+  }
   if (planner_manages_emergency_stop_) {
     reference_path_pub_ =
       create_publisher<nav_msgs::msg::Path>(reference_path_topic_, rclcpp::QoS(1));
@@ -120,8 +152,10 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
     candidate_reference_path_pub_ = create_publisher<nav_msgs::msg::Path>(
       candidate_reference_path_topic_, rclcpp::QoS(1).reliable());
   }
-  marker_pub_ =
-    create_publisher<visualization_msgs::msg::MarkerArray>(debug_marker_topic_, rclcpp::QoS(1));
+  if (!debug_marker_topic_.empty()) {
+    marker_pub_ =
+      create_publisher<visualization_msgs::msg::MarkerArray>(debug_marker_topic_, rclcpp::QoS(1));
+  }
   if (planner_manages_emergency_stop_) {
     emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
       emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
@@ -241,6 +275,8 @@ void MincoPlannerNode::declareAndLoadParams()
     "esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
   declare_parameter<double>(
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
+  declare_parameter<double>(
+    "guide_control_point_spacing", optimizer_params.guide_control_point_spacing);
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
@@ -272,6 +308,10 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<bool>(
     "path_footprint_aware_shortcut_enabled",
     optimizer_params.geometry_preprocessor.footprint_aware_shortcut_enabled);
+  declare_parameter<double>(
+    "path_fillet_radius", optimizer_params.geometry_preprocessor.fillet_radius);
+  declare_parameter<int>(
+    "path_fillet_arc_samples", optimizer_params.geometry_preprocessor.fillet_arc_samples);
 
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
@@ -386,6 +426,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("esdf_obstacle_max_iterations", optimizer_params.esdf_obstacle_max_iterations);
   get_parameter(
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
+  get_parameter(
+    "guide_control_point_spacing", optimizer_params.guide_control_point_spacing);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
   get_parameter("esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);
@@ -413,6 +455,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter(
     "path_footprint_aware_shortcut_enabled",
     optimizer_params.geometry_preprocessor.footprint_aware_shortcut_enabled);
+  get_parameter(
+    "path_fillet_radius", optimizer_params.geometry_preprocessor.fillet_radius);
+  get_parameter(
+    "path_fillet_arc_samples", optimizer_params.geometry_preprocessor.fillet_arc_samples);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
@@ -829,6 +875,29 @@ void MincoPlannerNode::onPlannerGoal(
         ats_navigation_interfaces::msg::PlannerStatus::FAILURE_INVALID_GOAL);
     return;
   }
+  InitialKinematicState frozen_seed;
+  const geometry_msgs::msg::PoseStamped * frozen_start = nullptr;
+  if (!msg->start_pose.header.frame_id.empty()) {
+    if (!finitePose(msg->start_pose.pose) ||
+      !std::isfinite(msg->start_twist.linear.x) ||
+      !std::isfinite(msg->start_twist.linear.y) ||
+      !std::isfinite(msg->start_twist.linear.z) ||
+      !std::isfinite(msg->start_twist.angular.x) ||
+      !std::isfinite(msg->start_twist.angular.y) ||
+      !std::isfinite(msg->start_twist.angular.z))
+    {
+      publishPlannerStatus(
+          msg->goal_id, msg->localization_epoch, msg->plan_request_sequence, 0,
+          msg->map_publication_sequence,
+          ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
+          ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER);
+      return;
+    }
+    frozen_start = &msg->start_pose;
+    frozen_seed.valid = true;
+    frozen_seed.velocity = Eigen::Vector2d(
+      msg->start_twist.linear.x, msg->start_twist.linear.y);
+  }
   publishPlannerStatus(
       msg->goal_id, msg->localization_epoch, msg->plan_request_sequence, 0,
       msg->map_publication_sequence,
@@ -837,14 +906,17 @@ void MincoPlannerNode::onPlannerGoal(
   planGoal(
     msg->goal_pose, msg->goal_id, msg->localization_epoch,
     msg->plan_request_sequence,
-    msg->map_publication_sequence, true);
+    msg->map_publication_sequence, true, frozen_start,
+    frozen_seed.valid ? &frozen_seed : nullptr);
 }
 
 void MincoPlannerNode::planGoal(
     const geometry_msgs::msg::PoseStamped &input_goal, std::uint64_t goal_id,
     std::uint64_t localization_epoch, std::uint64_t plan_request_sequence,
     std::uint64_t map_publication_sequence,
-    bool report_status) {
+    bool report_status,
+    const geometry_msgs::msg::PoseStamped * frozen_start,
+    const InitialKinematicState * initial_state) {
   setPlanSafe(false);
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
@@ -877,9 +949,15 @@ void MincoPlannerNode::planGoal(
   }
   const auto & planning_grid = map_snapshot->grid;
   const auto & clearance_esdf = map_snapshot->clearance_esdf;
+  InitialKinematicState frozen_seed;
+  const InitialKinematicState * seed_ptr = nullptr;
+  if (initial_state && initial_state->valid) {
+    frozen_seed = *initial_state;
+    seed_ptr = &frozen_seed;
+  }
 
   geometry_msgs::msg::PoseStamped start;
-  if (!lookupStartPose(planning_grid, start)) {
+  if (!resolveStartPose(planning_grid, frozen_start, start)) {
     RCLCPP_WARN(get_logger(), "Cannot plan because start pose lookup failed.");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_START_TF,
       map_snapshot->generation);
@@ -964,10 +1042,12 @@ void MincoPlannerNode::planGoal(
   // These are diagnostic-only products. They deliberately publish before the
   // candidate gate so a fail-closed rejection can still be attributed to a
   // geometry, ESDF, time-allocation, or dynamic-limit stage.
-  raw_path_pub_->publish(search_result.path);
+  if (raw_path_pub_) {
+    raw_path_pub_->publish(search_result.path);
+  }
   MincoOptimizationTrace selected_trace;
   ReferenceTrajectory center_reference = optimizer_.optimize(
-    search_result.path, clearance_esdf.get(), nullptr, nullptr, &planning_grid,
+    search_result.path, clearance_esdf.get(), nullptr, seed_ptr, &planning_grid,
     &safety_checker_, &selected_trace);
   if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
     preprocessed_guide_pub_->publish(selected_trace.preprocessed_guide);
@@ -1011,7 +1091,7 @@ void MincoPlannerNode::planGoal(
   if (optimizer_.esdfFootprintOptimizationEnabled()) {
     MincoOptimizationTrace footprint_trace;
     ReferenceTrajectory footprint_reference = optimizer_.optimize(
-      search_result.path, clearance_esdf.get(), &center_reference, nullptr, &planning_grid,
+      search_result.path, clearance_esdf.get(), &center_reference, seed_ptr, &planning_grid,
       &safety_checker_, &footprint_trace);
     if (footprint_reference.valid()) {
       footprint_reference.header.stamp = now();
@@ -1034,7 +1114,7 @@ void MincoPlannerNode::planGoal(
     // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
     MincoOptimizationTrace fallback_trace;
     ReferenceTrajectory fallback_reference = optimizer_.optimize(
-      search_result.path, nullptr, nullptr, nullptr, &planning_grid, &safety_checker_,
+      search_result.path, nullptr, nullptr, seed_ptr, &planning_grid, &safety_checker_,
       &fallback_trace);
     if (fallback_reference.valid()) {
       fallback_reference.header.stamp = now();
@@ -1082,7 +1162,7 @@ void MincoPlannerNode::planGoal(
     // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
     MincoOptimizationTrace repair_trace;
     ReferenceTrajectory repaired = optimizer_.optimize(
-      toPath(reference), clearance_esdf.get(), &reference, nullptr, &planning_grid,
+      toPath(reference), clearance_esdf.get(), &reference, seed_ptr, &planning_grid,
       &safety_checker_, &repair_trace);
     if (!repaired.valid()) {
       // 退回修复前轨迹,交给下面既有的 footprint 拒绝路径。那条路径报
@@ -1123,12 +1203,37 @@ void MincoPlannerNode::planGoal(
     const std::size_t original_collisions = safety.collisions.size();
     const std::vector<std::size_t> candidates = terminalYawRelocationCandidates(
       reference, static_cast<std::size_t>(terminal_yaw_relocation_max_candidates_));
+    std::ostringstream candidate_list;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      if (i != 0U) {
+        candidate_list << ',';
+      }
+      candidate_list << candidates[i];
+    }
+    std::size_t first_conflict = 0;
+    std::size_t last_conflict = 0;
+    if (!safety.collisions.empty()) {
+      first_conflict = safety.collisions.front().trajectory_index;
+      last_conflict = first_conflict;
+      for (const CollisionSample & collision : safety.collisions) {
+        first_conflict = std::min(first_conflict, collision.trajectory_index);
+        last_conflict = std::max(last_conflict, collision.trajectory_index);
+      }
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "Terminal yaw relocation trying: tail_start=%zu window_start=%zu candidates=[%s] "
+      "conflict_span=[%zu,%zu] collisions=%zu.",
+      tail_start, window_start, candidate_list.str().c_str(), first_conflict, last_conflict,
+      original_collisions);
     std::size_t built = 0;
+    std::ostringstream rejected;
     for (const std::size_t rotation_index : candidates) {
       ReferenceTrajectory candidate;
       if (!relocateTerminalYawRotation(
           reference, goal_yaw, rotation_index, terminal_yaw_relocation_params_, &candidate))
       {
+        rejected << rotation_index << ":build_failed;";
         continue;
       }
       ++built;
@@ -1139,6 +1244,7 @@ void MincoPlannerNode::planGoal(
       const FootprintSafetyResult candidate_safety = safety_checker_.check(
         candidate, planning_grid);
       if (!candidate_safety.safe) {
+        rejected << rotation_index << ":footprint;";
         continue;
       }
       RCLCPP_WARN(
@@ -1154,9 +1260,10 @@ void MincoPlannerNode::planGoal(
     if (!safety.safe) {
       RCLCPP_WARN(
         get_logger(),
-        "Terminal yaw relocation exhausted: tail_start=%zu window_start=%zu candidates=%zu "
-        "built=%zu collisions=%zu; keeping the existing footprint rejection path.",
-        tail_start, window_start, candidates.size(), built, original_collisions);
+        "Terminal yaw relocation exhausted: tail_start=%zu window_start=%zu candidates=[%s] "
+        "built=%zu collisions=%zu rejected=%s; keeping the existing footprint rejection path.",
+        tail_start, window_start, candidate_list.str().c_str(), built, original_collisions,
+        rejected.str().c_str());
     }
   }
 
@@ -1166,7 +1273,9 @@ void MincoPlannerNode::planGoal(
   if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
     esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
   }
-  marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
+  if (marker_pub_) {
+    marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
+  }
   if (!reference.valid()) {
     RCLCPP_ERROR(get_logger(), "Rejecting an invalid MINCO reference trajectory.");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
@@ -1214,7 +1323,8 @@ void MincoPlannerNode::planGoal(
         "Rejecting unsafe MINCO trajectory with %zu footprint collisions "
         "(discrete=%zu swept=%zu) first_index=%zu last_index=%zu points=%zu "
         "first_sample=(%.3f, %.3f) first_center=(%.3f, %.3f, yaw=%.3f) "
-        "start=(%.3f, %.3f, yaw=%.3f) raw_points=%zu escape_allowed=%d "
+        "start=(%.3f, %.3f, yaw=%.3f) raw_points=%zu preprocessed_points=%zu "
+        "esdf_refined_points=%zu escape_allowed=%d "
         "escape_head_offset=%.3f m escape_prefix_end=%zu escape_candidate_prefix_end=%zu "
         "escape_prefix_length=%.3f m escape_prefix_yaw_sweep=%.3f rad.",
         safety.collisions.size(), discrete_collisions, swept_collisions,
@@ -1222,7 +1332,8 @@ void MincoPlannerNode::planGoal(
         first_collision.x, first_collision.y,
         first_center.x, first_center.y, first_center.yaw,
         reference.points.front().x, reference.points.front().y, reference.points.front().yaw,
-        search_result.path.poses.size(), static_cast<int>(escape_decision.allowed),
+        search_result.path.poses.size(), selected_trace.preprocessed_guide.poses.size(),
+        selected_trace.esdf_refined_guide.poses.size(), static_cast<int>(escape_decision.allowed),
         escape_decision.head_offset_m, escape_decision.prefix_end,
         escape_decision.candidate_prefix_end,
         escape_decision.prefix_length_m, escape_decision.prefix_yaw_sweep_rad);
@@ -1276,10 +1387,21 @@ void MincoPlannerNode::planGoal(
   }
   const std::uint8_t yaw_authority = selectYawAuthority(
     reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
+  PlannerCommitTelemetry telemetry;
+  telemetry.grid_topic = grid_topic_;
+  telemetry.validation_frame = planning_grid.header.frame_id.empty() ?
+    global_frame_ : planning_grid.header.frame_id;
+  telemetry.gate_collision_count =
+    static_cast<std::uint32_t>(safety.collisions.size());
+  telemetry.gate_collision_indices = formatCollisionIndices(safety.collisions);
+  telemetry.occupancy_digest = planning_digest::occupancyDigest(planning_grid);
+  telemetry.content_digest = planning_digest::pathContentDigest(control_reference);
+  telemetry.reference_point_count =
+    static_cast<std::uint32_t>(reference.points.size());
   if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch,
                                  control_reference, reference, goal_id, localization_epoch,
                                  plan_request_sequence, map_publication_sequence, yaw_authority,
-                                 report_status)) {
+                                 report_status, telemetry)) {
     RCLCPP_WARN(
       get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
       static_cast<unsigned long long>(map_snapshot->generation));
@@ -1301,6 +1423,7 @@ void MincoPlannerNode::planGoal(
     get_logger(),
     "planned generation=%llu snapshot_publication=%llu raw_points=%zu preprocessed_points=%zu "
     "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
+    "collision_indices=%s occupancy_digest=%s content_digest=%s grid_topic=%s validation_frame=%s "
     "escape_prefix_end=%zu "
     "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
     "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
@@ -1310,6 +1433,9 @@ void MincoPlannerNode::planGoal(
     static_cast<unsigned long long>(map_publication_sequence), search_result.path.poses.size(),
     selected_trace.preprocessed_guide.poses.size(), selected_trace.esdf_refined_guide.poses.size(),
     reference.points.size(), reference.totalLength(), reference.totalTime(), safety.collisions.size(),
+    telemetry.gate_collision_indices.c_str(), telemetry.occupancy_digest.c_str(),
+    telemetry.content_digest.c_str(), telemetry.grid_topic.c_str(),
+    telemetry.validation_frame.c_str(),
     escape_decision.prefix_end,
     search_result.expanded_nodes, static_cast<unsigned int>(yaw_authority),
     quality.minimum_center_clearance, quality.minimum_footprint_clearance, quality.length_ratio,
@@ -1399,6 +1525,20 @@ bool MincoPlannerNode::lookupStartPose(
   }
 }
 
+bool MincoPlannerNode::resolveStartPose(
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const geometry_msgs::msg::PoseStamped * frozen_start,
+  geometry_msgs::msg::PoseStamped & start) const
+{
+  if (frozen_start == nullptr || frozen_start->header.frame_id.empty()) {
+    return lookupStartPose(grid, start);
+  }
+  if (!finitePose(frozen_start->pose)) {
+    return false;
+  }
+  return transformGoalToGrid(grid, *frozen_start, start);
+}
+
 bool MincoPlannerNode::transformGoalToGrid(
   const nav_msgs::msg::OccupancyGrid & grid,
   const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const
@@ -1474,7 +1614,8 @@ void MincoPlannerNode::publishPlannerStatus(
     std::uint64_t map_generation, std::uint64_t map_publication_sequence,
     std::uint8_t state, std::uint8_t failure_reason,
     const builtin_interfaces::msg::Time &reference_stamp,
-    std::uint8_t yaw_authority, bool requires_gimbal_lock) {
+    std::uint8_t yaw_authority, bool requires_gimbal_lock,
+    const PlannerCommitTelemetry & telemetry) {
   if (!planner_status_pub_) {
     return;
   }
@@ -1491,6 +1632,13 @@ void MincoPlannerNode::publishPlannerStatus(
   status.failure_reason = failure_reason;
   status.yaw_authority = yaw_authority;
   status.requires_gimbal_lock = requires_gimbal_lock;
+  status.grid_topic = telemetry.grid_topic;
+  status.validation_frame = telemetry.validation_frame;
+  status.gate_collision_count = telemetry.gate_collision_count;
+  status.gate_collision_indices = telemetry.gate_collision_indices;
+  status.occupancy_digest = telemetry.occupancy_digest;
+  status.content_digest = telemetry.content_digest;
+  status.reference_point_count = telemetry.reference_point_count;
   planner_status_pub_->publish(status);
 }
 
@@ -1511,7 +1659,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     std::uint64_t plan_request_sequence,
     std::uint64_t map_publication_sequence,
     std::uint8_t yaw_authority,
-    bool report_status) {
+    bool report_status,
+    const PlannerCommitTelemetry & telemetry) {
   bool publish = false;
   nav_msgs::msg::Path candidate_reference;
   {
@@ -1567,7 +1716,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
           ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NONE,
           candidate_reference.header.stamp, yaw_authority,
           yaw_authority == ats_navigation_interfaces::msg::PlannerStatus::
-            YAW_AUTHORITY_BODY_YAW_FOLLOW);
+            YAW_AUTHORITY_BODY_YAW_FOLLOW,
+          telemetry);
     }
   }
   return publish;

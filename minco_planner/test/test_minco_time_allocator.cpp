@@ -56,4 +56,21 @@ TEST(MincoTimeAllocator, ShortEndpointSegmentsRemainFiniteAndMonotonic)
   EXPECT_DOUBLE_EQ(allocation.waypoint_speeds.back(), 0.0);
 }
 
+TEST(MincoTimeAllocator, TinyInitialSpeedDoesNotCreateCrawlDuration)
+{
+  minco_planner::MincoTimeAllocatorParams params;
+  params.reference_speed = 1.5;
+  params.max_velocity = 2.0;
+  params.max_acceleration = 2.5;
+  params.min_segment_time = 0.05;
+  minco_planner::MincoTimeAllocator allocator(params);
+  const auto allocation = allocator.allocate(
+    {Point(0.0, 0.0), Point(2.5, 0.0)}, 0.008);
+
+  ASSERT_TRUE(allocation.valid);
+  ASSERT_EQ(allocation.durations.size(), 1);
+  EXPECT_LT(allocation.durations(0), 20.0);
+  EXPECT_GT(allocation.durations(0), 0.5);
+}
+
 }  // namespace

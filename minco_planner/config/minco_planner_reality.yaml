@@ -20,9 +20,9 @@ minco_planner:
     reference_path_topic: minco/reference_path
     # 正式 reference 由目标管理器复核并重定时后提交，MINCO 只发候选。
     candidate_reference_path_topic: /minco/reference_path_candidate
-    preprocessed_guide_topic: /minco/preprocessed_guide
-    esdf_refined_guide_topic: /minco/esdf_refined_guide
-    debug_marker_topic: minco/debug_markers
+    preprocessed_guide_topic: ""
+    esdf_refined_guide_topic: ""
+    debug_marker_topic: ""
     # 实车规划地图唯一所有者为 rog_map adapter 的续租心跳。
     map_ready_topic: /rog_map_adapter/ready
     emergency_stop_topic: /planner/emergency_stop
@@ -60,26 +60,29 @@ minco_planner:
     esdf_obstacle_target_clearance: 0.45
     esdf_obstacle_max_iterations: 6
     esdf_obstacle_control_point_spacing: 0.30
+    guide_control_point_spacing: 0.30
     esdf_obstacle_max_step: 0.10
-    esdf_obstacle_max_deviation: 0.50
+    esdf_obstacle_max_deviation: 0.35
     esdf_obstacle_trust_region: 0.10
     esdf_obstacle_backtracking_steps: 4
     esdf_obstacle_smoothing_weight: 0.25
     esdf_footprint_optimization_enabled: true
-    esdf_footprint_clearance: 0.10
-    esdf_footprint_trigger_clearance: 0.08
-    esdf_footprint_target_clearance: 0.10
+    esdf_footprint_clearance: 0.14
+    esdf_footprint_trigger_clearance: 0.12
+    esdf_footprint_target_clearance: 0.14
     esdf_footprint_sample_spacing: 0.10
     path_duplicate_epsilon: 0.000001
     path_collinear_lateral_tolerance: 0.025
     path_short_segment_length: 0.05
     path_corner_angle_threshold_rad: 0.20
     path_footprint_aware_shortcut_enabled: true
+    path_fillet_radius: 0.35
+    path_fillet_arc_samples: 3
 
     yaw_mode: clearance_aware
     yaw_rate_limit: 2.5
-    narrow_clearance_enter: 0.55
-    narrow_clearance_exit: 0.70
+    narrow_clearance_enter: 1.20
+    narrow_clearance_exit: 1.40
     terminal_yaw_sample_period: 0.10
 
     footprint_length: 0.70

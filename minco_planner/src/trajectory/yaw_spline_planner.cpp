@@ -54,6 +54,15 @@ void YawSplinePlanner::applyClearanceAware(
   const double enter_clearance = std::max(0.0, params_.narrow_clearance_enter);
   const double exit_clearance = std::max(enter_clearance, params_.narrow_clearance_exit);
   bool narrow = false;
+  for (const auto & point : trajectory.points) {
+    if (std::isfinite(point.clearance) && point.clearance <= enter_clearance) {
+      // A path that enters a narrow section must start rotating before the
+      // vehicle reaches the wall; delaying tangent alignment creates the
+      // large yaw error seen in red-box goal 8.
+      narrow = true;
+      break;
+    }
+  }
   double previous_yaw = normalizeAngle(initial_yaw);
   double previous_t = trajectory.points.front().t;
   trajectory.points.front().yaw = previous_yaw;

@@ -4,9 +4,11 @@
 #include "ats_goal_manager/plan_progress_watchdog.hpp"
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
 
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -35,6 +37,7 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "builtin_interfaces/msg/time.hpp"
 
 namespace ats_goal_manager {
 
@@ -51,6 +54,30 @@ using PlanningMapSnapshot = ats_navigation_interfaces::msg::PlanningMapSnapshot;
 using PlannerGoal = ats_navigation_interfaces::msg::PlannerGoal;
 using PlannerStatus = ats_navigation_interfaces::msg::PlannerStatus;
 using YawAuthorityRequest = ats_navigation_interfaces::msg::YawAuthorityRequest;
+
+void fillCandidateDigest(std::array<std::uint8_t, 32> & out, const std::string & hex) {
+  out.fill(0U);
+  auto from_hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') {
+      return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+      return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+      return c - 'A' + 10;
+    }
+    return -1;
+  };
+  for (std::size_t i = 0; i + 1U < hex.size() && i / 2U < out.size(); i += 2U) {
+    const int high = from_hex(hex[i]);
+    const int low = from_hex(hex[i + 1U]);
+    if (high < 0 || low < 0) {
+      break;
+    }
+    out[i / 2U] = static_cast<std::uint8_t>((high << 4) | low);
+  }
+}
 
 const char *plannerFailureMessage(std::uint8_t failure_reason) {
   switch (failure_reason) {
@@ -439,10 +466,18 @@ private:
         !planningSnapshotUsableLocked(required_snapshot_sequence, localization_epoch)) {
         return false;
       }
+      if (!has_current_pose_ || !has_current_velocity_ || !odom_tf_healthy_) {
+        return false;
+      }
       request.map_publication_sequence = required_snapshot_sequence != 0U ?
         required_snapshot_sequence : map_status_publication_sequence_;
       request.plan_request_sequence = ++active_goal_->next_plan_request_sequence;
       active_goal_->expected_plan_request_sequence = request.plan_request_sequence;
+      request.start_pose = current_pose_;
+      request.start_pose.header.stamp = current_localization_stamp_;
+      request.start_twist.linear.x = current_world_vx_;
+      request.start_twist.linear.y = current_world_vy_;
+      request.start_twist.angular.z = current_world_wz_;
     }
     request.goal_pose = target;
     planner_goal_pub_->publish(request);
@@ -779,11 +814,25 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     current_pose_ = normalized;
     current_planning_pose_ = planning_normalized;
-    current_linear_velocity_ = std::hypot(
-      message->twist.twist.linear.x, message->twist.twist.linear.y);
-    current_angular_velocity_ = std::abs(message->twist.twist.angular.z);
-    has_current_velocity_ = std::isfinite(current_linear_velocity_) &&
-      std::isfinite(current_angular_velocity_);
+    const double yaw = tf2::getYaw(normalized.pose.orientation);
+    const double vx_body = message->twist.twist.linear.x;
+    const double vy_body = message->twist.twist.linear.y;
+    const double wz = message->twist.twist.angular.z;
+    if (!std::isfinite(yaw) || !std::isfinite(vx_body) || !std::isfinite(vy_body) ||
+        !std::isfinite(wz)) {
+      has_current_velocity_ = false;
+      odom_tf_healthy_ = true;
+      has_current_pose_ = true;
+      has_current_planning_pose_ = true;
+      return;
+    }
+    current_world_vx_ = vx_body * std::cos(yaw) - vy_body * std::sin(yaw);
+    current_world_vy_ = vx_body * std::sin(yaw) + vy_body * std::cos(yaw);
+    current_world_wz_ = wz;
+    current_linear_velocity_ = std::hypot(vx_body, vy_body);
+    current_angular_velocity_ = std::abs(wz);
+    current_localization_stamp_ = message->header.stamp;
+    has_current_velocity_ = true;
     has_current_pose_ = true;
     has_current_planning_pose_ = true;
     odom_tf_healthy_ = true;
@@ -894,6 +943,8 @@ private:
       pending_yaw_authority_request_->request_sequence : 0;
     command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
+    fillCandidateDigest(command.candidate_content_digest,
+                        planner_ready_status_->content_digest);
     fail_stop_ = false;
     active_goal_->recovering = false;
     active_goal_->wait_for_publication_after = 0;
@@ -919,7 +970,8 @@ private:
       get_logger(),
       "P2 reference commit goal=%llu localization_epoch=%llu plan_request_sequence=%llu "
       "source_generation=%llu map_generation=%llu map_publication_sequence=%llu "
-      "reference_stamp_ns=%lld poses=%zu",
+      "reference_stamp_ns=%lld poses=%zu published_digest=%s occupancy_digest=%s "
+      "gate_collisions=%u gate_indices=%s grid_topic=%s validation_frame=%s",
       static_cast<unsigned long long>(command.goal_id),
       static_cast<unsigned long long>(command.localization_epoch),
       static_cast<unsigned long long>(planner_ready_status_->plan_request_sequence),
@@ -928,7 +980,13 @@ private:
       static_cast<unsigned long long>(command.map_generation),
       static_cast<unsigned long long>(command.map_publication_sequence),
       static_cast<long long>(rclcpp::Time(command.reference.header.stamp).nanoseconds()),
-      command.reference.poses.size());
+      command.reference.poses.size(),
+      planner_ready_status_->content_digest.c_str(),
+      planner_ready_status_->occupancy_digest.c_str(),
+      planner_ready_status_->gate_collision_count,
+      planner_ready_status_->gate_collision_indices.c_str(),
+      planner_ready_status_->grid_topic.c_str(),
+      planner_ready_status_->validation_frame.c_str());
     publishEmergencyStop(false);
     publishExecutionCommand(command);
     reference_path_pub_->publish(committed);
@@ -1768,10 +1826,14 @@ private:
   std::uint8_t localization_status_{LocalizationStatus::STATE_UNINITIALIZED};
   geometry_msgs::msg::PoseStamped current_pose_;
   geometry_msgs::msg::PoseStamped current_planning_pose_;
+  builtin_interfaces::msg::Time current_localization_stamp_;
   bool has_current_pose_{false};
   bool has_current_planning_pose_{false};
   double current_linear_velocity_{std::numeric_limits<double>::infinity()};
   double current_angular_velocity_{std::numeric_limits<double>::infinity()};
+  double current_world_vx_{0.0};
+  double current_world_vy_{0.0};
+  double current_world_wz_{0.0};
   bool has_current_velocity_{false};
   bool odom_tf_healthy_{false};
   PlanProgressWatchdog progress_watchdog_;

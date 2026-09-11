@@ -11,3 +11,8 @@ uint64 plan_request_sequence
 # distinct from ROG source and MINCO local snapshot generations.
 uint64 map_publication_sequence
 geometry_msgs/PoseStamped goal_pose
+# Frozen at dispatch with the same localization epoch as goal_id / map snapshot.
+# start_pose.header.stamp is the localization sample used for this request.
+geometry_msgs/PoseStamped start_pose
+# World-frame twist at that localization sample. linear.x/y are map/odom world axes.
+geometry_msgs/Twist start_twist

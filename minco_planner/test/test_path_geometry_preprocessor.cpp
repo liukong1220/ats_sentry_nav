@@ -107,4 +107,50 @@ TEST(PathGeometryPreprocessor, ShortcutRejectsUnknownOutsideAndSweptFootprintCol
   EXPECT_EQ(blocked.waypoints.size(), 3U);
 }
 
+TEST(PathGeometryPreprocessor, InnerFilletReplacesSharpCornerWithoutOutsidePoints)
+{
+  minco_planner::PathGeometryPreprocessorParams params;
+  params.fillet_radius = 0.55;
+  params.fillet_arc_samples = 1;
+  params.footprint_aware_shortcut_enabled = false;
+  minco_planner::PathGeometryPreprocessor preprocessor(params);
+  const auto result = preprocessor.preprocess(makePath({
+      {0.0, 0.0}, {0.0, 2.0}, {2.0, 2.0}}));
+
+  ASSERT_GT(result.waypoints.size(), 3U);
+  bool kept_sharp_corner = false;
+  for (const auto & waypoint : result.waypoints) {
+    EXPECT_GE(waypoint.x(), -1e-6);
+    EXPECT_LE(waypoint.y(), 2.0 + 1e-6);
+    EXPECT_LE(waypoint.x(), 2.0 + 1e-6);
+    EXPECT_GE(waypoint.y(), -1e-6);
+    if (std::abs(waypoint.x()) <= 1e-6 && std::abs(waypoint.y() - 2.0) <= 1e-6) {
+      kept_sharp_corner = true;
+    }
+  }
+  EXPECT_FALSE(kept_sharp_corner);
+}
+
+TEST(PathGeometryPreprocessor, InnerFilletKeepsCornerWhenInnerArcHitsOccupied)
+{
+  auto grid = makeGrid();
+  for (double x = 0.10; x <= 0.50; x += 0.10) {
+    for (double y = 1.50; y <= 1.90; y += 0.10) {
+      setOccupied(grid, x, y);
+    }
+  }
+  const auto checker = makeChecker();
+  minco_planner::PathGeometryPreprocessorParams params;
+  params.fillet_radius = 0.55;
+  params.fillet_arc_samples = 3;
+  params.footprint_aware_shortcut_enabled = false;
+  minco_planner::PathGeometryPreprocessor preprocessor(params);
+  const auto result = preprocessor.preprocess(
+    makePath({{0.0, 0.0}, {0.0, 2.0}, {2.0, 2.0}}), &grid, &checker);
+
+  ASSERT_EQ(result.waypoints.size(), 3U);
+  EXPECT_NEAR(result.waypoints[1].x(), 0.0, 1e-9);
+  EXPECT_NEAR(result.waypoints[1].y(), 2.0, 1e-9);
+}
+
 }  // namespace
