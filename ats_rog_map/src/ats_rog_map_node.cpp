@@ -72,6 +72,8 @@ RogMapCoreParameters declareCoreParameters(rclcpp::Node & node)
     "core.map_sliding.enable", parameters.map_sliding_enable);
   parameters.map_sliding_threshold = node.declare_parameter<double>(
     "core.map_sliding.threshold", parameters.map_sliding_threshold);
+  parameters.map_sliding_max_recenter_jump = node.declare_parameter<double>(
+    "core.map_sliding.max_recenter_jump", parameters.map_sliding_max_recenter_jump);
   parameters.fix_map_origin = declareFixedArray(node, "core.fix_map_origin", parameters.fix_map_origin);
   parameters.frontier_extraction_enable = node.declare_parameter<bool>(
     "core.frontier_extraction_enable", parameters.frontier_extraction_enable);

@@ -105,6 +105,10 @@ namespace rog_map {
 
             loader.LoadParam(name_space + "/map_sliding/enable", map_sliding_en, true);
             loader.LoadParam(name_space + "/map_sliding/threshold", map_sliding_thresh, -1.0);
+            // <=0 disables. Gazebo sets a finite cap so Point-LIO divergence cannot
+            // recenter/wipe the local map (d20: out-of-range reset storm).
+            loader.LoadParam(name_space + "/map_sliding/max_recenter_jump",
+                             map_sliding_max_recenter_jump, -1.0);
 
             vector<double> temp_fix_origin;
             loader.LoadParam(name_space + "/fix_map_origin", temp_fix_origin, vector<double>{0, 0, 0});
@@ -390,6 +394,7 @@ namespace rog_map {
 
         double unk_thresh{};
         double map_sliding_thresh{};
+        double map_sliding_max_recenter_jump{-1.0};
 
         void resetMapSize() {
             int inflation_ratio = ceil(inflation_resolution / resolution);
