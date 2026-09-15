@@ -285,6 +285,11 @@ private:
         0.1, declare_parameter<double>("default_goal_timeout_sec", 120.0));
     goal_position_tolerance_ = std::max(
         0.0, declare_parameter<double>("goal_position_tolerance", 0.08));
+    // Hold radius for progress-watchdog suppression. Defaults to the success
+    // disk; Gazebo widens this so replan storms stop before the success latch.
+    progress_hold_distance_m_ = std::max(
+        goal_position_tolerance_,
+        declare_parameter<double>("progress_hold_distance_m", goal_position_tolerance_));
     goal_yaw_tolerance_ =
         std::max(0.0, declare_parameter<double>("goal_yaw_tolerance", 0.15));
     terminal_linear_velocity_tolerance_ = std::max(
@@ -414,7 +419,12 @@ private:
                                 false,
                                 0};
       progress_watchdog_.resetGoal(id);
-      localization_epoch = localization_epoch_.value_or(0);
+      // Prefer live fusion epoch; when require_localization_status=false the
+      // status callback used to skip bookkeeping so this stayed 0 while adapter
+      // snapshots carried epoch>=1 and recoverySnapshotReadyLocked never armed
+      // (d28: waiting_for_map despite ready=1 heartbeats). Fall back to the
+      // latest map-status epoch for Gazebo.
+      localization_epoch = localization_epoch_.value_or(map_status_localization_epoch_);
       map_publication_sequence = map_status_publication_sequence_;
       active_goal_->localization_epoch = localization_epoch;
       if (lifecycle_.state() == GoalLifecycleState::kWaitingForMap) {
@@ -536,19 +546,23 @@ private:
              // 脱离动作就可能解除，所以按瞬时故障等待下一次 snapshot
              // 发布再重规划。上界由 onTick 里挂起态的
              // no_executable_plan 预算给出，不再只依赖外部目标超时。
-             // 目标真正不可达仍是 FAILURE_NO_PATH，保持立即失败。
+             // FAILURE_NO_PATH 在动态占据地图上同样可能是瞬时的：domain 215
+             // 已短暂 tracking 后一次 NO_PATH 重规划在 ~14s 内立即杀掉了
+             // 仍距目标 ~5m 的目标，绕过了 Gazebo 90s no_executable_plan
+             // 预算。真正不可达改由该预算收敛，而不是首击失败。
+             message->failure_reason == PlannerStatus::FAILURE_NO_PATH ||
              message->failure_reason == PlannerStatus::FAILURE_START_ENCLOSED ||
+             // Domain 229: after west_corridor_east success the Gazebo ROG grid
+             // still marks ego occupied (ego_clear=0). The next goal then gets
+             // FAILURE_START_OR_GOAL_OCCUPIED with map ready + !recovering and
+             // used to abort in ~3 s (stitch never moved). Treat start/goal
+             // occupied like START_ENCLOSED — wait for the next snapshot /
+             // escape, bounded by no_executable_plan.
+             message->failure_reason ==
+               PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED ||
              message->failure_reason == PlannerStatus::FAILURE_START_TF ||
              message->failure_reason == PlannerStatus::FAILURE_GOAL_TF ||
-             message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF ||
-             (active_goal_->recovering &&
-              message->failure_reason ==
-                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED) ||
-             (message->failure_reason ==
-                PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED &&
-              (!mapReadyLocked() ||
-               !planningSnapshotUsableLocked(
-                 message->map_publication_sequence, active_goal_->localization_epoch))));
+             message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF);
         if (transient_failure) {
           active_goal_->recovering = true;
           map_ready_signal_ = false;
@@ -714,7 +728,14 @@ private:
   }
 
   void onLocalizationStatus(const LocalizationStatus::SharedPtr message) {
+    // When localization is not required (Gazebo), still bookkeep epoch/state so
+    // goal.localization_epoch matches adapter snapshots. Do not run the
+    // fail-closed TRACKING invalidate path.
     if (!require_localization_status_) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      last_localization_status_signal_ = std::chrono::steady_clock::now();
+      localization_status_ = message->state;
+      localization_epoch_ = message->epoch;
       return;
     }
     bool stop_active = false;
@@ -1148,7 +1169,18 @@ private:
           } else {
             terminal_converged_since_.reset();
           }
-          if (require_planning_snapshot_ && !pose_converged) {
+          // Progress watchdog exists to catch "not closing XY distance".
+          // Once inside the position disk, remaining yaw/velocity dwell is a
+          // terminal-alignment wait, not a progress stall. Treating yaw-only
+          // waits as stalls exhausts bounded replans at distance≈0.15 m when
+          // MINCO terminal-yaw relocation is footprint-blocked (Gazebo
+          // domains 207/209).
+          // Success disk (goal_position_tolerance_) and progress-hold disk
+          // (progress_hold_distance_m_) are intentionally separate. Watchdog
+          // replan storms stop inside the hold disk so tracking can finish
+          // closing the last metres; SUCCEEDED still requires the success disk.
+          const bool in_progress_hold = distance <= progress_hold_distance_m_;
+          if (require_planning_snapshot_ && !pose_converged && !in_progress_hold) {
             PlanningSnapshotSafetyResult snapshot_safety;
             // Status and snapshot are separate DDS samples.  A newer ready
             // heartbeat can be observed just before its matching snapshot;
@@ -1479,10 +1511,15 @@ private:
           last_map_status_signal_ &&
           std::chrono::steady_clock::now() - *last_map_status_signal_ <=
               secondsToDuration(map_ready_timeout_sec_);
-      const std::uint64_t expected_epoch =
-          require_localization_status_ ? localization_epoch_.value_or(0) : 0;
-      return lease_ok && map_status_ready_ &&
-             map_status_localization_epoch_ == expected_epoch;
+      // When localization status is not required (Gazebo GICP flicker), do not
+      // force expected_epoch=0. Adapter still bookkeeps a real epoch (>=1); the
+      // old `? epoch : 0` form made mapReadyLocked() permanently false after
+      // health-probe epoch alignment (map_status_epoch=1 vs expected 0) and
+      // goals stuck in waiting_for_map until map_wait deadline.
+      const bool epoch_ok =
+          !require_localization_status_ ||
+          map_status_localization_epoch_ == localization_epoch_.value_or(0);
+      return lease_ok && map_status_ready_ && epoch_ok;
     }
     return map_ready_signal_ && last_map_ready_signal_ &&
            std::chrono::steady_clock::now() - *last_map_ready_signal_ <=
@@ -1505,10 +1542,10 @@ private:
         last_map_status_signal_ &&
         std::chrono::steady_clock::now() - *last_map_status_signal_ <=
             secondsToDuration(map_ready_timeout_sec_);
-    const std::uint64_t expected_epoch =
-        require_localization_status_ ? localization_epoch_.value_or(0) : 0;
-    return lease_ok && map_status_heartbeat_ready_ &&
-           map_status_localization_epoch_ == expected_epoch;
+    const bool epoch_ok =
+        !require_localization_status_ ||
+        map_status_localization_epoch_ == localization_epoch_.value_or(0);
+    return lease_ok && map_status_heartbeat_ready_ && epoch_ok;
   }
 
   bool planningSnapshotUsableLocked(
@@ -1780,6 +1817,7 @@ private:
   double map_wait_timeout_sec_{5.0};
   double default_goal_timeout_sec_{120.0};
   double goal_position_tolerance_{0.08};
+  double progress_hold_distance_m_{0.08};
   double goal_yaw_tolerance_{0.15};
   double terminal_linear_velocity_tolerance_{0.05};
   double terminal_angular_velocity_tolerance_{0.10};
