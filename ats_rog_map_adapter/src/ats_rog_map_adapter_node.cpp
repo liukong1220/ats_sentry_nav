@@ -91,6 +91,11 @@ public:
         "localization_status_topic", "/localization/status");
     require_localization_status_ =
         declare_parameter<bool>("require_localization_status", false);
+    // When false (Gazebo GT sim), missing/stale terrain+slope become all-unknown
+    // placeholders so static+ROGMap projection can still fuse. Production keeps
+    // true: terrain sync failure remains fail-closed.
+    require_terrain_inputs_ =
+        declare_parameter<bool>("require_terrain_inputs", true);
     localization_status_timeout_sec_ = std::max(
         0.1, declare_parameter<double>("localization_status_timeout_sec", 1.0));
     fusion_params_.static_obstacle_value_threshold = declare_parameter<int>(
@@ -211,15 +216,20 @@ private:
   void onLocalizationStatus(
       const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
           message) {
-    if (!require_localization_status_) {
-      return;
-    }
+    // Always bookkeep epoch/state so map_status.localization_epoch stays
+    // aligned with /localization/status. Gazebo may disable
+    // require_localization_status to keep planning through GICP flicker;
+    // skipping this update left map_status_epoch=0 while fusion published
+    // epoch>=1 and permanently failed the health probe (stable=0/3).
     const bool epoch_changed =
         has_localization_status_ && message->epoch != localization_epoch_;
     has_localization_status_ = true;
     localization_epoch_ = message->epoch;
     localization_state_ = message->state;
     last_localization_status_signal_ = std::chrono::steady_clock::now();
+    if (!require_localization_status_) {
+      return;
+    }
     if (epoch_changed || message->state !=
                              ats_navigation_interfaces::msg::
                                  LocalizationStatus::STATE_TRACKING) {
@@ -265,8 +275,13 @@ private:
   bool projectionFresh(const nav_msgs::msg::OccupancyGrid & grid) const
   {
     const rclcpp::Time stamp(grid.header.stamp);
+    // ROGMap Gazebo projections often omit stamps (source_stamp_ns=0). This
+    // helper is only called on a just-received service response, so a zero
+    // stamp means "fresh at receipt" rather than "infinitely stale". Domain26
+    // saw 177 ready=0 flaps from the old stamp<=0 => false rule despite 30s
+    // projection_snapshot_timeout_sec.
     if (stamp.nanoseconds() <= 0) {
-      return false;
+      return true;
     }
     const double age = (now() - stamp).seconds();
     return age >= -0.1 && age <= projection_snapshot_timeout_sec_;
@@ -433,7 +448,14 @@ private:
       timestamp_delta(traversability, response.occupancy_grid.header.stamp),
       message_stamp_ns(slope), message_age(slope),
       timestamp_delta(slope, response.occupancy_grid.header.stamp));
-    if (!numeric_snapshot.available() || !projectionFresh(response.occupancy_grid)) {
+    // Mutable copy: Gazebo ROGMap often returns stamp=0. Fill receipt time so
+    // projectionFresh + terrain sync/TF share a coherent clock (d26: 177
+    // ready=0 from zero-stamp before terrain could even be evaluated).
+    nav_msgs::msg::OccupancyGrid projection_grid = response.occupancy_grid;
+    if (rclcpp::Time(projection_grid.header.stamp).nanoseconds() <= 0) {
+      projection_grid.header.stamp = now();
+    }
+    if (!numeric_snapshot.available() || !projectionFresh(projection_grid)) {
       publishUnavailable("ROGMap projection is unavailable or stale");
       return;
     }
@@ -465,23 +487,53 @@ private:
     const bool traversability_fresh = traversability && inputFresh(*traversability);
     const bool slope_fresh = slope && inputFresh(*slope);
     const bool traversability_synchronized = traversability && inputSynchronized(
-      *traversability, response.occupancy_grid.header.stamp);
+      *traversability, projection_grid.header.stamp);
     const bool slope_synchronized = slope && inputSynchronized(
-      *slope, response.occupancy_grid.header.stamp);
-    if (!static_map || !traversability_fresh || !slope_fresh ||
-      !traversability_synchronized || !slope_synchronized)
-    {
+      *slope, projection_grid.header.stamp);
+    if (!static_map) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "Terrain rejected: static=%d traversal fresh=%d sync=%d age=%.3f delta=%.3f; "
-        "slope fresh=%d sync=%d age=%.3f delta=%.3f",
-        static_map ? 1 : 0, traversability_fresh ? 1 : 0,
-        traversability_synchronized ? 1 : 0, message_age(traversability),
-        timestamp_delta(traversability, response.occupancy_grid.header.stamp),
-        slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0, message_age(slope),
-        timestamp_delta(slope, response.occupancy_grid.header.stamp));
+        "Static map missing; cannot fuse planning grid");
       publishUnavailable("Terrain inputs are missing, stale, or unsynchronized");
       return;
+    }
+    if (!traversability_fresh || !slope_fresh ||
+      !traversability_synchronized || !slope_synchronized)
+    {
+      if (require_terrain_inputs_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Terrain rejected: static=%d traversal fresh=%d sync=%d age=%.3f delta=%.3f; "
+          "slope fresh=%d sync=%d age=%.3f delta=%.3f",
+          1, traversability_fresh ? 1 : 0,
+          traversability_synchronized ? 1 : 0, message_age(traversability),
+          timestamp_delta(traversability, projection_grid.header.stamp),
+          slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0, message_age(slope),
+          timestamp_delta(slope, projection_grid.header.stamp));
+        publishUnavailable("Terrain inputs are missing, stale, or unsynchronized");
+        return;
+      }
+      const auto make_unknown_like =
+        [](const nav_msgs::msg::OccupancyGrid & source) {
+          auto masked = std::make_shared<nav_msgs::msg::OccupancyGrid>();
+          masked->header = source.header;
+          masked->info = source.info;
+          masked->data.assign(
+            source.info.width * source.info.height, static_cast<std::int8_t>(-1));
+          return masked;
+        };
+      if (!traversability_fresh || !traversability_synchronized) {
+        traversability = make_unknown_like(projection_grid);
+      }
+      if (!slope_fresh || !slope_synchronized) {
+        slope = make_unknown_like(projection_grid);
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "require_terrain_inputs=false: substituting unknown terrain/slope "
+        "(traversal fresh=%d sync=%d; slope fresh=%d sync=%d)",
+        traversability_fresh ? 1 : 0, traversability_synchronized ? 1 : 0,
+        slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0);
     }
     if (mask_secondary_evidence) {
       const auto unknown_copy = [](const nav_msgs::msg::OccupancyGrid & source) {
@@ -537,10 +589,10 @@ private:
     geometry_msgs::msg::TransformStamped static_from_projection;
     geometry_msgs::msg::TransformStamped static_from_robot;
     if (!lookupAtProjectionStamp(
-        static_map->header.frame_id, response.occupancy_grid.header.frame_id,
-        response.occupancy_grid.header.stamp, static_from_projection) ||
+        static_map->header.frame_id, projection_grid.header.frame_id,
+        projection_grid.header.stamp, static_from_projection) ||
       !lookupAtProjectionStamp(
-        static_map->header.frame_id, robot_frame_, response.occupancy_grid.header.stamp,
+        static_map->header.frame_id, robot_frame_, projection_grid.header.stamp,
         static_from_robot)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
@@ -551,7 +603,7 @@ private:
 
     GroundProjectionFusionResult fusion;
     if (!GroundProjectionFusion::fuse(
-        response.occupancy_grid, *traversability, *slope, *static_map,
+        projection_grid, *traversability, *slope, *static_map,
         static_from_projection, fusion_params_, fusion))
     {
       publishUnavailable("ROGMap terrain fusion failed");
@@ -776,6 +828,7 @@ private:
   double robot_unknown_clear_radius_{0.0};
   double localization_status_timeout_sec_{1.0};
   bool require_localization_status_{false};
+  bool require_terrain_inputs_{true};
   GroundProjectionFusionParams fusion_params_;
 
   tf2_ros::Buffer tf_buffer_;
