@@ -25,6 +25,8 @@ struct RogMapCoreParameters
   std::string pcd_name{"map.pcd"};
   bool map_sliding_enable{true};
   double map_sliding_threshold{1.0};
+  // <=0 disables. Caps OOB recenter so LIO divergence cannot wipe the map.
+  double map_sliding_max_recenter_jump{-1.0};
   std::array<double, 3> fix_map_origin{0.0, 0.0, 0.5};
   bool frontier_extraction_enable{false};
   bool ros_callback_enable{false};
@@ -83,6 +85,7 @@ inline rog_map::Config makeRogMapConfig(const RogMapCoreParameters & parameters)
   config.pcd_name = parameters.pcd_name;
   config.map_sliding_en = parameters.map_sliding_enable;
   config.map_sliding_thresh = parameters.map_sliding_threshold;
+  config.map_sliding_max_recenter_jump = parameters.map_sliding_max_recenter_jump;
   config.fix_map_origin = toVec3(parameters.fix_map_origin);
   config.frontier_extraction_en = parameters.frontier_extraction_enable;
   config.ros_callback_en = parameters.ros_callback_enable;

@@ -344,6 +344,17 @@ void ProbMap::updateProbMap(
     time_consuming_[4] = cloud.size();
     // insideLocalMap 机器人当前位置已经抛出当前局部地图的窗口了  并且没有要处理的点云
     if (cfg_.map_sliding_en && !insideLocalMap(map_center) && raycast_data_.batch_update_counter == 0) {
+
+        const double recenter_jump = (map_center - local_map_origin_d_).norm();
+        if (cfg_.map_sliding_max_recenter_jump > 0.0 &&
+            recenter_jump > cfg_.map_sliding_max_recenter_jump) {
+            std::cout << RED
+                << " -- [ROGMapCore] cur_pose jump " << recenter_jump
+                << " m exceeds max_recenter_jump "
+                << cfg_.map_sliding_max_recenter_jump
+                << "; refuse map reset (fail-closed)." << RESET << std::endl;
+            return;
+        }
         std::cout << YELLOW << " -- [ROGMapCore] cur_pose out of map range, reset the map." << RESET << std::endl;
         std::cout << YELLOW << " -- [ROGMapCore] Sliding to map center at: " << map_center.transpose() << RESET << std::endl;
         slideAllMap(map_center);
