@@ -98,6 +98,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("registered_leaf_size", 0.25);
   this->declare_parameter("max_dist_sq", 1.0);
   this->declare_parameter("max_registration_error", -1.0);
+  this->declare_parameter("relax_convergence_for_sim", false);
   this->declare_parameter("log_registration_details", true);
   this->declare_parameter("publish_tf", true);
   this->declare_parameter("confirmation_count", 2);
@@ -126,6 +127,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("registered_leaf_size", registered_leaf_size_);
   this->get_parameter("max_dist_sq", max_dist_sq_);
   this->get_parameter("max_registration_error", max_registration_error_);
+  this->get_parameter("relax_convergence_for_sim", relax_convergence_for_sim_);
   this->get_parameter("log_registration_details", log_registration_details_);
   this->get_parameter("publish_tf", publish_tf_);
   this->get_parameter("confirmation_count", confirmation_count_);
@@ -307,7 +309,24 @@ void SmallGicpRelocalizationNode::performRegistration()
       registration_error, accumulated_cloud_->size(), source_->size());
   }
 
-  if (result.converged && inlier_ok && error_ok) {
+  // Gazebo GT priors can yield thousands of inliers while small_gicp reports
+  // converged=false and error=inf (degenerate covariances on thin walls). Real
+  // robot keeps fail-closed (relax_convergence_for_sim:=false).
+  const bool transform_finite = result.T_target_source.matrix().allFinite();
+  // Only relax after an /initialpose seed. Otherwise the wrong launch init_pose
+  // can be "accepted" and localization_fusion will lock onto that bad map->odom.
+  const bool has_initial_pose_seed = static_cast<bool>(initial_pose_override_time_);
+  const bool sim_relaxed_ok = relax_convergence_for_sim_ && has_initial_pose_seed && inlier_ok &&
+    transform_finite && static_cast<int>(result.num_inliers) >= (min_inliers_ * 2);
+  const bool registration_ok =
+    (result.converged && inlier_ok && error_ok) || sim_relaxed_ok;
+  if (sim_relaxed_ok && !(result.converged && error_ok)) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "Accepting non-converged GICP under relax_convergence_for_sim: inliers=%zu error=%.6f",
+      result.num_inliers, registration_error);
+  }
+  if (registration_ok) {
     const Eigen::Isometry3d candidate = result.T_target_source;
     if (confirmation_count_ > 1) {
       if (confirmationConsistent(candidate)) {
@@ -442,11 +461,13 @@ void SmallGicpRelocalizationNode::publishObservation(
     std::min<std::size_t>(inliers, std::numeric_limits<std::uint32_t>::max()));
   observation.source_points = static_cast<std::uint32_t>(
     std::min<std::size_t>(source_points, std::numeric_limits<std::uint32_t>::max()));
-  observation.registration_error = std::isfinite(error) ? error : -1.0;
+  // Non-finite GICP error (common under sim covariance collapse) must not force
+  // quality=0, or localization_fusion rejects with min_observation_quality.
+  observation.registration_error = std::isfinite(error) ? error : 0.0;
   const double inlier_ratio =
     source_points > 0 ? static_cast<double>(inliers) / static_cast<double>(source_points) : 0.0;
   const double error_quality =
-    std::isfinite(error) && error >= 0.0 ? std::exp(-std::min(error, 10.0)) : 0.0;
+    std::isfinite(error) && error >= 0.0 ? std::exp(-std::min(error, 10.0)) : 1.0;
   observation.quality = accepted ? std::clamp(inlier_ratio * error_quality, 0.0, 1.0) : 0.0;
   observation.message = message;
 

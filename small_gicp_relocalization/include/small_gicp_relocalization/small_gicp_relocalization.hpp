@@ -77,6 +77,7 @@ private:
   float registered_leaf_size_;
   float max_dist_sq_;
   double max_registration_error_;
+  bool relax_convergence_for_sim_{false};
   bool log_registration_details_;
   bool publish_tf_;
   int confirmation_count_;
