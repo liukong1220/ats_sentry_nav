@@ -130,6 +130,12 @@ public:
     max_correction_translation_ =
       std::max(0.0, declare_parameter<double>("max_correction_translation", 2.0));
     max_correction_yaw_ = std::max(0.0, declare_parameter<double>("max_correction_yaw", 1.0));
+    // LOST-only wider gates for global recovery; TRACKING stays fail-closed at the base limits.
+    lost_max_correction_translation_ = std::max(
+      max_correction_translation_,
+      declare_parameter<double>("lost_max_correction_translation", 5.0));
+    lost_max_correction_yaw_ =
+      std::max(max_correction_yaw_, declare_parameter<double>("lost_max_correction_yaw", 1.5));
     min_observation_quality_ =
       std::clamp(declare_parameter<double>("min_observation_quality", 0.0), 0.0, 1.0);
     min_observation_inliers_ = static_cast<std::uint32_t>(
@@ -289,14 +295,20 @@ private:
     const CorrectionUpdate correction = selectCorrectionUpdate(
       candidate_map_to_odom, current_map_to_odom, epoch_translation_threshold_,
       epoch_yaw_threshold_);
-    if (
-      has_map_to_odom_ &&
-      ((max_correction_translation_ > 0.0 &&
-        correction.delta.translation > max_correction_translation_) ||
-       (max_correction_yaw_ > 0.0 && correction.delta.yaw > max_correction_yaw_))) {
-      recordRejectionLocked("relocalization correction exceeded plausibility gate", true);
-      publishStatusLocked();
-      return;
+    {
+      const bool lost = status_ == LocalizationStatus::STATE_LOST;
+      const double max_xy = lost ? lost_max_correction_translation_ : max_correction_translation_;
+      const double max_yaw = lost ? lost_max_correction_yaw_ : max_correction_yaw_;
+      if (
+        has_map_to_odom_ && ((max_xy > 0.0 && correction.delta.translation > max_xy) ||
+                             (max_yaw > 0.0 && correction.delta.yaw > max_yaw))) {
+        recordRejectionLocked(
+          lost ? "LOST relocalization correction exceeded lost plausibility gate"
+               : "relocalization correction exceeded plausibility gate",
+          true);
+        publishStatusLocked();
+        return;
+      }
     }
 
     // 阈值内观测只刷新健康状态，不改 TF；一旦改 TF 就必须同步推进 epoch。
@@ -481,6 +493,8 @@ private:
   double epoch_yaw_threshold_{0.05};
   double max_correction_translation_{2.0};
   double max_correction_yaw_{1.0};
+  double lost_max_correction_translation_{5.0};
+  double lost_max_correction_yaw_{1.5};
   double min_observation_quality_{0.0};
   std::uint32_t min_observation_inliers_{1};
   double max_registration_error_{-1.0};
