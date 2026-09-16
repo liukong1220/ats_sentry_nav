@@ -41,6 +41,30 @@ struct TrajectoryQualityMetrics
   std::vector<double> segment_durations;
 };
 
+/// Commit-time geometry gate for start→goal chord quality.
+/// Limits <= 0 disable that axis (MuJoCo/production default: both off).
+struct CommitGeometryLimits
+{
+  double max_length_ratio = 0.0;
+  double max_lateral_deviation_m = 0.0;
+};
+
+/// Returns false when a nominal reference is an excessive detour relative to the
+/// start–goal chord. Escape-from-contact commits should skip this gate.
+inline bool admitsCommitGeometry(
+  const TrajectoryQualityMetrics & metrics, const CommitGeometryLimits & limits)
+{
+  if (limits.max_length_ratio > 0.0 && metrics.length_ratio > limits.max_length_ratio) {
+    return false;
+  }
+  if (limits.max_lateral_deviation_m > 0.0 &&
+    metrics.max_lateral_deviation > limits.max_lateral_deviation_m)
+  {
+    return false;
+  }
+  return true;
+}
+
 class TrajectoryQualityEvaluator
 {
 public:

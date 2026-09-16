@@ -176,4 +176,36 @@ TEST(TrajectoryQualityEvaluator, UnsafeCandidateFailsClosedAndOldReferenceCannot
   EXPECT_TRUE(state.mapSnapshotUsable(18));
 }
 
+TEST(CommitGeometryAdmission, DisabledLimitsAlwaysAdmit)
+{
+  minco_planner::TrajectoryQualityMetrics metrics;
+  metrics.length_ratio = 9.0;
+  metrics.max_lateral_deviation = 20.0;
+  EXPECT_TRUE(minco_planner::admitsCommitGeometry(metrics, {}));
+}
+
+TEST(CommitGeometryAdmission, RejectsD21NorthMegaDetour)
+{
+  // d21 gen173 committed values that drove the robot north of spawn.
+  minco_planner::TrajectoryQualityMetrics metrics;
+  metrics.length_ratio = 5.496;
+  metrics.max_lateral_deviation = 7.424;
+  minco_planner::CommitGeometryLimits limits;
+  limits.max_length_ratio = 2.5;
+  limits.max_lateral_deviation_m = 3.0;
+  EXPECT_FALSE(minco_planner::admitsCommitGeometry(metrics, limits));
+}
+
+TEST(CommitGeometryAdmission, AdmitsShortSouthPath)
+{
+  // d21 gen141 / gen152 still admit under the Gazebo gate.
+  minco_planner::TrajectoryQualityMetrics metrics;
+  metrics.length_ratio = 1.486;
+  metrics.max_lateral_deviation = 1.967;
+  minco_planner::CommitGeometryLimits limits;
+  limits.max_length_ratio = 2.5;
+  limits.max_lateral_deviation_m = 3.0;
+  EXPECT_TRUE(minco_planner::admitsCommitGeometry(metrics, limits));
+}
+
 }  // namespace

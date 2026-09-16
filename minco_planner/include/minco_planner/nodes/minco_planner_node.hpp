@@ -191,6 +191,8 @@ private:
   FootprintSafetyParams footprint_params_{};
   /// 目标位姿准入：目标点足迹不可行时，在成功容差域内挑一个可行终点。
   GoalPoseAdmissionParams goal_pose_admission_params_{};
+  /// Nominal commit geometry gate (disabled when both limits <= 0).
+  CommitGeometryLimits commit_geometry_limits_{};
   FootprintSafetyChecker safety_checker_;
   LocalCollisionRepair collision_repair_;
   PlannerDebugVisualizer visualizer_;
