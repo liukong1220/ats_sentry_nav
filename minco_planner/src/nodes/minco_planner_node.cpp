@@ -239,6 +239,11 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<int>(
     "goal_admission_yaw_samples",
     static_cast<int>(goal_pose_admission_params_.yaw_samples));
+  // <=0 disables. Gazebo red_box enables to block north mega-detours (d21).
+  declare_parameter<double>(
+    "commit_max_length_ratio", commit_geometry_limits_.max_length_ratio);
+  declare_parameter<double>(
+    "commit_max_lateral_deviation_m", commit_geometry_limits_.max_lateral_deviation_m);
   declare_parameter<bool>("planner_manages_emergency_stop", planner_manages_emergency_stop_);
 
   GridAstarParams astar_params;
@@ -399,6 +404,13 @@ void MincoPlannerNode::declareAndLoadParams()
     goal_pose_admission_params_.yaw_samples =
       static_cast<std::size_t>(std::max(1, goal_admission_yaw_samples));
   }
+  get_parameter("commit_max_length_ratio", commit_geometry_limits_.max_length_ratio);
+  get_parameter(
+    "commit_max_lateral_deviation_m", commit_geometry_limits_.max_lateral_deviation_m);
+  commit_geometry_limits_.max_length_ratio =
+    std::max(0.0, commit_geometry_limits_.max_length_ratio);
+  commit_geometry_limits_.max_lateral_deviation_m =
+    std::max(0.0, commit_geometry_limits_.max_lateral_deviation_m);
   get_parameter("planner_manages_emergency_stop", planner_manages_emergency_stop_);
   get_parameter("obstacle_value_threshold", obstacle_value_threshold_);
   get_parameter("unknown_is_obstacle", unknown_is_obstacle_);
@@ -1374,6 +1386,20 @@ void MincoPlannerNode::planGoal(
     RCLCPP_ERROR(
       get_logger(), "Rejecting MINCO trajectory with non-finite derivatives or non-monotonic time.");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
+      map_snapshot->generation);
+    return;
+  }
+  // Nominal commits only: escape-from-contact may need a short lateral shove.
+  // d21 gen173 committed length_ratio=5.496 lateral=7.424 and drove north of spawn.
+  if (safety.safe && !admitsCommitGeometry(quality, commit_geometry_limits_)) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Rejecting MINCO detour before commit: length_ratio=%.3f (max=%.3f) "
+      "lateral=%.3f m (max=%.3f m) path_length=%.2f direct=%.2f.",
+      quality.length_ratio, commit_geometry_limits_.max_length_ratio,
+      quality.max_lateral_deviation, commit_geometry_limits_.max_lateral_deviation_m,
+      quality.path_length, quality.direct_length);
+    fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_NO_PATH,
       map_snapshot->generation);
     return;
   }
