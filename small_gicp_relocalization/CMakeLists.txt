@@ -61,9 +61,20 @@ if(BUILD_TESTING)
   target_include_directories(test_localization_fusion_core PUBLIC include)
   ament_target_dependencies(test_localization_fusion_core rclcpp tf2)
 
+  ament_add_gtest(test_relocalization_candidate_core
+    test/test_relocalization_candidate_core.cpp
+  )
+  target_include_directories(test_relocalization_candidate_core PUBLIC include)
+  ament_target_dependencies(test_relocalization_candidate_core tf2_eigen)
+
   ament_add_pytest_test(test_localization_fusion_node
     test/test_localization_fusion_node.py
     TIMEOUT 40
+  )
+
+  ament_add_pytest_test(test_localization_fusion_cold_seed
+    test/test_localization_fusion_cold_seed.py
+    TIMEOUT 60
   )
 endif()
 
