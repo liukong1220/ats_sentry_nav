@@ -853,7 +853,7 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
     "Runtime swept footprint rejected goal=%llu candidate_generation=%llu "
     "current_generation=%llu collisions=%zu discrete_samples=%zu swept_samples=%zu "
     "first_index=%zu first_swept=%d first_collision=(%.3f,%.3f) "
-    "reference_center=(%.3f,%.3f,%.3f).",
+    "remaining_start=(%.3f,%.3f,%.3f) reference_center=(%.3f,%.3f,%.3f).",
     static_cast<unsigned long long>(active_reference->goal_id),
     static_cast<unsigned long long>(active_reference->map_generation),
     static_cast<unsigned long long>(snapshot->generation), safety.collisions.size(),
@@ -861,6 +861,7 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
     has_collision && safety.collisions.front().swept ? 1 : 0,
     has_collision ? safety.collisions.front().x : 0.0,
     has_collision ? safety.collisions.front().y : 0.0,
+    remaining.points.front().x, remaining.points.front().y, remaining.points.front().yaw,
     collision_reference.x, collision_reference.y, collision_reference.yaw);
   publishPlannerStatus(
     active_reference->goal_id, active_reference->localization_epoch,

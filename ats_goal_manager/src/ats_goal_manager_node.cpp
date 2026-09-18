@@ -1476,6 +1476,14 @@ private:
     publishExecutionStop(
       finished->id, finished->localization_epoch, PlannerStatus::FAILURE_NONE,
       0, 0);
+    RCLCPP_INFO(
+      get_logger(),
+      "TRACE action_result code=%u terminal_state=%s goal=%llu message=%s "
+      "final_distance_m=%.3f final_pose=(%.3f,%.3f,%.3f)",
+      static_cast<unsigned>(result_code), stateName(terminal_state).c_str(),
+      static_cast<unsigned long long>(finished->id), message.c_str(), distance,
+      final_pose.pose.position.x, final_pose.pose.position.y,
+      tf2::getYaw(final_pose.pose.orientation));
     if (finished->action_handle) {
       auto result = std::make_shared<NavigateToPose::Result>();
       result->result_code = result_code;
@@ -1774,7 +1782,23 @@ private:
   void publishExecutionCommand(ExecutionCommand command) {
     command.manager_incarnation = manager_incarnation_;
     command.command_sequence = ++next_execution_command_sequence_;
-    command.header.stamp = now();
+    const rclcpp::Time publish_stamp = now();
+    command.header.stamp = publish_stamp;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "TRACE execution_command emit mode=%u incarnation=%llu sequence=%llu "
+      "stamp_ns=%lld goal=%llu epoch=%llu map_generation=%llu map_sequence=%llu "
+      "reference_stamp_ns=%lld poses=%zu",
+      static_cast<unsigned>(command.mode),
+      static_cast<unsigned long long>(command.manager_incarnation),
+      static_cast<unsigned long long>(command.command_sequence),
+      static_cast<long long>(publish_stamp.nanoseconds()),
+      static_cast<unsigned long long>(command.goal_id),
+      static_cast<unsigned long long>(command.localization_epoch),
+      static_cast<unsigned long long>(command.map_generation),
+      static_cast<unsigned long long>(command.map_publication_sequence),
+      static_cast<long long>(rclcpp::Time(command.reference.header.stamp).nanoseconds()),
+      command.reference.poses.size());
     execution_command_pub_->publish(command);
   }
 
