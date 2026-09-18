@@ -594,8 +594,15 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
  */
 void AtsSwerveMpcNode::onExecutionCommand(
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message) {
+  const rclcpp::Time receipt = now();
+  const rclcpp::Time command_stamp = message ?
+    rclcpp::Time(message->header.stamp, receipt.get_clock_type()) : receipt;
   if (!message || message->manager_incarnation == 0 ||
       message->command_sequence == 0) {
+    RCLCPP_ERROR(
+        get_logger(),
+        "TRACE execution_command rejected=invalid receipt_ns=%lld",
+        static_cast<long long>(receipt.nanoseconds()));
     engageFailStop();
     return;
   }
@@ -605,6 +612,15 @@ void AtsSwerveMpcNode::onExecutionCommand(
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     if (message->manager_incarnation < last_execution_command_incarnation_) {
+      RCLCPP_WARN(
+          get_logger(),
+          "TRACE execution_command rejected=old_incarnation incarnation=%llu sequence=%llu "
+          "stamp_ns=%lld receipt_ns=%lld active_incarnation=%llu",
+          static_cast<unsigned long long>(message->manager_incarnation),
+          static_cast<unsigned long long>(message->command_sequence),
+          static_cast<long long>(command_stamp.nanoseconds()),
+          static_cast<long long>(receipt.nanoseconds()),
+          static_cast<unsigned long long>(last_execution_command_incarnation_));
       return;
     }
     if (message->manager_incarnation > last_execution_command_incarnation_) {
@@ -619,6 +635,15 @@ void AtsSwerveMpcNode::onExecutionCommand(
         active_execution_command_.reset();
       }
     } else if (message->command_sequence <= last_execution_command_sequence_) {
+      RCLCPP_WARN(
+          get_logger(),
+          "TRACE execution_command rejected=replay incarnation=%llu sequence=%llu "
+          "stamp_ns=%lld receipt_ns=%lld last_sequence=%llu",
+          static_cast<unsigned long long>(message->manager_incarnation),
+          static_cast<unsigned long long>(message->command_sequence),
+          static_cast<long long>(command_stamp.nanoseconds()),
+          static_cast<long long>(receipt.nanoseconds()),
+          static_cast<unsigned long long>(last_execution_command_sequence_));
       return;
     } else {
       last_execution_command_sequence_ = message->command_sequence;
@@ -658,13 +683,48 @@ void AtsSwerveMpcNode::onExecutionCommand(
     }
   }
   if (stop) {
+    RCLCPP_WARN(
+        get_logger(),
+        "TRACE execution_command accepted=0 stop=1 mode=%u incarnation=%llu sequence=%llu "
+        "stamp_ns=%lld receipt_ns=%lld goal=%llu map_generation=%llu map_sequence=%llu",
+        static_cast<unsigned>(message->mode),
+        static_cast<unsigned long long>(message->manager_incarnation),
+        static_cast<unsigned long long>(message->command_sequence),
+        static_cast<long long>(command_stamp.nanoseconds()),
+        static_cast<long long>(receipt.nanoseconds()),
+        static_cast<unsigned long long>(message->goal_id),
+        static_cast<unsigned long long>(message->map_generation),
+        static_cast<unsigned long long>(message->map_publication_sequence));
     engageFailStop();
     return;
   }
   if (install_reference && !installPath(message->reference)) {
+    RCLCPP_ERROR(
+        get_logger(),
+        "TRACE execution_command rejected=reference_install incarnation=%llu sequence=%llu "
+        "stamp_ns=%lld receipt_ns=%lld goal=%llu poses=%zu",
+        static_cast<unsigned long long>(message->manager_incarnation),
+        static_cast<unsigned long long>(message->command_sequence),
+        static_cast<long long>(command_stamp.nanoseconds()),
+        static_cast<long long>(receipt.nanoseconds()),
+        static_cast<unsigned long long>(message->goal_id), message->reference.poses.size());
     engageFailStop();
     return;
   }
+  RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "TRACE execution_command accepted=1 incarnation=%llu sequence=%llu "
+      "stamp_ns=%lld receipt_ns=%lld goal=%llu epoch=%llu map_generation=%llu "
+      "map_sequence=%llu snapshot_identity_pending=1 poses=%zu",
+      static_cast<unsigned long long>(message->manager_incarnation),
+      static_cast<unsigned long long>(message->command_sequence),
+      static_cast<long long>(command_stamp.nanoseconds()),
+      static_cast<long long>(receipt.nanoseconds()),
+      static_cast<unsigned long long>(message->goal_id),
+      static_cast<unsigned long long>(message->localization_epoch),
+      static_cast<unsigned long long>(message->map_generation),
+      static_cast<unsigned long long>(message->map_publication_sequence),
+      message->reference.poses.size());
   fail_stop_engaged_.store(false);
 }
 

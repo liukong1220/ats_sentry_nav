@@ -105,17 +105,32 @@ private:
     if (stamp > receipt) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "rejecting future ExecutionCommand incarnation=%llu sequence=%llu",
+        "TRACE execution_command rejected=future mode=%u incarnation=%llu sequence=%llu "
+        "stamp_ns=%lld receipt_ns=%lld future_ns=%lld",
+        static_cast<unsigned>(msg->mode),
         static_cast<unsigned long long>(msg->manager_incarnation),
-        static_cast<unsigned long long>(msg->command_sequence));
+        static_cast<unsigned long long>(msg->command_sequence),
+        static_cast<long long>(stamp.nanoseconds()),
+        static_cast<long long>(receipt.nanoseconds()),
+        static_cast<long long>((stamp - receipt).nanoseconds()));
       return;
     }
     const auto age = std::chrono::milliseconds(
       static_cast<int64_t>((receipt - stamp).seconds() * 1000.0));
     std::lock_guard<std::mutex> lock(mutex_);
-    arbiter_.onExecutionCommand(
+    const bool accepted = arbiter_.onExecutionCommand(
       execute, msg->manager_incarnation, msg->command_sequence, age,
       std::chrono::steady_clock::now());
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "TRACE execution_command accepted=%d mode=%u incarnation=%llu sequence=%llu "
+      "stamp_ns=%lld receipt_ns=%lld age_ms=%lld auto_authorized=%d",
+      accepted ? 1 : 0, static_cast<unsigned>(msg->mode),
+      static_cast<unsigned long long>(msg->manager_incarnation),
+      static_cast<unsigned long long>(msg->command_sequence),
+      static_cast<long long>(stamp.nanoseconds()),
+      static_cast<long long>(receipt.nanoseconds()),
+      static_cast<long long>(age.count()), arbiter_.autoAuthorized() ? 1 : 0);
   }
 
   void onEmergencyStop(const std_msgs::msg::Bool::SharedPtr msg)
