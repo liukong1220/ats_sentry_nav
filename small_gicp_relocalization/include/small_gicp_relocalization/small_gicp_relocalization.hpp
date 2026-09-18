@@ -39,6 +39,7 @@
 #include "small_gicp/registration/reduction_omp.hpp"
 #include "small_gicp/registration/registration.hpp"
 #include "small_gicp_relocalization/relocalization_candidate_core.hpp"
+#include "small_gicp_relocalization/scan_input_core.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -142,6 +143,7 @@ private:
   bool simRelaxAllowed() const;
   void clearAccumulation();
   void preprocessAccumulatedSource();
+  void recordDroppedScan(const std::string & reason);
   double accumulatedCloudAgeSeconds() const;
   std::optional<Eigen::Isometry3d> getCurrentRobotBaseToOdom() const;
   std::optional<Eigen::Isometry3d> getOdomToRobotBase(const rclcpp::Time & stamp) const;
@@ -207,6 +209,15 @@ private:
   double initial_pose_force_registration_window_s_;
   double transform_future_offset_s_;
   double max_scan_stamp_lag_s_;
+  double max_scan_age_s_{1.0};
+  double max_scan_future_s_{0.10};
+  double scan_min_range_m_{0.10};
+  double scan_max_range_m_{100.0};
+  double scan_min_z_m_{-5.0};
+  double scan_max_z_m_{5.0};
+  double min_scan_valid_ratio_{0.50};
+  std::size_t max_accumulated_points_{40000};
+  int max_accumulated_frames_{30};
   std::vector<double> init_pose_;
 
   // Coarse-to-fine / windowed alignment (BIT icp_relocalization + HWSentry quality gates).
@@ -282,6 +293,12 @@ private:
   std::optional<rclcpp::Time> first_accumulated_scan_time_;
   std::optional<rclcpp::Time> initial_pose_override_time_;
   bool has_received_scan_{false};
+  std::int64_t last_received_scan_stamp_ns_{0};
+  std::uint64_t accepted_scan_count_{0};
+  std::uint64_t dropped_scan_count_{0};
+  std::uint64_t stale_scan_count_{0};
+  std::uint64_t invalid_scan_count_{0};
+  std::uint64_t trimmed_accumulation_count_{0};
   std::uint64_t observation_sequence_{0};
   int pending_confirmation_count_{0};
   std::optional<ConfirmationSample> pending_confirmation_;
