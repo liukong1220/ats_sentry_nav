@@ -77,3 +77,9 @@ The default limits are conservative for real and simulated runs. Offline replay
 may set `max_scan_age_s:=0` when message timestamps intentionally do not share the
 replay node's clock; this disables only the age gate, not frame, monotonicity,
 finite-point or range checks.
+
+The fusion node applies a separate receive-time gate to accepted observations:
+`observation_stamp_max_age_s` and `observation_stamp_max_future_s` prevent a
+delayed message from changing `map->odom` merely because the matching odometry
+sample is still present in the history buffer. The existing odometry-history,
+quality, plausibility, confirmation and epoch checks remain authoritative.

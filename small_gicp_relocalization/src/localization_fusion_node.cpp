@@ -114,6 +114,10 @@ public:
     observation_lost_timeout_s_ = std::max(
       observation_degraded_timeout_s_,
       declare_parameter<double>("observation_lost_timeout_s", 10.0));
+    observation_stamp_max_age_s_ =
+      std::max(0.0, declare_parameter<double>("observation_stamp_max_age_s", 1.0));
+    observation_stamp_max_future_s_ =
+      std::max(0.0, declare_parameter<double>("observation_stamp_max_future_s", 0.25));
     history_duration_s_ = std::max(0.5, declare_parameter<double>("history_duration_s", 5.0));
     history_boundary_tolerance_s_ =
       std::max(0.0, declare_parameter<double>("history_boundary_tolerance_s", 0.10));
@@ -248,6 +252,14 @@ private:
     }
     last_input_observation_stamp_ = stamp;
     last_input_observation_sequence_ = message->sequence;
+
+    const std::string stamp_error = validateObservationStamp(
+      stamp, now(), observation_stamp_max_age_s_, observation_stamp_max_future_s_);
+    if (!stamp_error.empty()) {
+      recordRejectionLocked(stamp_error, true);
+      publishStatusLocked();
+      return;
+    }
 
     if (message->status == RelocalizationObservation::STATUS_PENDING_CONFIRMATION) {
       if (!has_map_to_odom_) {
@@ -499,6 +511,8 @@ private:
   double odom_timeout_s_{0.5};
   double observation_degraded_timeout_s_{3.0};
   double observation_lost_timeout_s_{10.0};
+  double observation_stamp_max_age_s_{1.0};
+  double observation_stamp_max_future_s_{0.25};
   double history_duration_s_{5.0};
   double history_boundary_tolerance_s_{0.1};
   double maximum_interpolation_gap_s_{0.2};
