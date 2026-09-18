@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <string>
 
 #include "rclcpp/rclcpp.hpp"
 #include "tf2/LinearMath/Transform.h"
@@ -106,6 +107,26 @@ inline bool observationIsNewer(
     return false;
   }
   return !last_sequence || sequence > *last_sequence;
+}
+
+/// Reject observations that arrive long after their measurement time. The comparison
+/// uses nanoseconds so ROS and system clock types cannot be mixed accidentally.
+inline std::string validateObservationStamp(
+  const rclcpp::Time & stamp, const rclcpp::Time & now, double max_age_s, double max_future_s)
+{
+  const std::int64_t stamp_ns = stamp.nanoseconds();
+  const std::int64_t now_ns = now.nanoseconds();
+  if (stamp_ns <= 0 || now_ns <= 0) {
+    return {};
+  }
+  const double age_s = static_cast<double>(now_ns - stamp_ns) * 1e-9;
+  if (max_age_s > 0.0 && age_s > max_age_s) {
+    return "observation stamp is stale by " + std::to_string(age_s) + " s";
+  }
+  if (max_future_s >= 0.0 && age_s < -max_future_s) {
+    return "observation stamp is too far in the future by " + std::to_string(-age_s) + " s";
+  }
+  return {};
 }
 
 inline CorrectionDelta correctionDelta(const tf2::Transform & newer, const tf2::Transform & older)

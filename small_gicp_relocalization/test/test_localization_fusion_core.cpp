@@ -77,6 +77,13 @@ TEST(LocalizationFusionCore, UsesStampBeforeSequenceAcrossPublisherRestart)
   EXPECT_TRUE(observationIsNewer(seconds(6.0), 1, last_stamp, last_sequence));
 }
 
+TEST(LocalizationFusionCore, RejectsDelayedOrFarFutureObservationStamp)
+{
+  EXPECT_NE(validateObservationStamp(seconds(1.0), seconds(3.0), 1.0, 0.25), "");
+  EXPECT_NE(validateObservationStamp(seconds(3.5), seconds(3.0), 1.0, 0.25), "");
+  EXPECT_EQ(validateObservationStamp(seconds(2.2), seconds(3.0), 1.0, 0.25), "");
+}
+
 TEST(LocalizationFusionCore, MeasuresWrappedCorrectionDelta)
 {
   const auto older = makeTransform(0.0, M_PI - 0.05);
