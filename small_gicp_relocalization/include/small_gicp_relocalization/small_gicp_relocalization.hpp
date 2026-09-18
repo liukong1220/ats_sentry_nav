@@ -38,6 +38,7 @@
 #include "small_gicp/pcl/pcl_point.hpp"
 #include "small_gicp/registration/reduction_omp.hpp"
 #include "small_gicp/registration/registration.hpp"
+#include "small_gicp_relocalization/relocalization_candidate_core.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -57,6 +58,10 @@ private:
   using GicpRegistration =
     small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP>;
 
+  /// 门禁语义分层。coarse 是被迭代上限截断的筛选级，其 converged 标志不携带信息，
+  /// 只有 fine 级有权认定收敛。kScreen 仅豁免 converged，其余硬门保持不变。
+  enum class GateStage { kScreen, kAccept };
+
   struct RegistrationAttempt
   {
     bool ok{false};
@@ -71,6 +76,52 @@ private:
     Eigen::Matrix<double, 6, 6> information{Eigen::Matrix<double, 6, 6>::Zero()};
     std::string stage{"none"};
     std::string reject_reason;
+    // 组合评分与歧义证据。单一 residual 不再是选择依据。
+    double score{std::numeric_limits<double>::infinity()};
+    double alternative_score{std::numeric_limits<double>::infinity()};
+    double score_margin{std::numeric_limits<double>::infinity()};
+    bool ambiguous{false};
+    double motion_residual{0.0};
+    double prior_deviation{0.0};
+  };
+
+  /// 异步 multi_guess 的不可变输入快照。worker 线程只读这些字段，
+  /// 不触碰节点状态，避免与 /initialpose、status 回调竞争。
+  struct MultiGuessRequest
+  {
+    PointCovarianceCloud::Ptr source;
+    std::shared_ptr<PointKdTree> source_tree;
+    /// coarse 筛选专用的降采样源云。为空时退回 source。
+    PointCovarianceCloud::Ptr screen_source;
+    std::shared_ptr<PointKdTree> screen_source_tree;
+    Eigen::Isometry3d seed{Eigen::Isometry3d::Identity()};
+    /// 本次扫描是为复核待确认假设而运行，cursor 不代表探索进度。
+    bool confirmation_recheck{false};
+    std::size_t cursor{0};
+    std::uint64_t sweep{0};
+    bool allow_unconverged{false};
+    /// 上一帧通过硬门的假设，供 motion 一致性软约束使用；无参考时为空。
+    std::optional<ConfirmationSample> reference;
+    std::optional<Eigen::Isometry3d> current_odom_to_base;
+    std::size_t source_points{0};
+  };
+
+  struct MultiGuessOutcome
+  {
+    RegistrationAttempt best;
+    CandidateLatticeStats lattice;
+    std::size_t evaluated{0};
+    std::size_t gated{0};
+    /// 实际做过 fine 精配准的候选数。screen 数远大于它是预期行为。
+    std::size_t refined{0};
+    std::size_t skipped{0};
+    std::size_t cursor{0};
+    bool confirmation_recheck{false};
+    std::size_t next_cursor{0};
+    bool wrapped{false};
+    bool budget_exhausted{false};
+    double elapsed_s{0.0};
+    CandidateSelection selection;
   };
 
   void registeredPcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
@@ -87,12 +138,16 @@ private:
   bool shouldRunRegistration();
   bool isRecoveringLocalization() const;
   bool preferMultiGuess() const;
+  bool inInitialPoseForceWindow() const;
+  bool simRelaxAllowed() const;
   void clearAccumulation();
   void preprocessAccumulatedSource();
   double accumulatedCloudAgeSeconds() const;
   std::optional<Eigen::Isometry3d> getCurrentRobotBaseToOdom() const;
   std::optional<Eigen::Isometry3d> getOdomToRobotBase(const rclcpp::Time & stamp) const;
-  bool confirmationConsistent(const Eigen::Isometry3d & candidate) const;
+  ConfirmationDecision evaluateCandidateConfirmation(
+    const Eigen::Isometry3d & candidate, const rclcpp::Time & scan_time,
+    const Eigen::Isometry3d & odom_to_base) const;
   double translationDeltaFromLastTrigger(
     const Eigen::Isometry3d & current_robot_base_to_odom) const;
   double yawDeltaFromLastTrigger(const Eigen::Isometry3d & current_robot_base_to_odom) const;
@@ -103,15 +158,19 @@ private:
     const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
     const PointCovarianceCloud::Ptr & source, const std::shared_ptr<PointKdTree> & source_tree,
     GicpRegistration & registration) const;
-  RegistrationAttempt runCoarseFineAlignment(const Eigen::Isometry3d & initial_guess);
-  RegistrationAttempt runMultiGuessAlignment();
-  RegistrationAttempt runMultiGuessAlignmentOn(
-    const PointCovarianceCloud::Ptr & source, const std::shared_ptr<PointKdTree> & source_tree,
-    const Eigen::Isometry3d & seed, const std::atomic<bool> & cancel_flag) const;
-  bool passesQualityGates(RegistrationAttempt & attempt) const;
-  std::vector<Eigen::Isometry3d> buildMultiGuessCandidates() const;
-  std::vector<Eigen::Isometry3d> buildMultiGuessCandidatesFrom(
-    const Eigen::Isometry3d & seed) const;
+  RegistrationAttempt runCoarseFineAlignment(
+    const Eigen::Isometry3d & initial_guess, bool allow_unconverged);
+  MultiGuessOutcome runMultiGuessAlignmentOn(
+    const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag) const;
+  CandidateHardGates hardGates(bool allow_unconverged) const;
+  bool passesQualityGates(
+    RegistrationAttempt & attempt, bool allow_unconverged, GateStage stage) const;
+  CandidateEvidence attemptEvidence(
+    const RegistrationAttempt & attempt, const Eigen::Isometry3d & seed,
+    const std::optional<ConfirmationSample> & reference,
+    const std::optional<Eigen::Isometry3d> & current_odom_to_base) const;
+  CandidateLatticeConfig latticeConfig() const;
+  void writeCandidateDiagnostics(const std::string & rows) const;
   void startAsyncMultiGuess();
   void cancelAsyncMultiGuess();
   void drainAsyncMultiGuessResult();
@@ -131,6 +190,8 @@ private:
   int min_inliers_;
   float global_leaf_size_;
   float registered_leaf_size_;
+  /// coarse 候选筛选的额外降采样尺度。<=registered_leaf_size_ 时不建立独立筛选云。
+  float multi_guess_screen_leaf_size_{0.0f};
   float max_dist_sq_;
   double max_registration_error_;
   bool relax_convergence_for_sim_{false};
@@ -164,8 +225,25 @@ private:
   double multi_guess_step_xy_{1.0};
   double multi_guess_step_yaw_{0.785398};
   std::vector<double> multi_guess_z_candidates_{0.0};
+  // 候选调度预算：每次扫描只评估一段，剩余候选由 cursor 延续到下一次扫描。
+  double multi_guess_time_budget_s_{1.5};
+  int multi_guess_max_candidates_per_scan_{48};
+  /// 每次扫描允许的 fine 精配准次数上限。筛选只排序，精配准才验收。
+  int multi_guess_max_fine_per_scan_{4};
+  bool multi_guess_log_candidates_{false};
+  std::string multi_guess_candidate_log_path_;
+  std::size_t multi_guess_cursor_{0};
+  std::uint64_t multi_guess_sweep_{0};
   bool need_coarse_alignment_{true};
   bool has_accepted_alignment_{false};
+
+  // 组合评分与歧义拒绝。权重/阈值由候选分布决定，min_score_margin<=0 表示门未启用。
+  CandidateScoreWeights score_weights_;
+  AmbiguityConfig ambiguity_;
+  double confirmation_min_interval_s_{0.05};
+  double confirmation_motion_translation_tolerance_{0.25};
+  double confirmation_motion_yaw_tolerance_{0.15};
+  double motion_reference_max_age_s_{2.0};
 
   // Status-driven recovery: TRACKING keeps fine-only; LOST opens async multi_guess.
   bool follow_localization_status_{true};
@@ -188,7 +266,7 @@ private:
   std::atomic<bool> cancel_multi_guess_{false};
   std::mutex async_result_mutex_;
   bool async_result_ready_{false};
-  RegistrationAttempt async_result_;
+  MultiGuessOutcome async_result_;
   rclcpp::Time async_result_scan_time_;
   std::size_t async_result_source_points_{0};
   std::thread multi_guess_thread_;
@@ -206,7 +284,10 @@ private:
   bool has_received_scan_{false};
   std::uint64_t observation_sequence_{0};
   int pending_confirmation_count_{0};
-  std::optional<Eigen::Isometry3d> pending_confirmation_transform_;
+  std::optional<ConfirmationSample> pending_confirmation_;
+  // 上一帧通过硬门的假设，用于候选级 motion 一致性软约束。
+  std::optional<ConfirmationSample> last_hypothesis_;
+  std::optional<rclcpp::Time> last_hypothesis_time_;
   Eigen::Isometry3d result_t_;
   Eigen::Isometry3d previous_result_t_;
   std::optional<Eigen::Isometry3d> last_registration_robot_base_to_odom_;
@@ -216,9 +297,12 @@ private:
   pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_cloud_;
   PointCovarianceCloud::Ptr target_;
   PointCovarianceCloud::Ptr source_;
+  /// coarse 候选筛选云。与 source_ 同一帧、同一滤波，只是更稀疏。
+  PointCovarianceCloud::Ptr screen_source_;
 
   std::shared_ptr<PointKdTree> target_tree_;
   std::shared_ptr<PointKdTree> source_tree_;
+  std::shared_ptr<PointKdTree> screen_source_tree_;
   std::shared_ptr<GicpRegistration> register_;
 
   rclcpp::TimerBase::SharedPtr transform_timer_;

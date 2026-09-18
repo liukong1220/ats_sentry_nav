@@ -18,10 +18,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 #include "pcl/common/transforms.h"
 #include "pcl_conversions/pcl_conversions.h"
@@ -36,27 +41,28 @@ namespace small_gicp_relocalization
 namespace
 {
 
+constexpr char kCandidateCsvHeader[] =
+  "sweep,cursor,candidate_index,seed_x,seed_y,seed_yaw,guess_x,guess_y,guess_yaw,stage,converged,"
+  "iterations,inliers,source_points,overlap,error,min_info_eigenvalue,condition_number,"
+  "motion_residual,prior_deviation,score,result_x,result_y,result_yaw,reject_reason\n";
+
 double normalizedRegistrationError(double error, std::size_t inliers)
 {
   return inliers > 0 && std::isfinite(error) ? error / static_cast<double>(inliers)
                                              : std::numeric_limits<double>::infinity();
 }
 
-double yawDistance(const Eigen::Isometry3d & lhs, const Eigen::Isometry3d & rhs)
-{
-  const double delta =
-    lhs.rotation().eulerAngles(0, 1, 2).z() - rhs.rotation().eulerAngles(0, 1, 2).z();
-  return std::abs(std::atan2(std::sin(delta), std::cos(delta)));
-}
-
+/// 协方差退化与 registration error 语义分离：solver 失败或误差非有限时退回保守
+/// 大协方差，绝不反过来篡改 registration error。
 std::array<double, 36> registrationCovariance(
   const Eigen::Matrix<double, 6, 6> & information, double error, std::size_t inliers)
 {
   Eigen::Matrix<double, 6, 6> covariance_rt = Eigen::Matrix<double, 6, 6>::Zero();
+  const bool error_usable = std::isfinite(error) && error >= 0.0;
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
     0.5 * (information + information.transpose()));
   if (
-    solver.info() == Eigen::Success && solver.eigenvalues().allFinite() &&
+    error_usable && solver.info() == Eigen::Success && solver.eigenvalues().allFinite() &&
     solver.eigenvectors().allFinite()) {
     const double degrees_of_freedom = std::max(1.0, 3.0 * static_cast<double>(inliers) - 6.0);
     const double residual_scale = std::clamp(2.0 * error / degrees_of_freedom, 1e-6, 1e3);
@@ -123,6 +129,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("confirmation_count", 2);
   this->declare_parameter("confirmation_translation_tolerance", 0.15);
   this->declare_parameter("confirmation_yaw_tolerance", 0.10);
+  this->declare_parameter("confirmation_min_interval_s", 0.05);
+  this->declare_parameter("confirmation_motion_translation_tolerance", 0.25);
+  this->declare_parameter("confirmation_motion_yaw_tolerance", 0.15);
   this->declare_parameter("registration_interval_s", 0.25);
   this->declare_parameter("max_accumulation_age_s", 0.30);
   this->declare_parameter("min_registration_translation_delta", 0.10);
@@ -154,6 +163,29 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("multi_guess.step_xy", 1.0);
   this->declare_parameter("multi_guess.step_yaw", 0.785398);
   this->declare_parameter("multi_guess.z_candidates", std::vector<double>{0.0});
+  this->declare_parameter("multi_guess.time_budget_s", 1.5);
+  this->declare_parameter("multi_guess.max_candidates_per_scan", 48);
+  this->declare_parameter("multi_guess.max_fine_per_scan", 4);
+  // coarse 筛选专用的稀疏尺度。<=registered_leaf_size 时不建立独立筛选云。
+  this->declare_parameter("multi_guess.screen_leaf_size", 0.0);
+  this->declare_parameter("multi_guess.log_candidates", false);
+  this->declare_parameter("multi_guess.candidate_log_path", "");
+  // 组合评分权重与饱和尺度。各项归一化到 [0,1]，总分范围 [0, sum(weights)]。
+  this->declare_parameter("candidate_score.weight_error", 1.0);
+  this->declare_parameter("candidate_score.weight_overlap", 1.0);
+  this->declare_parameter("candidate_score.weight_information", 0.5);
+  this->declare_parameter("candidate_score.weight_motion", 0.5);
+  this->declare_parameter("candidate_score.weight_prior", 0.2);
+  this->declare_parameter("candidate_score.error_scale", 1.0);
+  this->declare_parameter("candidate_score.information_eigenvalue_reference", 1.0);
+  this->declare_parameter("candidate_score.condition_number_reference", 1.0e4);
+  this->declare_parameter("candidate_score.motion_scale", 0.5);
+  this->declare_parameter("candidate_score.prior_scale", 2.0);
+  this->declare_parameter("candidate_score.motion_reference_max_age_s", 2.0);
+  // <=0 表示歧义门未启用；阈值必须由 correct/wrong 候选分布决定。
+  this->declare_parameter("ambiguity.min_score_margin", 0.0);
+  this->declare_parameter("ambiguity.min_separation_xy", 0.5);
+  this->declare_parameter("ambiguity.min_separation_yaw", 0.35);
   this->declare_parameter("follow_localization_status", true);
   this->declare_parameter("auto_multi_guess_on_lost", true);
   this->declare_parameter("force_registration_when_lost", true);
@@ -176,9 +208,17 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("confirmation_count", confirmation_count_);
   this->get_parameter("confirmation_translation_tolerance", confirmation_translation_tolerance_);
   this->get_parameter("confirmation_yaw_tolerance", confirmation_yaw_tolerance_);
+  this->get_parameter("confirmation_min_interval_s", confirmation_min_interval_s_);
+  this->get_parameter(
+    "confirmation_motion_translation_tolerance", confirmation_motion_translation_tolerance_);
+  this->get_parameter("confirmation_motion_yaw_tolerance", confirmation_motion_yaw_tolerance_);
   confirmation_count_ = std::max(1, confirmation_count_);
   confirmation_translation_tolerance_ = std::max(0.0, confirmation_translation_tolerance_);
   confirmation_yaw_tolerance_ = std::max(0.0, confirmation_yaw_tolerance_);
+  confirmation_min_interval_s_ = std::max(0.0, confirmation_min_interval_s_);
+  confirmation_motion_translation_tolerance_ =
+    std::max(0.0, confirmation_motion_translation_tolerance_);
+  confirmation_motion_yaw_tolerance_ = std::max(0.0, confirmation_motion_yaw_tolerance_);
   this->get_parameter("registration_interval_s", registration_interval_s_);
   this->get_parameter("max_accumulation_age_s", max_accumulation_age_s_);
   this->get_parameter("min_registration_translation_delta", min_registration_translation_delta_);
@@ -211,6 +251,30 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("multi_guess.step_xy", multi_guess_step_xy_);
   this->get_parameter("multi_guess.step_yaw", multi_guess_step_yaw_);
   this->get_parameter("multi_guess.z_candidates", multi_guess_z_candidates_);
+  this->get_parameter("multi_guess.time_budget_s", multi_guess_time_budget_s_);
+  this->get_parameter("multi_guess.max_candidates_per_scan", multi_guess_max_candidates_per_scan_);
+  this->get_parameter("multi_guess.max_fine_per_scan", multi_guess_max_fine_per_scan_);
+  multi_guess_screen_leaf_size_ =
+    static_cast<float>(this->get_parameter("multi_guess.screen_leaf_size").as_double());
+  this->get_parameter("multi_guess.log_candidates", multi_guess_log_candidates_);
+  this->get_parameter("multi_guess.candidate_log_path", multi_guess_candidate_log_path_);
+  this->get_parameter("candidate_score.weight_error", score_weights_.error);
+  this->get_parameter("candidate_score.weight_overlap", score_weights_.overlap);
+  this->get_parameter("candidate_score.weight_information", score_weights_.information);
+  this->get_parameter("candidate_score.weight_motion", score_weights_.motion);
+  this->get_parameter("candidate_score.weight_prior", score_weights_.prior);
+  this->get_parameter("candidate_score.error_scale", score_weights_.error_scale);
+  this->get_parameter(
+    "candidate_score.information_eigenvalue_reference",
+    score_weights_.information_eigenvalue_reference);
+  this->get_parameter(
+    "candidate_score.condition_number_reference", score_weights_.condition_number_reference);
+  this->get_parameter("candidate_score.motion_scale", score_weights_.motion_scale);
+  this->get_parameter("candidate_score.prior_scale", score_weights_.prior_scale);
+  this->get_parameter("candidate_score.motion_reference_max_age_s", motion_reference_max_age_s_);
+  this->get_parameter("ambiguity.min_score_margin", ambiguity_.min_score_margin);
+  this->get_parameter("ambiguity.min_separation_xy", ambiguity_.min_separation_xy);
+  this->get_parameter("ambiguity.min_separation_yaw", ambiguity_.min_separation_yaw);
   this->get_parameter("follow_localization_status", follow_localization_status_);
   this->get_parameter("auto_multi_guess_on_lost", auto_multi_guess_on_lost_);
   this->get_parameter("force_registration_when_lost", force_registration_when_lost_);
@@ -236,6 +300,23 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   multi_guess_search_half_xy_ = std::max(0.0, multi_guess_search_half_xy_);
   multi_guess_step_xy_ = std::max(0.05, multi_guess_step_xy_);
   multi_guess_step_yaw_ = std::max(0.05, multi_guess_step_yaw_);
+  multi_guess_time_budget_s_ = std::max(0.05, multi_guess_time_budget_s_);
+  multi_guess_max_candidates_per_scan_ = std::max(1, multi_guess_max_candidates_per_scan_);
+  score_weights_.error = std::max(0.0, score_weights_.error);
+  score_weights_.overlap = std::max(0.0, score_weights_.overlap);
+  score_weights_.information = std::max(0.0, score_weights_.information);
+  score_weights_.motion = std::max(0.0, score_weights_.motion);
+  score_weights_.prior = std::max(0.0, score_weights_.prior);
+  score_weights_.error_scale = std::max(1e-6, score_weights_.error_scale);
+  score_weights_.information_eigenvalue_reference =
+    std::max(1e-9, score_weights_.information_eigenvalue_reference);
+  score_weights_.condition_number_reference =
+    std::max(1e-6, score_weights_.condition_number_reference);
+  score_weights_.motion_scale = std::max(1e-6, score_weights_.motion_scale);
+  score_weights_.prior_scale = std::max(1e-6, score_weights_.prior_scale);
+  ambiguity_.min_separation_xy = std::max(0.0, ambiguity_.min_separation_xy);
+  ambiguity_.min_separation_yaw = std::max(0.0, ambiguity_.min_separation_yaw);
+  motion_reference_max_age_s_ = std::max(0.0, motion_reference_max_age_s_);
   if (multi_guess_z_candidates_.empty()) {
     multi_guess_z_candidates_ = {0.0};
   }
@@ -308,11 +389,16 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     this->get_logger(),
     "GICP coarse-fine ready: mode=%s accumulate_frames=%d fine=%s coarse_first_only=%s "
     "fine_max_corr=%.3f min_overlap=%.3f follow_status=%s auto_multi_guess_on_lost=%s "
-    "height_filter=%s",
+    "height_filter=%s confirmation=%d(min_interval=%.3fs motion_tol=%.2fm/%.2frad) "
+    "multi_guess_budget=%.2fs/%d ambiguity_margin=%.3f(sep=%.2fm/%.2frad)",
     registration_mode_.c_str(), accumulate_frames_, fine_alignment_enabled_ ? "true" : "false",
     coarse_first_window_only_ ? "true" : "false", std::sqrt(static_cast<double>(fine_max_dist_sq_)),
     min_overlap_ratio_, follow_localization_status_ ? "true" : "false",
-    auto_multi_guess_on_lost_ ? "true" : "false", height_filter_enable_ ? "true" : "false");
+    auto_multi_guess_on_lost_ ? "true" : "false", height_filter_enable_ ? "true" : "false",
+    confirmation_count_, confirmation_min_interval_s_, confirmation_motion_translation_tolerance_,
+    confirmation_motion_yaw_tolerance_, multi_guess_time_budget_s_,
+    multi_guess_max_candidates_per_scan_, ambiguity_.min_score_margin, ambiguity_.min_separation_xy,
+    ambiguity_.min_separation_yaw);
 }
 
 SmallGicpRelocalizationNode::~SmallGicpRelocalizationNode() { cancelAsyncMultiGuess(); }
@@ -389,14 +475,26 @@ bool SmallGicpRelocalizationNode::isRecoveringLocalization() const
          localization_state_ == LS::STATE_RELOCALIZING || !has_accepted_alignment_;
 }
 
+bool SmallGicpRelocalizationNode::inInitialPoseForceWindow() const
+{
+  return initial_pose_override_time_ && (this->now() - *initial_pose_override_time_).seconds() <=
+                                          initial_pose_force_registration_window_s_;
+}
+
+/// 仿真放宽只在 /initialpose force window 内有效，并且只允许放过 optimizer 的
+/// converged 标志。窗口结束后恢复完整严格门；有限误差、overlap、信息矩阵与
+/// transform finite 永不可绕过。
+bool SmallGicpRelocalizationNode::simRelaxAllowed() const
+{
+  return relax_convergence_for_sim_ && inInitialPoseForceWindow();
+}
+
 bool SmallGicpRelocalizationNode::preferMultiGuess() const
 {
   using LS = ats_navigation_interfaces::msg::LocalizationStatus;
   // Only suppress lattice search while the /initialpose force window is active.
   // A stale initial_pose_override_time_ must NOT permanently disable LOST recovery.
-  const bool in_initial_pose_force_window =
-    initial_pose_override_time_ && (this->now() - *initial_pose_override_time_).seconds() <=
-                                     initial_pose_force_registration_window_s_;
+  const bool in_initial_pose_force_window = inInitialPoseForceWindow();
 
   // Explicit multi_guess mode: lattice until first accept / while coarse needed.
   if (registration_mode_ == "multi_guess") {
@@ -411,13 +509,6 @@ bool SmallGicpRelocalizationNode::preferMultiGuess() const
   }
   if (in_initial_pose_force_window) {
     return false;
-  }
-  // Silence alone must not fire on UNINITIALIZED cold start (silence may be inf).
-  // Only reinforce LOST/DEGRADED when fusion already reports recovery health.
-  if (
-    observation_silence_sec_ >= 5.0 &&
-    (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED)) {
-    return localization_state_ == LS::STATE_LOST;
   }
   return localization_state_ == LS::STATE_LOST;
 }
@@ -449,6 +540,21 @@ void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
   small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
   source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+
+  // 稀疏筛选云只服务于 multi_guess 的 coarse 级：候选成本与源点数近似线性，
+  // 稀疏化直接决定单次扫描能覆盖多少候选。fine 与验收仍用 source_。
+  if (multi_guess_screen_leaf_size_ > registered_leaf_size_) {
+    screen_source_ = small_gicp::voxelgrid_sampling_omp<
+      pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
+      *filtered, multi_guess_screen_leaf_size_);
+    small_gicp::estimate_covariances_omp(*screen_source_, num_neighbors_, num_threads_);
+    screen_source_tree_ =
+      std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
+        screen_source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+  } else {
+    screen_source_.reset();
+    screen_source_tree_.reset();
+  }
 }
 
 SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::alignOnce(
@@ -492,151 +598,325 @@ SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::al
   return attempt;
 }
 
-bool SmallGicpRelocalizationNode::passesQualityGates(RegistrationAttempt & attempt) const
+CandidateHardGates SmallGicpRelocalizationNode::hardGates(bool allow_unconverged) const
 {
-  const bool inlier_ok = static_cast<int>(attempt.num_inliers) >= min_inliers_;
-  const bool error_ok =
-    max_registration_error_ < 0.0 || attempt.registration_error <= max_registration_error_;
-  const bool transform_finite = attempt.transform.matrix().allFinite();
-  const bool has_initial_pose_seed = static_cast<bool>(initial_pose_override_time_);
-  const bool sim_relaxed_ok = relax_convergence_for_sim_ && has_initial_pose_seed && inlier_ok &&
-                              transform_finite &&
-                              static_cast<int>(attempt.num_inliers) >= (min_inliers_ * 2);
+  CandidateHardGates gates;
+  gates.min_inliers = min_inliers_;
+  gates.max_registration_error = max_registration_error_;
+  gates.min_overlap_ratio = min_overlap_ratio_;
+  gates.min_information_eigenvalue = min_information_eigenvalue_;
+  gates.max_information_condition_number = max_information_condition_number_;
+  gates.allow_unconverged = allow_unconverged;
+  return gates;
+}
 
-  if (!(attempt.converged && inlier_ok && error_ok) && !sim_relaxed_ok) {
-    if (!attempt.converged) {
-      attempt.reject_reason = "not converged";
-    } else if (!inlier_ok) {
-      attempt.reject_reason = "insufficient inliers";
-    } else if (!error_ok) {
-      attempt.reject_reason = "registration error too large";
-    } else {
-      attempt.reject_reason = "rejected";
-    }
-    return false;
-  }
+bool SmallGicpRelocalizationNode::passesQualityGates(
+  RegistrationAttempt & attempt, bool allow_unconverged, GateStage stage) const
+{
+  CandidateEvidence evidence;
+  evidence.converged = attempt.converged;
+  evidence.transform_finite = attempt.transform.matrix().allFinite();
+  evidence.num_inliers = attempt.num_inliers;
+  evidence.registration_error = attempt.registration_error;
+  evidence.overlap_ratio = attempt.overlap_ratio;
+  evidence.min_information_eigenvalue = attempt.min_information_eigenvalue;
+  evidence.information_condition_number = attempt.information_condition_number;
 
-  if (min_overlap_ratio_ > 0.0 && attempt.overlap_ratio < min_overlap_ratio_ && !sim_relaxed_ok) {
-    attempt.reject_reason = "overlap ratio below threshold";
+  // 放宽 converged 仍要求内点数远超门限，避免把明显失败的优化放进来。
+  const bool relax_permitted =
+    allow_unconverged && static_cast<int>(attempt.num_inliers) >= (min_inliers_ * 2);
+  const bool screen_stage = stage == GateStage::kScreen;
+  CandidateHardGates gates = hardGates(relax_permitted);
+  if (screen_stage) {
+    gates = screenStageGates(gates);
+  }
+  const std::string reason = candidateRejectReason(evidence, gates);
+  if (!reason.empty()) {
+    attempt.ok = false;
+    attempt.reject_reason = reason;
     return false;
   }
-  if (
-    min_information_eigenvalue_ > 0.0 &&
-    attempt.min_information_eigenvalue < min_information_eigenvalue_ && !sim_relaxed_ok) {
-    attempt.reject_reason = "minimum information eigenvalue below threshold";
-    return false;
-  }
-  if (
-    max_information_condition_number_ > 0.0 &&
-    attempt.information_condition_number > max_information_condition_number_ && !sim_relaxed_ok) {
-    attempt.reject_reason = "information matrix is too ill-conditioned";
-    return false;
-  }
-
-  if (sim_relaxed_ok && !(attempt.converged && error_ok)) {
+  if (!screen_stage && relax_permitted && !attempt.converged) {
     attempt.stage += "+sim_relax";
   }
+  attempt.reject_reason.clear();
   attempt.ok = true;
   return true;
 }
 
-std::vector<Eigen::Isometry3d> SmallGicpRelocalizationNode::buildMultiGuessCandidates() const
+CandidateEvidence SmallGicpRelocalizationNode::attemptEvidence(
+  const RegistrationAttempt & attempt, const Eigen::Isometry3d & seed,
+  const std::optional<ConfirmationSample> & reference,
+  const std::optional<Eigen::Isometry3d> & current_odom_to_base) const
 {
-  return buildMultiGuessCandidatesFrom(previous_result_t_);
-}
-
-std::vector<Eigen::Isometry3d> SmallGicpRelocalizationNode::buildMultiGuessCandidatesFrom(
-  const Eigen::Isometry3d & seed) const
-{
-  std::vector<Eigen::Isometry3d> candidates;
-  const double seed_yaw = seed.rotation().eulerAngles(0, 1, 2).z();
-  const double cx = seed.translation().x();
-  const double cy = seed.translation().y();
-  const double half = multi_guess_search_half_xy_;
-  const double step = multi_guess_step_xy_;
-
-  for (double z : multi_guess_z_candidates_) {
-    for (double x = cx - half; x <= cx + half + 1e-9; x += step) {
-      for (double y = cy - half; y <= cy + half + 1e-9; y += step) {
-        for (double yaw = seed_yaw - M_PI; yaw < seed_yaw + M_PI - 1e-9;
-             yaw += multi_guess_step_yaw_) {
-          Eigen::Isometry3d guess = Eigen::Isometry3d::Identity();
-          guess.translation() << x, y, seed.translation().z() + z;
-          guess.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-          candidates.push_back(guess);
-        }
-      }
+  CandidateEvidence evidence;
+  evidence.converged = attempt.converged;
+  evidence.transform_finite = attempt.transform.matrix().allFinite();
+  evidence.num_inliers = attempt.num_inliers;
+  evidence.registration_error = attempt.registration_error;
+  evidence.overlap_ratio = attempt.overlap_ratio;
+  evidence.min_information_eigenvalue = attempt.min_information_eigenvalue;
+  evidence.information_condition_number = attempt.information_condition_number;
+  evidence.prior_deviation =
+    (attempt.transform.translation() - seed.translation()).head<2>().norm();
+  if (reference && current_odom_to_base) {
+    const ConfirmationMotionResidual residual = confirmationMotionResidual(
+      reference->map_to_odom, reference->odom_to_base, attempt.transform, *current_odom_to_base);
+    if (residual.valid) {
+      evidence.motion_residual = residual.translation;
     }
   }
-  if (candidates.empty()) {
-    candidates.push_back(seed);
-  }
-  return candidates;
+  return evidence;
 }
 
-SmallGicpRelocalizationNode::RegistrationAttempt
-SmallGicpRelocalizationNode::runMultiGuessAlignment()
+CandidateLatticeConfig SmallGicpRelocalizationNode::latticeConfig() const
 {
-  std::atomic<bool> never_cancel{false};
-  return runMultiGuessAlignmentOn(source_, source_tree_, previous_result_t_, never_cancel);
+  CandidateLatticeConfig config;
+  config.search_half_xy = multi_guess_search_half_xy_;
+  config.step_xy = multi_guess_step_xy_;
+  config.step_yaw = multi_guess_step_yaw_;
+  config.z_offsets = multi_guess_z_candidates_;
+  return config;
 }
 
-SmallGicpRelocalizationNode::RegistrationAttempt
+void SmallGicpRelocalizationNode::writeCandidateDiagnostics(const std::string & rows) const
+{
+  if (multi_guess_candidate_log_path_.empty() || rows.empty()) {
+    return;
+  }
+  std::error_code error_code;
+  const bool exists = std::filesystem::exists(multi_guess_candidate_log_path_, error_code);
+  std::ofstream stream(multi_guess_candidate_log_path_, std::ios::app);
+  if (!stream) {
+    RCLCPP_ERROR(
+      this->get_logger(), "Cannot open candidate diagnostics file '%s'",
+      multi_guess_candidate_log_path_.c_str());
+    return;
+  }
+  if (!exists) {
+    stream << kCandidateCsvHeader;
+  }
+  stream << rows;
+}
+
+SmallGicpRelocalizationNode::MultiGuessOutcome
 SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
-  const PointCovarianceCloud::Ptr & source, const std::shared_ptr<PointKdTree> & source_tree,
-  const Eigen::Isometry3d & seed, const std::atomic<bool> & cancel_flag) const
+  const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag) const
 {
-  RegistrationAttempt best;
-  best.reject_reason = "multi_guess produced no valid candidate";
-  if (!source || !source_tree || !target_ || !target_tree_) {
-    best.reject_reason = "registration inputs unavailable";
-    return best;
+  MultiGuessOutcome outcome;
+  outcome.cursor = request.cursor;
+  outcome.next_cursor = request.cursor;
+  outcome.confirmation_recheck = request.confirmation_recheck;
+  outcome.best.reject_reason = "multi_guess produced no valid candidate";
+  if (!request.source || !request.source_tree || !target_ || !target_tree_) {
+    outcome.best.reject_reason = "registration inputs unavailable";
+    return outcome;
   }
+
+  const auto candidates =
+    buildLayeredCandidateLattice(request.seed, latticeConfig(), &outcome.lattice);
+  const std::size_t total = candidates.size();
+  if (total == 0) {
+    return outcome;
+  }
+  const std::size_t cursor = request.cursor % total;
+  outcome.cursor = cursor;
+  const std::size_t budget_count =
+    static_cast<std::size_t>(std::max(1, multi_guess_max_candidates_per_scan_));
+  const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                  std::chrono::duration<double>(multi_guess_time_budget_s_));
+
+  // coarse 筛选跑稀疏云以提高每次扫描的候选吞吐；fine 与验收始终用完整源云。
+  const PointCovarianceCloud::Ptr & screen_source =
+    request.screen_source ? request.screen_source : request.source;
+  const std::shared_ptr<PointKdTree> & screen_tree =
+    request.screen_source && request.screen_source_tree ? request.screen_source_tree
+                                                        : request.source_tree;
+
+  RCLCPP_WARN(
+    this->get_logger(),
+    "multi_guess sweep=%s cursor=%zu/%zu budget=%zu/%.2fs seed=(%.3f,%.3f,%.3f) "
+    "coverage x=[%.2f,%.2f] y=[%.2f,%.2f] max_radius=%.2f rings=%zu "
+    "screen_points=%zu source_points=%zu",
+    std::to_string(request.sweep).c_str(), cursor, total, budget_count, multi_guess_time_budget_s_,
+    request.seed.translation().x(), request.seed.translation().y(), yawOf(request.seed),
+    outcome.lattice.min_x, outcome.lattice.max_x, outcome.lattice.min_y, outcome.lattice.max_y,
+    outcome.lattice.max_radius, outcome.lattice.rings, screen_source ? screen_source->size() : 0,
+    request.source_points);
 
   GicpRegistration local_register;
-  const auto candidates = buildMultiGuessCandidatesFrom(seed);
-  RCLCPP_WARN(
-    this->get_logger(), "Starting async multi_guess recovery with %zu candidates (state=%u)",
-    candidates.size(), static_cast<unsigned>(localization_state_));
-  constexpr std::size_t kMaxMultiGuessCandidates = 48;
-  const std::size_t limit = std::min(candidates.size(), kMaxMultiGuessCandidates);
-  for (std::size_t i = 0; i < limit; ++i) {
-    if (cancel_flag.load()) {
-      best.reject_reason = "multi_guess cancelled";
-      best.ok = false;
-      return best;
+  std::vector<RankedCandidate> ranked;
+  std::vector<RegistrationAttempt> retained;
+  std::string diagnostics;
+
+  const bool log_rows = multi_guess_log_candidates_ || !multi_guess_candidate_log_path_.empty();
+  const auto logRow = [&](
+                        std::size_t index, const Eigen::Isometry3d & guess,
+                        const RegistrationAttempt & attempt, const std::string & verdict) {
+    if (!log_rows) {
+      return;
     }
-    const auto & guess = candidates[i];
-    auto coarse =
-      alignOnceOn(guess, max_dist_sq_, coarse_max_iterations_, source, source_tree, local_register);
-    coarse.stage = "multi_guess_coarse";
-    if (!passesQualityGates(coarse)) {
+    std::ostringstream row;
+    row.setf(std::ios::fixed, std::ios::floatfield);
+    row.precision(6);
+    row << request.sweep << ',' << cursor << ',' << index << ',' << request.seed.translation().x()
+        << ',' << request.seed.translation().y() << ',' << yawOf(request.seed) << ','
+        << guess.translation().x() << ',' << guess.translation().y() << ',' << yawOf(guess) << ','
+        << attempt.stage << ',' << (attempt.converged ? 1 : 0) << ',' << attempt.iterations << ','
+        << attempt.num_inliers << ',' << request.source_points << ',' << attempt.overlap_ratio
+        << ',' << attempt.registration_error << ',' << attempt.min_information_eigenvalue << ','
+        << attempt.information_condition_number << ',' << attempt.motion_residual << ','
+        << attempt.prior_deviation << ',' << attempt.score << ','
+        << attempt.transform.translation().x() << ',' << attempt.transform.translation().y() << ','
+        << yawOf(attempt.transform) << ',' << verdict << '\n';
+    diagnostics += row.str();
+    if (multi_guess_log_candidates_) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "candidate[%zu] stage=%s guess=(%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f) inliers=%zu "
+        "overlap=%.3f error=%.6f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f %s",
+        index, attempt.stage.c_str(), guess.translation().x(), guess.translation().y(),
+        yawOf(guess), attempt.transform.translation().x(), attempt.transform.translation().y(),
+        yawOf(attempt.transform), attempt.num_inliers, attempt.overlap_ratio,
+        attempt.registration_error, attempt.min_information_eigenvalue,
+        attempt.information_condition_number, attempt.motion_residual, attempt.prior_deviation,
+        attempt.score, verdict.c_str());
+    }
+  };
+
+  // 第一遍：在稀疏筛选云上粗筛尽量多的候选。这一级只排序，不验收。
+  struct ScreenedCandidate
+  {
+    double score;
+    std::size_t index;
+    RegistrationAttempt attempt;
+  };
+  std::vector<ScreenedCandidate> screened;
+  std::size_t consumed = 0;
+  for (std::size_t step = 0; step < total; ++step) {
+    if (cancel_flag.load()) {
+      outcome.best.ok = false;
+      outcome.best.reject_reason = "multi_guess cancelled";
+      outcome.evaluated = consumed;
+      outcome.skipped = total - consumed;
+      outcome.elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      return outcome;
+    }
+    if (outcome.evaluated >= budget_count || std::chrono::steady_clock::now() >= deadline) {
+      outcome.budget_exhausted = true;
+      break;
+    }
+    const std::size_t index = (cursor + step) % total;
+    const Eigen::Isometry3d & guess = candidates[index];
+    ++consumed;
+    ++outcome.evaluated;
+
+    RegistrationAttempt attempt = alignOnceOn(
+      guess, max_dist_sq_, coarse_max_iterations_, screen_source, screen_tree, local_register);
+    attempt.stage = "multi_guess_screen";
+    // 截断的 coarse 只做筛选，不认定收敛；fine 级才是验收权威。
+    const bool screened_ok =
+      passesQualityGates(attempt, request.allow_unconverged, GateStage::kScreen);
+    const CandidateEvidence screen_evidence =
+      attemptEvidence(attempt, request.seed, request.reference, request.current_odom_to_base);
+    attempt.motion_residual = screen_evidence.motion_residual;
+    attempt.prior_deviation = screen_evidence.prior_deviation;
+    const CandidateScore screen_score = scoreCandidate(screen_evidence, score_weights_);
+    attempt.score = screened_ok ? screen_score.total : std::numeric_limits<double>::infinity();
+    logRow(index, guess, attempt, screened_ok ? std::string("screened") : attempt.reject_reason);
+    if (!screened_ok || !std::isfinite(attempt.score)) {
       continue;
     }
-    RegistrationAttempt refined = coarse;
+    screened.push_back(ScreenedCandidate{attempt.score, index, attempt});
+  }
+
+  // 第二遍：只把筛选分数最好的少数候选送进 fine 与完整硬门。
+  // 每次扫描的精配准次数因此有上界，候选覆盖速度不再被 fine 成本吞掉。
+  std::sort(
+    screened.begin(), screened.end(),
+    [](const ScreenedCandidate & lhs, const ScreenedCandidate & rhs) {
+      return lhs.score < rhs.score;
+    });
+  const std::size_t refine_budget =
+    static_cast<std::size_t>(std::max(1, multi_guess_max_fine_per_scan_));
+  const std::size_t refine_count =
+    fine_alignment_enabled_ ? std::min(screened.size(), refine_budget) : screened.size();
+  for (std::size_t i = 0; i < refine_count; ++i) {
+    if (cancel_flag.load()) {
+      outcome.best.ok = false;
+      outcome.best.reject_reason = "multi_guess cancelled";
+      outcome.evaluated = consumed;
+      outcome.skipped = total - consumed;
+      outcome.elapsed_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      return outcome;
+    }
+    const ScreenedCandidate & candidate = screened[i];
+    RegistrationAttempt attempt = candidate.attempt;
     if (fine_alignment_enabled_) {
-      refined = alignOnceOn(
-        coarse.transform, fine_max_dist_sq_, fine_max_iterations_, source, source_tree,
-        local_register);
-      refined.stage = "multi_guess_fine";
-      if (!passesQualityGates(refined)) {
-        continue;
-      }
+      attempt = alignOnceOn(
+        candidate.attempt.transform, fine_max_dist_sq_, fine_max_iterations_, request.source,
+        request.source_tree, local_register);
+      attempt.stage = "multi_guess_fine";
+      ++outcome.refined;
     }
-    if (!best.ok || refined.registration_error < best.registration_error) {
-      best = refined;
+    const bool accepted =
+      passesQualityGates(attempt, request.allow_unconverged, GateStage::kAccept);
+    const CandidateEvidence evidence =
+      attemptEvidence(attempt, request.seed, request.reference, request.current_odom_to_base);
+    attempt.motion_residual = evidence.motion_residual;
+    attempt.prior_deviation = evidence.prior_deviation;
+    const CandidateScore score = scoreCandidate(evidence, score_weights_);
+    attempt.score = accepted ? score.total : std::numeric_limits<double>::infinity();
+    logRow(
+      candidate.index, candidates[candidate.index], attempt,
+      accepted ? std::string("accepted") : attempt.reject_reason);
+    if (!accepted || !std::isfinite(attempt.score)) {
+      continue;
     }
+    ++outcome.gated;
+    ranked.push_back(RankedCandidate{attempt.score, attempt.transform});
+    retained.push_back(attempt);
   }
-  if (candidates.size() > kMaxMultiGuessCandidates) {
-    RCLCPP_WARN(
-      this->get_logger(), "multi_guess truncated %zu -> %zu candidates to protect latency",
-      candidates.size(), kMaxMultiGuessCandidates);
+
+  outcome.skipped = total - consumed;
+  outcome.wrapped = cursor + consumed >= total;
+  outcome.next_cursor = total > 0 ? (cursor + consumed) % total : 0;
+  outcome.elapsed_s =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+  outcome.selection = selectCandidate(ranked, ambiguity_);
+  if (!outcome.selection.has_best) {
+    outcome.best.ok = false;
+    writeCandidateDiagnostics(diagnostics);
+    return outcome;
   }
-  return best;
+
+  outcome.best = retained[outcome.selection.best_index];
+  outcome.best.score = outcome.selection.best_score;
+  outcome.best.alternative_score = outcome.selection.alternative_score;
+  outcome.best.score_margin = outcome.selection.score_margin;
+  outcome.best.ambiguous = outcome.selection.ambiguous;
+  if (outcome.selection.ambiguous) {
+    outcome.best.ok = false;
+    std::ostringstream reason;
+    reason.setf(std::ios::fixed, std::ios::floatfield);
+    reason.precision(4);
+    reason << "ambiguous candidates (best=" << outcome.selection.best_score
+           << " second=" << outcome.selection.alternative_score
+           << " margin=" << outcome.selection.score_margin << " < " << ambiguity_.min_score_margin
+           << ")";
+    outcome.best.reject_reason = reason.str();
+  }
+  writeCandidateDiagnostics(diagnostics);
+  return outcome;
 }
 
 SmallGicpRelocalizationNode::RegistrationAttempt
-SmallGicpRelocalizationNode::runCoarseFineAlignment(const Eigen::Isometry3d & initial_guess)
+SmallGicpRelocalizationNode::runCoarseFineAlignment(
+  const Eigen::Isometry3d & initial_guess, bool allow_unconverged)
 {
   const bool coarse_required = !fine_alignment_enabled_ || !coarse_first_window_only_ ||
                                need_coarse_alignment_ || !has_accepted_alignment_;
@@ -645,15 +925,16 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(const Eigen::Isometry3d & in
   if (coarse_required || !fine_alignment_enabled_) {
     attempt = alignOnce(initial_guess, max_dist_sq_, coarse_max_iterations_);
     attempt.stage = fine_alignment_enabled_ ? "coarse" : "single";
-    if (!passesQualityGates(attempt)) {
+    // coarse 后面还有 fine 时按筛选级放行 converged，否则 coarse 自己承担验收。
+    const GateStage coarse_stage =
+      fine_alignment_enabled_ ? GateStage::kScreen : GateStage::kAccept;
+    if (!passesQualityGates(attempt, allow_unconverged, coarse_stage)) {
       return attempt;
     }
     if (fine_alignment_enabled_) {
       auto fine = alignOnce(attempt.transform, fine_max_dist_sq_, fine_max_iterations_);
       fine.stage = "coarse+fine";
-      if (!passesQualityGates(fine)) {
-        return fine;
-      }
+      passesQualityGates(fine, allow_unconverged, GateStage::kAccept);
       return fine;
     }
     return attempt;
@@ -661,7 +942,7 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(const Eigen::Isometry3d & in
 
   attempt = alignOnce(initial_guess, fine_max_dist_sq_, fine_max_iterations_);
   attempt.stage = "fine_only";
-  passesQualityGates(attempt);
+  passesQualityGates(attempt, allow_unconverged, GateStage::kAccept);
   return attempt;
 }
 
@@ -698,7 +979,13 @@ void SmallGicpRelocalizationNode::performRegistration()
     return;
   }
 
-  RegistrationAttempt attempt = runCoarseFineAlignment(previous_result_t_);
+  RegistrationAttempt attempt = runCoarseFineAlignment(previous_result_t_, simRelaxAllowed());
+  const CandidateEvidence evidence = attemptEvidence(
+    attempt, previous_result_t_, last_hypothesis_, getOdomToRobotBase(last_scan_time_));
+  attempt.motion_residual = evidence.motion_residual;
+  attempt.prior_deviation = evidence.prior_deviation;
+  attempt.score = attempt.ok ? scoreCandidate(evidence, score_weights_).total
+                             : std::numeric_limits<double>::infinity();
   handleRegistrationAttempt(attempt, last_scan_time_, source_->size());
   clearAccumulation();
 }
@@ -711,22 +998,42 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
   }
   cancel_multi_guess_.store(false);
 
-  const auto source = source_;
-  const auto source_tree = source_tree_;
-  const Eigen::Isometry3d seed = previous_result_t_;
+  MultiGuessRequest request;
+  request.source = source_;
+  request.source_tree = source_tree_;
+  request.screen_source = screen_source_;
+  request.screen_source_tree = screen_source_tree_;
+  request.seed = previous_result_t_;
+  request.cursor = multi_guess_cursor_;
+  // 有待确认假设时，本帧必须先复核同一假设：确认要求连续扫描上独立命中同一解，
+  // 而 cursor 会把候选带到搜索窗的其它区域，命中只能靠巧合。种子优先的分层顺序
+  // 把该假设放在第 0 位，它仍要独立通过完整验收门与 odometry 运动一致性。
+  if (pending_confirmation_ && pending_confirmation_count_ > 0) {
+    request.seed = pending_confirmation_->map_to_odom;
+    request.cursor = 0;
+    request.confirmation_recheck = true;
+  }
+  request.sweep = multi_guess_sweep_;
+  request.allow_unconverged = simRelaxAllowed();
+  request.source_points = source_ ? source_->size() : 0;
+  request.current_odom_to_base = getOdomToRobotBase(last_scan_time_);
+  if (
+    last_hypothesis_ && last_hypothesis_time_ &&
+    (last_scan_time_ - *last_hypothesis_time_).seconds() <= motion_reference_max_age_s_) {
+    request.reference = last_hypothesis_;
+  }
   const rclcpp::Time scan_time = last_scan_time_;
-  const std::size_t source_points = source ? source->size() : 0;
+  const std::size_t source_points = request.source_points;
 
   if (multi_guess_thread_.joinable()) {
     multi_guess_thread_.join();
   }
 
-  multi_guess_thread_ = std::thread([this, source, source_tree, seed, scan_time, source_points]() {
-    RegistrationAttempt attempt =
-      runMultiGuessAlignmentOn(source, source_tree, seed, cancel_multi_guess_);
+  multi_guess_thread_ = std::thread([this, request, scan_time, source_points]() {
+    MultiGuessOutcome outcome = runMultiGuessAlignmentOn(request, cancel_multi_guess_);
     {
       std::lock_guard<std::mutex> lock(async_result_mutex_);
-      async_result_ = attempt;
+      async_result_ = outcome;
       async_result_scan_time_ = scan_time;
       async_result_source_points_ = source_points;
       async_result_ready_ = true;
@@ -748,7 +1055,7 @@ void SmallGicpRelocalizationNode::cancelAsyncMultiGuess()
 
 void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
 {
-  RegistrationAttempt attempt;
+  MultiGuessOutcome outcome;
   rclcpp::Time scan_time;
   std::size_t source_points = 0;
   {
@@ -756,12 +1063,60 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
     if (!async_result_ready_) {
       return;
     }
-    attempt = async_result_;
+    outcome = async_result_;
     scan_time = async_result_scan_time_;
     source_points = async_result_source_points_;
     async_result_ready_ = false;
   }
-  handleRegistrationAttempt(attempt, scan_time, source_points);
+
+  const bool cancelled = outcome.best.reject_reason == "multi_guess cancelled";
+  // 确认复核用的是待确认假设作为种子，其 cursor 不代表探索进度：
+  // 若把它写回，未评估候选的扫描进度会被反复重置。
+  if (!cancelled && !outcome.confirmation_recheck) {
+    multi_guess_cursor_ = outcome.next_cursor;
+    if (outcome.wrapped) {
+      ++multi_guess_sweep_;
+    }
+  }
+  RCLCPP_WARN(
+    this->get_logger(),
+    "multi_guess done: generated=%zu screened=%zu refined=%zu gated=%zu skipped=%zu "
+    "next_cursor=%zu "
+    "wrapped=%s budget_exhausted=%s elapsed=%.3fs best_score=%.4f second=%.4f margin=%.4f "
+    "ambiguous=%s",
+    outcome.lattice.generated, outcome.evaluated, outcome.refined, outcome.gated, outcome.skipped,
+    outcome.next_cursor, outcome.wrapped ? "true" : "false",
+    outcome.budget_exhausted ? "true" : "false", outcome.elapsed_s, outcome.selection.best_score,
+    outcome.selection.alternative_score, outcome.selection.score_margin,
+    outcome.selection.ambiguous ? "true" : "false");
+
+  if (cancelled) {
+    return;
+  }
+  handleRegistrationAttempt(outcome.best, scan_time, source_points);
+}
+
+ConfirmationDecision SmallGicpRelocalizationNode::evaluateCandidateConfirmation(
+  const Eigen::Isometry3d & candidate, const rclcpp::Time & scan_time,
+  const Eigen::Isometry3d & odom_to_base) const
+{
+  ConfirmationDecision decision;
+  if (!pending_confirmation_) {
+    decision.reason = "no pending confirmation anchor";
+    return decision;
+  }
+  ConfirmationGates gates;
+  gates.translation_tolerance = confirmation_translation_tolerance_;
+  gates.yaw_tolerance = confirmation_yaw_tolerance_;
+  gates.min_interval_s = confirmation_min_interval_s_;
+  gates.motion_translation_tolerance = confirmation_motion_translation_tolerance_;
+  gates.motion_yaw_tolerance = confirmation_motion_yaw_tolerance_;
+
+  ConfirmationSample sample;
+  sample.map_to_odom = candidate;
+  sample.odom_to_base = odom_to_base;
+  sample.scan_time_s = scan_time.seconds();
+  return evaluateConfirmation(*pending_confirmation_, sample, gates);
 }
 
 void SmallGicpRelocalizationNode::handleRegistrationAttempt(
@@ -774,69 +1129,14 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
     RCLCPP_INFO(
       this->get_logger(),
       "GICP result: stage=%s ok=%s converged=%s iterations=%zu inliers=%zu error=%.6f "
-      "overlap=%.3f source_points=%zu",
+      "overlap=%.3f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f source_points=%zu",
       attempt.stage.c_str(), attempt.ok ? "true" : "false", attempt.converged ? "true" : "false",
       attempt.iterations, attempt.num_inliers, attempt.registration_error, attempt.overlap_ratio,
-      source_points);
+      attempt.min_information_eigenvalue, attempt.information_condition_number,
+      attempt.motion_residual, attempt.prior_deviation, attempt.score, source_points);
   }
 
-  if (attempt.ok) {
-    const Eigen::Isometry3d candidate = attempt.transform;
-    if (confirmation_count_ > 1) {
-      if (confirmationConsistent(candidate)) {
-        ++pending_confirmation_count_;
-      } else {
-        pending_confirmation_transform_ = candidate;
-        pending_confirmation_count_ = 1;
-      }
-      if (pending_confirmation_count_ < confirmation_count_) {
-        const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
-        const Eigen::Isometry3d map_to_robot_base =
-          odom_to_robot_base ? candidate * *odom_to_robot_base : Eigen::Isometry3d::Identity();
-        publishObservation(
-          false,
-          ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_PENDING_CONFIRMATION,
-          "awaiting consistent GICP confirmation", attempt.num_inliers, attempt.registration_error,
-          source_points, map_to_robot_base, covariance);
-        if (coarse_first_window_only_ && fine_alignment_enabled_) {
-          need_coarse_alignment_ = false;
-        }
-        return;
-      }
-    }
-
-    const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
-    if (!odom_to_robot_base) {
-      publishObservation(
-        false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
-        "odom->robot_base unavailable at observation time", attempt.num_inliers,
-        attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
-      return;
-    }
-
-    result_t_ = previous_result_t_ = candidate;
-    if (auto current_robot_base_to_odom = getCurrentRobotBaseToOdom()) {
-      last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
-    }
-    pending_confirmation_transform_.reset();
-    pending_confirmation_count_ = 0;
-    has_accepted_alignment_ = true;
-    if (coarse_first_window_only_ && fine_alignment_enabled_) {
-      using LS = ats_navigation_interfaces::msg::LocalizationStatus;
-      if (!follow_localization_status_) {
-        need_coarse_alignment_ = false;
-      } else {
-        need_coarse_alignment_ = localization_state_ == LS::STATE_LOST ||
-                                 localization_state_ == LS::STATE_DEGRADED ||
-                                 localization_state_ == LS::STATE_RELOCALIZING;
-      }
-    }
-
-    publishObservation(
-      true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
-      "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
-      result_t_ * *odom_to_robot_base, covariance);
-  } else {
+  if (!attempt.ok) {
     RCLCPP_WARN(
       this->get_logger(),
       "Reject GICP result: stage=%s reason=%s converged=%s inliers=%zu/%d error=%.6f "
@@ -844,14 +1144,97 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       attempt.stage.c_str(), attempt.reject_reason.c_str(), attempt.converged ? "true" : "false",
       attempt.num_inliers, min_inliers_, attempt.registration_error, attempt.overlap_ratio,
       max_registration_error_);
-    pending_confirmation_transform_.reset();
+    pending_confirmation_.reset();
     pending_confirmation_count_ = 0;
     need_coarse_alignment_ = true;
     publishObservation(
       false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
       attempt.reject_reason.empty() ? "rejected" : attempt.reject_reason, attempt.num_inliers,
       attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
+    return;
   }
+
+  // 确认与接受都必须锚定同一扫描时刻的 odom 位姿；拿不到就不能推进确认状态。
+  const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
+  if (!odom_to_robot_base) {
+    publishObservation(
+      false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
+      "odom->robot_base unavailable at observation time", attempt.num_inliers,
+      attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
+    return;
+  }
+
+  const Eigen::Isometry3d candidate = attempt.transform;
+  ConfirmationSample sample;
+  sample.map_to_odom = candidate;
+  sample.odom_to_base = *odom_to_robot_base;
+  sample.scan_time_s = scan_time.seconds();
+
+  // 记录本帧假设，供下一帧候选 motion 一致性软约束使用。
+  last_hypothesis_ = sample;
+  last_hypothesis_time_ = scan_time;
+
+  if (confirmation_count_ > 1) {
+    if (!pending_confirmation_) {
+      pending_confirmation_ = sample;
+      pending_confirmation_count_ = 1;
+    } else {
+      const ConfirmationDecision decision =
+        evaluateCandidateConfirmation(candidate, scan_time, *odom_to_robot_base);
+      if (decision.consistent) {
+        ++pending_confirmation_count_;
+      } else {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Confirmation restart: %s (dxy=%.3f dyaw=%.3f motion_dxy=%.3f motion_dyaw=%.3f)",
+          decision.reason.c_str(), decision.translation_delta, decision.yaw_delta,
+          decision.motion_translation, decision.motion_yaw);
+        // 时间戳不递增/间隔不足意味着这是同一扫描窗口，不能重置锚点后重复计数。
+        const bool same_window = decision.reason == "confirmation scan stamp not increasing" ||
+                                 decision.reason == "confirmation scan interval too short";
+        if (!same_window) {
+          pending_confirmation_ = sample;
+          pending_confirmation_count_ = 1;
+        }
+      }
+    }
+    if (pending_confirmation_count_ < confirmation_count_) {
+      publishObservation(
+        false,
+        ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_PENDING_CONFIRMATION,
+        "awaiting consistent GICP confirmation", attempt.num_inliers, attempt.registration_error,
+        source_points, candidate * *odom_to_robot_base, covariance);
+      if (coarse_first_window_only_ && fine_alignment_enabled_) {
+        need_coarse_alignment_ = false;
+      }
+      return;
+    }
+  }
+
+  result_t_ = previous_result_t_ = candidate;
+  if (auto current_robot_base_to_odom = getCurrentRobotBaseToOdom()) {
+    last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
+  }
+  pending_confirmation_.reset();
+  pending_confirmation_count_ = 0;
+  has_accepted_alignment_ = true;
+  // 接受后 seed 变了，格网 cursor 必须从新 seed 的中心重新开始。
+  multi_guess_cursor_ = 0;
+  if (coarse_first_window_only_ && fine_alignment_enabled_) {
+    using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+    if (!follow_localization_status_) {
+      need_coarse_alignment_ = false;
+    } else {
+      need_coarse_alignment_ = localization_state_ == LS::STATE_LOST ||
+                               localization_state_ == LS::STATE_DEGRADED ||
+                               localization_state_ == LS::STATE_RELOCALIZING;
+    }
+  }
+
+  publishObservation(
+    true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
+    "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
+    result_t_ * *odom_to_robot_base, covariance);
 }
 
 void SmallGicpRelocalizationNode::publishTransform()
@@ -905,26 +1288,38 @@ void SmallGicpRelocalizationNode::publishObservation(
     return;
   }
 
-  ats_navigation_interfaces::msg::RelocalizationObservation observation;
+  using Observation = ats_navigation_interfaces::msg::RelocalizationObservation;
+  const ObservationQualityResult quality =
+    observationQuality(accepted, error, inliers, source_points);
+
+  bool effective_accepted = accepted;
+  std::uint8_t effective_status = status;
+  std::string effective_message = message;
+  // 非有限 registration error 绝不允许成为 STATUS_ACCEPTED，也绝不改写成 0.0。
+  if (!quality.error_finite && (accepted || status == Observation::STATUS_ACCEPTED)) {
+    effective_accepted = false;
+    effective_status = Observation::STATUS_INVALID;
+    effective_message = "non-finite registration error must never be accepted";
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Blocked acceptance with non-finite registration error (%f); reporting STATUS_INVALID",
+      error);
+  }
+
+  Observation observation;
   observation.header.stamp = has_received_scan_ ? last_scan_time_ : now();
   observation.header.frame_id = map_frame_;
   observation.child_frame_id = robot_base_frame_;
   observation.sequence = ++observation_sequence_;
-  observation.accepted = accepted;
-  observation.status = status;
+  observation.accepted = effective_accepted;
+  observation.status = effective_status;
   observation.inlier_count = static_cast<std::uint32_t>(
     std::min<std::size_t>(inliers, std::numeric_limits<std::uint32_t>::max()));
   observation.source_points = static_cast<std::uint32_t>(
     std::min<std::size_t>(source_points, std::numeric_limits<std::uint32_t>::max()));
-  // Non-finite GICP error (common under sim covariance collapse) must not force
-  // quality=0, or localization_fusion rejects with min_observation_quality.
-  observation.registration_error = std::isfinite(error) ? error : 0.0;
-  const double inlier_ratio =
-    source_points > 0 ? static_cast<double>(inliers) / static_cast<double>(source_points) : 0.0;
-  const double error_quality =
-    std::isfinite(error) && error >= 0.0 ? std::exp(-std::min(error, 10.0)) : 1.0;
-  observation.quality = accepted ? std::clamp(inlier_ratio * error_quality, 0.0, 1.0) : 0.0;
-  observation.message = message;
+  observation.registration_error = error;
+  observation.quality = quality.quality;
+  observation.message = effective_message;
 
   const Eigen::Vector3d translation = map_to_robot_base.translation();
   const Eigen::Quaterniond rotation(map_to_robot_base.rotation());
@@ -963,8 +1358,11 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     Eigen::Isometry3d map_to_odom = map_to_robot_base * robot_base_to_odom;
 
     previous_result_t_ = result_t_ = map_to_odom;
-    pending_confirmation_transform_.reset();
+    pending_confirmation_.reset();
     pending_confirmation_count_ = 0;
+    last_hypothesis_.reset();
+    last_hypothesis_time_.reset();
+    multi_guess_cursor_ = 0;
     clearAccumulation();
     initial_pose_override_time_ = this->now();
     need_coarse_alignment_ = true;
@@ -999,8 +1397,9 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
     (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED);
   if (entered_recovery) {
     need_coarse_alignment_ = true;
-    pending_confirmation_transform_.reset();
+    pending_confirmation_.reset();
     pending_confirmation_count_ = 0;
+    multi_guess_cursor_ = 0;
     RCLCPP_WARN(
       this->get_logger(),
       "Localization left TRACKING (state=%u epoch=%s silence=%.2f) - forcing coarse recovery",
@@ -1026,10 +1425,7 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
     }
   }
 
-  const bool force_after_initial_pose =
-    initial_pose_override_time_ && (this->now() - *initial_pose_override_time_).seconds() <=
-                                     initial_pose_force_registration_window_s_;
-  if (force_after_initial_pose) {
+  if (inInitialPoseForceWindow()) {
     return true;
   }
 
@@ -1042,7 +1438,7 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
     return false;
   }
 
-  if (pending_confirmation_transform_) {
+  if (pending_confirmation_) {
     return true;
   }
 
@@ -1103,14 +1499,6 @@ std::optional<Eigen::Isometry3d> SmallGicpRelocalizationNode::getOdomToRobotBase
   }
 }
 
-bool SmallGicpRelocalizationNode::confirmationConsistent(const Eigen::Isometry3d & candidate) const
-{
-  return pending_confirmation_transform_ &&
-         (candidate.translation() - pending_confirmation_transform_->translation()).norm() <=
-           confirmation_translation_tolerance_ &&
-         yawDistance(candidate, *pending_confirmation_transform_) <= confirmation_yaw_tolerance_;
-}
-
 double SmallGicpRelocalizationNode::translationDeltaFromLastTrigger(
   const Eigen::Isometry3d & current_robot_base_to_odom) const
 {
@@ -1128,11 +1516,7 @@ double SmallGicpRelocalizationNode::yawDeltaFromLastTrigger(
   if (!last_registration_robot_base_to_odom_) {
     return 0.0;
   }
-  const double current_yaw = current_robot_base_to_odom.rotation().eulerAngles(0, 1, 2).z();
-  const double previous_yaw =
-    last_registration_robot_base_to_odom_->rotation().eulerAngles(0, 1, 2).z();
-  return std::abs(
-    std::atan2(std::sin(current_yaw - previous_yaw), std::cos(current_yaw - previous_yaw)));
+  return yawDistance(current_robot_base_to_odom, *last_registration_robot_base_to_odom_);
 }
 
 }  // namespace small_gicp_relocalization

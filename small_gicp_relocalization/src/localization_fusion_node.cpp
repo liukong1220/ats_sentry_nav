@@ -366,6 +366,19 @@ private:
     status_message_ = message;
   }
 
+  /// Steady-clock silence since the last ACCEPTED observation. Before the first
+  /// accepted observation it counts from map-frame initialization, so a cold
+  /// start on a wrong seed still reaches DEGRADED and LOST on schedule.
+  double observationSilenceLocked() const
+  {
+    const std::optional<SteadyTime> & reference =
+      last_observation_receive_time_ ? last_observation_receive_time_ : observation_clock_start_;
+    if (!reference) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return std::max(0.0, steadySecondsSince(*reference));
+  }
+
   void updateHealthLocked()
   {
     if (!last_odom_receive_time_) {
@@ -390,18 +403,24 @@ private:
       return;
     }
     relocalizing_until_.reset();
-    if (
-      last_observation_receive_time_ && observation_lost_timeout_s_ > 0.0 &&
-      steadySecondsSince(*last_observation_receive_time_) > observation_lost_timeout_s_) {
+    if (!observation_clock_start_) {
+      observation_clock_start_ = std::chrono::steady_clock::now();
+    }
+    const double observation_silence = observationSilenceLocked();
+    const bool never_accepted = !last_observation_receive_time_;
+    if (observation_lost_timeout_s_ > 0.0 && observation_silence > observation_lost_timeout_s_) {
       status_ = LocalizationStatus::STATE_LOST;
-      status_message_ = "accepted relocalization observation timed out";
+      status_message_ = never_accepted
+                          ? "no accepted relocalization observation since map-frame init"
+                          : "accepted relocalization observation timed out";
       return;
     }
     if (
-      last_observation_receive_time_ && observation_degraded_timeout_s_ > 0.0 &&
-      steadySecondsSince(*last_observation_receive_time_) > observation_degraded_timeout_s_) {
+      observation_degraded_timeout_s_ > 0.0 &&
+      observation_silence > observation_degraded_timeout_s_) {
       status_ = LocalizationStatus::STATE_DEGRADED;
-      status_message_ = "accepted relocalization observation stale";
+      status_message_ = never_accepted ? "awaiting first accepted relocalization observation"
+                                       : "accepted relocalization observation stale";
       return;
     }
     if (consecutive_rejections_ >= static_cast<std::uint32_t>(max_consecutive_rejections_)) {
@@ -445,10 +464,7 @@ private:
     status.odometry_silence_sec = last_odom_receive_time_
                                     ? std::max(0.0, steadySecondsSince(*last_odom_receive_time_))
                                     : std::numeric_limits<double>::infinity();
-    status.observation_silence_sec =
-      last_observation_receive_time_
-        ? std::max(0.0, steadySecondsSince(*last_observation_receive_time_))
-        : std::numeric_limits<double>::infinity();
+    status.observation_silence_sec = observationSilenceLocked();
     if (last_observation_stamp_) {
       const auto stamp_ns = last_observation_stamp_->nanoseconds();
       status.last_observation_stamp.sec = static_cast<std::int32_t>(stamp_ns / 1000000000LL);
@@ -508,6 +524,9 @@ private:
   std::optional<rclcpp::Time> last_observation_stamp_;
   std::optional<std::uint64_t> last_observation_sequence_;
   std::optional<SteadyTime> last_observation_receive_time_;
+  // Armed when map->odom first exists so that "never received an accepted
+  // observation" is measured silence, not unearned TRACKING confidence.
+  std::optional<SteadyTime> observation_clock_start_;
   std::optional<SteadyTime> relocalizing_until_;
   tf2::Transform map_to_odom_{tf2::Transform::getIdentity()};
   bool has_map_to_odom_{false};
