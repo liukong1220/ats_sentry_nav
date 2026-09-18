@@ -67,6 +67,11 @@ if(BUILD_TESTING)
   target_include_directories(test_relocalization_candidate_core PUBLIC include)
   ament_target_dependencies(test_relocalization_candidate_core tf2_eigen)
 
+  ament_add_gtest(test_scan_input_core
+    test/test_scan_input_core.cpp
+  )
+  target_include_directories(test_scan_input_core PUBLIC include)
+
   ament_add_pytest_test(test_localization_fusion_node
     test/test_localization_fusion_node.py
     TIMEOUT 40

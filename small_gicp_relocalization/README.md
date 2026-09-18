@@ -52,3 +52,28 @@ cd ..
     ```zsh
     ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py
     ```
+
+## Runtime input contract
+
+`registered_scan` is consumed with `SensorDataQoS.keep_last(1)` so a delayed
+scan cannot build an unbounded backlog while GICP is busy. Before a scan enters
+the accumulation window, the node checks:
+
+- non-empty `frame_id` and (when `lidar_frame` is configured) an exact frame match;
+- positive, strictly increasing timestamps, a bounded age (`max_scan_age_s`) and
+  future tolerance (`max_scan_future_s`);
+- finite XYZ values, range and height limits, and `min_scan_valid_ratio`.
+
+Invalid points are removed from an otherwise usable frame. A frame whose valid
+ratio is below the configured threshold is rejected as a whole. The accumulation
+window is bounded by `max_accumulated_points` and `max_accumulated_frames`; when
+the limit is reached the old window is cleared before accepting the newest frame.
+Drop, stale, invalid, accepted and trimmed-window counters are emitted in a
+throttled diagnostic log. This node does not deskew scans: the upstream
+`registered_scan` producer must publish a cloud already expressed at its header
+timestamp, or the frame is not suitable for global relocalization.
+
+The default limits are conservative for real and simulated runs. Offline replay
+may set `max_scan_age_s:=0` when message timestamps intentionally do not share the
+replay node's clock; this disables only the age gate, not frame, monotonicity,
+finite-point or range checks.

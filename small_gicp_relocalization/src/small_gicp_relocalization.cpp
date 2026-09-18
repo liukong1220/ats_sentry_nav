@@ -139,6 +139,15 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("initial_pose_force_registration_window_s", 2.0);
   this->declare_parameter("transform_future_offset_s", 0.25);
   this->declare_parameter("max_scan_stamp_lag_s", 0.25);
+  this->declare_parameter("max_scan_age_s", 1.0);
+  this->declare_parameter("max_scan_future_s", 0.10);
+  this->declare_parameter("scan_min_range_m", 0.10);
+  this->declare_parameter("scan_max_range_m", 100.0);
+  this->declare_parameter("scan_min_z_m", -5.0);
+  this->declare_parameter("scan_max_z_m", 5.0);
+  this->declare_parameter("min_scan_valid_ratio", 0.50);
+  this->declare_parameter("max_accumulated_points", 40000);
+  this->declare_parameter("max_accumulated_frames", 30);
   this->declare_parameter("map_frame", "map");
   this->declare_parameter("odom_frame", "odom");
   this->declare_parameter("base_frame", "");
@@ -227,6 +236,17 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     "initial_pose_force_registration_window_s", initial_pose_force_registration_window_s_);
   this->get_parameter("transform_future_offset_s", transform_future_offset_s_);
   this->get_parameter("max_scan_stamp_lag_s", max_scan_stamp_lag_s_);
+  this->get_parameter("max_scan_age_s", max_scan_age_s_);
+  this->get_parameter("max_scan_future_s", max_scan_future_s_);
+  this->get_parameter("scan_min_range_m", scan_min_range_m_);
+  this->get_parameter("scan_max_range_m", scan_max_range_m_);
+  this->get_parameter("scan_min_z_m", scan_min_z_m_);
+  this->get_parameter("scan_max_z_m", scan_max_z_m_);
+  this->get_parameter("min_scan_valid_ratio", min_scan_valid_ratio_);
+  std::int64_t max_accumulated_points = static_cast<std::int64_t>(max_accumulated_points_);
+  std::int64_t max_accumulated_frames = static_cast<std::int64_t>(max_accumulated_frames_);
+  this->get_parameter("max_accumulated_points", max_accumulated_points);
+  this->get_parameter("max_accumulated_frames", max_accumulated_frames);
   this->get_parameter("map_frame", map_frame_);
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("base_frame", base_frame_);
@@ -280,6 +300,18 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("force_registration_when_lost", force_registration_when_lost_);
   this->get_parameter("status_stale_skip_registration_s", status_stale_skip_registration_s_);
   status_stale_skip_registration_s_ = std::max(0.0, status_stale_skip_registration_s_);
+  max_scan_age_s_ = std::max(0.0, max_scan_age_s_);
+  max_scan_future_s_ = std::max(0.0, max_scan_future_s_);
+  scan_min_range_m_ = std::max(0.0, scan_min_range_m_);
+  scan_max_range_m_ = std::max(scan_min_range_m_, scan_max_range_m_);
+  if (!std::isfinite(scan_min_z_m_) || !std::isfinite(scan_max_z_m_)) {
+    throw std::invalid_argument("scan z limits must be finite");
+  }
+  scan_max_z_m_ = std::max(scan_min_z_m_, scan_max_z_m_);
+  min_scan_valid_ratio_ = std::clamp(min_scan_valid_ratio_, 0.0, 1.0);
+  max_accumulated_points_ =
+    static_cast<std::size_t>(std::max<std::int64_t>(1, max_accumulated_points));
+  max_accumulated_frames_ = static_cast<int>(std::max<std::int64_t>(1, max_accumulated_frames));
   double height_min_z = -0.5;
   double height_max_z = 2.5;
   this->get_parameter("height_filter.enable", height_filter_enable_);
@@ -361,7 +393,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     target_, small_gicp::KdTreeBuilderOMP(num_threads_));
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "registered_scan", 10,
+    "registered_scan", rclcpp::SensorDataQoS().keep_last(1),
     std::bind(&SmallGicpRelocalizationNode::registeredPcdCallback, this, std::placeholders::_1));
 
   initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
@@ -399,6 +431,13 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     confirmation_motion_yaw_tolerance_, multi_guess_time_budget_s_,
     multi_guess_max_candidates_per_scan_, ambiguity_.min_score_margin, ambiguity_.min_separation_xy,
     ambiguity_.min_separation_yaw);
+  RCLCPP_INFO(
+    this->get_logger(),
+    "scan input gate: expected_frame='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
+    "valid_ratio=%.2f accumulation_limit=%zu points/%d frames",
+    lidar_frame_.c_str(), max_scan_age_s_, max_scan_future_s_, scan_min_range_m_, scan_max_range_m_,
+    scan_min_z_m_, scan_max_z_m_, min_scan_valid_ratio_, max_accumulated_points_,
+    max_accumulated_frames_);
 }
 
 SmallGicpRelocalizationNode::~SmallGicpRelocalizationNode() { cancelAsyncMultiGuess(); }
@@ -444,17 +483,104 @@ void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
 void SmallGicpRelocalizationNode::registeredPcdCallback(
   const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
+  if (!msg) {
+    recordDroppedScan("received null scan message");
+    return;
+  }
+  ScanInputConfig input_config;
+  input_config.expected_frame = lidar_frame_;
+  input_config.max_age_s = max_scan_age_s_;
+  input_config.max_future_s = max_scan_future_s_;
+  input_config.min_range_m = scan_min_range_m_;
+  input_config.max_range_m = scan_max_range_m_;
+  input_config.min_z_m = scan_min_z_m_;
+  input_config.max_z_m = scan_max_z_m_;
+  input_config.min_valid_ratio = min_scan_valid_ratio_;
+  const std::int64_t stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+  const std::int64_t now_ns = this->now().nanoseconds();
+  const std::string metadata_error = validateScanMetadata(
+    msg->header.frame_id, stamp_ns, now_ns, last_received_scan_stamp_ns_, input_config);
+  if (!metadata_error.empty()) {
+    if (
+      metadata_error.find("stale") != std::string::npos ||
+      metadata_error.find("future") != std::string::npos ||
+      metadata_error.find("order") != std::string::npos ||
+      metadata_error.find("duplicate") != std::string::npos) {
+      ++stale_scan_count_;
+    } else {
+      ++invalid_scan_count_;
+    }
+    recordDroppedScan(metadata_error);
+    return;
+  }
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
+  try {
+    pcl::fromROSMsg(*msg, *scan);
+  } catch (const std::exception & exception) {
+    ++invalid_scan_count_;
+    recordDroppedScan(std::string("failed to decode scan: ") + exception.what());
+    return;
+  }
+  ScanInputStats stats;
+  stats.total_points = scan->size();
+  pcl::PointCloud<pcl::PointXYZ>::Ptr valid_scan(new pcl::PointCloud<pcl::PointXYZ>());
+  valid_scan->points.reserve(scan->size());
+  for (const auto & point : scan->points) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+      continue;
+    }
+    ++stats.finite_points;
+    if (scanPointInRange(point.x, point.y, point.z, input_config)) {
+      valid_scan->points.push_back(point);
+      ++stats.valid_points;
+    }
+  }
+  const std::string point_error = validateScanPointStats(stats, input_config);
+  if (!point_error.empty()) {
+    ++invalid_scan_count_;
+    recordDroppedScan(point_error);
+    return;
+  }
+  valid_scan->width = static_cast<std::uint32_t>(valid_scan->points.size());
+  valid_scan->height = 1;
+  valid_scan->is_dense = true;
+
+  // Keep the callback bounded when registration is blocked by stale TF/status or a
+  // long-running LOST search. The newest scan starts a fresh window and old points
+  // cannot silently survive a recovery transition.
+  if (
+    accumulated_frame_count_ >= max_accumulated_frames_ ||
+    accumulated_cloud_->size() + valid_scan->size() > max_accumulated_points_) {
+    ++trimmed_accumulation_count_;
+    clearAccumulation();
+  }
   last_scan_time_ = msg->header.stamp;
+  last_received_scan_stamp_ns_ = stamp_ns;
   current_scan_frame_id_ = msg->header.frame_id;
   has_received_scan_ = true;
   if (!first_accumulated_scan_time_) {
     first_accumulated_scan_time_ = msg->header.stamp;
   }
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
-  pcl::fromROSMsg(*msg, *scan);
-  *accumulated_cloud_ += *scan;
+  ++accepted_scan_count_;
+  *accumulated_cloud_ += *valid_scan;
+  accumulated_cloud_->width = static_cast<std::uint32_t>(accumulated_cloud_->size());
+  accumulated_cloud_->height = 1;
+  accumulated_cloud_->is_dense = true;
   ++accumulated_frame_count_;
+}
+
+void SmallGicpRelocalizationNode::recordDroppedScan(const std::string & reason)
+{
+  ++dropped_scan_count_;
+  RCLCPP_WARN_THROTTLE(
+    this->get_logger(), *this->get_clock(), 2000,
+    "Dropped registered_scan (%s); dropped=%s stale=%s invalid=%s accepted=%s "
+    "trimmed_windows=%s",
+    reason.c_str(), std::to_string(dropped_scan_count_).c_str(),
+    std::to_string(stale_scan_count_).c_str(), std::to_string(invalid_scan_count_).c_str(),
+    std::to_string(accepted_scan_count_).c_str(),
+    std::to_string(trimmed_accumulation_count_).c_str());
 }
 
 void SmallGicpRelocalizationNode::clearAccumulation()
