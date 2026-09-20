@@ -54,6 +54,8 @@ public:
   ~SmallGicpRelocalizationNode() override;
 
 private:
+  friend class SmallGicpRelocalizationFrameTest;
+
   using PointCovarianceCloud = pcl::PointCloud<pcl::PointCovariance>;
   using PointKdTree = small_gicp::KdTree<PointCovarianceCloud>;
   using GicpRegistration =
@@ -90,6 +92,7 @@ private:
   /// 不触碰节点状态，避免与 /initialpose、status 回调竞争。
   struct MultiGuessRequest
   {
+    std::uint64_t generation{0};
     PointCovarianceCloud::Ptr source;
     std::shared_ptr<PointKdTree> source_tree;
     /// coarse 筛选专用的降采样源云。为空时退回 source。
@@ -109,6 +112,7 @@ private:
 
   struct MultiGuessOutcome
   {
+    std::uint64_t generation{0};
     RegistrationAttempt best;
     CandidateLatticeStats lattice;
     std::size_t evaluated{0};
@@ -126,7 +130,7 @@ private:
   };
 
   void registeredPcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
-  void loadGlobalMap(const std::string & file_name);
+  bool loadGlobalMap(const std::string & file_name);
   void performRegistration();
   void publishTransform();
   void publishObservation(
@@ -206,6 +210,7 @@ private:
   double max_accumulation_age_s_;
   double min_registration_translation_delta_;
   double min_registration_yaw_delta_;
+  double accepted_observation_refresh_interval_s_;
   double initial_pose_force_registration_window_s_;
   double transform_future_offset_s_;
   double max_scan_stamp_lag_s_;
@@ -223,7 +228,6 @@ private:
   // Coarse-to-fine / windowed alignment (BIT icp_relocalization + HWSentry quality gates).
   std::string registration_mode_{"initial_guess"};
   int accumulate_frames_{1};
-  int accumulated_frame_count_{0};
   bool fine_alignment_enabled_{true};
   bool coarse_first_window_only_{true};
   float fine_max_dist_sq_{0.2025f};  // 0.45 m
@@ -265,6 +269,7 @@ private:
   std::uint64_t localization_epoch_{0};
   double observation_silence_sec_{0.0};
   std::optional<rclcpp::Time> last_status_receive_time_;
+  std::int64_t last_status_stamp_ns_{0};
   // After a stall (e.g. SIGSTOP), skip registration until a fresh status sample arrives
   // so we do not act on a ghost TRACKING state that missed LOST transitions.
   double status_stale_skip_registration_s_{1.0};
@@ -273,6 +278,8 @@ private:
   float height_filter_max_z_{2.5f};
 
   // LOST multi_guess runs off the ROS callback thread so /initialpose stays responsive.
+  RelocalizationGeneration relocalization_generation_;
+  std::uint64_t stale_async_result_count_{0};
   std::atomic<bool> multi_guess_running_{false};
   std::atomic<bool> cancel_multi_guess_{false};
   std::mutex async_result_mutex_;
@@ -285,12 +292,9 @@ private:
   std::string map_frame_;
   std::string odom_frame_;
   std::string prior_pcd_file_;
-  std::string base_frame_;
   std::string robot_base_frame_;
-  std::string lidar_frame_;
   std::string current_scan_frame_id_;
   rclcpp::Time last_scan_time_;
-  std::optional<rclcpp::Time> first_accumulated_scan_time_;
   std::optional<rclcpp::Time> initial_pose_override_time_;
   bool has_received_scan_{false};
   std::int64_t last_received_scan_stamp_ns_{0};
@@ -299,19 +303,22 @@ private:
   std::uint64_t stale_scan_count_{0};
   std::uint64_t invalid_scan_count_{0};
   std::uint64_t trimmed_accumulation_count_{0};
+  std::uint64_t sampled_scan_points_count_{0};
+  std::uint64_t evicted_scan_frames_count_{0};
   std::uint64_t observation_sequence_{0};
   int pending_confirmation_count_{0};
   std::optional<ConfirmationSample> pending_confirmation_;
   // 上一帧通过硬门的假设，用于候选级 motion 一致性软约束。
   std::optional<ConfirmationSample> last_hypothesis_;
   std::optional<rclcpp::Time> last_hypothesis_time_;
+  std::optional<rclcpp::Time> last_accepted_observation_scan_time_;
   Eigen::Isometry3d result_t_;
   Eigen::Isometry3d previous_result_t_;
   std::optional<Eigen::Isometry3d> last_registration_robot_base_to_odom_;
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr global_map_;
   pcl::PointCloud<pcl::PointXYZ>::Ptr registered_scan_;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_cloud_;
+  ScanAccumulationWindow<pcl::PointCloud<pcl::PointXYZ>::VectorType> scan_window_{40000, 30, 1};
   PointCovarianceCloud::Ptr target_;
   PointCovarianceCloud::Ptr source_;
   /// coarse 候选筛选云。与 source_ 同一帧、同一滤波，只是更稀疏。

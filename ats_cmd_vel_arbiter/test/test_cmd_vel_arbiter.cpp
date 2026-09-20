@@ -238,7 +238,7 @@ TEST(CmdVelArbiter, StaleOrReplayExecutionCommandIsRejected)
   EXPECT_FALSE(arbiter.autoAuthorized());
   ASSERT_TRUE(execute(arbiter, 2, milliseconds(0), t0));
   EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), t0));
-  EXPECT_TRUE(arbiter.autoAuthorized());
+  EXPECT_FALSE(arbiter.autoAuthorized());
 }
 
 TEST(CmdVelArbiter, AutoTimeoutDoesNotResurrectOldCommand)
@@ -318,7 +318,7 @@ TEST(CmdVelArbiter, NewIncarnationRequiresStopBeforeExecute)
 
   EXPECT_FALSE(arbiter.onExecutionCommand(
     true, kManagerIncarnation + 1, 1, milliseconds(0), t0 + milliseconds(1)));
-  EXPECT_EQ(arbiter.tick(t0 + milliseconds(2)).source, CmdVelSource::AUTO);
+  EXPECT_TRUE(arbiter.tick(t0 + milliseconds(2)).isZero());
 
   ASSERT_TRUE(arbiter.onExecutionCommand(
     false, kManagerIncarnation + 1, 1, milliseconds(0), t0 + milliseconds(3)));
@@ -477,3 +477,79 @@ TEST(CmdVelArbiter, BodyFrameHolonomicComponentsArePreserved)
   EXPECT_DOUBLE_EQ(manual_output.vy, -0.22);
   EXPECT_DOUBLE_EQ(manual_output.wz, 0.33);
 }
+
+namespace
+{
+
+struct RejectedCommand
+{
+  const char * name;
+  uint8_t mode;
+  uint64_t incarnation;
+  uint64_t sequence;
+  std::chrono::nanoseconds age;
+};
+
+class CmdVelArbiterRejection : public ::testing::TestWithParam<RejectedCommand> {};
+
+TEST_P(CmdVelArbiterRejection, RevokesActiveAutoWithoutResettingReplayWatermarks)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  armLink(arbiter, now);
+  ASSERT_TRUE(execute(arbiter, 10, milliseconds(0), now));
+  arbiter.onAuto(1.0, -0.2, 0.3, now);
+  ASSERT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+
+  const auto & rejected = GetParam();
+  EXPECT_FALSE(arbiter.onExecutionCommand(
+    rejected.mode, rejected.incarnation, rejected.sequence, rejected.age, now));
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+
+  // Invalid input must neither erase nor advance the accepted identity watermark.
+  EXPECT_FALSE(execute(arbiter, 10, milliseconds(0), now));
+  ASSERT_TRUE(execute(arbiter, 11, milliseconds(0), now));
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onAuto(0.6, 0.1, -0.2, now);
+  const auto recovered = arbiter.tick(now);
+  EXPECT_EQ(recovered.source, CmdVelSource::AUTO);
+  EXPECT_DOUBLE_EQ(recovered.vx, 0.6);
+}
+
+TEST_P(CmdVelArbiterRejection, PreservesIndependentManualAuthority)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  armLink(arbiter, now);
+  ASSERT_TRUE(execute(arbiter, 10, milliseconds(0), now));
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  arbiter.onManual(0.4, -0.1, 0.2, now);
+  const auto & rejected = GetParam();
+  EXPECT_FALSE(arbiter.onExecutionCommand(
+    rejected.mode, rejected.incarnation, rejected.sequence, rejected.age, now));
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  const auto output = arbiter.tick(now);
+  EXPECT_EQ(output.source, CmdVelSource::MANUAL);
+  EXPECT_DOUBLE_EQ(output.vx, 0.4);
+  EXPECT_DOUBLE_EQ(output.vy, -0.1);
+  EXPECT_DOUBLE_EQ(output.wz, 0.2);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  InvalidAuthorization, CmdVelArbiterRejection,
+  ::testing::Values(
+    RejectedCommand{"FutureNanosecond", 1, kManagerIncarnation, 99,
+      std::chrono::nanoseconds(-1)},
+    RejectedCommand{"StaleNanosecond", 1, kManagerIncarnation, 99,
+      milliseconds(500) + std::chrono::nanoseconds(1)},
+    RejectedCommand{"Replay", 1, kManagerIncarnation, 10, milliseconds(0)},
+    RejectedCommand{"OlderSequence", 1, kManagerIncarnation, 9, milliseconds(0)},
+    RejectedCommand{"OldIncarnation", 1, kManagerIncarnation - 1, 99, milliseconds(0)},
+    RejectedCommand{"NewOwnerWithoutStop", 1, kManagerIncarnation + 1, 99, milliseconds(0)},
+    RejectedCommand{"InvalidMode", 2, kManagerIncarnation + 1, 99, milliseconds(0)},
+    RejectedCommand{"MissingIncarnation", 1, 0, 99, milliseconds(0)},
+    RejectedCommand{"MissingSequence", 1, kManagerIncarnation, 0, milliseconds(0)}),
+  [](const ::testing::TestParamInfo<RejectedCommand> & info) {return info.param.name;});
+
+}  // namespace

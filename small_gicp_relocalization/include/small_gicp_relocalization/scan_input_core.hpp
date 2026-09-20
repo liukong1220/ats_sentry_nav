@@ -18,8 +18,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace small_gicp_relocalization
 {
@@ -52,7 +56,7 @@ inline std::string validateScanMetadata(
   if (frame_id.empty()) {
     return "scan frame_id is empty";
   }
-  if (!config.expected_frame.empty() && frame_id != config.expected_frame) {
+  if (frame_id != config.expected_frame) {
     return "scan frame_id mismatch: expected " + config.expected_frame + ", got " + frame_id;
   }
   if (stamp_ns <= 0) {
@@ -105,6 +109,117 @@ inline std::string validateScanPointStats(
   }
   return {};
 }
+
+/// Own whole scan chunks; callbacks never concatenate or shift the existing window.
+/// PointVector is the cloud's native vector type (including its aligned allocator).
+template <typename PointVector>
+class ScanAccumulationWindow
+{
+public:
+  struct Trim
+  {
+    std::size_t sampled_points{0};
+    std::size_t evicted_frames{0};
+  };
+
+  ScanAccumulationWindow(
+    std::size_t max_points, std::size_t max_frames, std::size_t required_frames)
+  : max_points_(max_points), max_frames_(max_frames)
+  {
+    if (required_frames == 0 || required_frames > max_frames || max_points < max_frames) {
+      throw std::invalid_argument(
+        "accumulate_frames must be positive and <= max_accumulated_frames; "
+        "max_accumulated_points must retain at least one point per maximum frame");
+    }
+    // Reserve room for the full temporal window, not just required_frames: the
+    // registration gate also requires a minimum scan timestamp span. With quota
+    // max_points/required_frames, dense scans could still starve that age gate.
+    // Cadences needing more than max_frames to span that duration remain invalid
+    // operational inputs; neither the frame bound nor the age gate is relaxed.
+    per_scan_points_ = max_points / max_frames;
+  }
+
+  Trim append(PointVector points, std::int64_t stamp_ns)
+  {
+    if (points.empty()) {
+      throw std::invalid_argument("cannot accumulate an empty scan");
+    }
+    Trim trim;
+    if (points.size() > per_scan_points_) {
+      trim.sampled_points = points.size() - per_scan_points_;
+      PointVector sampled;
+      sampled.reserve(per_scan_points_);
+      // Sample the entire ordered scan, not a first-N crop. Both endpoints survive
+      // when there is room for two points. Integer stepping avoids index overflow.
+      if (per_scan_points_ == 1) {
+        sampled.push_back(points[points.size() / 2]);
+      } else {
+        const auto intervals = per_scan_points_ - 1;
+        const auto step = (points.size() - 1) / intervals;
+        const auto remainder = (points.size() - 1) % intervals;
+        std::size_t index = 0;
+        std::size_t error = 0;
+        for (std::size_t i = 0; i < per_scan_points_; ++i) {
+          sampled.push_back(points[index]);
+          if (i + 1 < per_scan_points_) {
+            index += step;
+            if (error >= intervals - remainder) {
+              ++index;
+              error -= intervals - remainder;
+            } else {
+              error += remainder;
+            }
+          }
+        }
+      }
+      points = std::move(sampled);
+    }
+    while (!frames_.empty() &&
+           (frames_.size() >= max_frames_ || point_count_ > max_points_ - points.size())) {
+      point_count_ -= frames_.front().points.size();
+      frames_.pop_front();
+      ++trim.evicted_frames;
+    }
+    const auto added_points = points.size();
+    frames_.push_back({std::move(points), stamp_ns});
+    point_count_ += added_points;
+    return trim;
+  }
+
+  void clear()
+  {
+    frames_.clear();
+    point_count_ = 0;
+  }
+
+  std::size_t pointCount() const { return point_count_; }
+  std::size_t frameCount() const { return frames_.size(); }
+  std::optional<std::int64_t> firstStamp() const
+  {
+    return frames_.empty() ? std::nullopt : std::optional<std::int64_t>(frames_.front().stamp_ns);
+  }
+
+  void assemble(PointVector & points) const
+  {
+    points.clear();
+    points.reserve(point_count_);
+    for (const auto & frame : frames_) {
+      points.insert(points.end(), frame.points.begin(), frame.points.end());
+    }
+  }
+
+private:
+  struct Frame
+  {
+    PointVector points;
+    std::int64_t stamp_ns;
+  };
+  std::size_t max_points_;
+  std::size_t max_frames_;
+  std::size_t per_scan_points_;
+  std::size_t point_count_{0};
+  std::deque<Frame> frames_;
+};
 
 }  // namespace small_gicp_relocalization
 

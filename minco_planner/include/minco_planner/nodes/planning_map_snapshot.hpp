@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
@@ -32,6 +33,17 @@ struct PlannerSafetyState
     minimum_map_generation = current_generation + 1;
   }
 
+  // A fresh grid is still a healthy map source, but every reference committed
+  // against the previous immutable snapshot is no longer executable.  Keep
+  // the heartbeat lease alive while requiring a new plan for this generation.
+  void invalidatePlanForNewMap(std::uint64_t generation)
+  {
+    plan_safe = false;
+    if (generation > minimum_map_generation) {
+      minimum_map_generation = generation;
+    }
+  }
+
   bool mapSnapshotUsable(std::uint64_t generation) const
   {
     return map_ready && generation >= minimum_map_generation;
@@ -46,8 +58,18 @@ struct PlannerSafetyState
 struct PlanningMapSnapshot
 {
   std::uint64_t generation{0};
+  // A local safety identity, not a ROGMap source-generation or adapter
+  // publication sequence.  It binds the exact inputs from which RC-ESDF and
+  // swept-footprint checks are derived.
+  std::string safety_content_digest;
   nav_msgs::msg::OccupancyGrid grid;
   std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> clearance_esdf;
+
+  bool hasSameSafetyContent(const PlanningMapSnapshot & other) const
+  {
+    return !safety_content_digest.empty() &&
+           safety_content_digest == other.safety_content_digest;
+  }
 
   static std::shared_ptr<const PlanningMapSnapshot> create(
     std::uint64_t generation,

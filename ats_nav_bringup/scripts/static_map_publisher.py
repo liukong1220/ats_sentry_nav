@@ -14,6 +14,7 @@ import numpy as np
 from nav_msgs.msg import OccupancyGrid
 from PIL import Image
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import QoSProfile
@@ -104,13 +105,20 @@ class StaticMapPublisher(Node):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
-    node = StaticMapPublisher()
+    context = rclpy.get_default_context()
+    node = None
     try:
+        rclpy.init(args=args, context=context)
+        node = StaticMapPublisher()
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            context.try_shutdown()
 
 
 if __name__ == "__main__":

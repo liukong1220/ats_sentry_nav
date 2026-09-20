@@ -20,6 +20,7 @@ ats_swerve_mpc:
     # 唯一执行授权。非空时 legacy Path 不能装载 tracker，
     # 单独的 Bool false 不能解除急停。
     execution_command_topic: /planner/execution_command
+    # 与 cmd_vel_arbiter 使用同一 producer-stamp lease；未来/过期授权在 MPC 侧也拒绝。
     execution_command_timeout: 0.5
     gimbal_status_topic: /gimbal/yaw_status
     # 实车默认要求真实云台 ack；受控抬轮 HIL 才可由 launch 覆盖为 false。

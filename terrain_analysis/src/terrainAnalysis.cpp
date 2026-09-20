@@ -261,7 +261,15 @@ int main(int argc, char **argv) {
   rclcpp::Rate rate(100);
   bool status = rclcpp::ok();
   while (status) {
-    rclcpp::spin_some(nh);
+    try {
+      rclcpp::spin_some(nh);
+    } catch (const rclcpp::exceptions::RCLError &) {
+      // SIGINT may invalidate the context after the loop's status check.
+      if (!rclcpp::ok()) {
+        break;
+      }
+      throw;
+    }
     if (newlaserCloud) {
       newlaserCloud = false;
 

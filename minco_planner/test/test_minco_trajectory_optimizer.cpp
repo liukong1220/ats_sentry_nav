@@ -208,6 +208,31 @@ TEST(MincoTrajectoryOptimizer, UniformFallbackClosesCoupledDynamicLimits)
   EXPECT_LE(trace.peak_jerk, params.max_jerk + 1e-6);
 }
 
+TEST(MincoTrajectoryOptimizer, MovingStraightReplanPreservesBoundaryAndClosesJerk)
+{
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.max_jerk = 12.0;
+  params.guide_control_point_spacing = 0.30;
+  params.esdf_obstacle_optimization_enabled = false;
+  minco_planner::MincoTrajectoryOptimizer optimizer(params);
+  auto path = makeObstacleSkimmingPath();
+  path.poses.back().pose.position.x = 0.9;
+  minco_planner::InitialKinematicState initial_state;
+  initial_state.valid = true;
+  initial_state.velocity = Eigen::Vector2d(0.7, 0.0);
+  minco_planner::MincoOptimizationTrace trace;
+  const auto trajectory = optimizer.optimize(
+    path, nullptr, nullptr, &initial_state, nullptr, nullptr, &trace);
+  ASSERT_FALSE(trajectory.empty()) << trace.failure_reason << ": jerk=" << trace.peak_jerk;
+  EXPECT_NEAR(trajectory.points.front().vx, 0.7, 1e-8);
+  EXPECT_NEAR(trajectory.points.front().vy, 0.0, 1e-8);
+  EXPECT_NEAR(trajectory.points.back().x, 0.9, 1e-8);
+  EXPECT_NEAR(trajectory.points.back().v, 0.0, 1e-8);
+  EXPECT_LE(trace.peak_velocity, params.max_velocity + 1e-6);
+  EXPECT_LE(trace.peak_acceleration, params.max_acceleration + 1e-6);
+  EXPECT_LE(trace.peak_jerk, params.max_jerk + 1e-6);
+}
+
 TEST(MincoTrajectoryOptimizer, UsesEsdfGradientToIncreaseObstacleClearance)
 {
   minco_planner::MincoTrajectoryOptimizerParams params;

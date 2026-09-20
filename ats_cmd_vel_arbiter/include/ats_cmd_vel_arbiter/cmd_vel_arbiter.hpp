@@ -100,33 +100,34 @@ public:
   }
 
   /// age 是命令戳在到达时的年龄。租约从（now - age）起算，到期后即使 autonomy 持续刷新也必须归零。
-  /// stale / replay 不得延长已有授权。MODE_STOP、急停、断链立即撤销租约。
+  /// 拒绝命令必须撤销已有授权并清空自动源；防重放水位和手动源保持不变。
   /// 进程首次连接可接受新鲜 EXECUTE，以便 arbiter 重启后重新建立 DDS 状态；
   /// 已有 owner 时，新 manager_incarnation 只能由新鲜 MODE_STOP 接管。
   bool onExecutionCommand(
-    bool execute,
+    uint8_t mode,
     uint64_t manager_incarnation,
     uint64_t sequence,
-    std::chrono::milliseconds age,
+    std::chrono::nanoseconds age,
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
   {
+    const bool execute = mode == 1;
     if (
-      manager_incarnation == 0 || sequence == 0 || age.count() < 0 ||
+      mode > 1 || manager_incarnation == 0 || sequence == 0 || age.count() < 0 ||
       age > config_.execution_command_timeout)
     {
-      return false;
+      return rejectExecutionCommand();
     }
     if (!has_manager_incarnation_) {
       has_manager_incarnation_ = true;
       active_manager_incarnation_ = manager_incarnation;
       has_command_sequence_ = false;
     } else if (manager_incarnation < active_manager_incarnation_) {
-      return false;
+      return rejectExecutionCommand();
     } else if (manager_incarnation > active_manager_incarnation_) {
       // A restarted manager's sequence starts from one. Its EXECUTE must not
       // reactivate an old lease before the restart STOP has invalidated it.
       if (execute) {
-        return false;
+        return rejectExecutionCommand();
       }
       clearExecutionLease();
       invalidateAuto();
@@ -134,7 +135,7 @@ public:
       has_command_sequence_ = false;
     }
     if (has_command_sequence_ && sequence <= last_command_sequence_) {
-      return false;
+      return rejectExecutionCommand();
     }
     has_command_sequence_ = true;
     last_command_sequence_ = sequence;
@@ -250,6 +251,13 @@ public:
   }
 
 private:
+  bool rejectExecutionCommand()
+  {
+    clearExecutionLease();
+    invalidateAuto();
+    return false;
+  }
+
   static CmdVelArbiterOutput zero(CmdVelArbiterReason reason)
   {
     CmdVelArbiterOutput output;

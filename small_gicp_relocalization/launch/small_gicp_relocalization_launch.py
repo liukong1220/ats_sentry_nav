@@ -12,8 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def validate_prior_pcd(context):
+    path = LaunchConfiguration("prior_pcd_file").perform(context)
+    if not os.path.isfile(path) or not os.access(path, os.R_OK):
+        raise RuntimeError(
+            f"Localization prior unavailable: '{path}'. Provide "
+            "prior_pcd_file:=/absolute/path/to/the_matching_world.pcd "
+            "containing points already expressed in map_frame."
+        )
+    return []
 
 
 def generate_launch_description():
@@ -40,11 +55,17 @@ def generate_launch_description():
                 "max_dist_sq": 1.0,
                 "map_frame": "map",
                 "odom_frame": "odom",
-                "base_frame": "",
-                "lidar_frame": "",
-                "prior_pcd_file": "",
+                "robot_base_frame": "gimbal_yaw_odom",
+                "publish_tf": False,
+                "prior_pcd_file": LaunchConfiguration("prior_pcd_file"),
             }
         ],
     )
 
-    return LaunchDescription([node])
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            "prior_pcd_file", description="Matching-world prior PCD already in map_frame"
+        ),
+        OpaqueFunction(function=validate_prior_pcd),
+        node,
+    ])

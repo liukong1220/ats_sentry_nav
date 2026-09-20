@@ -19,6 +19,7 @@
 #include <optional>
 
 #include "small_gicp_relocalization/localization_fusion_core.hpp"
+#include "small_gicp_relocalization/localization_status_input_core.hpp"
 
 namespace small_gicp_relocalization
 {
@@ -115,6 +116,71 @@ TEST(LocalizationFusionCore, AppliesOnlyCorrectionsThatAdvanceEpoch)
     selectCorrectionUpdate(small_candidate, std::nullopt, 0.05, 0.05);
   EXPECT_TRUE(initialized.apply);
   EXPECT_TRUE(initialized.advance_epoch);
+}
+
+TEST(LocalizationFusionCore, CountCapPreservesNewestInterpolationAndRejectsEvictedSamples)
+{
+  std::deque<OdomPoseSample> history;
+  for (int index = 0; index < 5; ++index) {
+    history.push_back({seconds(1.0 + index * 0.1), makeTransform(index, 0.0)});
+  }
+  // Time eviction removes the first sample, then the count cap removes two more.
+  EXPECT_EQ(pruneOdomHistory(history, seconds(1.1), 2), 2U);
+  ASSERT_EQ(history.size(), 2U);
+  EXPECT_EQ(history.front().stamp, seconds(1.3));
+  EXPECT_EQ(pruneOdomHistory(history, seconds(1.1), 2), 0U);
+  EXPECT_FALSE(interpolateOdomPose(history, seconds(1.2), 0.02, 0.2));
+  const auto pose = interpolateOdomPose(history, seconds(1.35), 0.02, 0.2);
+  ASSERT_TRUE(pose);
+  EXPECT_NEAR(pose->getOrigin().x(), 3.5, 1e-7);
+  EXPECT_EQ(pruneOdomHistory(history, seconds(2.0), 2), 0U);
+  EXPECT_TRUE(history.empty());
+}
+
+TEST(LocalizationStatusInput, ChecksExactFrameAndCanonicalNonzeroStamp)
+{
+  const auto validate = [](const std::string & frame, int sec, std::uint32_t ns) {
+    return validateLocalizationStatusMetadata(
+      frame, "map", sec, ns, 2000000000LL, 0, 1, 0, true, 1.0, 0.1);
+  };
+  EXPECT_EQ(validate("map", 2, 0), "");
+  EXPECT_NE(validate("", 2, 0), "");
+  EXPECT_NE(validate("/map", 2, 0), "");
+  EXPECT_NE(validate("odom", 2, 0), "");
+  EXPECT_NE(validate("map", 0, 0), "");
+  EXPECT_NE(validate("map", -1, 0), "");
+  EXPECT_NE(validate("map", 1, 1000000000U), "");
+}
+
+TEST(LocalizationStatusInput, FreshnessBoundariesAndReplayAreFailClosed)
+{
+  const auto validate = [](int sec, std::uint32_t ns, std::int64_t last = 0) {
+    return validateLocalizationStatusMetadata(
+      "map", "map", sec, ns, 2000000000LL, last, 2, 2, true, 1.0, 0.1);
+  };
+  EXPECT_EQ(validate(1, 0), "");
+  EXPECT_NE(validate(0, 999999999), "");
+  EXPECT_EQ(validate(2, 100000000), "");
+  EXPECT_NE(validate(2, 100000001), "");
+  EXPECT_NE(validate(2, 0, 2000000000LL), "");
+  EXPECT_NE(validate(2, 0, 2000000001LL), "");
+  EXPECT_NE(validateLocalizationStatusMetadata(
+    "map", "map", 2, 0, 0, 0, 1, 0, true, 1.0, 0.1), "");
+}
+
+TEST(LocalizationStatusInput, AllowsZeroEpochBootstrapButNeverTrackingOrRollback)
+{
+  const auto validate = [](std::uint64_t epoch, std::uint64_t last, bool tracking) {
+    return validateLocalizationStatusMetadata(
+      "map", "map", 2, 0, 2000000000LL, 0, epoch, last, tracking, 1.0, 0.1);
+  };
+  EXPECT_EQ(validate(0, 0, false), "");
+  EXPECT_NE(validate(0, 0, true), "");
+  EXPECT_EQ(validate(1, 0, true), "");
+  EXPECT_EQ(validate(2, 2, true), "");
+  EXPECT_EQ(validate(3, 2, true), "");
+  EXPECT_NE(validate(1, 2, true), "");
+  EXPECT_NE(validate(0, 2, false), "");
 }
 
 }  // namespace small_gicp_relocalization

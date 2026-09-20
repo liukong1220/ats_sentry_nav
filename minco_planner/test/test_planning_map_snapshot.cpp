@@ -42,6 +42,45 @@ TEST(PlanningMapSnapshot, KeepsGridAndEsdfImmutableAcrossGenerations)
   EXPECT_GT(second->clearance_esdf->getDistance(2.5, 2.5), 0.0);
 }
 
+TEST(PlanningMapSnapshot, SafetyIdentityIgnoresHeartbeatButRejectsSemanticChanges)
+{
+  auto base_grid = makeGrid();
+  base_grid.header.stamp.sec = 10;
+  const auto base = minco_planner::PlanningMapSnapshot::create(7, base_grid, 50, true);
+  ASSERT_NE(base, nullptr);
+
+  auto heartbeat_grid = base_grid;
+  heartbeat_grid.header.stamp.sec = 11;
+  const auto heartbeat =
+    minco_planner::PlanningMapSnapshot::create(8, heartbeat_grid, 50, true);
+  ASSERT_NE(heartbeat, nullptr);
+  EXPECT_EQ(base->safety_content_digest, heartbeat->safety_content_digest);
+  EXPECT_TRUE(base->hasSameSafetyContent(*heartbeat));
+
+  auto unknown_grid = base_grid;
+  unknown_grid.data[0] = -1;
+  const auto unknown = minco_planner::PlanningMapSnapshot::create(9, unknown_grid, 50, true);
+  ASSERT_NE(unknown, nullptr);
+  EXPECT_FALSE(base->hasSameSafetyContent(*unknown));
+
+  auto occupied_grid = base_grid;
+  occupied_grid.data[0] = 100;
+  const auto occupied = minco_planner::PlanningMapSnapshot::create(10, occupied_grid, 50, true);
+  ASSERT_NE(occupied, nullptr);
+  EXPECT_FALSE(base->hasSameSafetyContent(*occupied));
+
+  auto shifted_grid = base_grid;
+  shifted_grid.info.origin.position.x = 0.1;
+  const auto shifted = minco_planner::PlanningMapSnapshot::create(11, shifted_grid, 50, true);
+  ASSERT_NE(shifted, nullptr);
+  EXPECT_FALSE(base->hasSameSafetyContent(*shifted));
+
+  const auto changed_unknown_policy =
+    minco_planner::PlanningMapSnapshot::create(12, base_grid, 50, false);
+  ASSERT_NE(changed_unknown_policy, nullptr);
+  EXPECT_FALSE(base->hasSameSafetyContent(*changed_unknown_policy));
+}
+
 TEST(PlanningMapSnapshot, RejectsMalformedGrid)
 {
   auto grid = makeGrid();
@@ -80,6 +119,22 @@ TEST(PlannerSafetyState, HealthLossRequiresANewerMapSnapshot)
   state.invalidateMap(7);
   EXPECT_FALSE(state.mapSnapshotUsable(7));
   state.map_ready = true;
+  EXPECT_FALSE(state.mapSnapshotUsable(7));
+  EXPECT_TRUE(state.mapSnapshotUsable(8));
+}
+
+TEST(PlannerSafetyState, NewMapInvalidatesPlanButKeepsHealthyMapLease)
+{
+  minco_planner::PlannerSafetyState state;
+  state.map_ready = true;
+  state.plan_safe = true;
+  state.minimum_map_generation = 7;
+
+  state.invalidatePlanForNewMap(8);
+
+  EXPECT_TRUE(state.map_ready);
+  EXPECT_FALSE(state.plan_safe);
+  EXPECT_TRUE(state.emergencyStopRequired());
   EXPECT_FALSE(state.mapSnapshotUsable(7));
   EXPECT_TRUE(state.mapSnapshotUsable(8));
 }

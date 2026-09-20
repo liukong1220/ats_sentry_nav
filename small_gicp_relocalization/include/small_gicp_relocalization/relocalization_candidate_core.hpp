@@ -20,6 +20,8 @@
 
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,34 @@
 
 namespace small_gicp_relocalization
 {
+
+// Callback-owned admission fence; workers carry only the captured generation.
+class RelocalizationGeneration
+{
+public:
+  std::uint64_t current() const { return generation_.load(); }
+  void invalidate() { generation_.fetch_add(1); }
+
+  template <typename Apply>
+  bool admit(std::uint64_t generation, Apply && apply) const
+  {
+    if (generation != current()) {
+      return false;
+    }
+    apply();
+    return true;
+  }
+
+private:
+  std::atomic<std::uint64_t> generation_{0};
+};
+
+// Scheduling AND result-admission deadline, not an interruptible align() timeout.
+inline bool multiGuessDeadlineExpired(
+  std::chrono::steady_clock::time_point now, std::chrono::steady_clock::time_point deadline)
+{
+  return now >= deadline;
+}
 
 /// 从旋转矩阵直接取 yaw。Eigen 的 eulerAngles(0,1,2) 在 roll/pitch 出现极小负值时
 /// 会翻转到 (pi, pi-eps, yaw+pi) 分支，导致 yaw 出现 180 度跳变，进而使整个候选
@@ -47,6 +77,25 @@ inline double wrapAngle(double angle) { return std::atan2(std::sin(angle), std::
 inline double yawDistance(const Eigen::Isometry3d & lhs, const Eigen::Isometry3d & rhs)
 {
   return std::abs(wrapAngle(yawOf(lhs) - yawOf(rhs)));
+}
+
+/// A fresh scan must periodically revalidate a previously accepted global pose,
+/// even while the chassis is stationary.  Returning false for a disabled or
+/// non-monotonic interval prevents a stale scan from manufacturing freshness.
+inline bool acceptedObservationRefreshDue(
+  const std::optional<double> & last_accepted_scan_time_s, double current_scan_time_s,
+  double refresh_interval_s)
+{
+  if (
+    refresh_interval_s <= 0.0 || !std::isfinite(refresh_interval_s) ||
+    !std::isfinite(current_scan_time_s)) {
+    return false;
+  }
+  if (!last_accepted_scan_time_s || !std::isfinite(*last_accepted_scan_time_s)) {
+    return true;
+  }
+  const double elapsed_s = current_scan_time_s - *last_accepted_scan_time_s;
+  return elapsed_s >= refresh_interval_s;
 }
 
 /// [0, count) 的确定性二分广度优先排列。任意前缀都近似均匀铺满整个区间，

@@ -649,7 +649,12 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   // Segment-wise scaling keeps a high-curvature corner slow without globally
   // stretching unrelated straight segments.  MINCO is re-solved each round.
   const int maximum_scaling_iterations = std::max(0, params_.max_time_scaling_iterations);
-  for (int iteration = 0; iteration <= maximum_scaling_iterations;
+  // A fixed nonzero boundary velocity breaks exact inverse-time scaling.
+  // Reserve one existing iteration for a second coupled solve, rather than
+  // spending every iteration locally and assuming one uniform pass is enough.
+  const int local_scaling_iterations = std::max(0, maximum_scaling_iterations - 1);
+  const int uniform_scaling_iterations = maximum_scaling_iterations - local_scaling_iterations + 1;
+  for (int iteration = 0; iteration <= local_scaling_iterations;
     ++iteration)
   {
     peak_velocity = 0.0;
@@ -672,7 +677,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       dynamic_limits_satisfied = true;
       break;
     }
-    if (iteration == maximum_scaling_iterations) {
+    if (iteration == local_scaling_iterations) {
       break;
     }
     if (!time_allocator.applyLocalDynamicScaling(
@@ -689,7 +694,9 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       return trajectory;
     }
   }
-  if (!dynamic_limits_satisfied) {
+  for (int iteration = 0; !dynamic_limits_satisfied && iteration < uniform_scaling_iterations;
+    ++iteration)
+  {
     double required_scale = 1.0;
     if (params_.max_velocity > 0.0) {
       required_scale = std::max(required_scale, peak_velocity / params_.max_velocity);

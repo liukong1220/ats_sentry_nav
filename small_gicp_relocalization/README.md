@@ -41,11 +41,15 @@ cd ..
 
 1. Set prior pointcloud file in [launch file](launch/small_gicp_relocalization_launch.py)
 
-2. Adjust the transformation between `base_frame` and `lidar_frame`
+2. Set the coordinate-frame contract
 
-    The `global_pcd_map` output by algorithms such as `pointlio` and `fastlio` is strictly based on the `lidar_odom` frame. However, the initial position of the robot is typically defined by the `base_link` frame within the `odom` coordinate system. To address this discrepancy, the code listens for the coordinate transformation from `base_frame`(velocity_reference_frame) to `lidar_frame`, allowing the `global_pcd_map` to be converted into the `odom` coordinate system.
-
-    If not set, empty transformation will be used.
+    The prior PCD must already be expressed in `map_frame`. It is loaded unchanged;
+    no mechanical body-to-lidar transform is applied or required at startup.
+    `registered_scan` must be expressed in `odom_frame`, so registration estimates
+    `T_map_odom`. Set `robot_base_frame` to the body pose frame used for scan-time
+    `T_odom_base` when composing relocalization observations. GICP has no
+    `base_frame` or `lidar_frame` parameters; sensor extrinsics belong to the
+    upstream odometry pipeline. An empty or unreadable prior fails startup.
 
 3. Run
 
@@ -59,7 +63,7 @@ cd ..
 scan cannot build an unbounded backlog while GICP is busy. Before a scan enters
 the accumulation window, the node checks:
 
-- non-empty `frame_id` and (when `lidar_frame` is configured) an exact frame match;
+- non-empty `frame_id` exactly matching `odom_frame` (physical lidar frames are rejected);
 - positive, strictly increasing timestamps, a bounded age (`max_scan_age_s`) and
   future tolerance (`max_scan_future_s`);
 - finite XYZ values, range and height limits, and `min_scan_valid_ratio`.
