@@ -32,8 +32,8 @@ ats_goal_manager:
     require_localization_status: false
     require_map_status: true
     emergency_stop_heartbeat_period_sec: 0.1
-    # 未就绪时 topic/action 目标最多等待该时间，期间始终急停。
-    map_wait_timeout_sec: 5.0
+    # Real GICP recovery after odometry_stale often exceeds 5s (recovery184).
+    map_wait_timeout_sec: 30.0
     default_goal_timeout_sec: 120.0
     goal_position_tolerance: 0.08
     goal_yaw_tolerance: 0.15

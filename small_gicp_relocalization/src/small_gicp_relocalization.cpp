@@ -1251,6 +1251,7 @@ void SmallGicpRelocalizationNode::clearConfirmation()
   pending_confirmation_.reset();
   pending_confirmation_count_ = 0;
   confirmation_started_at_.reset();
+  pending_holds_lattice_origin_ = false;
 }
 
 void SmallGicpRelocalizationNode::invalidateRecovery()
@@ -1369,6 +1370,16 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       pending_confirmation_ = sample;
       pending_confirmation_count_ = 1;
       confirmation_started_at_ = std::chrono::steady_clock::now();
+      using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+      // Latch at episode open under recovery states even after a prior accept.
+      // odometry_stale LOST (recovery180) reopened confirmation with
+      // has_accepted_alignment_=true; mismatch then adopted a bad pending and
+      // recentered multi_guess (seed yaw ~π). Retain last trusted pose until a
+      // full confirmation succeeds. UNINITIALIZED/TRACKING still adopt.
+      pending_holds_lattice_origin_ =
+        preferMultiGuess() || localization_state_ == LS::STATE_LOST ||
+        localization_state_ == LS::STATE_RELOCALIZING ||
+        localization_state_ == LS::STATE_BOOTSTRAP;
     } else {
       const ConfirmationDecision decision =
         evaluateCandidateConfirmation(candidate, scan_time, *odom_to_robot_base);
@@ -1385,6 +1396,20 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
         const bool same_window = decision.reason == "confirmation scan stamp not increasing" ||
                                  decision.reason == "confirmation scan interval too short";
         if (!same_window) {
+          // Recovery lattice pending must not recenter multi_guess on mismatch.
+          // Seeded UNINITIALIZED confirmation still adopts the new sample
+          // (ConfirmationRetainsFirstGeometryAndEpisodeDeadline).
+          if (pending_holds_lattice_origin_) {
+            clearConfirmation();
+            publishObservation(
+              scan_time, false,
+              ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
+              "recovery confirmation mismatch; retaining lattice origin", attempt.num_inliers,
+              attempt.registration_error, source_points, Eigen::Isometry3d::Identity(),
+              covariance);
+            need_coarse_alignment_ = true;
+            return;
+          }
           pending_confirmation_ = sample;
           pending_confirmation_count_ = 1;
         }

@@ -347,6 +347,13 @@ private:
         publishStatusLocked();
         return;
       }
+      // Incremental GICP confirmation while already map-locked must not demote
+      // TRACKING/CONFIRMED to RELOCALIZING: that races DualMap ready and clears
+      // EXECUTE within ~1s of every reference commit (recovery229).
+      if (has_accepted_observation_ && !lost_latched_) {
+        publishStatusLocked();
+        return;
+      }
       if (!recovery_until_) {
         recovery_until_ = std::chrono::steady_clock::now() +
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -357,6 +364,7 @@ private:
       publishStatusLocked();
       return;
     }
+
 
     const tf2::Transform candidate_map_to_odom =
       poseToTransform(message->pose.pose) * odom_to_base->inverse();

@@ -315,6 +315,9 @@ private:
   int pending_confirmation_count_{0};
   std::optional<ConfirmationSample> pending_confirmation_;
   std::optional<std::chrono::steady_clock::time_point> confirmation_started_at_;
+  // Set when the pending episode was opened under cold lattice search (LOST /
+  // BOOTSTRAP / multi_guess). Survives brief status flicker during async apply.
+  bool pending_holds_lattice_origin_{false};
   double confirmation_timeout_s_{10.0};
   // 上一帧通过硬门的假设，用于候选级 motion 一致性软约束。
   std::optional<ConfirmationSample> last_hypothesis_;

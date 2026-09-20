@@ -386,8 +386,9 @@ TEST(CmdVelArbiter, HeartbeatTimeoutThenLinkUpDiscardsBufferedCommands)
   EXPECT_FALSE(arbiter.autoAuthorized());
 }
 
-// 契约：急停期间到达的 ExecutionCommand 不建立租约；
-// 单独的 `emergency_stop=false` 不构成新授权，必须等急停解除后的新 EXECUTE。
+// 契约：急停期间到达的 DualMap 合法 EXECUTE 不得立刻授权；
+// 急停解除时可兑现该闩锁（GM 先发 estop=false 再发 EXECUTE，DDS 可乱序，
+// recovery182：accepted=1 且 auto_authorized=0）。无 DualMap 闩锁时仍须新 EXECUTE。
 TEST(CmdVelArbiter, ExecutionCommandDuringEmergencyStopIsNotHonored)
 {
   CmdVelArbiter arbiter(config());
@@ -401,14 +402,30 @@ TEST(CmdVelArbiter, ExecutionCommandDuringEmergencyStopIsNotHonored)
   arbiter.onAuto(1.0, 0.0, 0.0, t0 + milliseconds(2));
   EXPECT_EQ(arbiter.tick(t0 + milliseconds(3)).reason, CmdVelArbiterReason::EMERGENCY_STOP);
 
-  // 急停解除本身不恢复运动：自动源持续刷新也只能拿到未授权归零。
+  // DualMap 已校验的 EXECUTE 在急停解除后兑现授权（对抗 estop/EXECUTE 乱序）。
+  arbiter.onEmergencyStop(false);
+  EXPECT_TRUE(arbiter.autoAuthorized());
+  arbiter.onAuto(1.0, 0.0, 0.0, t0 + milliseconds(10));
+  const auto after_clear = arbiter.tick(t0 + milliseconds(11));
+  EXPECT_EQ(after_clear.source, CmdVelSource::AUTO);
+  EXPECT_EQ(after_clear.reason, CmdVelArbiterReason::AUTO_AUTHORIZED);
+}
+
+TEST(CmdVelArbiter, EmergencyStopClearWithoutDualMapLatchStaysUnauthorized)
+{
+  CmdVelArbiter arbiter(config());
+  const auto t0 = std::chrono::steady_clock::now();
+  armLink(arbiter, t0);
+  arbiter.onEmergencyStop(true);
+  // STOP during estop must not create a DualMap execute latch.
+  EXPECT_TRUE(arbiter.onExecutionCommand(
+    false, kManagerIncarnation, 1, 7, 11, milliseconds(0), t0 + milliseconds(1)));
+  EXPECT_FALSE(arbiter.autoAuthorized());
   arbiter.onEmergencyStop(false);
   arbiter.onAuto(1.0, 0.0, 0.0, t0 + milliseconds(10));
   const auto after_clear = arbiter.tick(t0 + milliseconds(11));
   EXPECT_TRUE(after_clear.isZero());
   EXPECT_EQ(after_clear.reason, CmdVelArbiterReason::AUTO_UNAUTHORIZED);
-
-  // 解除后的新 EXECUTE 才重建租约。
   ASSERT_TRUE(execute(arbiter, 2, milliseconds(0), t0 + milliseconds(20)));
   arbiter.onAuto(1.0, 0.0, 0.0, t0 + milliseconds(20));
   EXPECT_EQ(arbiter.tick(t0 + milliseconds(21)).source, CmdVelSource::AUTO);

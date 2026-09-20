@@ -439,7 +439,9 @@ TEST_F(
       },
       2s));
 
-  publishStatus(LocalizationStatus::STATE_DEGRADED, 1);
+  // LOST (not DEGRADED/CONFIRMED) is the fail-closed localization boundary for
+  // MPC after CONFIRMED/DEGRADED were aligned with adapter planning health.
+  publishStatus(LocalizationStatus::STATE_LOST, 1);
   ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 1s));
 
   // 定位失效期间即使收到解除急停和新时间戳轨迹，也必须持续双零并丢弃轨迹。

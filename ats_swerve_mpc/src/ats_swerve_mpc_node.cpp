@@ -922,12 +922,19 @@ void AtsSwerveMpcNode::onEmergencyStop(
   }
 }
 
-/** @brief 只接受 TRACKING 定位状态；epoch 切换或失跟立即使当前轨迹和 warm-start 失效。 */
+/** @brief Align with adapter/goal_manager planning-healthy states.
+ *  CONFIRMED is the post-accept hold; rejecting it made GM commit while MPC
+ *  fail-stopped (recovery182: mode=1 DualMap-ok on arbiter, MPC accepted=0).
+ *  DEGRADED remains usable for control; LOST/BOOTSTRAP/RELOCALIZING/UNINITIALIZED
+ *  stay fail-closed. */
 void AtsSwerveMpcNode::onLocalizationStatus(
     const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
         message) {
-  if (message->state !=
-      ats_navigation_interfaces::msg::LocalizationStatus::STATE_TRACKING) {
+  using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+  const bool allows_control = message->state == LS::STATE_TRACKING ||
+    message->state == LS::STATE_CONFIRMED ||
+    message->state == LS::STATE_DEGRADED;
+  if (!allows_control) {
     localization_tracking_.store(false);
     engageFailStop();
     return;

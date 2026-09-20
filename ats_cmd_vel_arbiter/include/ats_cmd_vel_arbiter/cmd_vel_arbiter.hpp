@@ -215,32 +215,49 @@ public:
     if (!execute) {
       clearExecutionLease();
       invalidateAuto();
+      dual_map_execute_latched_ = false;
     } else if (!emergency_stop_ && link_up_) {
       auto_authorized_ = true;
       has_execution_lease_ = true;
       execution_lease_stamp_ = now - age;
+      dual_map_execute_latched_ = false;
     } else {
+      // DualMap passed but estop/link blocked authorization. GM publishes
+      // estop=false then MODE_EXECUTE in one critical section; DDS can deliver
+      // EXECUTE first (recovery182: accepted=1 auto_authorized=0). Latch so
+      // estop clear can authorize without a second command.
       auto_authorized_ = false;
       has_execution_lease_ = false;
+      dual_map_execute_latched_ = true;
+      latched_execute_epoch_ = localization_epoch;
+      latched_execute_generation_ = map_generation;
+      latched_execute_stamp_ = now - age;
     }
     return true;
   }
 
-  void onEmergencyStop(bool active)
+  void onEmergencyStop(
+    bool active,
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
   {
     emergency_stop_ = active;
     if (active) {
       clearExecutionLease();
+      dual_map_execute_latched_ = false;
       invalidateSources();
+      return;
     }
+    maybeAuthorizeLatchedExecute(now);
   }
 
   void onSerialLinkDown()
   {
     link_up_ = false;
     clearExecutionLease();
+    dual_map_execute_latched_ = false;
     invalidateSources();
   }
+
 
   /// DOWN->UP 的第一个心跳必须丢弃链路不可用期间缓存的两源和授权。
   /// 这也覆盖进程启动后第一个 UP：无心跳时收到的命令不能在链路后来可用时复活。
@@ -249,10 +266,12 @@ public:
     if (!link_up_) {
       clearExecutionLease();
       invalidateSources();
+      dual_map_execute_latched_ = false;
     }
     has_link_heartbeat_ = true;
     last_link_stamp_ = now;
     link_up_ = true;
+    maybeAuthorizeLatchedExecute(now);
   }
 
   /// 串口节点发布的 `/serial/link_up` 心跳。false 立即断链；true 只放开链路。
@@ -411,6 +430,33 @@ private:
     has_execution_lease_ = false;
   }
 
+  void maybeAuthorizeLatchedExecute(std::chrono::steady_clock::time_point now)
+  {
+    if (!dual_map_execute_latched_ || emergency_stop_ || !link_up_) {
+      return;
+    }
+    expireMapReady(now);
+    if (!mapReady(now) || !planner_generation_usable_ ||
+      latched_execute_epoch_ == 0 || latched_execute_generation_ == 0 ||
+      latched_execute_epoch_ != planner_epoch_ ||
+      latched_execute_generation_ != planner_generation_)
+    {
+      dual_map_execute_latched_ = false;
+      return;
+    }
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - latched_execute_stamp_);
+    if (age.count() < 0 || age > config_.execution_command_timeout) {
+      dual_map_execute_latched_ = false;
+      return;
+    }
+    auto_authorized_ = true;
+    has_execution_lease_ = true;
+    execution_lease_stamp_ = latched_execute_stamp_;
+    dual_map_execute_latched_ = false;
+  }
+
+
   void expireExecutionLease(std::chrono::steady_clock::time_point now)
   {
     if (!auto_authorized_) {
@@ -441,6 +487,10 @@ private:
   uint64_t active_manager_incarnation_ = 0;
   bool has_execution_lease_ = false;
   std::chrono::steady_clock::time_point execution_lease_stamp_{};
+  bool dual_map_execute_latched_ = false;
+  uint64_t latched_execute_epoch_ = 0;
+  uint64_t latched_execute_generation_ = 0;
+  std::chrono::steady_clock::time_point latched_execute_stamp_{};
   uint64_t planner_epoch_ = 0;
   uint64_t planner_generation_ = 0;
   uint64_t ready_lease_generation_ = 0;
