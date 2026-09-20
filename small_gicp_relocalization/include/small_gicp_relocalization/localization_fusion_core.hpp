@@ -49,6 +49,22 @@ struct CorrectionUpdate
   bool advance_epoch{false};
 };
 
+/// Evict by measurement time first, then enforce a hard sample-count bound.
+/// Return count-cap drops separately from ordinary time-window eviction.
+inline std::size_t pruneOdomHistory(
+  std::deque<OdomPoseSample> & history, const rclcpp::Time & cutoff,
+  std::size_t max_samples)
+{
+  while (!history.empty() && history.front().stamp < cutoff) {
+    history.pop_front();
+  }
+  const std::size_t dropped = history.size() > max_samples ? history.size() - max_samples : 0;
+  for (std::size_t index = 0; index < dropped; ++index) {
+    history.pop_front();
+  }
+  return dropped;
+}
+
 inline std::optional<tf2::Transform> interpolateOdomPose(
   const std::deque<OdomPoseSample> & history, const rclcpp::Time & stamp,
   double boundary_tolerance_s, double maximum_interpolation_gap_s)

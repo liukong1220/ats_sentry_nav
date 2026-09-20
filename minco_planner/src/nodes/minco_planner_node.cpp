@@ -714,18 +714,66 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     RCLCPP_ERROR(get_logger(), "Rejected an invalid planning grid.");
     return;
   }
-  std::lock_guard<std::mutex> lock(map_mutex_);
-  if (
-    candidate_health_epoch != map_health_epoch_ ||
-    candidate_generation != next_map_generation_ + 1)
+  std::optional<ActiveSafetyReference> invalidated_reference;
+  bool retained_identical_snapshot = false;
+  std::uint64_t retained_generation = 0;
+  std::string retained_digest;
   {
-    RCLCPP_WARN(get_logger(), "Discarded a planning grid built across a map-health change.");
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (
+      candidate_health_epoch != map_health_epoch_ ||
+      candidate_generation != next_map_generation_ + 1)
+    {
+      RCLCPP_WARN(get_logger(), "Discarded a planning grid built across a map-health change.");
+      return;
+    }
+    const bool replaces_existing_snapshot = latest_map_snapshot_ != nullptr;
+    retained_identical_snapshot =
+      replaces_existing_snapshot && snapshot->hasSameSafetyContent(*latest_map_snapshot_);
+    if (retained_identical_snapshot) {
+      retained_generation = latest_map_snapshot_->generation;
+      retained_digest = latest_map_snapshot_->safety_content_digest;
+    } else {
+      if (replaces_existing_snapshot && active_safety_reference_) {
+        invalidated_reference = active_safety_reference_;
+        active_safety_reference_.reset();
+      }
+      next_map_generation_ = snapshot->generation;
+      latest_map_snapshot_ = snapshot;
+      if (replaces_existing_snapshot) {
+        // A safety-semantic change creates a new immutable map identity.  The
+        // old reference cannot execute even though the source heartbeat stays
+        // healthy; a fresh plan must bind this exact local generation.
+        safety_state_.invalidatePlanForNewMap(snapshot->generation);
+      }
+      if (map_ready_topic_.empty()) {
+        safety_state_.map_ready = true;
+      }
+      publishEmergencyStop(safety_state_.emergencyStopRequired());
+    }
+  }
+  if (retained_identical_snapshot) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "Retained immutable planning snapshot generation=%llu for identical safety content "
+      "digest=%s; adapter publication/source generations remain heartbeat evidence.",
+      static_cast<unsigned long long>(retained_generation), retained_digest.c_str());
     return;
   }
-  next_map_generation_ = snapshot->generation;
-  latest_map_snapshot_ = snapshot;
-  if (map_ready_topic_.empty()) {
-    safety_state_.map_ready = true;
+  if (invalidated_reference) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Invalidated active reference goal=%llu map_generation=%llu for new map generation=%llu.",
+      static_cast<unsigned long long>(invalidated_reference->goal_id),
+      static_cast<unsigned long long>(invalidated_reference->map_generation),
+      static_cast<unsigned long long>(snapshot->generation));
+    publishPlannerStatus(
+      invalidated_reference->goal_id, invalidated_reference->localization_epoch,
+      invalidated_reference->plan_request_sequence, snapshot->generation,
+      invalidated_reference->map_publication_sequence,
+      ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
+      ats_navigation_interfaces::msg::PlannerStatus::FAILURE_SNAPSHOT_CHANGED,
+      invalidated_reference->trajectory.header.stamp);
   }
 }
 

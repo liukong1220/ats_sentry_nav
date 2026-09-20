@@ -19,8 +19,8 @@ namespace ats_cmd_vel_arbiter
 class CmdVelArbiterNode : public rclcpp::Node
 {
 public:
-  CmdVelArbiterNode()
-  : Node("cmd_vel_arbiter")
+  explicit CmdVelArbiterNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
+  : Node("cmd_vel_arbiter", options)
   {
     manual_topic_ = declare_parameter<std::string>("manual_cmd_vel_topic", "/cmd_vel");
     auto_topic_ = declare_parameter<std::string>("autonomy_cmd_vel_topic", "/cmd_vel/autonomy");
@@ -98,33 +98,21 @@ private:
   void onExecutionCommand(
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr msg)
   {
-    using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
-    const bool execute = msg->mode == ExecutionCommand::MODE_EXECUTE;
     const rclcpp::Time receipt = now();
     const rclcpp::Time stamp(msg->header.stamp, receipt.get_clock_type());
-    if (stamp > receipt) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "TRACE execution_command rejected=future mode=%u incarnation=%llu sequence=%llu "
-        "stamp_ns=%lld receipt_ns=%lld future_ns=%lld",
-        static_cast<unsigned>(msg->mode),
-        static_cast<unsigned long long>(msg->manager_incarnation),
-        static_cast<unsigned long long>(msg->command_sequence),
-        static_cast<long long>(stamp.nanoseconds()),
-        static_cast<long long>(receipt.nanoseconds()),
-        static_cast<long long>((stamp - receipt).nanoseconds()));
-      return;
-    }
-    const auto age = std::chrono::milliseconds(
-      static_cast<int64_t>((receipt - stamp).seconds() * 1000.0));
+    const auto age = std::chrono::nanoseconds((receipt - stamp).nanoseconds());
     std::lock_guard<std::mutex> lock(mutex_);
     const bool accepted = arbiter_.onExecutionCommand(
-      execute, msg->manager_incarnation, msg->command_sequence, age,
+      msg->mode, msg->manager_incarnation, msg->command_sequence, age,
       std::chrono::steady_clock::now());
+    if (!accepted) {
+      // Do not wait for the control timer to withdraw a rejected AUTO command.
+      selected_pub_->publish(geometry_msgs::msg::Twist{});
+    }
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "TRACE execution_command accepted=%d mode=%u incarnation=%llu sequence=%llu "
-      "stamp_ns=%lld receipt_ns=%lld age_ms=%lld auto_authorized=%d",
+      "stamp_ns=%lld receipt_ns=%lld age_ns=%lld auto_authorized=%d",
       accepted ? 1 : 0, static_cast<unsigned>(msg->mode),
       static_cast<unsigned long long>(msg->manager_incarnation),
       static_cast<unsigned long long>(msg->command_sequence),
@@ -147,11 +135,8 @@ private:
 
   void onTimer()
   {
-    CmdVelArbiterOutput output;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      output = arbiter_.tick(std::chrono::steady_clock::now());
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto output = arbiter_.tick(std::chrono::steady_clock::now());
     geometry_msgs::msg::Twist twist;
     twist.linear.x = output.vx;
     twist.linear.y = output.vy;
@@ -181,6 +166,7 @@ private:
 
 }  // namespace ats_cmd_vel_arbiter
 
+#ifndef ATS_CMD_VEL_ARBITER_NO_MAIN
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
@@ -188,3 +174,4 @@ int main(int argc, char ** argv)
   rclcpp::shutdown();
   return 0;
 }
+#endif

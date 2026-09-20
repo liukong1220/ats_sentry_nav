@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ats_rog_map/debug_viz.hpp"
+#include "ats_rog_map/point_cloud_input.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map/test_fault_authorization.hpp"
@@ -221,7 +222,14 @@ public:
         return result;
       });
 
-    map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(declareCoreParameters(*this)));
+    const auto core_parameters = declareCoreParameters(*this);
+    intensity_required_ = core_parameters.intensity_threshold > 0;
+    map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(core_parameters));
+    if (!intensity_required_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "ROGMap intensity filter disabled; XYZ-only clouds are accepted with unavailable intensity.");
+    }
 
     odom_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     cloud_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -357,8 +365,16 @@ private:
       return;
     }
 
-    rog_map::PointCloud input_cloud;
-    pcl::fromROSMsg(*msg, input_cloud);
+    auto decoded = decodePointCloudForRogMap(*msg, intensity_required_);
+    if (decoded.status != PointCloudInputStatus::kAccepted) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "ROGMap rejected point cloud: %s. No map update is committed; stale-map safety applies.",
+        pointCloudInputStatusString(decoded.status));
+      return;
+    }
+
+    rog_map::PointCloud input_cloud = std::move(decoded.points);
     rog_map::PointCloud cloud;
     cloud.reserve(input_cloud.size());
     tf2::Transform cloud_transform;
@@ -1105,6 +1121,7 @@ private:
   std::uint64_t projection_request_sequence_{0};
   rclcpp::Time last_map_stamp_{0, 0, RCL_ROS_TIME};
   bool has_map_data_{false};
+  bool intensity_required_{false};
 
   rclcpp::CallbackGroup::SharedPtr odom_callback_group_;
   rclcpp::CallbackGroup::SharedPtr cloud_callback_group_;

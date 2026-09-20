@@ -115,6 +115,13 @@ def generate_launch_description():
         DeclareLaunchArgument("require_gimbal_status", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
     ]
+    prior_preflight = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(launch_dir, "prior_pcd_preflight.launch.py")),
+        launch_arguments={
+            "world": world, "prior_pcd_file": prior_pcd_file,
+            "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
+        }.items(),
+    )
     robot_state_publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "robot_state_publisher_launch.py")),
         condition=IfCondition(use_robot_state_pub),
@@ -163,6 +170,7 @@ def generate_launch_description():
     ld.add_action(SetEnvironmentVariable("LD_LIBRARY_PATH", _filtered_ld_library_path()))
     for declaration in declarations:
         ld.add_action(declaration)
+    ld.add_action(prior_preflight)
     for action in (robot_state_publisher, livox, navigation, joy, rviz):
         ld.add_action(action)
     return ld

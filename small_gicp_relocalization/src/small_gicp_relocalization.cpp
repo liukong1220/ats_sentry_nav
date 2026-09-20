@@ -25,13 +25,14 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
-#include "pcl/common/transforms.h"
 #include "pcl_conversions/pcl_conversions.h"
 #include "small_gicp/pcl/pcl_registration.hpp"
 #include "small_gicp/util/downsampling_omp.hpp"
+#include "small_gicp_relocalization/localization_status_input_core.hpp"
 #include "tf2/utils.h"
 #include "tf2_eigen/tf2_eigen.hpp"
 
@@ -136,6 +137,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_accumulation_age_s", 0.30);
   this->declare_parameter("min_registration_translation_delta", 0.10);
   this->declare_parameter("min_registration_yaw_delta", 0.12);
+  this->declare_parameter("accepted_observation_refresh_interval_s", 1.0);
   this->declare_parameter("initial_pose_force_registration_window_s", 2.0);
   this->declare_parameter("transform_future_offset_s", 0.25);
   this->declare_parameter("max_scan_stamp_lag_s", 0.25);
@@ -150,9 +152,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_accumulated_frames", 30);
   this->declare_parameter("map_frame", "map");
   this->declare_parameter("odom_frame", "odom");
-  this->declare_parameter("base_frame", "");
   this->declare_parameter("robot_base_frame", "");
-  this->declare_parameter("lidar_frame", "");
   this->declare_parameter("prior_pcd_file", "");
   this->declare_parameter("init_pose", std::vector<double>{0., 0., 0., 0., 0., 0.});
 
@@ -233,6 +233,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("min_registration_translation_delta", min_registration_translation_delta_);
   this->get_parameter("min_registration_yaw_delta", min_registration_yaw_delta_);
   this->get_parameter(
+    "accepted_observation_refresh_interval_s", accepted_observation_refresh_interval_s_);
+  accepted_observation_refresh_interval_s_ =
+    std::max(0.0, accepted_observation_refresh_interval_s_);
+  this->get_parameter(
     "initial_pose_force_registration_window_s", initial_pose_force_registration_window_s_);
   this->get_parameter("transform_future_offset_s", transform_future_offset_s_);
   this->get_parameter("max_scan_stamp_lag_s", max_scan_stamp_lag_s_);
@@ -249,9 +253,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_accumulated_frames", max_accumulated_frames);
   this->get_parameter("map_frame", map_frame_);
   this->get_parameter("odom_frame", odom_frame_);
-  this->get_parameter("base_frame", base_frame_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
-  this->get_parameter("lidar_frame", lidar_frame_);
   this->get_parameter("prior_pcd_file", prior_pcd_file_);
   this->get_parameter("init_pose", init_pose_);
 
@@ -309,9 +311,15 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   }
   scan_max_z_m_ = std::max(scan_min_z_m_, scan_max_z_m_);
   min_scan_valid_ratio_ = std::clamp(min_scan_valid_ratio_, 0.0, 1.0);
-  max_accumulated_points_ =
-    static_cast<std::size_t>(std::max<std::int64_t>(1, max_accumulated_points));
-  max_accumulated_frames_ = static_cast<int>(std::max<std::int64_t>(1, max_accumulated_frames));
+  if (
+    max_accumulated_points <= 0 || max_accumulated_frames <= 0 ||
+    max_accumulated_frames > std::numeric_limits<int>::max() || accumulate_frames_ <= 0) {
+    throw std::invalid_argument("scan accumulation limits must be positive and representable");
+  }
+  max_accumulated_points_ = static_cast<std::size_t>(max_accumulated_points);
+  max_accumulated_frames_ = static_cast<int>(max_accumulated_frames);
+  scan_window_ = decltype(scan_window_)(
+    max_accumulated_points_, max_accumulated_frames_, accumulate_frames_);
   double height_min_z = -0.5;
   double height_max_z = 2.5;
   this->get_parameter("height_filter.enable", height_filter_enable_);
@@ -320,7 +328,6 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   height_filter_min_z_ = static_cast<float>(height_min_z);
   height_filter_max_z_ = static_cast<float>(std::max(height_min_z + 1e-3, height_max_z));
 
-  accumulate_frames_ = std::max(1, accumulate_frames_);
   coarse_max_iterations_ = std::max(1, coarse_max_iterations_);
   fine_max_iterations_ = std::max(1, fine_max_iterations_);
   fine_max_correspondence_distance = std::max(1e-3, fine_max_correspondence_distance);
@@ -372,7 +379,6 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   need_coarse_alignment_ = true;
   has_accepted_alignment_ = false;
 
-  accumulated_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   global_map_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   register_ = std::make_shared<
     small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP>>();
@@ -381,7 +387,14 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
-  loadGlobalMap(prior_pcd_file_);
+  if (!loadGlobalMap(prior_pcd_file_)) {
+    if (!rclcpp::ok(this->get_node_base_interface()->get_context())) {
+      // Return an inert node so the component executable can unwind normally.
+      // No registration timers, subscriptions, or observation publisher exist yet.
+      return;
+    }
+    throw std::runtime_error("Global map unavailable");
+  }
 
   target_ = small_gicp::voxelgrid_sampling_omp<
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
@@ -435,49 +448,29 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     this->get_logger(),
     "scan input gate: expected_frame='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
     "valid_ratio=%.2f accumulation_limit=%zu points/%d frames",
-    lidar_frame_.c_str(), max_scan_age_s_, max_scan_future_s_, scan_min_range_m_, scan_max_range_m_,
+    odom_frame_.c_str(), max_scan_age_s_, max_scan_future_s_, scan_min_range_m_, scan_max_range_m_,
     scan_min_z_m_, scan_max_z_m_, min_scan_valid_ratio_, max_accumulated_points_,
     max_accumulated_frames_);
 }
 
 SmallGicpRelocalizationNode::~SmallGicpRelocalizationNode() { cancelAsyncMultiGuess(); }
 
-void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
+bool SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
 {
-  if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) == -1) {
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) < 0) {
     RCLCPP_ERROR(this->get_logger(), "Couldn't read PCD file: %s", file_name.c_str());
-    return;
+    return false;
   }
-  RCLCPP_INFO(this->get_logger(), "Loaded global map with %zu points", global_map_->points.size());
-
-  if (base_frame_.empty() || lidar_frame_.empty()) {
-    RCLCPP_WARN(
-      this->get_logger(),
-      "Skip global map frame conversion because base_frame or lidar_frame is empty.");
-    return;
+  if (global_map_->empty()) {
+    RCLCPP_ERROR(this->get_logger(), "Global map PCD is empty: %s", file_name.c_str());
+    return false;
   }
-
-  Eigen::Affine3d odom_to_lidar_odom;
-  while (true) {
-    try {
-      auto tf_stamped = tf_buffer_->lookupTransform(
-        base_frame_, lidar_frame_, rclcpp::Time(0, 0, this->get_clock()->get_clock_type()),
-        rclcpp::Duration::from_seconds(1.0));
-      odom_to_lidar_odom = tf2::transformToEigen(tf_stamped.transform);
-      RCLCPP_INFO_STREAM(
-        this->get_logger(), "odom_to_lidar_odom: translation = "
-                              << odom_to_lidar_odom.translation().transpose() << ", rpy = "
-                              << odom_to_lidar_odom.rotation().eulerAngles(0, 1, 2).transpose());
-      break;
-    } catch (tf2::TransformException & ex) {
-      RCLCPP_WARN(
-        this->get_logger(),
-        "TF lookup failed while waiting for %s -> %s. Retrying with latest available TF: %s",
-        lidar_frame_.c_str(), base_frame_.c_str(), ex.what());
-      rclcpp::sleep_for(std::chrono::seconds(1));
-    }
-  }
-  pcl::transformPointCloud(*global_map_, *global_map_, odom_to_lidar_odom);
+  // The prior is already expressed in map_frame_; mechanical sensor extrinsics
+  // must never shift it. Registration estimates T_map_odom from odom-frame scans.
+  RCLCPP_INFO(
+    this->get_logger(), "Loaded global map: frame='%s' points=%zu",
+    map_frame_.c_str(), global_map_->size());
+  return true;
 }
 
 void SmallGicpRelocalizationNode::registeredPcdCallback(
@@ -488,7 +481,7 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
     return;
   }
   ScanInputConfig input_config;
-  input_config.expected_frame = lidar_frame_;
+  input_config.expected_frame = odom_frame_;
   input_config.max_age_s = max_scan_age_s_;
   input_config.max_future_s = max_scan_future_s_;
   input_config.min_range_m = scan_min_range_m_;
@@ -524,16 +517,13 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
   }
   ScanInputStats stats;
   stats.total_points = scan->size();
-  pcl::PointCloud<pcl::PointXYZ>::Ptr valid_scan(new pcl::PointCloud<pcl::PointXYZ>());
-  valid_scan->points.reserve(scan->size());
   for (const auto & point : scan->points) {
     if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
       continue;
     }
     ++stats.finite_points;
     if (scanPointInRange(point.x, point.y, point.z, input_config)) {
-      valid_scan->points.push_back(point);
-      ++stats.valid_points;
+      scan->points[stats.valid_points++] = point;
     }
   }
   const std::string point_error = validateScanPointStats(stats, input_config);
@@ -542,32 +532,18 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
     recordDroppedScan(point_error);
     return;
   }
-  valid_scan->width = static_cast<std::uint32_t>(valid_scan->points.size());
-  valid_scan->height = 1;
-  valid_scan->is_dense = true;
-
-  // Keep the callback bounded when registration is blocked by stale TF/status or a
-  // long-running LOST search. The newest scan starts a fresh window and old points
-  // cannot silently survive a recovery transition.
-  if (
-    accumulated_frame_count_ >= max_accumulated_frames_ ||
-    accumulated_cloud_->size() + valid_scan->size() > max_accumulated_points_) {
+  scan->points.resize(stats.valid_points);
+  const auto trim = scan_window_.append(std::move(scan->points), stamp_ns);
+  if (trim.sampled_points != 0 || trim.evicted_frames != 0) {
     ++trimmed_accumulation_count_;
-    clearAccumulation();
   }
+  sampled_scan_points_count_ += trim.sampled_points;
+  evicted_scan_frames_count_ += trim.evicted_frames;
   last_scan_time_ = msg->header.stamp;
   last_received_scan_stamp_ns_ = stamp_ns;
   current_scan_frame_id_ = msg->header.frame_id;
   has_received_scan_ = true;
-  if (!first_accumulated_scan_time_) {
-    first_accumulated_scan_time_ = msg->header.stamp;
-  }
   ++accepted_scan_count_;
-  *accumulated_cloud_ += *valid_scan;
-  accumulated_cloud_->width = static_cast<std::uint32_t>(accumulated_cloud_->size());
-  accumulated_cloud_->height = 1;
-  accumulated_cloud_->is_dense = true;
-  ++accumulated_frame_count_;
 }
 
 void SmallGicpRelocalizationNode::recordDroppedScan(const std::string & reason)
@@ -576,18 +552,18 @@ void SmallGicpRelocalizationNode::recordDroppedScan(const std::string & reason)
   RCLCPP_WARN_THROTTLE(
     this->get_logger(), *this->get_clock(), 2000,
     "Dropped registered_scan (%s); dropped=%s stale=%s invalid=%s accepted=%s "
-    "trimmed_windows=%s",
+    "trimmed_windows=%s sampled_points=%s evicted_frames=%s",
     reason.c_str(), std::to_string(dropped_scan_count_).c_str(),
     std::to_string(stale_scan_count_).c_str(), std::to_string(invalid_scan_count_).c_str(),
     std::to_string(accepted_scan_count_).c_str(),
-    std::to_string(trimmed_accumulation_count_).c_str());
+    std::to_string(trimmed_accumulation_count_).c_str(),
+    std::to_string(sampled_scan_points_count_).c_str(),
+    std::to_string(evicted_scan_frames_count_).c_str());
 }
 
 void SmallGicpRelocalizationNode::clearAccumulation()
 {
-  accumulated_cloud_->clear();
-  first_accumulated_scan_time_.reset();
-  accumulated_frame_count_ = 0;
+  scan_window_.clear();
 }
 
 bool SmallGicpRelocalizationNode::isRecoveringLocalization() const
@@ -641,7 +617,11 @@ bool SmallGicpRelocalizationNode::preferMultiGuess() const
 
 void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
 {
-  pcl::PointCloud<pcl::PointXYZ>::Ptr filtered = accumulated_cloud_;
+  auto filtered = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  scan_window_.assemble(filtered->points);
+  filtered->width = static_cast<std::uint32_t>(filtered->size());
+  filtered->height = 1;
+  filtered->is_dense = true;
   if (height_filter_enable_ && filtered && !filtered->empty()) {
     auto cropped = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     cropped->points.reserve(filtered->points.size());
@@ -830,6 +810,7 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
   const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag) const
 {
   MultiGuessOutcome outcome;
+  outcome.generation = request.generation;
   outcome.cursor = request.cursor;
   outcome.next_cursor = request.cursor;
   outcome.confirmation_recheck = request.confirmation_recheck;
@@ -930,7 +911,8 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       return outcome;
     }
-    if (outcome.evaluated >= budget_count || std::chrono::steady_clock::now() >= deadline) {
+    if (outcome.evaluated >= budget_count ||
+        multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
       outcome.budget_exhausted = true;
       break;
     }
@@ -979,6 +961,10 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       return outcome;
     }
+    if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+      outcome.budget_exhausted = true;
+      break;
+    }
     const ScreenedCandidate & candidate = screened[i];
     RegistrationAttempt attempt = candidate.attempt;
     if (fine_alignment_enabled_) {
@@ -987,6 +973,10 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         request.source_tree, local_register);
       attempt.stage = "multi_guess_fine";
       ++outcome.refined;
+    }
+    if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+      outcome.budget_exhausted = true;
+      break;
     }
     const bool accepted =
       passesQualityGates(attempt, request.allow_unconverged, GateStage::kAccept);
@@ -1013,6 +1003,13 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
   outcome.elapsed_s =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
+  if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+    outcome.budget_exhausted = true;
+    outcome.best.ok = false;
+    outcome.best.reject_reason = "multi_guess budget_exhausted";
+    writeCandidateDiagnostics(diagnostics);
+    return outcome;
+  }
   outcome.selection = selectCandidate(ranked, ambiguity_);
   if (!outcome.selection.has_best) {
     outcome.best.ok = false;
@@ -1037,6 +1034,19 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     outcome.best.reject_reason = reason.str();
   }
   writeCandidateDiagnostics(diagnostics);
+  outcome.elapsed_s =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  // align() cannot be interrupted. Never admit a result completed past budget,
+  // including an earlier good candidate followed by an over-budget refinement.
+  if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+    outcome.budget_exhausted = true;
+    outcome.best.ok = false;
+    outcome.best.reject_reason = "multi_guess budget_exhausted";
+  }
+  if (cancel_flag.load()) {
+    outcome.best.ok = false;
+    outcome.best.reject_reason = "multi_guess cancelled";
+  }
   return outcome;
 }
 
@@ -1080,11 +1090,11 @@ void SmallGicpRelocalizationNode::performRegistration()
     return;
   }
 
-  if (accumulated_cloud_->empty()) {
+  if (scan_window_.pointCount() == 0) {
     return;
   }
 
-  if (static_cast<int>(accumulated_cloud_->size()) < min_source_points_) {
+  if (scan_window_.pointCount() < static_cast<std::size_t>(std::max(0, min_source_points_))) {
     return;
   }
 
@@ -1125,6 +1135,7 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
   cancel_multi_guess_.store(false);
 
   MultiGuessRequest request;
+  request.generation = relocalization_generation_.current();
   request.source = source_;
   request.source_tree = source_tree_;
   request.screen_source = screen_source_;
@@ -1195,6 +1206,7 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
     async_result_ready_ = false;
   }
 
+  if (!relocalization_generation_.admit(outcome.generation, [&]() {
   const bool cancelled = outcome.best.reject_reason == "multi_guess cancelled";
   // 确认复核用的是待确认假设作为种子，其 cursor 不代表探索进度：
   // 若把它写回，未评估候选的扫描进度会被反复重置。
@@ -1220,6 +1232,11 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
     return;
   }
   handleRegistrationAttempt(outcome.best, scan_time, source_points);
+  })) {
+    ++stale_async_result_count_;
+    RCLCPP_WARN(this->get_logger(), "Dropped stale multi_guess result (count=%s)",
+      std::to_string(stale_async_result_count_).c_str());
+  }
 }
 
 ConfirmationDecision SmallGicpRelocalizationNode::evaluateCandidateConfirmation(
@@ -1338,6 +1355,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   result_t_ = previous_result_t_ = candidate;
+  last_accepted_observation_scan_time_ = scan_time;
   if (auto current_robot_base_to_odom = getCurrentRobotBaseToOdom()) {
     last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
   }
@@ -1465,6 +1483,10 @@ void SmallGicpRelocalizationNode::publishObservation(
 void SmallGicpRelocalizationNode::initialPoseCallback(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
 {
+  // Invalidate even when TF lookup below fails: old work cannot answer a new reset.
+  relocalization_generation_.invalidate();
+  cancel_multi_guess_.store(true);
+  clearAccumulation();
   RCLCPP_INFO(
     this->get_logger(), "Received initial pose: [x: %f, y: %f, z: %f]", msg->pose.pose.position.x,
     msg->pose.pose.position.y, msg->pose.pose.position.z);
@@ -1489,7 +1511,6 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     last_hypothesis_.reset();
     last_hypothesis_time_.reset();
     multi_guess_cursor_ = 0;
-    clearAccumulation();
     initial_pose_override_time_ = this->now();
     need_coarse_alignment_ = true;
     has_accepted_alignment_ = false;
@@ -1511,17 +1532,33 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   if (!msg) {
     return;
   }
+  using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+  const auto received_at = this->now();
+  const auto rejection = validateLocalizationStatusMetadata(
+    msg->header.frame_id, map_frame_, msg->header.stamp.sec, msg->header.stamp.nanosec,
+    received_at.nanoseconds(), last_status_stamp_ns_, msg->epoch, localization_epoch_,
+    msg->state == LS::STATE_TRACKING, status_stale_skip_registration_s_, max_scan_future_s_);
+  if (!rejection.empty() || msg->state > LS::STATE_LOST) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000, "Rejecting localization status: %s",
+      rejection.empty() ? "unknown state" : rejection.c_str());
+    return;
+  }
+  last_status_stamp_ns_ =
+    static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec;
   const std::uint8_t previous = localization_state_;
   localization_state_ = msg->state;
   localization_epoch_ = msg->epoch;
   observation_silence_sec_ = msg->observation_silence_sec;
-  last_status_receive_time_ = this->now();
+  last_status_receive_time_ = received_at;
 
-  using LS = ats_navigation_interfaces::msg::LocalizationStatus;
   const bool entered_recovery =
     previous == LS::STATE_TRACKING &&
     (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED);
   if (entered_recovery) {
+    relocalization_generation_.invalidate();
+    cancel_multi_guess_.store(true);
+    clearAccumulation();
     need_coarse_alignment_ = true;
     pending_confirmation_.reset();
     pending_confirmation_count_ = 0;
@@ -1536,32 +1573,33 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
 
 bool SmallGicpRelocalizationNode::shouldRunRegistration()
 {
-  if (!has_received_scan_ || accumulated_cloud_->empty()) {
+  if (!has_received_scan_ || scan_window_.pointCount() == 0) {
     return false;
   }
 
-  if (accumulated_frame_count_ < accumulate_frames_) {
+  if (scan_window_.frameCount() < static_cast<std::size_t>(accumulate_frames_)) {
     return false;
   }
 
-  if (first_accumulated_scan_time_) {
+  if (scan_window_.firstStamp()) {
     const double accumulation_age = accumulatedCloudAgeSeconds();
     if (max_accumulation_age_s_ > 0.0 && accumulation_age < max_accumulation_age_s_) {
       return false;
     }
   }
 
-  if (inInitialPoseForceWindow()) {
-    return true;
-  }
-
   // After a process stall, cached TRACKING can be older than fusion's LOST.
   // Wait for a fresh /localization/status before registering.
   if (
-    follow_localization_status_ && status_stale_skip_registration_s_ > 0.0 &&
-    last_status_receive_time_ &&
-    (this->now() - *last_status_receive_time_).seconds() > status_stale_skip_registration_s_) {
+    follow_localization_status_ &&
+    (!last_status_receive_time_ ||
+     (status_stale_skip_registration_s_ > 0.0 &&
+      (this->now() - *last_status_receive_time_).seconds() > status_stale_skip_registration_s_))) {
     return false;
+  }
+
+  if (inInitialPoseForceWindow()) {
+    return true;
   }
 
   if (pending_confirmation_) {
@@ -1575,6 +1613,20 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
 
   // LOST/DEGRADED: correctness over frequency — keep attempting recovery windows.
   if (force_registration_when_lost_ && isRecoveringLocalization()) {
+    return true;
+  }
+
+  // A stationary chassis still receives new LiDAR measurements. Re-run the
+  // complete registration and quality gates before fusion's accepted-observation
+  // lease expires; never refresh status from an old scan alone.
+  const std::optional<double> last_accepted_scan_time_s =
+    last_accepted_observation_scan_time_
+      ? std::optional<double>(last_accepted_observation_scan_time_->seconds())
+      : std::nullopt;
+  if (
+    acceptedObservationRefreshDue(
+      last_accepted_scan_time_s, last_scan_time_.seconds(),
+      accepted_observation_refresh_interval_s_)) {
     return true;
   }
 
@@ -1596,10 +1648,11 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
 
 double SmallGicpRelocalizationNode::accumulatedCloudAgeSeconds() const
 {
-  if (!first_accumulated_scan_time_) {
+  const auto first_stamp = scan_window_.firstStamp();
+  if (!first_stamp) {
     return 0.0;
   }
-  return std::max(0.0, (last_scan_time_ - *first_accumulated_scan_time_).seconds());
+  return std::max(0.0, static_cast<double>(last_scan_time_.nanoseconds() - *first_stamp) * 1e-9);
 }
 
 std::optional<Eigen::Isometry3d> SmallGicpRelocalizationNode::getCurrentRobotBaseToOdom() const

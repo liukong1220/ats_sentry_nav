@@ -212,10 +212,12 @@ protected:
   void publishExecutionWithSequence(
     std::uint64_t sequence, std::uint64_t epoch, std::uint64_t map_generation,
     std::uint64_t gimbal_request_sequence = 0,
-    std::uint64_t manager_incarnation = 0)
+    std::uint64_t manager_incarnation = 0,
+    double command_stamp_offset_s = 0.0)
   {
     ExecutionCommand command;
-    command.header.stamp = driver_->now();
+    command.header.stamp = driver_->now() +
+      rclcpp::Duration::from_seconds(command_stamp_offset_s);
     command.header.frame_id = "odom";
     command.mode = ExecutionCommand::MODE_EXECUTE;
     command.manager_incarnation = manager_incarnation == 0 ?
@@ -266,6 +268,66 @@ protected:
     command.localization_epoch = 1;
     command.failure_reason = ExecutionCommand::FAILURE_RUNTIME_UNSAFE;
     execution_pub_->publish(command);
+  }
+
+  void expectRejectedExecutionStopsActiveTracker(bool old_incarnation, bool older_sequence)
+  {
+    manager_incarnation_ = 2;
+    publishExecutionStop();
+    ASSERT_TRUE(spinUntil(
+      [this]() {
+        if (command_norm_.load() > 0.02) {
+          return true;
+        }
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishExecution(1);
+        return false;
+      },
+      2s));
+
+    const auto accepted_sequence = execution_sequence_;
+    const auto rejected_sequence = old_incarnation ? accepted_sequence + 1000 :
+      accepted_sequence - (older_sequence ? 1 : 0);
+    publishExecutionWithSequence(
+      rejected_sequence, 1, 1, 0, old_incarnation ? 1 : manager_incarnation_);
+    // Keep every other gate healthy. Stop must precede the 500 ms execution
+    // lease expiry, not merely wait for the old authorization to time out.
+    ASSERT_TRUE(spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        return command_norm_.load() < 1e-6;
+      },
+      200ms));
+
+    // Healthy feedback, legacy false and a fresh legacy path cannot revive
+    // the cleared tracker. A replay with a freshly stamped path cannot either.
+    publishExecutionWithSequence(accepted_sequence, 1, 1);
+    EXPECT_FALSE(spinUntil(
+      [this]() {
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishStop(false);
+        publishPath();
+        EXPECT_LT(command_norm_.load(), 1e-6);
+        return false;
+      },
+      100ms));
+
+    // A fresh command at the next sequence restores motion; in particular an
+    // old incarnation's large sequence must not advance the replay watermark.
+    ASSERT_TRUE(spinUntil(
+      [this]() {
+        if (command_norm_.load() > 0.02) {
+          return true;
+        }
+        publishOdometry();
+        publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+        publishExecution(1);
+        return false;
+      },
+      2s));
   }
 
   rclcpp::executors::SingleThreadedExecutor executor_;
@@ -337,6 +399,26 @@ TEST_F(
         return command_norm_.load() > 0.02;
       },
       2s));
+}
+
+TEST_F(MpcLocalizationGateTest, RejectsFutureAndStaleExecutionCommandTimestamps) {
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+
+  // A command with a producer clock ahead of the consumer must not install a
+  // reference, even though its manager identity and sequence are otherwise
+  // valid.
+  publishExecutionWithSequence(
+    ++execution_sequence_, 1, 1, gimbal_request_sequence_, manager_incarnation_, 1.0);
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 500ms));
+
+  // Establish a fresh STOP handoff before testing the stale side of the same
+  // contract.  The old timestamp must not be allowed to become a new lease.
+  publishExecutionStop(manager_incarnation_, ++execution_sequence_);
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 500ms));
+  publishExecutionWithSequence(
+    ++execution_sequence_, 1, 1, gimbal_request_sequence_, manager_incarnation_, -1.0);
+  ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 500ms));
 }
 
 TEST_F(MpcLocalizationGateTest, QpShadowRetainsTheSingleIlqrCommandPublisher) {
@@ -429,18 +511,32 @@ TEST_F(MpcLocalizationGateTest, RejectsOldSequenceAndOldEpochExecutionCommands) 
       500ms));
 }
 
+TEST_F(MpcLocalizationGateTest, OldIncarnationStopsActiveTrackerUntilFreshAuthorization) {
+  expectRejectedExecutionStopsActiveTracker(true, false);
+}
+
+TEST_F(MpcLocalizationGateTest, DuplicateSequenceStopsActiveTrackerUntilFreshAuthorization) {
+  expectRejectedExecutionStopsActiveTracker(false, false);
+}
+
+TEST_F(MpcLocalizationGateTest, OlderSequenceStopsActiveTrackerUntilFreshAuthorization) {
+  expectRejectedExecutionStopsActiveTracker(false, true);
+}
+
 TEST_F(MpcLocalizationGateTest, RequiresStopHandshakeForNewManagerIncarnation) {
   constexpr std::uint64_t kOldIncarnation = 100;
   constexpr std::uint64_t kNewIncarnation = 101;
+  std::uint64_t old_sequence = 1;
+  std::uint64_t new_sequence = 1;
   publishOdometry();
   publishStatus(LocalizationStatus::STATE_TRACKING, 1);
 
   publishExecutionStop(kOldIncarnation, 1);
   ASSERT_TRUE(spinUntil(
-    [this]() {
+    [this, &old_sequence]() {
       publishOdometry();
       publishStatus(LocalizationStatus::STATE_TRACKING, 1);
-      publishExecutionWithSequence(2, 1, 1, 0, kOldIncarnation);
+      publishExecutionWithSequence(++old_sequence, 1, 1, 0, kOldIncarnation);
       return command_norm_.load() > 0.02;
     },
     2s));
@@ -452,15 +548,15 @@ TEST_F(MpcLocalizationGateTest, RequiresStopHandshakeForNewManagerIncarnation) {
 
   publishExecutionStop(kNewIncarnation, 1);
   ASSERT_TRUE(spinUntil(
-    [this]() {
+    [this, &new_sequence]() {
       publishOdometry();
       publishStatus(LocalizationStatus::STATE_TRACKING, 1);
-      publishExecutionWithSequence(2, 1, 1, 0, kNewIncarnation);
+      publishExecutionWithSequence(++new_sequence, 1, 1, 0, kNewIncarnation);
       return command_norm_.load() > 0.02;
     },
     2s));
 
-  publishExecutionStop(kNewIncarnation, 3);
+  publishExecutionStop(kNewIncarnation, ++new_sequence);
   ASSERT_TRUE(spinUntil([this]() {return command_norm_.load() < 1e-6;}, 1s));
 
   // A delayed command from the old manager cannot revive the stopped tracker.

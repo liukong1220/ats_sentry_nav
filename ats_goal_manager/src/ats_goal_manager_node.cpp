@@ -5,6 +5,7 @@
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <cmath>
@@ -279,6 +280,9 @@ private:
     emergency_stop_heartbeat_period_sec_ = std::max(
         0.02,
         declare_parameter<double>("emergency_stop_heartbeat_period_sec", 0.1));
+    execution_command_stamp_backdate_sec_ = std::clamp(
+      declare_parameter<double>("execution_command_stamp_backdate_sec", 0.02),
+      0.0, 0.25);
     map_wait_timeout_sec_ =
         std::max(0.0, declare_parameter<double>("map_wait_timeout_sec", 5.0));
     default_goal_timeout_sec_ = std::max(
@@ -528,6 +532,8 @@ private:
     if (message->state == PlannerStatus::STATE_FAILED) {
       bool matches = false;
       bool transient_failure = false;
+      bool reuse_newer_snapshot = false;
+      std::uint64_t reused_publication_sequence = 0;
       std::uint64_t wait_for_publication_after = 0;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -565,8 +571,29 @@ private:
              message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF);
         if (transient_failure) {
           active_goal_->recovering = true;
-          map_ready_signal_ = false;
-          map_status_ready_ = false;
+          const bool snapshot_changed =
+            message->failure_reason == PlannerStatus::FAILURE_SNAPSHOT_CHANGED;
+          if (snapshot_changed) {
+            // The failure identifies the old committed publication.  A later
+            // status/snapshot pair is eligible for the next request only when
+            // it has already arrived as one coherent, valid map identity.
+            wait_for_publication_after = message->map_publication_sequence;
+            reuse_newer_snapshot =
+              map_status_ready_ &&
+              map_status_publication_sequence_ > message->map_publication_sequence &&
+              planningSnapshotUsableLocked(
+                map_status_publication_sequence_, active_goal_->localization_epoch);
+            if (reuse_newer_snapshot) {
+              reused_publication_sequence = map_status_publication_sequence_;
+            }
+          }
+          if (!reuse_newer_snapshot) {
+            // Cross-topic status/snapshot delivery is unordered.  Without a
+            // complete newer pair, discard the local readiness evidence and
+            // keep the recovery path fail-closed until the adapter republishes.
+            map_ready_signal_ = false;
+            map_status_ready_ = false;
+          }
           if (message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
             message->failure_reason == PlannerStatus::FAILURE_FOOTPRINT)
           {
@@ -576,8 +603,18 @@ private:
       }
       if (matches) {
         if (transient_failure) {
+          if (reuse_newer_snapshot) {
+            RCLCPP_INFO(
+              get_logger(),
+              "Recovering snapshot-changed goal=%llu from already received map publication "
+              "%llu after invalidated publication %llu.",
+              static_cast<unsigned long long>(message->goal_id),
+              static_cast<unsigned long long>(reused_publication_sequence),
+              static_cast<unsigned long long>(message->map_publication_sequence));
+          }
           // planning grid 与 ready/status 是独立 topic，跨 topic 不具备原子顺序。
-          // 恢复期 snapshot 尚未安装或仍是 blocked grid 时等待下一次 map status。
+          // 尚无完整的更新 snapshot 时等待下一次 map status；已经收到严格更新
+          // 的同序号 snapshot 时可立即派发新请求，旧 command 仍先经 suspend 清除。
           suspendActiveGoal(
             message->goal_id, std::nullopt, wait_for_publication_after);
         } else {
@@ -1783,7 +1820,13 @@ private:
     command.manager_incarnation = manager_incarnation_;
     command.command_sequence = ++next_execution_command_sequence_;
     const rclcpp::Time publish_stamp = now();
-    command.header.stamp = publish_stamp;
+    // /clock is delivered independently to producer and consumer nodes. A
+    // consumer can therefore observe a just-published sample against an older
+    // clock tick. Backdate only the producer lease; consumers still reject any
+    // genuinely future or expired sample with their hard timestamp gates.
+    const rclcpp::Time lease_stamp = publish_stamp -
+      rclcpp::Duration::from_seconds(execution_command_stamp_backdate_sec_);
+    command.header.stamp = lease_stamp;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "TRACE execution_command emit mode=%u incarnation=%llu sequence=%llu "
@@ -1792,7 +1835,7 @@ private:
       static_cast<unsigned>(command.mode),
       static_cast<unsigned long long>(command.manager_incarnation),
       static_cast<unsigned long long>(command.command_sequence),
-      static_cast<long long>(publish_stamp.nanoseconds()),
+      static_cast<long long>(lease_stamp.nanoseconds()),
       static_cast<unsigned long long>(command.goal_id),
       static_cast<unsigned long long>(command.localization_epoch),
       static_cast<unsigned long long>(command.map_generation),
@@ -1840,6 +1883,7 @@ private:
   double emergency_stop_heartbeat_period_sec_{0.1};
   double map_wait_timeout_sec_{5.0};
   double default_goal_timeout_sec_{120.0};
+  double execution_command_stamp_backdate_sec_{0.02};
   double goal_position_tolerance_{0.08};
   double progress_hold_distance_m_{0.08};
   double goal_yaw_tolerance_{0.15};

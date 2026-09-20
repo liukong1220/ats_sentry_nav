@@ -73,6 +73,16 @@ TEST(RelocalizationCandidateCore, YawExtractionSurvivesTinyNegativeRollPitch)
   EXPECT_NEAR(yawOf(rotation), 0.7, 1e-5);
 }
 
+TEST(RelocalizationCandidateCore, FreshScanRefreshesAcceptedObservationWithoutMotion)
+{
+  EXPECT_FALSE(acceptedObservationRefreshDue(10.0, 11.0, 0.0));
+  EXPECT_TRUE(acceptedObservationRefreshDue(std::nullopt, 11.0, 1.0));
+  EXPECT_FALSE(acceptedObservationRefreshDue(10.0, 10.99, 1.0));
+  EXPECT_TRUE(acceptedObservationRefreshDue(10.0, 11.0, 1.0));
+  EXPECT_FALSE(acceptedObservationRefreshDue(10.0, 9.0, 1.0));
+  EXPECT_FALSE(acceptedObservationRefreshDue(10.0, std::numeric_limits<double>::quiet_NaN(), 1.0));
+}
+
 TEST(RelocalizationCandidateCore, BisectionOrderIsAPermutationWithSpreadPrefix)
 {
   const auto order = bisectionOrder(9);
@@ -453,6 +463,61 @@ TEST(RelocalizationCandidateCore, ConfirmationRejectsTransformJump)
   candidate.map_to_odom = makePose(0.9, 0.0, 0.0);
   EXPECT_EQ(
     evaluateConfirmation(pending, candidate, gates).reason, "confirmation transform mismatch");
+}
+
+TEST(RelocalizationLifecycle, ResetRejectsCompletedAndLateWorkerResultsBeforeMutation)
+{
+  RelocalizationGeneration generation;
+  const auto completed_request = generation.current();
+  const auto in_flight_request = generation.current();
+  generation.invalidate();  // /initialpose or recovery reset
+  int observations = 0;
+  double seed = 7.0;
+  const auto apply_old_result = [&]() {
+    ++observations;
+    seed = -3.0;
+  };
+  EXPECT_FALSE(generation.admit(completed_request, apply_old_result));
+  EXPECT_FALSE(generation.admit(in_flight_request, apply_old_result));
+  EXPECT_EQ(observations, 0);
+  EXPECT_DOUBLE_EQ(seed, 7.0);
+  EXPECT_TRUE(generation.admit(generation.current(), [&]() { ++observations; }));
+  EXPECT_EQ(observations, 1);
+  generation.invalidate();
+  EXPECT_FALSE(generation.admit(completed_request, apply_old_result));
+}
+
+TEST(RelocalizationLifecycle, FineDeadlineRejectsOverrunAndStopsScheduling)
+{
+  using Clock = std::chrono::steady_clock;
+  auto now = Clock::time_point{};
+  const auto deadline = now + std::chrono::milliseconds(10);
+  int align_calls = 0;
+  int admitted = 0;
+  for (int candidate = 0; candidate < 3; ++candidate) {
+    if (multiGuessDeadlineExpired(now, deadline)) {
+      break;
+    }
+    ++align_calls;
+    now += std::chrono::milliseconds(11);  // Non-interruptible alignment completes late.
+    if (multiGuessDeadlineExpired(now, deadline)) {
+      break;
+    }
+    ++admitted;
+  }
+  EXPECT_EQ(align_calls, 1);
+  EXPECT_EQ(admitted, 0);
+  EXPECT_TRUE(multiGuessDeadlineExpired(deadline, deadline));
+  EXPECT_FALSE(multiGuessDeadlineExpired(deadline - std::chrono::nanoseconds(1), deadline));
+}
+
+TEST(RelocalizationLifecycle, FinalAdmissionRejectsEarlierCandidateAfterBudgetExpires)
+{
+  const auto start = std::chrono::steady_clock::time_point{};
+  const auto deadline = start + std::chrono::milliseconds(10);
+  EXPECT_FALSE(multiGuessDeadlineExpired(start + std::chrono::milliseconds(4), deadline));
+  // A good early candidate cannot survive later refinement/diagnostic overrun.
+  EXPECT_TRUE(multiGuessDeadlineExpired(start + std::chrono::milliseconds(12), deadline));
 }
 
 }  // namespace small_gicp_relocalization

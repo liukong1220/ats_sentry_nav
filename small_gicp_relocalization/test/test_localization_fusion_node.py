@@ -55,6 +55,8 @@ class TestLocalizationFusionNode(unittest.TestCase):
             "odom_timeout_s": 0.25,
             "observation_timeout_s": 0.8,
             "observation_lost_timeout_s": 2.0,
+            "observation_stamp_max_age_s": 0.05,
+            "observation_stamp_max_future_s": 0.05,
             "history_duration_s": 3.0,
             "history_boundary_tolerance_s": 0.02,
             "maximum_interpolation_gap_s": 0.10,
@@ -250,6 +252,7 @@ class TestLocalizationFusionNode(unittest.TestCase):
             self.wait_for_status(
                 lambda status: status.state == LocalizationStatus.STATE_TRACKING
                 and status.epoch == 1
+                and status.observation_sequence == 3
                 and status.consecutive_rejections == 0
             )
         )
@@ -257,8 +260,40 @@ class TestLocalizationFusionNode(unittest.TestCase):
             self.transforms[-1].transform.translation.x, 1.0, places=3
         )
 
-        false_match_odom = self.publish_odometry(0.4)
+        # The odom history still covers this scan, but the producer timestamp
+        # is now outside the fusion observation lease.  It must be rejected
+        # before interpolation/correction and therefore cannot change either
+        # map->odom or the localization epoch.
+        stale_odom = self.publish_odometry(0.35)
         self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 5))
+        stale_transform_x = self.transforms[-1].transform.translation.x
+        stale_status_epoch = next(
+            status.epoch
+            for status in reversed(self.statuses)
+            if status.observation_sequence == 3
+        )
+        stale_rejections_before = self.statuses[-1].consecutive_rejections
+        end_wait = time.monotonic() + 0.08
+        while time.monotonic() < end_wait:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+        status_index = len(self.statuses)
+        # Keep geometry and quality otherwise admissible: without the stamp gate
+        # this observation would be accepted and advance the sequence to 8.
+        self.publish_observation(stale_odom.header.stamp, 8, 1.35)
+        self.assertTrue(
+            self.wait_for_status(
+                lambda status: status.consecutive_rejections > stale_rejections_before
+                and status.observation_sequence == 3
+                and status.epoch == stale_status_epoch,
+                start_index=status_index,
+            )
+        )
+        self.assertAlmostEqual(
+            self.transforms[-1].transform.translation.x, stale_transform_x, places=3
+        )
+
+        false_match_odom = self.publish_odometry(0.4)
+        self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 6))
         status_index = len(self.statuses)
         self.publish_observation(false_match_odom.header.stamp, 4, 2.4)
         self.assertTrue(
@@ -274,7 +309,8 @@ class TestLocalizationFusionNode(unittest.TestCase):
         self.publish_observation(future_stamp, 5, 1.4)
         self.assertTrue(
             self.wait_for_status(
-                lambda status: "outside odometry history" in status.message,
+                lambda status: "observation stamp is too far in the future"
+                in status.message,
                 start_index=status_index,
             )
         )
@@ -283,7 +319,7 @@ class TestLocalizationFusionNode(unittest.TestCase):
         while time.monotonic() < end_wait:
             rclpy.spin_once(self.node, timeout_sec=0.02)
         jump_odom = self.publish_odometry(0.5)
-        self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 6))
+        self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 7))
         self.publish_observation(jump_odom.header.stamp, 6, 1.7)
         self.assertTrue(
             self.wait_for_status(
@@ -309,7 +345,7 @@ class TestLocalizationFusionNode(unittest.TestCase):
         )
 
         restored_odom = self.publish_odometry(0.6)
-        self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 7))
+        self.assertTrue(self.spin_until(lambda: len(self.localizations) >= 8))
         self.publish_observation(restored_odom.header.stamp, 7, 1.8)
         self.assertTrue(
             self.wait_for_status(

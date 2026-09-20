@@ -72,6 +72,15 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_scan_input_core PUBLIC include)
 
+  ament_add_gtest(test_relocalization_frame_contract
+    test/test_relocalization_frame_contract.cpp
+    TIMEOUT 30
+  )
+  target_link_libraries(test_relocalization_frame_contract ${PROJECT_NAME})
+  ament_target_dependencies(test_relocalization_frame_contract
+    ats_navigation_interfaces rclcpp sensor_msgs geometry_msgs pcl_conversions tf2_ros tf2_eigen
+  )
+
   ament_add_pytest_test(test_localization_fusion_node
     test/test_localization_fusion_node.py
     TIMEOUT 40

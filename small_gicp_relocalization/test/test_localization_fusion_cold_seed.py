@@ -21,10 +21,13 @@
 # budget, which made every deviation above the TRACKING gate unrecoverable.
 
 import math
+from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
+import uuid
 
 from ament_index_python.packages import get_package_prefix
 from ats_navigation_interfaces.msg import LocalizationStatus
@@ -163,6 +166,57 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
         # NOTE: the first sub-timeout window still reports TRACKING. Tightening
         # that would make every cold boot start DEGRADED, which is a separate
         # downstream contract change and is deliberately not done here.
+
+
+class TestRelocalizationStartupShutdown(unittest.TestCase):
+    def test_map_loads_without_extrinsic_tf_and_paused_clock_sigint_exits_cleanly(self):
+        executable = (
+            get_package_prefix("small_gicp_relocalization")
+            + "/lib/small_gicp_relocalization/small_gicp_relocalization_node"
+        )
+        with tempfile.TemporaryDirectory(prefix="relocalization_startup_") as directory:
+            pcd = Path(directory) / "map.pcd"
+            points = [f"{x} {y} {z}" for x in range(4) for y in range(4) for z in range(4)]
+            pcd.write_text(
+                "VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"
+                f"COUNT 1 1 1\nWIDTH {len(points)}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\n"
+                f"POINTS {len(points)}\nDATA ascii\n" + "\n".join(points) + "\n"
+            )
+            token = uuid.uuid4().hex
+            command = [
+                executable, "--ros-args",
+                "-r", f"__node:=startup_shutdown_{token}",
+                "-p", f"prior_pcd_file:={pcd}",
+                "-p", f"map_frame:=prior_map_{token}",
+                "-p", f"odom_frame:=registered_odom_{token}",
+                "-p", f"robot_base_frame:=missing_body_{token}",
+                "-p", "use_sim_time:=true",
+            ]
+            log_path = Path(directory) / "process.log"
+            with log_path.open("w") as log:
+                process = subprocess.Popen(command, stdout=log, stderr=log)
+                try:
+                    deadline = time.monotonic() + 10.0
+                    while time.monotonic() < deadline:
+                        output = log_path.read_text()
+                        if "scan input gate:" in output:
+                            break
+                        self.assertIsNone(process.poll(), output)
+                        time.sleep(0.05)
+                    else:
+                        self.fail("Map startup incorrectly depends on extrinsic TF: " + output)
+                    self.assertIn("GICP coarse-fine ready:", output)
+                    self.assertIn(f"Loaded global map: frame='prior_map_{token}' points=64", output)
+                    self.assertIn(f"expected_frame='registered_odom_{token}'", output)
+                    process.send_signal(signal.SIGINT)
+                    self.assertEqual(
+                        process.wait(timeout=5.0), 0,
+                        "Startup shutdown must not abort: " + log_path.read_text(),
+                    )
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5.0)
 
 
 if __name__ == "__main__":

@@ -97,6 +97,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_unknown_projection_audit test/test_unknown_projection_audit.cpp)
   target_link_libraries(test_unknown_projection_audit ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_point_cloud_input test/test_point_cloud_input.cpp)
+  target_link_libraries(test_point_cloud_input ${PROJECT_NAME}_core)
 endif()
 
 ament_export_include_directories(include)

@@ -606,11 +606,35 @@ void AtsSwerveMpcNode::onExecutionCommand(
     engageFailStop();
     return;
   }
+  // The command lease is measured from the producer timestamp as well as DDS
+  // receipt time.  A transient-local sample can be delivered immediately
+  // after startup even though it was emitted by an older process; accepting it
+  // here would let a stale/future authorization install a reference before the
+  // arbiter sees it.  Keep the MPC gate identical to the arbiter gate so either
+  // consumer fails closed on the same clock contract.
+  const rclcpp::Duration command_age = receipt - command_stamp;
+  if (command_age.nanoseconds() < 0 ||
+      command_age > rclcpp::Duration::from_seconds(execution_command_timeout_)) {
+    RCLCPP_ERROR(
+        get_logger(),
+        "TRACE execution_command rejected=timestamp mode=%u incarnation=%llu "
+        "sequence=%llu stamp_ns=%lld receipt_ns=%lld age_ns=%lld limit_ns=%lld",
+        static_cast<unsigned>(message->mode),
+        static_cast<unsigned long long>(message->manager_incarnation),
+        static_cast<unsigned long long>(message->command_sequence),
+        static_cast<long long>(command_stamp.nanoseconds()),
+        static_cast<long long>(receipt.nanoseconds()),
+        static_cast<long long>(command_age.nanoseconds()),
+        static_cast<long long>(
+            rclcpp::Duration::from_seconds(execution_command_timeout_).nanoseconds()));
+    engageFailStop();
+    return;
+  }
   bool install_reference = false;
   bool stop = message->mode ==
     ats_navigation_interfaces::msg::ExecutionCommand::MODE_STOP;
   {
-    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    std::unique_lock<std::mutex> lock(trajectory_mutex_);
     if (message->manager_incarnation < last_execution_command_incarnation_) {
       RCLCPP_WARN(
           get_logger(),
@@ -621,6 +645,9 @@ void AtsSwerveMpcNode::onExecutionCommand(
           static_cast<long long>(command_stamp.nanoseconds()),
           static_cast<long long>(receipt.nanoseconds()),
           static_cast<unsigned long long>(last_execution_command_incarnation_));
+      active_execution_command_.reset();
+      lock.unlock();
+      engageFailStop();
       return;
     }
     if (message->manager_incarnation > last_execution_command_incarnation_) {
@@ -644,6 +671,9 @@ void AtsSwerveMpcNode::onExecutionCommand(
           static_cast<long long>(command_stamp.nanoseconds()),
           static_cast<long long>(receipt.nanoseconds()),
           static_cast<unsigned long long>(last_execution_command_sequence_));
+      active_execution_command_.reset();
+      lock.unlock();
+      engageFailStop();
       return;
     } else {
       last_execution_command_sequence_ = message->command_sequence;

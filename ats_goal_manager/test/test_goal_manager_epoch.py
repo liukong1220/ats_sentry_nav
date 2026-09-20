@@ -467,6 +467,44 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             )
         )
 
+        # The MPC and cmd_vel arbiter validate the producer timestamp as a
+        # lease. Goal Manager heartbeats must therefore refresh that stamp
+        # while preserving the same goal/reference identity.
+        first_execute = next(
+            command
+            for command in reversed(self.execution_commands)
+            if command.mode == ExecutionCommand.MODE_EXECUTE
+            and command.goal_id == first_goal.goal_id
+        )
+        first_execute_stamp_ns = (
+            first_execute.header.stamp.sec * 1_000_000_000
+            + first_execute.header.stamp.nanosec
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_EXECUTE
+                    and command.goal_id == first_goal.goal_id
+                    and command.command_sequence > first_execute.command_sequence
+                    for command in self.execution_commands
+                ),
+                timeout=1.0,
+            )
+        )
+        refreshed_execute = next(
+            command
+            for command in reversed(self.execution_commands)
+            if command.mode == ExecutionCommand.MODE_EXECUTE
+            and command.goal_id == first_goal.goal_id
+            and command.command_sequence > first_execute.command_sequence
+        )
+        refreshed_stamp_ns = (
+            refreshed_execute.header.stamp.sec * 1_000_000_000
+            + refreshed_execute.header.stamp.nanosec
+        )
+        self.assertGreater(refreshed_stamp_ns, first_execute_stamp_ns)
+        self.assertLessEqual(refreshed_stamp_ns, self.node.get_clock().now().nanoseconds)
+
         # A mode change while tracking must first publish a structured STOP.
         # BODY_YAW_FOLLOW then waits for the matching *locked* acknowledgement.
         stop_event_count = len(self.stop_states)
@@ -756,5 +794,60 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             self.spin_until(
                 lambda: self.stop_states.count(False) > false_count,
                 periodic=lambda: self.publish_health(2, 2.0, 4),
+            )
+        )
+
+        # MINCO can report FAILURE_SNAPSHOT_CHANGED after the adapter's next
+        # coherent status/snapshot pair already reached Goal Manager.  The old
+        # command must stop, but recovery must use that newer identity directly
+        # instead of needlessly waiting for a third publication.
+        stop_event_count = len(self.stop_states)
+        self.publish_health(2, 2.0, 5)
+        self.assertFalse(
+            self.spin_until(
+                lambda: True in self.stop_states[stop_event_count:],
+                timeout=0.3,
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        goal_count = len(self.planner_goals)
+        command_count = len(self.execution_commands)
+        snapshot_changed = PlannerStatus()
+        snapshot_changed.header.stamp = self.node.get_clock().now().to_msg()
+        snapshot_changed.goal_id = recovered_goal.goal_id
+        snapshot_changed.localization_epoch = recovered_goal.localization_epoch
+        snapshot_changed.plan_request_sequence = recovered_goal.plan_request_sequence
+        snapshot_changed.map_generation = 5
+        snapshot_changed.map_publication_sequence = recovered_goal.map_publication_sequence
+        snapshot_changed.state = PlannerStatus.STATE_FAILED
+        snapshot_changed.failure_reason = PlannerStatus.FAILURE_SNAPSHOT_CHANGED
+        self.planner_status_pub.publish(snapshot_changed)
+        self.assertTrue(
+            self.spin_until(
+                lambda: any(
+                    command.mode == ExecutionCommand.MODE_STOP
+                    for command in self.execution_commands[command_count:]
+                ),
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        self.assertTrue(
+            self.spin_until(
+                lambda: len(self.planner_goals) > goal_count,
+                periodic=lambda: self.publish_tf(2.0),
+            )
+        )
+        immediate_recovery_goal = self.planner_goals[-1]
+        self.assertEqual(immediate_recovery_goal.goal_id, recovered_goal.goal_id)
+        self.assertEqual(immediate_recovery_goal.localization_epoch, 2)
+        self.assertEqual(immediate_recovery_goal.map_publication_sequence, 5)
+        self.assertGreater(
+            immediate_recovery_goal.plan_request_sequence,
+            recovered_goal.plan_request_sequence,
+        )
+        self.assertFalse(
+            any(
+                command.mode == ExecutionCommand.MODE_EXECUTE
+                for command in self.execution_commands[command_count:]
             )
         )

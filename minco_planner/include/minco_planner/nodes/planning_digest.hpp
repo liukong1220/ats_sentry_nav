@@ -5,6 +5,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -134,6 +135,62 @@ inline std::string occupancyDigest(const std::vector<int8_t> & occupancy)
 inline std::string occupancyDigest(const nav_msgs::msg::OccupancyGrid & grid)
 {
   return occupancyDigest(grid.data);
+}
+
+// This identity deliberately excludes publication time and map_load_time: they
+// renew transport/heartbeat evidence but do not change the grid consumed by
+// JPS, RC-ESDF, or the swept-footprint gate.  Include every field that changes
+// grid coordinates or cell semantics so a local immutable snapshot is never
+// reused across a safety-relevant map change.
+inline void appendDigestBytes(
+  std::vector<std::uint8_t> & output, const void * data, std::size_t length)
+{
+  if (length == 0U) {
+    return;
+  }
+  const auto * bytes = static_cast<const std::uint8_t *>(data);
+  output.insert(output.end(), bytes, bytes + length);
+}
+
+template<typename ValueT>
+inline void appendDigestValue(std::vector<std::uint8_t> & output, const ValueT & value)
+{
+  appendDigestBytes(output, &value, sizeof(ValueT));
+}
+
+inline void appendDigestString(std::vector<std::uint8_t> & output, const std::string & value)
+{
+  const auto length = static_cast<std::uint64_t>(value.size());
+  appendDigestValue(output, length);
+  appendDigestBytes(output, value.data(), value.size());
+}
+
+inline std::string gridSafetyDigest(
+  const nav_msgs::msg::OccupancyGrid & grid, int obstacle_value_threshold,
+  bool unknown_is_obstacle)
+{
+  std::vector<std::uint8_t> raw;
+  raw.reserve(
+    sizeof(std::uint64_t) + grid.header.frame_id.size() + sizeof(grid.info.resolution) +
+    sizeof(grid.info.width) + sizeof(grid.info.height) + 7U * sizeof(double) +
+    sizeof(std::int32_t) + sizeof(std::uint8_t) + grid.data.size());
+  appendDigestString(raw, grid.header.frame_id);
+  appendDigestValue(raw, grid.info.resolution);
+  appendDigestValue(raw, grid.info.width);
+  appendDigestValue(raw, grid.info.height);
+  appendDigestValue(raw, grid.info.origin.position.x);
+  appendDigestValue(raw, grid.info.origin.position.y);
+  appendDigestValue(raw, grid.info.origin.position.z);
+  appendDigestValue(raw, grid.info.origin.orientation.x);
+  appendDigestValue(raw, grid.info.origin.orientation.y);
+  appendDigestValue(raw, grid.info.origin.orientation.z);
+  appendDigestValue(raw, grid.info.origin.orientation.w);
+  const auto threshold = static_cast<std::int32_t>(obstacle_value_threshold);
+  const auto unknown = static_cast<std::uint8_t>(unknown_is_obstacle ? 1U : 0U);
+  appendDigestValue(raw, threshold);
+  appendDigestValue(raw, unknown);
+  appendDigestBytes(raw, grid.data.data(), grid.data.size());
+  return toHex(sha256(raw.data(), raw.size()));
 }
 
 inline std::string pathContentDigest(const nav_msgs::msg::Path & path)

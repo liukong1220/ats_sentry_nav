@@ -4,6 +4,8 @@
 
 #include <cmath>
 
+#include "minco_planner/nodes/planning_digest.hpp"
+
 namespace minco_planner
 {
 
@@ -35,6 +37,8 @@ std::shared_ptr<const PlanningMapSnapshot> PlanningMapSnapshot::create(
   auto snapshot = std::make_shared<PlanningMapSnapshot>();
   snapshot->generation = generation;
   snapshot->grid = grid;
+  snapshot->safety_content_digest = planning_digest::gridSafetyDigest(
+    grid, obstacle_value_threshold, unknown_is_obstacle);
   auto esdf = std::make_shared<ats_rc_esdf::RcTraversabilityEsdfProvider>();
   esdf->updateGrid(grid, obstacle_value_threshold, unknown_is_obstacle);
   snapshot->clearance_esdf = std::move(esdf);

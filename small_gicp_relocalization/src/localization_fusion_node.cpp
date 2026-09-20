@@ -119,6 +119,11 @@ public:
     observation_stamp_max_future_s_ =
       std::max(0.0, declare_parameter<double>("observation_stamp_max_future_s", 0.25));
     history_duration_s_ = std::max(0.5, declare_parameter<double>("history_duration_s", 5.0));
+    const auto max_history = declare_parameter<std::int64_t>("max_odom_history_samples", 2000);
+    if (max_history < 2) {
+      throw std::invalid_argument("max_odom_history_samples must be at least 2");
+    }
+    max_odom_history_samples_ = static_cast<std::size_t>(max_history);
     history_boundary_tolerance_s_ =
       std::max(0.0, declare_parameter<double>("history_boundary_tolerance_s", 0.10));
     maximum_interpolation_gap_s_ =
@@ -450,8 +455,13 @@ private:
     }
     const rclcpp::Time cutoff =
       *latest_odom_stamp_ - rclcpp::Duration::from_seconds(history_duration_s_);
-    while (!odom_history_.empty() && odom_history_.front().stamp < cutoff) {
-      odom_history_.pop_front();
+    const auto dropped = pruneOdomHistory(odom_history_, cutoff, max_odom_history_samples_);
+    if (dropped > 0) {
+      odom_history_count_drops_ += dropped;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Odometry history sample cap reached: retained=%zu count_cap_drops=%llu",
+        odom_history_.size(), static_cast<unsigned long long>(odom_history_count_drops_));
     }
   }
 
@@ -514,6 +524,8 @@ private:
   double observation_stamp_max_age_s_{1.0};
   double observation_stamp_max_future_s_{0.25};
   double history_duration_s_{5.0};
+  std::size_t max_odom_history_samples_{2000};
+  std::uint64_t odom_history_count_drops_{0};
   double history_boundary_tolerance_s_{0.1};
   double maximum_interpolation_gap_s_{0.2};
   double transform_future_offset_s_{0.05};

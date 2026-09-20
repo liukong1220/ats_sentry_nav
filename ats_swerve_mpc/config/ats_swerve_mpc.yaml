@@ -13,6 +13,8 @@ ats_swerve_mpc:
     # P4 authorization is atomic.  When non-empty, legacy Path cannot install
     # or revive a tracker and legacy Bool false cannot release a stop.
     execution_command_topic: /planner/execution_command
+    # MPC 与 cmd_vel_arbiter 共同校验 ExecutionCommand.header.stamp：未来或超过
+    # execution_command_timeout 的 transient-local 旧样本一律 fail-stop，不能装载旧 reference。
     execution_command_timeout: 0.5
     gimbal_status_topic: /gimbal/yaw_status
     require_gimbal_status: true
