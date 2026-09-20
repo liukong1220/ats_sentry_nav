@@ -1,11 +1,15 @@
 # header.stamp 是融合节点发布健康状态的时间，header.frame_id 是 map_frame。
 std_msgs/Header header
 
+# UNINITIALIZED is INIT; RELOCALIZING is a bounded pending RECOVERING episode.
 uint8 STATE_UNINITIALIZED=0
 uint8 STATE_TRACKING=1
 uint8 STATE_RELOCALIZING=2
 uint8 STATE_DEGRADED=3
 uint8 STATE_LOST=4
+uint8 STATE_BOOTSTRAP=5
+# Accepted evidence committed; execution remains inhibited during the hold.
+uint8 STATE_CONFIRMED=6
 uint8 state
 
 uint64 epoch

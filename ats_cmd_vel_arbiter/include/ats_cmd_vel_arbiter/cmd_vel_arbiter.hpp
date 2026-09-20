@@ -48,6 +48,7 @@ struct CmdVelArbiterConfig
   std::chrono::milliseconds execution_command_timeout{500};
   /// `/serial/link_up` heartbeat 超时。无样本或超龄都必须按链路失效归零。
   std::chrono::milliseconds link_timeout{300};
+  std::chrono::milliseconds map_ready_timeout{5000};
 };
 
 struct CmdVelSample
@@ -99,6 +100,68 @@ public:
     auto_.valid = true;
   }
 
+  // PlannerStatus carries MINCO-local identity, never the map producer generation.
+  void onPlannerStatus(
+    uint64_t epoch, uint64_t generation, int64_t stamp_ns,
+    bool reference_ready, bool failed, bool map_unready)
+  {
+    if ((!reference_ready && !failed && !map_unready) ||
+      epoch == 0 || generation == 0 || stamp_ns <= 0 ||
+      epoch < planner_epoch_ ||
+      (epoch == planner_epoch_ && generation < planner_generation_))
+    {
+      return;
+    }
+    const bool changed = epoch != planner_epoch_ || generation != planner_generation_;
+    if (!changed && stamp_ns <= planner_status_stamp_ns_) {
+      return;
+    }
+    if (changed) {
+      rejectExecutionCommand();
+      planner_epoch_ = epoch;
+      planner_generation_ = generation;
+      planner_generation_usable_ = false;
+      planner_generation_retired_ = false;
+    }
+    planner_status_stamp_ns_ = stamp_ns;
+    if (failed || map_unready) {
+      planner_generation_usable_ = false;
+      planner_generation_retired_ = planner_generation_retired_ || map_unready;
+      rejectExecutionCommand();
+    } else if (reference_ready && !planner_generation_retired_) {
+      planner_generation_usable_ = true;
+      // Bind the ready lease to the identity that actually became usable. armLink
+      // publishes ready before the first PlannerStatus, so onMapReady alone would
+      // leave ready_lease_generation_ at 0 and skip retirement on expiry.
+      ready_lease_generation_ = planner_generation_;
+    }
+  }
+
+  void onMapReady(bool ready, std::chrono::steady_clock::time_point now)
+  {
+    // Even a recovery heartbeat must first notice an expired previous lease.
+    // Retire only the identity that held authority under that lease; a newer
+    // generation published while unready must not be permanently retired by the
+    // recovery pulse (status alone still cannot resume without fresh auth).
+    if (map_ready_ && !mapReady(now)) {
+      map_ready_ = false;
+      if (planner_generation_ == ready_lease_generation_) {
+        retirePlannerGeneration();
+      } else {
+        planner_generation_usable_ = false;
+        rejectExecutionCommand();
+      }
+    } else if (!ready) {
+      retirePlannerGeneration();
+    }
+    has_map_ready_ = true;
+    map_ready_ = ready;
+    map_ready_stamp_ = now;
+    if (ready) {
+      ready_lease_generation_ = planner_generation_;
+    }
+  }
+
   /// age 是命令戳在到达时的年龄。租约从（now - age）起算，到期后即使 autonomy 持续刷新也必须归零。
   /// 拒绝命令必须撤销已有授权并清空自动源；防重放水位和手动源保持不变。
   /// 进程首次连接可接受新鲜 EXECUTE，以便 arbiter 重启后重新建立 DDS 状态；
@@ -107,6 +170,8 @@ public:
     uint8_t mode,
     uint64_t manager_incarnation,
     uint64_t sequence,
+    uint64_t localization_epoch,
+    uint64_t map_generation,
     std::chrono::nanoseconds age,
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
   {
@@ -139,6 +204,14 @@ public:
     }
     has_command_sequence_ = true;
     last_command_sequence_ = sequence;
+    expireMapReady(now);
+    if (execute && (!mapReady(now) || !planner_generation_usable_ ||
+      localization_epoch == 0 || map_generation == 0 ||
+      localization_epoch != planner_epoch_ || map_generation != planner_generation_))
+    {
+      // Consume the accepted command identity before checking map authorization.
+      return rejectExecutionCommand();
+    }
     if (!execute) {
       clearExecutionLease();
       invalidateAuto();
@@ -220,6 +293,10 @@ public:
       return zero(CmdVelArbiterReason::EMERGENCY_STOP);
     }
     expireExecutionLease(now);
+    expireMapReady(now);
+    if (!mapReady(now)) {
+      rejectExecutionCommand();
+    }
 
     const bool manual_was_valid = manual_.valid;
     const bool auto_was_valid = auto_.valid;
@@ -251,6 +328,33 @@ public:
   }
 
 private:
+  bool mapReady(std::chrono::steady_clock::time_point now) const
+  {
+    const auto age = now - map_ready_stamp_;
+    return has_map_ready_ && map_ready_ && age >= std::chrono::steady_clock::duration::zero() &&
+           age <= config_.map_ready_timeout;
+  }
+
+  void retirePlannerGeneration()
+  {
+    planner_generation_usable_ = false;
+    planner_generation_retired_ = true;
+    rejectExecutionCommand();
+  }
+
+  void expireMapReady(std::chrono::steady_clock::time_point now)
+  {
+    if (map_ready_ && !mapReady(now)) {
+      map_ready_ = false;
+      if (planner_generation_ == ready_lease_generation_) {
+        retirePlannerGeneration();
+      } else {
+        planner_generation_usable_ = false;
+        rejectExecutionCommand();
+      }
+    }
+  }
+
   bool rejectExecutionCommand()
   {
     clearExecutionLease();
@@ -337,6 +441,15 @@ private:
   uint64_t active_manager_incarnation_ = 0;
   bool has_execution_lease_ = false;
   std::chrono::steady_clock::time_point execution_lease_stamp_{};
+  uint64_t planner_epoch_ = 0;
+  uint64_t planner_generation_ = 0;
+  uint64_t ready_lease_generation_ = 0;
+  int64_t planner_status_stamp_ns_ = -1;
+  bool planner_generation_usable_ = false;
+  bool planner_generation_retired_ = false;
+  bool has_map_ready_ = false;
+  bool map_ready_ = false;
+  std::chrono::steady_clock::time_point map_ready_stamp_{};
 };
 
 }  // namespace ats_cmd_vel_arbiter

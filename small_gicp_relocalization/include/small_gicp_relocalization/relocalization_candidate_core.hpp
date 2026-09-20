@@ -573,6 +573,8 @@ struct ConfirmationSample
   Eigen::Isometry3d map_to_odom{Eigen::Isometry3d::Identity()};
   Eigen::Isometry3d odom_to_base{Eigen::Isometry3d::Identity()};
   double scan_time_s{0.0};
+  // Geometry stays anchored to the first sample; counting follows the latest distinct scan.
+  double last_counted_scan_time_s{0.0};
 };
 
 struct ConfirmationDecision
@@ -592,11 +594,12 @@ inline ConfirmationDecision evaluateConfirmation(
   const ConfirmationGates & gates)
 {
   ConfirmationDecision decision;
-  if (!(candidate.scan_time_s > pending.scan_time_s)) {
+  const double last_counted = std::max(pending.scan_time_s, pending.last_counted_scan_time_s);
+  if (!(candidate.scan_time_s > last_counted)) {
     decision.reason = "confirmation scan stamp not increasing";
     return decision;
   }
-  const double interval = candidate.scan_time_s - pending.scan_time_s;
+  const double interval = candidate.scan_time_s - last_counted;
   if (interval < std::max(0.0, gates.min_interval_s)) {
     decision.reason = "confirmation scan interval too short";
     return decision;

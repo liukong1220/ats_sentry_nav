@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 
+#include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
@@ -52,6 +53,66 @@ struct PlannerSafetyState
   bool emergencyStopRequired() const
   {
     return !map_ready || !plan_safe;
+  }
+};
+
+// Accessed under the node's map mutex, including publication.  Unlike the
+// active trajectory, this identity survives replanning and map-health loss.
+struct PlannerStatusState
+{
+  using Status = ats_navigation_interfaces::msg::PlannerStatus;
+  std::optional<Status> latest;
+
+  bool update(Status & status)
+  {
+    if (latest) {
+      if (status.localization_epoch < latest->localization_epoch) {
+        return false;
+      }
+      if (status.localization_epoch == latest->localization_epoch) {
+        if (status.map_generation < latest->map_generation ||
+          status.plan_request_sequence < latest->plan_request_sequence)
+        {
+          return false;
+        }
+        if (status.map_generation == latest->map_generation &&
+          latest->state == Status::STATE_FAILED &&
+          latest->failure_reason == Status::FAILURE_MAP_UNREADY &&
+          status.failure_reason != Status::FAILURE_MAP_UNREADY)
+        {
+          return false;
+        }
+      }
+      // ROS time may stand still in simulation.  Give serialized transitions
+      // distinct stamps so a queued healthy sample cannot undo invalidation.
+      if (status.header.stamp.sec < latest->header.stamp.sec ||
+        (status.header.stamp.sec == latest->header.stamp.sec &&
+        status.header.stamp.nanosec <= latest->header.stamp.nanosec))
+      {
+        status.header.stamp = latest->header.stamp;
+        if (++status.header.stamp.nanosec == 1000000000U) {
+          status.header.stamp.nanosec = 0;
+          ++status.header.stamp.sec;
+        }
+      }
+    }
+    latest = status;
+    return true;
+  }
+
+  bool invalidate(
+    std::uint64_t generation, std::uint8_t failure_reason,
+    const builtin_interfaces::msg::Time & stamp)
+  {
+    if (!latest) {
+      return false;
+    }
+    auto status = *latest;
+    status.header.stamp = stamp;
+    status.map_generation = generation;
+    status.state = Status::STATE_FAILED;
+    status.failure_reason = failure_reason;
+    return update(status);
   }
 };
 

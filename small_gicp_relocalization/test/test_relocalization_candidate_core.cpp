@@ -406,6 +406,28 @@ TEST(RelocalizationCandidateCore, ConfirmationRequiresIncreasingStampAndInterval
   EXPECT_TRUE(evaluateConfirmation(pending, candidate, gates).consistent);
 }
 
+TEST(RelocalizationCandidateCore, ConfirmationCountsDistinctScansAgainstFirstGeometryAnchor)
+{
+  ConfirmationGates gates;
+  ConfirmationSample first;
+  first.scan_time_s = 10.0;
+  first.last_counted_scan_time_s = 10.2;
+  ConfirmationSample candidate;
+  candidate.scan_time_s = 10.2;
+  EXPECT_EQ(evaluateConfirmation(first, candidate, gates).reason,
+    "confirmation scan stamp not increasing");
+  candidate.scan_time_s = 10.22;
+  EXPECT_EQ(evaluateConfirmation(first, candidate, gates).reason,
+    "confirmation scan interval too short");
+  candidate.scan_time_s = 10.4;
+  candidate.map_to_odom = makePose(0.20, 0.0, 0.0);
+  EXPECT_EQ(evaluateConfirmation(first, candidate, gates).reason,
+    "confirmation transform mismatch");
+  candidate.map_to_odom = makePose(0.10, 0.0, 0.0);
+  EXPECT_TRUE(evaluateConfirmation(first, candidate, gates).consistent);
+  EXPECT_DOUBLE_EQ(first.scan_time_s, 10.0);
+}
+
 TEST(RelocalizationCandidateCore, ConfirmationRejectsOdometryInconsistentPair)
 {
   ConfirmationGates gates;

@@ -137,6 +137,12 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
                                                      "/minco/reference_path");
   execution_command_topic_ = declare_parameter<std::string>(
       "execution_command_topic", "/planner/execution_command");
+  planner_status_topic_ = declare_parameter<std::string>(
+      "planner_status_topic", "/minco/planning_status");
+  map_ready_topic_ = declare_parameter<std::string>(
+      "map_ready_topic", "/rog_map_adapter/ready");
+  map_ready_timeout_sec_ = std::max(0.1, declare_parameter<double>(
+      "map_ready_timeout_sec", map_ready_timeout_sec_));
   command_topic_ = declare_parameter<std::string>("command_topic",
                                                   "/cmd_vel/autonomy_raw");
   emergency_stop_topic_ = declare_parameter<std::string>(
@@ -253,6 +259,17 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       trajectory_topic_, rclcpp::QoS(1).reliable(),
       std::bind(&AtsSwerveMpcNode::onPath, this, std::placeholders::_1));
   if (execution_command_enabled_) {
+    if (planner_status_topic_.empty() || map_ready_topic_.empty()) {
+      throw std::invalid_argument(
+          "ExecutionCommand requires planner_status_topic and map_ready_topic");
+    }
+    planner_status_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::PlannerStatus>(
+      planner_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&AtsSwerveMpcNode::onPlannerStatus, this, std::placeholders::_1));
+    map_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+      map_ready_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&AtsSwerveMpcNode::onMapReady, this, std::placeholders::_1));
     execution_command_sub_ = create_subscription<
         ats_navigation_interfaces::msg::ExecutionCommand>(
       execution_command_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -678,7 +695,8 @@ void AtsSwerveMpcNode::onExecutionCommand(
     } else {
       last_execution_command_sequence_ = message->command_sequence;
     }
-    last_execution_command_signal_ = std::chrono::steady_clock::now();
+    last_execution_command_signal_ = std::chrono::steady_clock::now() -
+      std::chrono::nanoseconds(command_age.nanoseconds());
     if (stop) {
       active_execution_command_.reset();
     } else if (message->mode !=
@@ -690,6 +708,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
        message->yaw_authority !=
         ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_BODY_YAW_FOLLOW) ||
       !gimbalExecutionValidLocked(*message) ||
+      !mapExecutionValidLocked(*message) ||
       (require_localization_status_ &&
        (!localization_tracking_.load() || !localization_epoch_ ||
         *localization_epoch_ != message->localization_epoch))) {
@@ -745,7 +764,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
       get_logger(), *get_clock(), 1000,
       "TRACE execution_command accepted=1 incarnation=%llu sequence=%llu "
       "stamp_ns=%lld receipt_ns=%lld goal=%llu epoch=%llu map_generation=%llu "
-      "map_sequence=%llu snapshot_identity_pending=1 poses=%zu",
+      "map_sequence=%llu local_generation_authorized=1 content_lineage_pending=1 poses=%zu",
       static_cast<unsigned long long>(message->manager_incarnation),
       static_cast<unsigned long long>(message->command_sequence),
       static_cast<long long>(command_stamp.nanoseconds()),
@@ -756,6 +775,122 @@ void AtsSwerveMpcNode::onExecutionCommand(
       static_cast<unsigned long long>(message->map_publication_sequence),
       message->reference.poses.size());
   fail_stop_engaged_.store(false);
+}
+
+// PlannerStatus proves only MINCO's local immutable map identity. It is not
+// adapter source-generation or atomic publication/content lineage evidence.
+void AtsSwerveMpcNode::onPlannerStatus(
+    const ats_navigation_interfaces::msg::PlannerStatus::SharedPtr message) {
+  using Status = ats_navigation_interfaces::msg::PlannerStatus;
+  if (!message || message->state == Status::STATE_ACCEPTED ||
+      message->localization_epoch == 0 || message->map_generation == 0) {
+    return;  // Scheduling telemetry cannot establish or erase map authority.
+  }
+  if (message->header.frame_id.empty() || message->header.stamp.sec < 0 ||
+      message->header.stamp.nanosec >= 1000000000u) {
+    return;
+  }
+  const auto stamp_ns = rclcpp::Time(message->header.stamp).nanoseconds();
+  if (stamp_ns <= 0) {
+    return;
+  }
+  bool stop = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (message->localization_epoch < planner_epoch_ ||
+        (message->localization_epoch == planner_epoch_ &&
+         message->map_generation < planner_generation_)) {
+      return;
+    }
+    const bool changed_epoch = message->localization_epoch > planner_epoch_;
+    const bool changed_identity = changed_epoch ||
+      message->map_generation > planner_generation_;
+    if (!changed_identity && stamp_ns <= planner_status_stamp_ns_) {
+      return;
+    }
+    if (changed_epoch) {
+      retired_planner_generation_ = 0;
+    }
+    if (changed_identity) {
+      planner_generation_usable_ = false;
+      stop = true;
+    }
+    planner_epoch_ = message->localization_epoch;
+    planner_generation_ = message->map_generation;
+    planner_status_stamp_ns_ = stamp_ns;
+    if (message->state == Status::STATE_FAILED ||
+        message->failure_reason != Status::FAILURE_NONE) {
+      planner_generation_usable_ = false;
+      stop = true;
+      if (message->failure_reason == Status::FAILURE_MAP_UNREADY) {
+        retired_planner_generation_ = std::max(
+          retired_planner_generation_, planner_generation_);
+      }
+    } else if (message->state == Status::STATE_REFERENCE_READY) {
+      planner_generation_usable_ = planner_generation_ > retired_planner_generation_;
+      if (planner_generation_usable_ && mapReadyFreshLocked()) {
+        ready_lease_generation_ = planner_generation_;
+      }
+    } else {
+      planner_generation_usable_ = false;
+      stop = true;
+    }
+    if (stop) {
+      active_execution_command_.reset();
+    }
+  }
+  if (stop) {
+    engageFailStop();
+  }
+}
+
+bool AtsSwerveMpcNode::mapReadyFreshLocked() const {
+  if (!map_ready_ || !last_map_ready_signal_) {
+    return false;
+  }
+  const auto age = std::chrono::steady_clock::now() - *last_map_ready_signal_;
+  return age >= std::chrono::steady_clock::duration::zero() &&
+    std::chrono::duration<double>(age).count() <= map_ready_timeout_sec_;
+}
+
+bool AtsSwerveMpcNode::mapExecutionValidLocked(
+    const ats_navigation_interfaces::msg::ExecutionCommand & command) const {
+  return mapReadyFreshLocked() && planner_generation_usable_ &&
+    command.localization_epoch != 0 && command.localization_epoch == planner_epoch_ &&
+    command.map_generation != 0 && command.map_generation == planner_generation_ &&
+    command.map_generation > retired_planner_generation_;
+}
+
+void AtsSwerveMpcNode::onMapReady(const std_msgs::msg::Bool::SharedPtr message) {
+  bool stop = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    const bool expired =
+      map_ready_ && last_map_ready_signal_ && !mapReadyFreshLocked();
+    stop = !message->data || expired;
+    if (stop) {
+      // Retire only the identity covered by the expired/false lease. A newer
+      // generation published while unready must remain eligible after a fresh
+      // REFERENCE_READY + EXECUTE; the recovery heartbeat must not raise the
+      // floor past it.
+      const std::uint64_t retire_floor =
+        (expired && ready_lease_generation_ != 0)
+          ? ready_lease_generation_
+          : planner_generation_;
+      retired_planner_generation_ = std::max(
+        retired_planner_generation_, retire_floor);
+      planner_generation_usable_ = false;
+      active_execution_command_.reset();
+    }
+    map_ready_ = message->data;
+    last_map_ready_signal_ = std::chrono::steady_clock::now();
+    if (message->data) {
+      ready_lease_generation_ = planner_generation_;
+    }
+  }
+  if (stop) {
+    engageFailStop();
+  }
 }
 
 /**
@@ -867,11 +1002,22 @@ void AtsSwerveMpcNode::onControlTimer() {
     const auto lease_check_time = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      if (map_ready_ && last_map_ready_signal_ && !mapReadyFreshLocked()) {
+        const std::uint64_t retire_floor = ready_lease_generation_ != 0
+          ? ready_lease_generation_
+          : planner_generation_;
+        retired_planner_generation_ = std::max(
+          retired_planner_generation_, retire_floor);
+        planner_generation_usable_ = false;
+        active_execution_command_.reset();
+        map_ready_ = false;
+      }
       execution_lease_valid = last_execution_command_signal_ &&
         lease_check_time >= *last_execution_command_signal_ &&
         std::chrono::duration<double>(
           lease_check_time - *last_execution_command_signal_).count() <=
           execution_command_timeout_ && active_execution_command_ &&
+        mapExecutionValidLocked(*active_execution_command_) &&
         gimbalExecutionValidLocked(*active_execution_command_);
       gimbal_valid = active_execution_command_ &&
                      gimbalExecutionValidLocked(*active_execution_command_);

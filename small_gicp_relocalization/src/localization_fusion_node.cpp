@@ -114,6 +114,9 @@ public:
     observation_lost_timeout_s_ = std::max(
       observation_degraded_timeout_s_,
       declare_parameter<double>("observation_lost_timeout_s", 10.0));
+    if (!std::isfinite(observation_lost_timeout_s_) || observation_lost_timeout_s_ <= 0.0) {
+      throw std::invalid_argument("observation_lost_timeout_s must be positive and finite");
+    }
     observation_stamp_max_age_s_ =
       std::max(0.0, declare_parameter<double>("observation_stamp_max_age_s", 1.0));
     observation_stamp_max_future_s_ =
@@ -224,12 +227,23 @@ private:
       return;
     }
 
+    if (localization.header.stamp.sec < 0 || localization.header.stamp.nanosec >= 1000000000U ||
+        (localization.header.stamp.sec == 0 && localization.header.stamp.nanosec == 0)) {
+      setStatus(LocalizationStatus::STATE_LOST, "invalid odometry stamp");
+      return;
+    }
     const rclcpp::Time stamp(localization.header.stamp);
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      // Observe an expired lease before this input can renew its receive time.
+      updateHealthLocked();
       if (latest_odom_stamp_ && stamp < *latest_odom_stamp_) {
-        status_ = LocalizationStatus::STATE_DEGRADED;
-        status_message_ = "dropped out-of-order odometry";
+        recordRejectionLocked("dropped out-of-order odometry", true);
+        if (!lost_latched_) {
+          status_ = LocalizationStatus::STATE_DEGRADED;
+          relocalizing_until_.reset();
+        }
+        publishStatusLocked();
         return;
       }
       if (latest_odom_stamp_ && stamp == *latest_odom_stamp_) {
@@ -237,8 +251,13 @@ private:
       }
       latest_odom_stamp_ = stamp;
       last_odom_receive_time_ = std::chrono::steady_clock::now();
+      if (!observation_clock_start_) {
+        observation_clock_start_ = last_odom_receive_time_;
+      }
       odom_history_.push_back(OdomPoseSample{stamp, poseToTransform(localization.pose.pose)});
       pruneHistoryLocked();
+      updateHealthLocked();
+      publishStatusLocked();
     }
     // /localization 保持连续 odom 状态；全局修正只通过唯一 map->odom 表达。
     localization_pub_->publish(localization);
@@ -247,7 +266,25 @@ private:
   void onObservation(const RelocalizationObservation::SharedPtr message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_recovering = recovery_until_.has_value();
+    updateHealthLocked();
+    if (was_recovering && !recovery_until_) {
+      recordRejectionLocked("relocalization recovery episode expired", true);
+      publishStatusLocked();
+      return;
+    }
+    if (message->header.stamp.sec < 0 || message->header.stamp.nanosec >= 1000000000U ||
+        (message->header.stamp.sec == 0 && message->header.stamp.nanosec == 0)) {
+      recordRejectionLocked("invalid relocalization observation stamp", true);
+      publishStatusLocked();
+      return;
+    }
     const rclcpp::Time stamp(message->header.stamp);
+    if (recovery_observation_floor_ && stamp <= *recovery_observation_floor_) {
+      recordRejectionLocked("relocalization observation predates recovery boundary", true);
+      publishStatusLocked();
+      return;
+    }
     if (!observationIsNewer(
           stamp, message->sequence, last_input_observation_stamp_,
           last_input_observation_sequence_)) {
@@ -255,8 +292,6 @@ private:
       publishStatusLocked();
       return;
     }
-    last_input_observation_stamp_ = stamp;
-    last_input_observation_sequence_ = message->sequence;
 
     const std::string stamp_error = validateObservationStamp(
       stamp, now(), observation_stamp_max_age_s_, observation_stamp_max_future_s_);
@@ -266,16 +301,11 @@ private:
       return;
     }
 
-    if (message->status == RelocalizationObservation::STATUS_PENDING_CONFIRMATION) {
-      if (!has_map_to_odom_) {
-        status_ = LocalizationStatus::STATE_RELOCALIZING;
-      }
-      status_message_ =
-        message->message.empty() ? "waiting for GICP confirmation" : message->message;
-      publishStatusLocked();
-      return;
-    }
-    if (!message->accepted || message->status != RelocalizationObservation::STATUS_ACCEPTED) {
+    const bool pending = message->status == RelocalizationObservation::STATUS_PENDING_CONFIRMATION;
+    if (!pending &&
+        (!message->accepted || message->status != RelocalizationObservation::STATUS_ACCEPTED)) {
+      last_input_observation_stamp_ = stamp;
+      last_input_observation_sequence_ = message->sequence;
       recordRejectionLocked("GICP rejected: " + message->message, true);
       publishStatusLocked();
       return;
@@ -286,8 +316,9 @@ private:
       return;
     }
     if (
-      !finitePose(message->pose.pose) || !finiteCovariance(message->pose.covariance) ||
-      !std::isfinite(message->quality) || message->quality < min_observation_quality_ ||
+      (pending && message->accepted) || !finitePose(message->pose.pose) ||
+      !finiteCovariance(message->pose.covariance) || !std::isfinite(message->quality) ||
+      message->quality < 0.0 || (!pending && message->quality < min_observation_quality_) ||
       message->quality > 1.0 || message->inlier_count < min_observation_inliers_ ||
       message->source_points < message->inlier_count ||
       !std::isfinite(message->registration_error) || message->registration_error < 0.0 ||
@@ -299,8 +330,30 @@ private:
 
     const auto odom_to_base = interpolateOdomPose(
       odom_history_, stamp, history_boundary_tolerance_s_, maximum_interpolation_gap_s_);
-    if (!odom_to_base) {
-      recordRejectionLocked("relocalization observation is outside odometry history", true);
+    if (!odom_to_base || !last_odom_receive_time_ ||
+        steadySecondsSince(*last_odom_receive_time_) > odom_timeout_s_) {
+      recordRejectionLocked("relocalization observation is outside fresh odometry history", true);
+      publishStatusLocked();
+      return;
+    }
+    last_input_observation_stamp_ = stamp;
+    last_input_observation_sequence_ = message->sequence;
+    // Pending carries zero accepted-quality, but must pass evidence/frame/time gates.
+    // Repeated pending messages never renew the episode deadline, and a closed
+    // episode cannot be reopened by pending alone.
+    if (pending) {
+      if (recovery_episode_closed_) {
+        recordRejectionLocked("relocalization recovery episode closed", true);
+        publishStatusLocked();
+        return;
+      }
+      if (!recovery_until_) {
+        recovery_until_ = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(observation_lost_timeout_s_));
+      }
+      status_ = LocalizationStatus::STATE_RELOCALIZING;
+      status_message_ = "waiting for GICP confirmation";
       publishStatusLocked();
       return;
     }
@@ -313,7 +366,7 @@ private:
       candidate_map_to_odom, current_map_to_odom, epoch_translation_threshold_,
       epoch_yaw_threshold_);
     {
-      const bool lost = status_ == LocalizationStatus::STATE_LOST;
+      const bool lost = lost_latched_;
       const double max_xy = lost ? lost_max_correction_translation_ : max_correction_translation_;
       const double max_yaw = lost ? lost_max_correction_yaw_ : max_correction_yaw_;
       if (
@@ -328,10 +381,15 @@ private:
       }
     }
 
+    const bool requires_hold = correction.advance_epoch ||
+      status_ != LocalizationStatus::STATE_TRACKING;
     // 阈值内观测只刷新健康状态，不改 TF；一旦改 TF 就必须同步推进 epoch。
     map_to_odom_ = correction.map_to_odom;
     has_map_to_odom_ = true;
     has_accepted_observation_ = true;
+    lost_latched_ = false;
+    recovery_episode_closed_ = false;
+    recovery_until_.reset();
     last_observation_stamp_ = stamp;
     last_observation_sequence_ = message->sequence;
     last_observation_receive_time_ = std::chrono::steady_clock::now();
@@ -340,16 +398,14 @@ private:
     consecutive_rejections_ = 0;
     if (correction.advance_epoch) {
       ++epoch_;
-      status_ = LocalizationStatus::STATE_RELOCALIZING;
+    }
+    if (requires_hold && (!relocalizing_until_ || correction.advance_epoch)) {
       relocalizing_until_ = std::chrono::steady_clock::now() +
                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                               std::chrono::duration<double>(relocalizing_hold_s_));
-      status_message_ = "accepted relocalization and advanced localization epoch";
-    } else {
-      relocalizing_until_.reset();
-      status_ = LocalizationStatus::STATE_TRACKING;
-      status_message_ = "accepted relocalization below epoch threshold; retained map->odom";
     }
+    status_ = requires_hold ? LocalizationStatus::STATE_CONFIRMED : LocalizationStatus::STATE_TRACKING;
+    updateHealthLocked();
     publishStatusLocked();
   }
 
@@ -366,8 +422,13 @@ private:
   void setStatus(std::uint8_t status, const std::string & message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    status_ = status;
-    status_message_ = message;
+    if (status == LocalizationStatus::STATE_LOST) {
+      enterLostLocked(message);
+    } else {
+      status_ = status;
+      status_message_ = message;
+    }
+    publishStatusLocked();
   }
 
   void recordRejectionLocked(const std::string & message, bool count_failure)
@@ -375,17 +436,16 @@ private:
     if (count_failure) {
       ++consecutive_rejections_;
     }
-    if (!has_accepted_observation_) {
-      status_ = LocalizationStatus::STATE_UNINITIALIZED;
-    } else if (consecutive_rejections_ >= static_cast<std::uint32_t>(max_consecutive_rejections_)) {
-      status_ = LocalizationStatus::STATE_DEGRADED;
+    if (recovery_until_) {
+      enterLostLocked(message);
+    } else {
+      updateHealthLocked();
     }
     status_message_ = message;
   }
 
-  /// Steady-clock silence since the last ACCEPTED observation. Before the first
-  /// accepted observation it counts from map-frame initialization, so a cold
-  /// start on a wrong seed still reaches DEGRADED and LOST on schedule.
+  /// Steady silence starts at the first valid odometry, regardless of seed/TF.
+  /// Pending and rejected observations never renew this accepted-evidence lease.
   double observationSilenceLocked() const
   {
     const std::optional<SteadyTime> & reference =
@@ -398,54 +458,78 @@ private:
 
   void updateHealthLocked()
   {
+    const auto steady_now = std::chrono::steady_clock::now();
     if (!last_odom_receive_time_) {
-      status_ = LocalizationStatus::STATE_UNINITIALIZED;
-      status_message_ = "waiting for odometry";
-      return;
-    }
-    if (steadySecondsSince(*last_odom_receive_time_) > odom_timeout_s_) {
-      status_ = LocalizationStatus::STATE_LOST;
-      status_message_ = "odometry input stale";
-      return;
-    }
-    if (!has_map_to_odom_) {
-      if (status_ != LocalizationStatus::STATE_RELOCALIZING) {
+      if (steadySecondsSince(startup_time_) > odom_timeout_s_) {
+        enterLostLocked("initial odometry input timed out");
+      } else if (!lost_latched_) {
         status_ = LocalizationStatus::STATE_UNINITIALIZED;
-        status_message_ = "waiting for map-frame relocalization";
+        status_message_ = "waiting for odometry";
       }
       return;
     }
-    if (relocalizing_until_ && std::chrono::steady_clock::now() < *relocalizing_until_) {
+    if (steadySecondsSince(*last_odom_receive_time_) > odom_timeout_s_) {
+      enterLostLocked("odometry input stale");
+      return;
+    }
+    if (recovery_until_ && steady_now >= *recovery_until_) {
+      enterLostLocked("relocalization recovery episode timed out");
+      return;
+    }
+    if (lost_latched_) {
+      status_ = recovery_until_ ? LocalizationStatus::STATE_RELOCALIZING
+                                : LocalizationStatus::STATE_LOST;
+      return;
+    }
+    const double silence = observationSilenceLocked();
+    if (observation_lost_timeout_s_ > 0.0 && silence > observation_lost_timeout_s_) {
+      enterLostLocked(has_accepted_observation_
+        ? "accepted relocalization observation timed out"
+        : "no accepted relocalization observation since first odometry");
+      return;
+    }
+    if (recovery_until_) {
       status_ = LocalizationStatus::STATE_RELOCALIZING;
       return;
     }
+    if (status_ == LocalizationStatus::STATE_DEGRADED ||
+        (observation_degraded_timeout_s_ > 0.0 && silence > observation_degraded_timeout_s_) ||
+        consecutive_rejections_ >= static_cast<std::uint32_t>(max_consecutive_rejections_)) {
+      status_ = LocalizationStatus::STATE_DEGRADED;
+      relocalizing_until_.reset();
+      status_message_ = has_accepted_observation_ ? "accepted relocalization observation stale"
+        : "awaiting first accepted relocalization observation";
+      return;
+    }
+    if (!has_accepted_observation_) {
+      status_ = LocalizationStatus::STATE_BOOTSTRAP;
+      status_message_ = "valid odometry; awaiting confirmed map-frame evidence";
+      return;
+    }
+    if (relocalizing_until_ && steady_now < *relocalizing_until_) {
+      status_ = LocalizationStatus::STATE_CONFIRMED;
+      status_message_ = "accepted relocalization; postcommit hold";
+      return;
+    }
     relocalizing_until_.reset();
-    if (!observation_clock_start_) {
-      observation_clock_start_ = std::chrono::steady_clock::now();
-    }
-    const double observation_silence = observationSilenceLocked();
-    const bool never_accepted = !last_observation_receive_time_;
-    if (observation_lost_timeout_s_ > 0.0 && observation_silence > observation_lost_timeout_s_) {
-      status_ = LocalizationStatus::STATE_LOST;
-      status_message_ = never_accepted
-                          ? "no accepted relocalization observation since map-frame init"
-                          : "accepted relocalization observation timed out";
-      return;
-    }
-    if (
-      observation_degraded_timeout_s_ > 0.0 &&
-      observation_silence > observation_degraded_timeout_s_) {
-      status_ = LocalizationStatus::STATE_DEGRADED;
-      status_message_ = never_accepted ? "awaiting first accepted relocalization observation"
-                                       : "accepted relocalization observation stale";
-      return;
-    }
-    if (consecutive_rejections_ >= static_cast<std::uint32_t>(max_consecutive_rejections_)) {
-      status_ = LocalizationStatus::STATE_DEGRADED;
-      return;
-    }
     status_ = LocalizationStatus::STATE_TRACKING;
     status_message_ = "tracking";
+  }
+
+  void enterLostLocked(const std::string & message)
+  {
+    if (recovery_until_) {
+      // Pending-only traffic must not arm another episode after this timeout.
+      recovery_episode_closed_ = true;
+    }
+    if (!lost_latched_ || recovery_until_) {
+      recovery_observation_floor_ = now();
+    }
+    lost_latched_ = true;
+    recovery_until_.reset();
+    relocalizing_until_.reset();
+    status_ = LocalizationStatus::STATE_LOST;
+    status_message_ = message;
   }
 
   void pruneHistoryLocked()
@@ -550,10 +634,16 @@ private:
   std::optional<rclcpp::Time> last_observation_stamp_;
   std::optional<std::uint64_t> last_observation_sequence_;
   std::optional<SteadyTime> last_observation_receive_time_;
-  // Armed when map->odom first exists so that "never received an accepted
-  // observation" is measured silence, not unearned TRACKING confidence.
+  const SteadyTime startup_time_{std::chrono::steady_clock::now()};
+  // First valid odometry arms bootstrap even when there is no map->odom seed.
   std::optional<SteadyTime> observation_clock_start_;
   std::optional<SteadyTime> relocalizing_until_;
+  std::optional<SteadyTime> recovery_until_;
+  std::optional<rclcpp::Time> recovery_observation_floor_;
+  // After a recovery episode times out, pending alone cannot reopen it.
+  bool recovery_episode_closed_{false};
+  // Survives RECOVERING so only LOST-origin recovery receives the wider gate.
+  bool lost_latched_{false};
   tf2::Transform map_to_odom_{tf2::Transform::getIdentity()};
   bool has_map_to_odom_{false};
   bool has_accepted_observation_{false};

@@ -36,6 +36,8 @@ CmdVelArbiterConfig config()
 void armLink(CmdVelArbiter & arbiter, std::chrono::steady_clock::time_point now)
 {
   arbiter.onLinkHealth(true, now);
+  arbiter.onMapReady(true, now);
+  arbiter.onPlannerStatus(7, 11, 1, true, false, false);
 }
 
 constexpr uint64_t kManagerIncarnation = 100;
@@ -44,7 +46,7 @@ bool execute(
   CmdVelArbiter & arbiter, uint64_t sequence, milliseconds age,
   std::chrono::steady_clock::time_point now)
 {
-  return arbiter.onExecutionCommand(true, kManagerIncarnation, sequence, age, now);
+  return arbiter.onExecutionCommand(true, kManagerIncarnation, sequence, 7, 11, age, now);
 }
 
 }  // namespace
@@ -220,6 +222,8 @@ TEST(CmdVelArbiter, AuthorizationDuringLinkDownIsNotHonored)
 {
   CmdVelArbiter arbiter(config());
   const auto t0 = std::chrono::steady_clock::now();
+  arbiter.onMapReady(true, t0);
+  arbiter.onPlannerStatus(7, 11, 1, true, false, false);
   EXPECT_TRUE(execute(arbiter, 1, milliseconds(0), t0));
   EXPECT_FALSE(arbiter.autoAuthorized());
   armLink(arbiter, t0);
@@ -280,8 +284,7 @@ TEST(CmdVelArbiter, StopRevokesAutoAndRequiresNewAutoSample)
   arbiter.onAuto(1.0, 0.0, 0.0, t0);
   EXPECT_EQ(arbiter.tick(t0).source, CmdVelSource::AUTO);
 
-  ASSERT_TRUE(arbiter.onExecutionCommand(
-    false, kManagerIncarnation, 2, milliseconds(0), t0 + milliseconds(1)));
+  ASSERT_TRUE(arbiter.onExecutionCommand(false, kManagerIncarnation, 2, 7, 11, milliseconds(0), t0 + milliseconds(1)));
   EXPECT_TRUE(arbiter.tick(t0 + milliseconds(2)).isZero());
   EXPECT_FALSE(arbiter.autoAuthorized());
 
@@ -299,8 +302,7 @@ TEST(CmdVelArbiter, StopDoesNotClearFreshManual)
   ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), t0));
   arbiter.onAuto(1.0, 0.0, 0.0, t0);
   arbiter.onManual(0.4, -0.1, 0.2, t0);
-  ASSERT_TRUE(arbiter.onExecutionCommand(
-    false, kManagerIncarnation, 2, milliseconds(0), t0 + milliseconds(1)));
+  ASSERT_TRUE(arbiter.onExecutionCommand(false, kManagerIncarnation, 2, 7, 11, milliseconds(0), t0 + milliseconds(1)));
 
   const auto output = arbiter.tick(t0 + milliseconds(2));
   EXPECT_EQ(output.source, CmdVelSource::MANUAL);
@@ -316,18 +318,14 @@ TEST(CmdVelArbiter, NewIncarnationRequiresStopBeforeExecute)
   ASSERT_TRUE(execute(arbiter, 10, milliseconds(0), t0));
   arbiter.onAuto(1.0, 0.0, 0.0, t0);
 
-  EXPECT_FALSE(arbiter.onExecutionCommand(
-    true, kManagerIncarnation + 1, 1, milliseconds(0), t0 + milliseconds(1)));
+  EXPECT_FALSE(arbiter.onExecutionCommand(true, kManagerIncarnation + 1, 1, 7, 11, milliseconds(0), t0 + milliseconds(1)));
   EXPECT_TRUE(arbiter.tick(t0 + milliseconds(2)).isZero());
 
-  ASSERT_TRUE(arbiter.onExecutionCommand(
-    false, kManagerIncarnation + 1, 1, milliseconds(0), t0 + milliseconds(3)));
+  ASSERT_TRUE(arbiter.onExecutionCommand(false, kManagerIncarnation + 1, 1, 7, 11, milliseconds(0), t0 + milliseconds(3)));
   EXPECT_TRUE(arbiter.tick(t0 + milliseconds(4)).isZero());
-  EXPECT_FALSE(arbiter.onExecutionCommand(
-    true, kManagerIncarnation, 11, milliseconds(0), t0 + milliseconds(5)));
+  EXPECT_FALSE(arbiter.onExecutionCommand(true, kManagerIncarnation, 11, 7, 11, milliseconds(0), t0 + milliseconds(5)));
 
-  ASSERT_TRUE(arbiter.onExecutionCommand(
-    true, kManagerIncarnation + 1, 2, milliseconds(0), t0 + milliseconds(6)));
+  ASSERT_TRUE(arbiter.onExecutionCommand(true, kManagerIncarnation + 1, 2, 7, 11, milliseconds(0), t0 + milliseconds(6)));
   arbiter.onAuto(0.7, 0.0, 0.0, t0 + milliseconds(6));
   EXPECT_EQ(arbiter.tick(t0 + milliseconds(7)).source, CmdVelSource::AUTO);
 }
@@ -502,8 +500,7 @@ TEST_P(CmdVelArbiterRejection, RevokesActiveAutoWithoutResettingReplayWatermarks
   ASSERT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
 
   const auto & rejected = GetParam();
-  EXPECT_FALSE(arbiter.onExecutionCommand(
-    rejected.mode, rejected.incarnation, rejected.sequence, rejected.age, now));
+  EXPECT_FALSE(arbiter.onExecutionCommand(rejected.mode, rejected.incarnation, rejected.sequence, 7, 11, rejected.age, now));
   EXPECT_FALSE(arbiter.autoAuthorized());
   EXPECT_TRUE(arbiter.tick(now).isZero());
 
@@ -526,8 +523,7 @@ TEST_P(CmdVelArbiterRejection, PreservesIndependentManualAuthority)
   arbiter.onAuto(1.0, 0.0, 0.0, now);
   arbiter.onManual(0.4, -0.1, 0.2, now);
   const auto & rejected = GetParam();
-  EXPECT_FALSE(arbiter.onExecutionCommand(
-    rejected.mode, rejected.incarnation, rejected.sequence, rejected.age, now));
+  EXPECT_FALSE(arbiter.onExecutionCommand(rejected.mode, rejected.incarnation, rejected.sequence, 7, 11, rejected.age, now));
   EXPECT_FALSE(arbiter.autoAuthorized());
   const auto output = arbiter.tick(now);
   EXPECT_EQ(output.source, CmdVelSource::MANUAL);
@@ -553,3 +549,149 @@ INSTANTIATE_TEST_SUITE_P(
   [](const ::testing::TestParamInfo<RejectedCommand> & info) {return info.param.name;});
 
 }  // namespace
+
+TEST(CmdVelArbiterMapAuthority, UnknownOldFutureAndZeroIdentityConsumeSequence)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  arbiter.onSerialLinkUp(now);
+  arbiter.onMapReady(true, now);
+  EXPECT_FALSE(execute(arbiter, 1, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 11, 1, true, false, false);
+  EXPECT_FALSE(execute(arbiter, 1, milliseconds(0), now));
+  ASSERT_TRUE(execute(arbiter, 2, milliseconds(0), now));
+  for (const uint64_t generation : {0U, 10U, 12U}) {
+    arbiter.onAuto(1.0, 0.0, 0.0, now);
+    const uint64_t sequence = 10 + generation;
+    EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, sequence, 7, generation, milliseconds(0), now));
+    EXPECT_TRUE(arbiter.tick(now).isZero());
+    EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, sequence, 7, 11, milliseconds(0), now));
+  }
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 30, 0, 11, milliseconds(0), now));
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 31, 6, 11, milliseconds(0), now));
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 32, 8, 11, milliseconds(0), now));
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 32, 7, 11, milliseconds(0), now));
+  ASSERT_TRUE(execute(arbiter, 33, milliseconds(0), now));
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onAuto(0.7, -0.2, 0.3, now);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+}
+
+TEST(CmdVelArbiterMapAuthority, GenerationAndEpochAdvanceRevokeWithoutStatusOnlyResume)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  armLink(arbiter, now);
+  ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), now));
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  arbiter.onPlannerStatus(7, 11, 2, true, false, false);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+  arbiter.onPlannerStatus(7, 12, 3, true, false, false);
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onPlannerStatus(7, 11, 100, true, false, false);
+  EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), now));
+  ASSERT_TRUE(arbiter.onExecutionCommand(1, 100, 3, 7, 12, milliseconds(0), now));
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+  arbiter.onPlannerStatus(8, 1, 1, true, false, false);
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onPlannerStatus(7, 99, 1000, true, false, false);
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 4, 7, 99, milliseconds(0), now));
+  ASSERT_TRUE(arbiter.onExecutionCommand(1, 100, 5, 8, 1, milliseconds(0), now));
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+}
+
+TEST(CmdVelArbiterMapAuthority, FailedStatusOrderingAndMapRetirement)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  armLink(arbiter, now);
+  ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), now));
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  arbiter.onPlannerStatus(7, 11, 10, false, true, false);
+  EXPECT_TRUE(arbiter.tick(now).isZero());
+  arbiter.onPlannerStatus(7, 11, 9, true, false, false);
+  arbiter.onPlannerStatus(7, 11, 10, true, false, false);
+  EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 11, 11, true, false, false);
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), now));
+  ASSERT_TRUE(execute(arbiter, 3, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 11, 12, false, true, true);
+  arbiter.onPlannerStatus(7, 11, 13, true, false, false);
+  EXPECT_FALSE(execute(arbiter, 4, milliseconds(0), now));
+  // SNAPSHOT_CHANGED names a new usable candidate, not a permanently retired map.
+  arbiter.onPlannerStatus(7, 12, 14, false, true, false);
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 5, 7, 12, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 12, 15, true, false, false);
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  ASSERT_TRUE(arbiter.onExecutionCommand(1, 100, 6, 7, 12, milliseconds(0), now));
+}
+
+TEST(CmdVelArbiterMapAuthority, AcceptedCannotEstablishAuthorityOrChurnHealthyGeneration)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  arbiter.onSerialLinkUp(now);
+  arbiter.onMapReady(true, now);
+  arbiter.onPlannerStatus(7, 0, 1, false, false, false);
+  arbiter.onPlannerStatus(7, 11, 2, false, false, false);
+  EXPECT_FALSE(execute(arbiter, 1, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 11, 3, true, false, false);
+  ASSERT_TRUE(execute(arbiter, 2, milliseconds(0), now));
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  arbiter.onPlannerStatus(7, 11, 4, false, false, false);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+  arbiter.onPlannerStatus(7, 12, 5, false, false, false);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::AUTO);
+}
+
+TEST(CmdVelArbiterMapAuthority, ReadyFalsePreservesManualAndRequiresNewGenerationAndAuthorization)
+{
+  CmdVelArbiter arbiter(config());
+  const auto now = std::chrono::steady_clock::now();
+  armLink(arbiter, now);
+  ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), now));
+  arbiter.onAuto(1.0, 0.0, 0.0, now);
+  arbiter.onManual(0.4, -0.1, 0.2, now);
+  arbiter.onMapReady(false, now);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::MANUAL);
+  EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), now));
+  arbiter.onPlannerStatus(7, 12, 2, true, false, false);
+  EXPECT_EQ(arbiter.tick(now).source, CmdVelSource::MANUAL);
+  arbiter.onMapReady(true, now);
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  EXPECT_FALSE(arbiter.onExecutionCommand(1, 100, 2, 7, 12, milliseconds(0), now));
+  ASSERT_TRUE(arbiter.onExecutionCommand(1, 100, 3, 7, 12, milliseconds(0), now));
+  arbiter.onLinkHealth(true, now + milliseconds(301));
+  EXPECT_TRUE(arbiter.tick(now + milliseconds(301)).isZero());
+}
+
+TEST(CmdVelArbiterMapAuthority, ReadyLeaseExpiryAndLateHeartbeatRetireGeneration)
+{
+  for (const bool tick_before_heartbeat : {false, true}) {
+    auto settings = config();
+    settings.map_ready_timeout = milliseconds(50);
+    CmdVelArbiter arbiter(settings);
+    const auto now = std::chrono::steady_clock::now();
+    armLink(arbiter, now);
+    ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), now));
+    arbiter.onAuto(1.0, 0.0, 0.0, now);
+    EXPECT_EQ(arbiter.tick(now + milliseconds(50)).source, CmdVelSource::AUTO);
+    if (tick_before_heartbeat) {
+      EXPECT_TRUE(arbiter.tick(now + milliseconds(51)).isZero());
+    }
+    arbiter.onMapReady(true, now + milliseconds(51));
+    arbiter.onPlannerStatus(7, 11, 2, true, false, false);
+    EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), now + milliseconds(51)));
+    arbiter.onPlannerStatus(7, 12, 3, true, false, false);
+    EXPECT_FALSE(arbiter.autoAuthorized());
+    ASSERT_TRUE(arbiter.onExecutionCommand(
+      1, 100, 3, 7, 12, milliseconds(0), now + milliseconds(51)));
+    EXPECT_TRUE(arbiter.tick(now + milliseconds(51)).isZero());
+    arbiter.onAuto(0.5, 0.0, 0.0, now + milliseconds(51));
+    EXPECT_EQ(arbiter.tick(now + milliseconds(51)).source, CmdVelSource::AUTO);
+  }
+}

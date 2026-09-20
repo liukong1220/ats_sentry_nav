@@ -31,6 +31,7 @@ import uuid
 
 from ament_index_python.packages import get_package_prefix
 from ats_navigation_interfaces.msg import LocalizationStatus
+from ats_navigation_interfaces.msg import RelocalizationObservation
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.qos import DurabilityPolicy
@@ -45,6 +46,10 @@ LOST_TIMEOUT_S = 1.6
 
 
 class TestLocalizationFusionColdSeed(unittest.TestCase):
+    use_seed = True
+    odom_timeout = 5.0
+    paused_clock = False
+
     @classmethod
     def setUpClass(cls):
         executable = (
@@ -61,16 +66,17 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
             "robot_base_frame": "base_test",
             # The whole point of the fixture: map->odom exists from a parameter,
             # no accepted observation has ever arrived.
-            "use_initial_map_to_odom": True,
+            "use_initial_map_to_odom": cls.use_seed,
             "initial_map_to_odom_x": 2.5,
             "initial_map_to_odom_y": -1.5,
             "initial_map_to_odom_yaw": 0.4,
             "publish_tf": False,
             "allow_initial_identity": False,
-            "odom_timeout_s": 5.0,
+            "odom_timeout_s": cls.odom_timeout,
             "observation_timeout_s": DEGRADED_TIMEOUT_S,
             "observation_lost_timeout_s": LOST_TIMEOUT_S,
             "relocalizing_hold_s": 0.0,
+            "use_sim_time": cls.paused_clock,
         }
         command = [executable, "--ros-args", "-r", "__node:=fusion_cold_seed_test"]
         for name, value in parameters.items():
@@ -89,6 +95,9 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
         )
         cls.odom_pub = cls.node.create_publisher(
             Odometry, f"{TOPIC_PREFIX}/odometry", qos_profile_sensor_data
+        )
+        cls.observation_pub = cls.node.create_publisher(
+            RelocalizationObservation, f"{TOPIC_PREFIX}/observation", 10
         )
         cls.statuses = []
         cls.node.create_subscription(
@@ -131,6 +140,11 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
         return None
 
     def test_seeded_map_to_odom_degrades_then_reports_lost(self):
+        bootstrap = self.drive_until(
+            lambda s: s.state == LocalizationStatus.STATE_BOOTSTRAP, timeout=4.0
+        )
+        self.assertIsNotNone(bootstrap, "valid odometry must expose unearned BOOTSTRAP")
+        self.assertEqual(bootstrap.observation_sequence, 0)
         degraded = self.drive_until(
             lambda s: s.state == LocalizationStatus.STATE_DEGRADED, timeout=8.0
         )
@@ -144,7 +158,7 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
         )
         self.assertTrue(
             math.isfinite(degraded.observation_silence_sec),
-            "observation silence must be armed at map-frame init, not left infinite",
+            "observation silence must be armed by first valid odometry",
         )
         self.assertGreaterEqual(degraded.observation_silence_sec, DEGRADED_TIMEOUT_S)
 
@@ -157,15 +171,83 @@ class TestLocalizationFusionColdSeed(unittest.TestCase):
             "autonomous lattice and the LOST correction budget can engage",
         )
         self.assertIn(
-            "no accepted relocalization observation since map-frame init", lost.message
+            "no accepted relocalization observation since first odometry", lost.message
         )
         self.assertGreaterEqual(lost.observation_silence_sec, LOST_TIMEOUT_S)
         self.assertEqual(
-            lost.epoch, 1, "a seeded map->odom stays epoch 1 until a real correction"
+            lost.epoch, int(self.use_seed), "seed alone must not advance the epoch"
         )
-        # NOTE: the first sub-timeout window still reports TRACKING. Tightening
-        # that would make every cold boot start DEGRADED, which is a separate
-        # downstream contract change and is deliberately not done here.
+        self.assertFalse(any(s.state == LocalizationStatus.STATE_TRACKING for s in self.statuses))
+        self.assertFalse(any(s.state == LocalizationStatus.STATE_CONFIRMED for s in self.statuses))
+
+        # LOST remains latched through odometry and rejected observations.
+        start_index = len(self.statuses)
+        observation = RelocalizationObservation()
+        observation.header.stamp = self.node.get_clock().now().to_msg()
+        observation.status = RelocalizationObservation.STATUS_REJECTED
+        observation.sequence = 1
+        self.observation_pub.publish(observation)
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            self.publish_odometry()
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+        self.assertTrue(self.statuses[start_index:])
+        self.assertTrue(all(s.state == LocalizationStatus.STATE_LOST for s in self.statuses[start_index:]))
+
+        # Pending carries zero accepted-quality; repeated pending cannot renew
+        # its steady deadline or mutate the seed/epoch/accepted sequence.
+        start_index = len(self.statuses)
+        deadline = time.monotonic() + LOST_TIMEOUT_S + 1.0
+        recovery_seen = False
+        timeout_seen = False
+        sequence = 2
+        while time.monotonic() < deadline and not timeout_seen:
+            self.publish_odometry()
+            observation.header.stamp = self.node.get_clock().now().to_msg()
+            observation.header.frame_id = "map"
+            observation.child_frame_id = "base_test"
+            observation.pose.pose.orientation.w = 1.0
+            observation.inlier_count = 50
+            observation.source_points = 100
+            observation.registration_error = 0.5
+            observation.quality = 0.0
+            observation.status = RelocalizationObservation.STATUS_PENDING_CONFIRMATION
+            observation.sequence = sequence
+            sequence += 1
+            self.observation_pub.publish(observation)
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+            for status in self.statuses[start_index:]:
+                recovery_seen |= status.state == LocalizationStatus.STATE_RELOCALIZING
+                timeout_seen |= (
+                    recovery_seen and status.state == LocalizationStatus.STATE_LOST
+                    and "recovery episode" in status.message
+                )
+                self.assertEqual(status.epoch, int(self.use_seed))
+                self.assertEqual(status.observation_sequence, 0)
+            start_index = len(self.statuses)
+        self.assertTrue(recovery_seen)
+        self.assertTrue(timeout_seen, "repeated pending must not renew recovery")
+
+
+class TestLocalizationFusionUnseeded(TestLocalizationFusionColdSeed):
+    use_seed = False
+
+
+class TestLocalizationFusionNoInput(TestLocalizationFusionColdSeed):
+    odom_timeout = 0.3
+    paused_clock = True
+
+    def test_seeded_map_to_odom_degrades_then_reports_lost(self):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+            if any(s.state == LocalizationStatus.STATE_LOST for s in self.statuses):
+                break
+        self.assertTrue(any(s.state == LocalizationStatus.STATE_LOST for s in self.statuses))
+        self.assertTrue(all(s.state in (
+            LocalizationStatus.STATE_UNINITIALIZED, LocalizationStatus.STATE_LOST
+        ) for s in self.statuses))
+        self.assertTrue(all(s.observation_sequence == 0 for s in self.statuses))
 
 
 class TestRelocalizationStartupShutdown(unittest.TestCase):

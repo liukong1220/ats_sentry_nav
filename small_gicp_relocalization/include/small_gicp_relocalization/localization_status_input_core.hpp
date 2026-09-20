@@ -17,6 +17,23 @@
 namespace small_gicp_relocalization
 {
 
+template<typename LS>
+inline bool isKnownLocalizationState(std::uint8_t state)
+{
+  switch (state) {
+    case LS::STATE_UNINITIALIZED:
+    case LS::STATE_BOOTSTRAP:
+    case LS::STATE_TRACKING:
+    case LS::STATE_DEGRADED:
+    case LS::STATE_LOST:
+    case LS::STATE_RELOCALIZING:
+    case LS::STATE_CONFIRMED:
+      return true;
+    default:
+      return false;
+  }
+}
+
 /// Admission only: callers must commit state and refresh their lease only on success.
 /// Epoch ordering is local to this consumer lifetime, not a producer incarnation ID.
 inline std::string validateLocalizationStatusMetadata(
