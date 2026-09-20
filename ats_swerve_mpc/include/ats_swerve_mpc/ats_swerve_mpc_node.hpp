@@ -16,6 +16,7 @@
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
+#include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
 #include "ats_swerve_mpc/qp/control_cycle_snapshot.hpp"
 #include "ats_swerve_mpc/qp/control_cycle_telemetry.hpp"
@@ -53,6 +54,12 @@ private:
   /** @brief 接收原子执行授权，校验 identity/gimbal/localization 后安装 reference 或急停。 */
   void onExecutionCommand(
       const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message);
+  void onPlannerStatus(
+      const ats_navigation_interfaces::msg::PlannerStatus::SharedPtr message);
+  void onMapReady(const std_msgs::msg::Bool::SharedPtr message);
+  bool mapReadyFreshLocked() const;
+  bool mapExecutionValidLocked(
+      const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
   /** @brief 处理 legacy emergency stop；false 不能越过结构化 ExecutionCommand 授权。 */
   void onEmergencyStop(const std_msgs::msg::Bool::SharedPtr message);
   /** @brief 接收定位状态并在非 TRACKING 或 epoch 切换时触发 fail-stop。 */
@@ -112,6 +119,9 @@ private:
   std::string odom_topic_;
   std::string trajectory_topic_;
   std::string execution_command_topic_;
+  std::string planner_status_topic_;
+  std::string map_ready_topic_;
+  double map_ready_timeout_sec_ = 5.0;
   std::string command_topic_;
   std::string emergency_stop_topic_;
   std::string localization_status_topic_;
@@ -174,6 +184,16 @@ private:
   std::optional<std::chrono::steady_clock::time_point> last_execution_command_signal_;
   std::uint64_t last_execution_command_incarnation_{0};
   std::uint64_t last_execution_command_sequence_{0};
+  // MINCO-local identity, independent of adapter publication/source generation.
+  std::uint64_t planner_epoch_{0};
+  std::uint64_t planner_generation_{0};
+  std::uint64_t retired_planner_generation_{0};
+  // Generation that held authority under the current/last ready lease.
+  std::uint64_t ready_lease_generation_{0};
+  std::int64_t planner_status_stamp_ns_{0};
+  bool planner_generation_usable_{false};
+  bool map_ready_{false};
+  std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<ats_navigation_interfaces::msg::ExecutionCommand>
       active_execution_command_;
   std::optional<ats_navigation_interfaces::msg::GimbalYawStatus> gimbal_status_;
@@ -183,6 +203,9 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr trajectory_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::ExecutionCommand>::SharedPtr
       execution_command_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr
+      planner_status_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
       SharedPtr localization_status_sub_;

@@ -15,6 +15,7 @@
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
+#include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "ats_swerve_mpc/ats_swerve_mpc_node.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -30,10 +31,12 @@ using namespace std::chrono_literals;
 using LocalizationStatus = ats_navigation_interfaces::msg::LocalizationStatus;
 using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
 using GimbalYawStatus = ats_navigation_interfaces::msg::GimbalYawStatus;
+using PlannerStatus = ats_navigation_interfaces::msg::PlannerStatus;
 
 class MpcLocalizationGateTest : public ::testing::Test
 {
 protected:
+  virtual bool initializePlannerAuthority() const {return true;}
   static void SetUpTestSuite()
   {
     if (!rclcpp::ok()) {
@@ -61,6 +64,9 @@ protected:
         rclcpp::Parameter("emergency_stop_topic", "/test_mpc_gate/stop"),
         rclcpp::Parameter("localization_status_topic", "/test_mpc_gate/status"),
         rclcpp::Parameter("gimbal_status_topic", "/test_mpc_gate/gimbal_status"),
+        rclcpp::Parameter("planner_status_topic", "/test_mpc_gate/planner_status"),
+        rclcpp::Parameter("map_ready_topic", "/test_mpc_gate/map_ready"),
+        rclcpp::Parameter("map_ready_timeout_sec", 0.2),
         rclcpp::Parameter("require_localization_status", true),
         rclcpp::Parameter("require_gimbal_status", true),
         rclcpp::Parameter("gimbal_status_timeout", 0.1),
@@ -85,6 +91,10 @@ protected:
       "/test_mpc_gate/status", rclcpp::QoS(1).reliable().transient_local());
     gimbal_status_pub_ = driver_->create_publisher<GimbalYawStatus>(
       "/test_mpc_gate/gimbal_status", rclcpp::QoS(1).reliable().transient_local());
+    planner_status_pub_ = driver_->create_publisher<PlannerStatus>(
+      "/test_mpc_gate/planner_status", rclcpp::QoS(1).reliable().transient_local());
+    map_ready_pub_ = driver_->create_publisher<std_msgs::msg::Bool>(
+      "/test_mpc_gate/map_ready", rclcpp::QoS(1).reliable().transient_local());
     command_sub_ = driver_->create_subscription<geometry_msgs::msg::Twist>(
       "/test_mpc_gate/cmd", 10,
       [this](const geometry_msgs::msg::Twist::SharedPtr message) {
@@ -105,12 +115,19 @@ protected:
           stop_pub_->get_subscription_count() == 1 &&
           status_pub_->get_subscription_count() == 1 &&
           gimbal_status_pub_->get_subscription_count() == 1 &&
+          planner_status_pub_->get_subscription_count() == 1 &&
+          map_ready_pub_->get_subscription_count() == 1 &&
           telemetry_client_->service_is_ready();
         },
         2s));
     // Production Goal Manager publishes a transient-local STOP at process
     // start. Establish the same handoff before this fixture sends EXECUTE.
     publishExecutionStop();
+    publishMapReady(true);
+    if (initializePlannerAuthority()) {
+      publishPlannerStatus(1, 1);
+    }
+    executor_.spin_some();
   }
 
   void TearDown() override
@@ -121,6 +138,8 @@ protected:
     telemetry_client_.reset();
     status_pub_.reset();
     gimbal_status_pub_.reset();
+    planner_status_pub_.reset();
+    map_ready_pub_.reset();
     stop_pub_.reset();
     path_pub_.reset();
     execution_pub_.reset();
@@ -154,6 +173,9 @@ protected:
     message.pose.pose.orientation.w = 1.0;
     odom_pub_->publish(message);
     publishGimbalStatus();
+    if (renew_map_ready_) {
+      publishMapReady(true);
+    }
   }
 
   void publishGimbalStatus(bool locked = false)
@@ -177,6 +199,55 @@ protected:
     message.state = state;
     message.epoch = epoch;
     status_pub_->publish(message);
+  }
+
+  void publishMapReady(bool ready)
+  {
+    std_msgs::msg::Bool message;
+    message.data = ready;
+    map_ready_pub_->publish(message);
+  }
+
+  void publishPlannerStatus(
+    std::uint64_t epoch, std::uint64_t generation,
+    std::uint8_t state = PlannerStatus::STATE_REFERENCE_READY,
+    std::uint8_t failure = PlannerStatus::FAILURE_NONE,
+    std::uint64_t publication = 1, double stamp_offset_s = 0.0)
+  {
+    PlannerStatus message;
+    message.header.stamp = driver_->now() +
+      rclcpp::Duration::from_seconds(stamp_offset_s);
+    message.header.frame_id = "map";
+    message.goal_id = 1;
+    message.plan_request_sequence = 1;
+    message.localization_epoch = epoch;
+    message.map_generation = generation;
+    message.map_publication_sequence = publication;
+    message.state = state;
+    message.failure_reason = failure;
+    planner_status_pub_->publish(message);
+  }
+
+  bool moveOnGeneration(std::uint64_t generation, std::uint64_t epoch = 1)
+  {
+    return spinUntil([this, generation, epoch]() {
+      if (command_norm_.load() > 0.02) {
+        return true;
+      }
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, epoch);
+      publishExecutionWithSequence(++execution_sequence_, epoch, generation);
+      return false;
+    }, 2s);
+  }
+
+  void expectRemainsStopped(std::uint64_t epoch = 1)
+  {
+    EXPECT_FALSE(spinUntil([this, epoch]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, epoch);
+      return command_norm_.load() > 1e-6;
+    }, 100ms));
   }
 
   void publishStop(bool stop)
@@ -339,6 +410,9 @@ protected:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stop_pub_;
   rclcpp::Publisher<LocalizationStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<GimbalYawStatus>::SharedPtr gimbal_status_pub_;
+  rclcpp::Publisher<PlannerStatus>::SharedPtr planner_status_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr map_ready_pub_;
+  bool renew_map_ready_{true};
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_sub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr telemetry_client_;
   std::atomic<double> command_norm_{0.0};
@@ -614,6 +688,177 @@ TEST_F(MpcLocalizationGateTest, RejectsExecutionForDifferentGimbalRequest) {
         return command_norm_.load() > 0.02;
       },
       2s));
+}
+
+TEST_F(MpcLocalizationGateTest, RejectsZeroOldAndFutureLocalGenerations) {
+  publishPlannerStatus(1, 7);
+  for (const std::uint64_t rejected_generation : {0u, 6u, 8u}) {
+    ASSERT_TRUE(moveOnGeneration(7));
+    publishExecutionWithSequence(++execution_sequence_, 1, rejected_generation);
+    ASSERT_TRUE(spinUntil([this]() {
+      publishOdometry();
+      return command_norm_.load() < 1e-6;
+    }, 200ms));
+    expectRemainsStopped();
+  }
+  ASSERT_TRUE(moveOnGeneration(7));
+}
+
+TEST_F(MpcLocalizationGateTest, NewGenerationRevokesAndLateOldStatusCannotRestore) {
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
+  publishPlannerStatus(1, 8, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_SNAPSHOT_CHANGED);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 7);  // New timestamp must not lower the generation floor.
+  publishExecutionWithSequence(++execution_sequence_, 1, 7);
+  expectRemainsStopped();
+  publishPlannerStatus(1, 8);
+  expectRemainsStopped();  // A READY is map evidence, never execution permission.
+  ASSERT_TRUE(moveOnGeneration(8));
+}
+
+TEST_F(MpcLocalizationGateTest, SameGenerationPublicationAndAcceptedStatusDoNotChurn) {
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
+  publishPlannerStatus(1, 7, PlannerStatus::STATE_REFERENCE_READY,
+    PlannerStatus::FAILURE_NONE, 999);
+  EXPECT_FALSE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 100ms));
+  publishPlannerStatus(1, 0, PlannerStatus::STATE_ACCEPTED);
+  EXPECT_FALSE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 100ms));
+}
+
+TEST_F(MpcLocalizationGateTest, FailedStatusRejectsDelayedReadyAndNeedsFreshAuthorization) {
+  ASSERT_TRUE(moveOnGeneration(1));
+  publishPlannerStatus(1, 1, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_RUNTIME_UNSAFE);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 1, PlannerStatus::STATE_REFERENCE_READY,
+    PlannerStatus::FAILURE_NONE, 1, -1.0);
+  publishExecutionWithSequence(++execution_sequence_, 1, 1);
+  expectRemainsStopped();
+  publishPlannerStatus(1, 1);
+  expectRemainsStopped();
+  ASSERT_TRUE(moveOnGeneration(1));
+}
+
+TEST_F(MpcLocalizationGateTest, MapUnreadyRetiresGenerationAcrossReadyRecovery) {
+  ASSERT_TRUE(moveOnGeneration(1));
+  publishPlannerStatus(1, 1, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_MAP_UNREADY);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 1);
+  publishExecutionWithSequence(++execution_sequence_, 1, 1);
+  expectRemainsStopped();
+  publishPlannerStatus(1, 2);
+  expectRemainsStopped();
+  ASSERT_TRUE(moveOnGeneration(2));
+}
+
+TEST_F(MpcLocalizationGateTest, ReadyFalseStopsAndStatusBeforeReadyDoesNotResume) {
+  ASSERT_TRUE(moveOnGeneration(1));
+  renew_map_ready_ = false;
+  publishMapReady(false);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 2);
+  expectRemainsStopped();
+  publishMapReady(true);
+  renew_map_ready_ = true;
+  expectRemainsStopped();
+  ASSERT_TRUE(moveOnGeneration(2));
+}
+
+TEST_F(MpcLocalizationGateTest, ReadyLeaseExpiresBeforeCommandLeaseAndRetiresOldMap) {
+  ASSERT_TRUE(moveOnGeneration(1));
+  renew_map_ready_ = false;
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 350ms));
+  renew_map_ready_ = true;
+  publishMapReady(true);
+  publishExecutionWithSequence(++execution_sequence_, 1, 1);
+  expectRemainsStopped();
+  publishPlannerStatus(1, 2);
+  ASSERT_TRUE(moveOnGeneration(2));
+}
+
+TEST_F(MpcLocalizationGateTest, EpochChangeRevokesAndOldEpochStatusCannotRestore) {
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
+  publishStatus(LocalizationStatus::STATE_TRACKING, 2);
+  publishPlannerStatus(2, 1);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 999);
+  publishExecutionWithSequence(++execution_sequence_, 2, 7);
+  expectRemainsStopped(2);
+  ASSERT_TRUE(moveOnGeneration(1, 2));
+}
+
+class MpcUnknownMapGateTest : public MpcLocalizationGateTest
+{
+protected:
+  bool initializePlannerAuthority() const override {return false;}
+};
+
+TEST_F(MpcUnknownMapGateTest, StatusAfterCommandRequiresNewSequenceNotReplay) {
+  publishOdometry();
+  publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+  const auto rejected_sequence = ++execution_sequence_;
+  publishExecutionWithSequence(rejected_sequence, 1, 7);
+  expectRemainsStopped();
+  publishPlannerStatus(1, 7);
+  expectRemainsStopped();
+  publishExecutionWithSequence(rejected_sequence, 1, 7);
+  expectRemainsStopped();
+  ASSERT_TRUE(moveOnGeneration(7));
+}
+
+TEST_F(MpcUnknownMapGateTest, MalformedStatusHeaderCannotEstablishAuthority) {
+  for (int defect = 0; defect < 4; ++defect) {
+    PlannerStatus status;
+    status.header.stamp = driver_->now();
+    status.header.frame_id = "map";
+    status.localization_epoch = 1;
+    status.map_generation = 7;
+    status.state = PlannerStatus::STATE_REFERENCE_READY;
+    if (defect == 0) {
+      status.header.frame_id.clear();
+    } else if (defect == 1) {
+      status.header.stamp.sec = -1;
+    } else if (defect == 2) {
+      status.header.stamp.nanosec = 1000000000u;
+    } else {
+      status.header.stamp.sec = 0;
+      status.header.stamp.nanosec = 0;
+    }
+    planner_status_pub_->publish(status);
+    publishExecutionWithSequence(++execution_sequence_, 1, 7);
+    expectRemainsStopped();
+  }
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
 }
 
 TEST(AtsSwerveMpcNodeConstruction, RejectsOversizedHorizonBeforeControllerCreation) {

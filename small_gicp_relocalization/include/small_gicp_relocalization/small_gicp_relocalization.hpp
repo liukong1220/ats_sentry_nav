@@ -18,6 +18,7 @@
 #include <Eigen/Geometry>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -134,7 +135,8 @@ private:
   void performRegistration();
   void publishTransform();
   void publishObservation(
-    bool accepted, std::uint8_t status, const std::string & message, std::size_t inliers,
+    const rclcpp::Time & scan_time, bool accepted, std::uint8_t status,
+    const std::string & message, std::size_t inliers,
     double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
     const std::array<double, 36> & covariance);
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
@@ -154,6 +156,9 @@ private:
   ConfirmationDecision evaluateCandidateConfirmation(
     const Eigen::Isometry3d & candidate, const rclcpp::Time & scan_time,
     const Eigen::Isometry3d & odom_to_base) const;
+  void clearConfirmation();
+  void invalidateRecovery();
+  bool expireConfirmation();
   double translationDeltaFromLastTrigger(
     const Eigen::Isometry3d & current_robot_base_to_odom) const;
   double yawDeltaFromLastTrigger(const Eigen::Isometry3d & current_robot_base_to_odom) const;
@@ -267,6 +272,7 @@ private:
   std::uint8_t localization_state_{
     ats_navigation_interfaces::msg::LocalizationStatus::STATE_UNINITIALIZED};
   std::uint64_t localization_epoch_{0};
+  bool recovery_from_lost_{false};
   double observation_silence_sec_{0.0};
   std::optional<rclcpp::Time> last_status_receive_time_;
   std::int64_t last_status_stamp_ns_{0};
@@ -308,6 +314,8 @@ private:
   std::uint64_t observation_sequence_{0};
   int pending_confirmation_count_{0};
   std::optional<ConfirmationSample> pending_confirmation_;
+  std::optional<std::chrono::steady_clock::time_point> confirmation_started_at_;
+  double confirmation_timeout_s_{10.0};
   // 上一帧通过硬门的假设，用于候选级 motion 一致性软约束。
   std::optional<ConfirmationSample> last_hypothesis_;
   std::optional<rclcpp::Time> last_hypothesis_time_;

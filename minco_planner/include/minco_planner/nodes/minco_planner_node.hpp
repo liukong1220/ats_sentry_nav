@@ -126,6 +126,17 @@ private:
                        std::uint8_t yaw_authority = 0,
                        bool requires_gimbal_lock = false,
                        const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
+  // Both helpers require map_mutex_; no nested lock acquisition.
+  void publishPlannerStatusLocked(
+    std::uint64_t goal_id, std::uint64_t localization_epoch,
+    std::uint64_t plan_request_sequence, std::uint64_t map_generation,
+    std::uint64_t map_publication_sequence, std::uint8_t state,
+    std::uint8_t failure_reason,
+    const builtin_interfaces::msg::Time & reference_stamp = builtin_interfaces::msg::Time(),
+    std::uint8_t yaw_authority = 0, bool requires_gimbal_lock = false,
+    const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
+  void invalidatePlannerStatusLocked(std::uint8_t failure_reason, std::uint64_t generation);
+  void invalidateMapLocked();
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
@@ -203,6 +214,7 @@ private:
   std::uint64_t next_map_generation_{0};
   std::uint64_t map_health_epoch_{0};
   PlannerSafetyState safety_state_;
+  PlannerStatusState planner_status_state_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   struct ActiveSafetyReference
   {

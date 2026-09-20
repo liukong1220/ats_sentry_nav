@@ -139,6 +139,107 @@ TEST(PlannerSafetyState, NewMapInvalidatesPlanButKeepsHealthyMapLease)
   EXPECT_TRUE(state.mapSnapshotUsable(8));
 }
 
+ats_navigation_interfaces::msg::PlannerStatus makeReadyStatus()
+{
+  ats_navigation_interfaces::msg::PlannerStatus status;
+  status.header.stamp.sec = 10;
+  status.goal_id = 12;
+  status.localization_epoch = 3;
+  status.plan_request_sequence = 7;
+  status.map_generation = 5;
+  status.map_publication_sequence = 19;
+  status.reference_stamp.sec = 9;
+  status.state = status.STATE_REFERENCE_READY;
+  status.failure_reason = status.FAILURE_NONE;
+  return status;
+}
+
+TEST(PlannerStatusState, MapLossRetainsIdentityWithoutAnActiveReference)
+{
+  minco_planner::PlannerStatusState state;
+  auto ready = makeReadyStatus();
+  EXPECT_FALSE(state.invalidate(5, ready.FAILURE_MAP_UNREADY, ready.header.stamp));
+  ASSERT_TRUE(state.update(ready));
+  ASSERT_TRUE(state.invalidate(5, ready.FAILURE_MAP_UNREADY, ready.header.stamp));
+  ASSERT_TRUE(state.latest.has_value());
+  EXPECT_EQ(state.latest->state, ready.STATE_FAILED);
+  EXPECT_EQ(state.latest->failure_reason, ready.FAILURE_MAP_UNREADY);
+  EXPECT_EQ(state.latest->goal_id, ready.goal_id);
+  EXPECT_EQ(state.latest->localization_epoch, ready.localization_epoch);
+  EXPECT_EQ(state.latest->plan_request_sequence, ready.plan_request_sequence);
+  EXPECT_EQ(state.latest->map_generation, ready.map_generation);
+  EXPECT_EQ(state.latest->map_publication_sequence, ready.map_publication_sequence);
+  EXPECT_EQ(state.latest->reference_stamp, ready.reference_stamp);
+  EXPECT_EQ(state.latest->header.stamp.nanosec, 1U);
+
+  // Repeated false-ready/watchdog reports retain the same invalidated identity.
+  ASSERT_TRUE(state.invalidate(5, ready.FAILURE_MAP_UNREADY, ready.header.stamp));
+  EXPECT_EQ(state.latest->header.stamp.nanosec, 2U);
+  EXPECT_FALSE(state.update(ready));
+  ++ready.plan_request_sequence;
+  EXPECT_FALSE(state.update(ready));
+  ++ready.map_generation;
+  EXPECT_TRUE(state.update(ready));
+}
+
+TEST(PlannerStatusState, PlanFailureAndMapReplacementPermitFreshReference)
+{
+  minco_planner::PlannerStatusState state;
+  auto ready = makeReadyStatus();
+  ASSERT_TRUE(state.update(ready));
+  ASSERT_TRUE(state.invalidate(5, ready.FAILURE_RUNTIME_UNSAFE, ready.header.stamp));
+  ++ready.plan_request_sequence;
+  ASSERT_TRUE(state.update(ready));
+  ASSERT_TRUE(state.invalidate(6, ready.FAILURE_SNAPSHOT_CHANGED, ready.header.stamp));
+  EXPECT_FALSE(state.update(ready));
+  ++ready.map_generation;
+  ++ready.plan_request_sequence;
+  EXPECT_TRUE(state.update(ready));
+  EXPECT_EQ(state.latest->state, ready.STATE_REFERENCE_READY);
+}
+
+TEST(PlannerStatusState, RejectsObsoleteEpochGenerationAndRequest)
+{
+  minco_planner::PlannerStatusState state;
+  auto ready = makeReadyStatus();
+  ASSERT_TRUE(state.update(ready));
+  auto stale = ready;
+  --stale.localization_epoch;
+  ++stale.map_generation;
+  EXPECT_FALSE(state.update(stale));
+  stale = ready;
+  --stale.map_generation;
+  EXPECT_FALSE(state.update(stale));
+  stale = ready;
+  --stale.plan_request_sequence;
+  EXPECT_FALSE(state.update(stale));
+  EXPECT_EQ(state.latest->goal_id, ready.goal_id);
+  EXPECT_EQ(state.latest->map_generation, ready.map_generation);
+
+  ++ready.localization_epoch;
+  ready.map_generation = 1;
+  ready.plan_request_sequence = 1;
+  EXPECT_TRUE(state.update(ready));
+}
+
+TEST(PlannerStatusState, SerializesEqualAndBackwardClockStamps)
+{
+  minco_planner::PlannerStatusState state;
+  auto ready = makeReadyStatus();
+  ready.header.stamp.nanosec = 999999999U;
+  ASSERT_TRUE(state.update(ready));
+  auto heartbeat = ready;
+  ASSERT_TRUE(state.update(heartbeat));
+  EXPECT_EQ(heartbeat.header.stamp.sec, 11);
+  EXPECT_EQ(heartbeat.header.stamp.nanosec, 0U);
+  heartbeat.header.stamp.sec = 1;
+  ASSERT_TRUE(state.update(heartbeat));
+  EXPECT_EQ(heartbeat.header.stamp.sec, 11);
+  EXPECT_EQ(heartbeat.header.stamp.nanosec, 1U);
+  EXPECT_EQ(heartbeat.map_generation, ready.map_generation);
+  EXPECT_EQ(heartbeat.state, ready.STATE_REFERENCE_READY);
+}
+
 TEST(HeartbeatLease, RejectsMissingFutureAndExpiredSignals)
 {
   using Clock = std::chrono::steady_clock;

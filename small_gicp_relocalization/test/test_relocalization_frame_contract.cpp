@@ -20,6 +20,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "rcl/time.h"
@@ -133,7 +135,7 @@ protected:
     node_ = std::make_shared<SmallGicpRelocalizationNode>(settings);
   }
 
-  void receiveStatus(std::int64_t stamp_ns, std::uint8_t state)
+  void receiveStatus(std::int64_t stamp_ns, std::uint8_t state, std::uint64_t epoch = 1)
   {
     auto clock = node_->get_clock()->get_clock_handle();
     ASSERT_EQ(rcl_enable_ros_time_override(clock), RCL_RET_OK);
@@ -142,7 +144,7 @@ protected:
     status->header.frame_id = "prior_map";
     status->header.stamp = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
     status->state = state;
-    status->epoch = 1;
+    status->epoch = epoch;
     node_->localizationStatusCallback(status);
     EXPECT_EQ(node_->localization_state_, state);
   }
@@ -183,6 +185,7 @@ protected:
   void resetInitialPose(bool install_tf)
   {
     if (install_tf) {
+      node_->robot_base_frame_ = "robot_body";
       geometry_msgs::msg::TransformStamped transform;
       transform.header.frame_id = "odom";
       transform.child_frame_id = "robot_body";
@@ -201,6 +204,105 @@ protected:
     EXPECT_EQ(node_->evicted_scan_frames_count_, frames);
   }
 
+  using Observation = ats_navigation_interfaces::msg::RelocalizationObservation;
+  using Status = ats_navigation_interfaces::msg::LocalizationStatus;
+
+  void createConfirmationNode(int count = 3, bool odometry = true)
+  {
+    auto settings = options(prior_path_.string());
+    settings.append_parameter_override("confirmation_count", count);
+    node_ = std::make_shared<SmallGicpRelocalizationNode>(settings);
+    node_->register_timer_->cancel();
+    node_->transform_timer_->cancel();
+    if (odometry) {
+      geometry_msgs::msg::TransformStamped transform;
+      transform.header.frame_id = "odom";
+      transform.child_frame_id = "robot_body";
+      transform.transform.rotation.w = 1.0;
+      ASSERT_TRUE(node_->tf_buffer_->setTransform(transform, "confirmation_test", true));
+    }
+  }
+
+  void observePublications()
+  {
+    observation_sub_ = node_->create_subscription<Observation>(
+      "relocalization_observation", rclcpp::QoS(10).reliable(),
+      [this](const Observation::SharedPtr msg) { observations_.push_back(*msg); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (node_->observation_pub_->get_subscription_count() == 0 &&
+      std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GT(node_->observation_pub_->get_subscription_count(), 0U);
+  }
+
+  void expectPublication(std::int64_t stamp_ns, std::uint8_t status)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (observations_.empty() && std::chrono::steady_clock::now() < deadline) {
+      rclcpp::spin_some(node_);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(observations_.size(), 1U);
+    EXPECT_EQ(rclcpp::Time(observations_.front().header.stamp).nanoseconds(), stamp_ns);
+    EXPECT_EQ(observations_.front().status, status);
+    observations_.clear();
+  }
+
+  void attempt(std::int64_t stamp_ns, double x = 0.0, bool ok = true)
+  {
+    SmallGicpRelocalizationNode::RegistrationAttempt result;
+    result.ok = ok;
+    result.converged = ok;
+    result.registration_error = 0.01;
+    result.num_inliers = 900;
+    result.information.setIdentity();
+    result.transform.translation().x() = x;
+    node_->handleRegistrationAttempt(result, rclcpp::Time(stamp_ns, RCL_ROS_TIME), 1000);
+  }
+
+  void drainCapturedResult(std::int64_t stamp_ns, bool ok, std::uint64_t generation)
+  {
+    node_->last_scan_time_ = rclcpp::Time(stamp_ns + 500000000LL, RCL_ROS_TIME);
+    node_->has_received_scan_ = true;
+    node_->async_result_ = SmallGicpRelocalizationNode::MultiGuessOutcome{};
+    node_->async_result_.generation = generation;
+    node_->async_result_.best.ok = ok;
+    node_->async_result_.best.registration_error = 0.01;
+    node_->async_result_.best.num_inliers = 900;
+    node_->async_result_.best.information.setIdentity();
+    node_->async_result_scan_time_ = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
+    node_->async_result_source_points_ = 1000;
+    node_->async_result_ready_ = true;
+    node_->drainAsyncMultiGuessResult();
+  }
+
+  std::uint64_t generation() const { return node_->relocalization_generation_.current(); }
+  int pendingCount() const { return node_->pending_confirmation_count_; }
+  bool accepted() const { return node_->has_accepted_alignment_; }
+  bool latticeAllowed() const { return node_->preferMultiGuess(); }
+  std::uint64_t sequence() const { return node_->observation_sequence_; }
+  std::uint64_t staleResults() const { return node_->stale_async_result_count_; }
+  std::optional<std::chrono::steady_clock::time_point> episodeStart() const
+  {
+    return node_->confirmation_started_at_;
+  }
+  void ageEpisode()
+  {
+    ASSERT_TRUE(node_->confirmation_started_at_);
+    *node_->confirmation_started_at_ -= std::chrono::seconds(11);
+  }
+  void runRegistrationTimer() { node_->performRegistration(); }
+  void removeOdometry() { node_->robot_base_frame_ = "unavailable_robot_body"; }
+  void expectAnchor(double first, double counted)
+  {
+    ASSERT_TRUE(node_->pending_confirmation_);
+    EXPECT_DOUBLE_EQ(node_->pending_confirmation_->scan_time_s, first);
+    EXPECT_DOUBLE_EQ(node_->pending_confirmation_->last_counted_scan_time_s, counted);
+  }
+
+  rclcpp::Subscription<Observation>::SharedPtr observation_sub_;
+  std::vector<Observation> observations_;
   std::filesystem::path directory_;
   std::filesystem::path prior_path_;
   pcl::PointCloud<pcl::PointXYZ> prior_;
@@ -308,6 +410,166 @@ TEST_F(SmallGicpRelocalizationFrameTest, ImpossibleAccumulationParametersFailSta
   EXPECT_THROW(createWindowNode(0, 30, 40000), std::invalid_argument);
   EXPECT_THROW(createWindowNode(3, 0, 40000), std::invalid_argument);
   EXPECT_THROW(createWindowNode(3, 30, 0), std::invalid_argument);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, AsyncObservationsKeepCapturedScanStampOnEveryOutcome)
+{
+  createConfirmationNode(2);
+  observePublications();
+  drainCapturedResult(1000000000LL, true, generation());
+  expectPublication(1000000000LL, Observation::STATUS_PENDING_CONFIRMATION);
+  drainCapturedResult(1200000000LL, true, generation());
+  expectPublication(1200000000LL, Observation::STATUS_ACCEPTED);
+  drainCapturedResult(1400000000LL, false, generation());
+  expectPublication(1400000000LL, Observation::STATUS_REJECTED);
+  removeOdometry();
+  drainCapturedResult(1600000000LL, true, generation());
+  expectPublication(1600000000LL, Observation::STATUS_NO_ODOM);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ThirdConfirmationCannotCountSecondScanTwice)
+{
+  createConfirmationNode();
+  attempt(1000000000LL);
+  const auto started = episodeStart();
+  attempt(1200000000LL, 0.10);
+  EXPECT_EQ(pendingCount(), 2);
+  expectAnchor(1.0, 1.2);
+  attempt(1200000000LL, 0.10);
+  attempt(1220000000LL, 0.10);
+  EXPECT_EQ(pendingCount(), 2);
+  EXPECT_FALSE(accepted());
+  EXPECT_EQ(episodeStart(), started);
+  attempt(1400000000LL, 0.10);
+  EXPECT_TRUE(accepted());
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ConfirmationRetainsFirstGeometryAndEpisodeDeadline)
+{
+  createConfirmationNode();
+  attempt(1000000000LL);
+  const auto started = episodeStart();
+  attempt(1200000000LL, 0.10);
+  attempt(1400000000LL, 0.20);  // Close to second, but not to the first anchor.
+  EXPECT_FALSE(accepted());
+  EXPECT_EQ(pendingCount(), 1);
+  expectAnchor(1.4, 1.4);
+  EXPECT_EQ(episodeStart(), started);  // Geometry restart is not a fresh episode.
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, SteadyTimeoutRejectsConfirmationWithPausedRosClock)
+{
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_LOST);
+  attempt(1000000000LL);
+  receiveStatus(1100000000LL, Status::STATE_RELOCALIZING);
+  const auto before = generation();
+  ageEpisode();  // Advance only the stored steady anchor, not ROS time.
+  observePublications();
+  attempt(1200000000LL);
+  expectPublication(1200000000LL, Observation::STATUS_REJECTED);
+  EXPECT_GT(generation(), before);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  EXPECT_FALSE(accepted());
+  attempt(1400000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, TimerTimeoutFencesLateWorkerBeforeObservationMutation)
+{
+  createConfirmationNode();
+  attempt(1000000000LL);
+  const auto old_generation = generation();
+  const auto old_sequence = sequence();
+  ageEpisode();
+  runRegistrationTimer();
+  EXPECT_GT(generation(), old_generation);
+  EXPECT_EQ(pendingCount(), 0);
+  drainCapturedResult(1200000000LL, true, old_generation);
+  EXPECT_EQ(sequence(), old_sequence);
+  EXPECT_EQ(staleResults(), 1U);
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, MissingOdometryAndFailedInitialPoseClearPendingEpisode)
+{
+  createConfirmationNode();
+  attempt(1000000000LL);
+  removeOdometry();
+  attempt(1200000000LL);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  resetInitialPose(true);
+  attempt(1400000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  removeOdometry();
+  resetInitialPose(false);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, RecoveryAndEpochBoundariesFenceWorkersWithoutResetLoops)
+{
+  createConfirmationNode();
+  receiveStatus(1000000000LL, Status::STATE_BOOTSTRAP, 0);
+  attempt(1000000000LL);
+  auto before = generation();
+  receiveStatus(1100000000LL, Status::STATE_LOST, 0);
+  EXPECT_GT(generation(), before);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_TRUE(latticeAllowed());
+  attempt(1200000000LL);
+  before = generation();
+  const auto started = episodeStart();
+  receiveStatus(1300000000LL, Status::STATE_RELOCALIZING, 0);
+  receiveStatus(1400000000LL, Status::STATE_RELOCALIZING, 0);
+  EXPECT_EQ(generation(), before);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_EQ(episodeStart(), started);
+  EXPECT_TRUE(latticeAllowed());  // LOST origin survives the pending wire state.
+  receiveStatus(1500000000LL, Status::STATE_LOST, 0);
+  EXPECT_GT(generation(), before);
+  EXPECT_EQ(pendingCount(), 0);
+  const auto old_sequence = sequence();
+  drainCapturedResult(1450000000LL, true, before);
+  EXPECT_EQ(sequence(), old_sequence);
+  EXPECT_EQ(staleResults(), 1U);
+  receiveStatus(1600000000LL, Status::STATE_DEGRADED, 0);
+  EXPECT_FALSE(latticeAllowed());
+  attempt(1700000000LL);
+  before = generation();
+  receiveStatus(1800000000LL, Status::STATE_RELOCALIZING, 0);
+  EXPECT_EQ(generation(), before);
+  EXPECT_FALSE(latticeAllowed());
+  receiveStatus(1900000000LL, Status::STATE_CONFIRMED, 1);
+  EXPECT_GT(generation(), before);
+  EXPECT_EQ(pendingCount(), 0);
+  before = generation();
+  receiveStatus(2000000000LL, Status::STATE_CONFIRMED, 1);
+  receiveStatus(2100000000LL, Status::STATE_TRACKING, 1);
+  EXPECT_EQ(generation(), before);
+  attempt(2200000000LL);
+  receiveStatus(2300000000LL, Status::STATE_TRACKING, 2);
+  EXPECT_GT(generation(), before);
+  EXPECT_EQ(pendingCount(), 0);
+  const auto sequence_after_epoch = sequence();
+  drainCapturedResult(2250000000LL, true, before);
+  EXPECT_EQ(sequence(), sequence_after_epoch);
+  EXPECT_EQ(staleResults(), 2U);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ConfirmationTimeoutMustBeFiniteAndPositive)
+{
+  for (const double timeout : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+    std::numeric_limits<double>::quiet_NaN()}) {
+    auto settings = options(prior_path_.string());
+    settings.append_parameter_override("confirmation_timeout_s", timeout);
+    EXPECT_THROW(std::make_shared<SmallGicpRelocalizationNode>(settings), std::invalid_argument);
+  }
 }
 
 }  // namespace small_gicp_relocalization

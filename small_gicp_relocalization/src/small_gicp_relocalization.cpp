@@ -128,6 +128,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("log_registration_details", true);
   this->declare_parameter("publish_tf", true);
   this->declare_parameter("confirmation_count", 2);
+  this->declare_parameter("confirmation_timeout_s", 10.0);
   this->declare_parameter("confirmation_translation_tolerance", 0.15);
   this->declare_parameter("confirmation_yaw_tolerance", 0.10);
   this->declare_parameter("confirmation_min_interval_s", 0.05);
@@ -215,6 +216,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("log_registration_details", log_registration_details_);
   this->get_parameter("publish_tf", publish_tf_);
   this->get_parameter("confirmation_count", confirmation_count_);
+  this->get_parameter("confirmation_timeout_s", confirmation_timeout_s_);
+  if (!std::isfinite(confirmation_timeout_s_) || confirmation_timeout_s_ <= 0.0) {
+    throw std::invalid_argument("confirmation_timeout_s must be finite and positive");
+  }
   this->get_parameter("confirmation_translation_tolerance", confirmation_translation_tolerance_);
   this->get_parameter("confirmation_yaw_tolerance", confirmation_yaw_tolerance_);
   this->get_parameter("confirmation_min_interval_s", confirmation_min_interval_s_);
@@ -573,7 +578,7 @@ bool SmallGicpRelocalizationNode::isRecoveringLocalization() const
   }
   using LS = ats_navigation_interfaces::msg::LocalizationStatus;
   return localization_state_ == LS::STATE_UNINITIALIZED || localization_state_ == LS::STATE_LOST ||
-         localization_state_ == LS::STATE_DEGRADED ||
+         localization_state_ == LS::STATE_BOOTSTRAP || localization_state_ == LS::STATE_DEGRADED ||
          localization_state_ == LS::STATE_RELOCALIZING || !has_accepted_alignment_;
 }
 
@@ -612,7 +617,8 @@ bool SmallGicpRelocalizationNode::preferMultiGuess() const
   if (in_initial_pose_force_window) {
     return false;
   }
-  return localization_state_ == LS::STATE_LOST;
+  return localization_state_ == LS::STATE_LOST ||
+         (localization_state_ == LS::STATE_RELOCALIZING && recovery_from_lost_);
 }
 
 void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
@@ -1084,6 +1090,7 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(
 
 void SmallGicpRelocalizationNode::performRegistration()
 {
+  expireConfirmation();
   drainAsyncMultiGuessResult();
 
   if (!shouldRunRegistration()) {
@@ -1239,6 +1246,36 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
   }
 }
 
+void SmallGicpRelocalizationNode::clearConfirmation()
+{
+  pending_confirmation_.reset();
+  pending_confirmation_count_ = 0;
+  confirmation_started_at_.reset();
+}
+
+void SmallGicpRelocalizationNode::invalidateRecovery()
+{
+  relocalization_generation_.invalidate();
+  cancel_multi_guess_.store(true);
+  clearAccumulation();
+  clearConfirmation();
+  last_hypothesis_.reset();
+  last_hypothesis_time_.reset();
+  multi_guess_cursor_ = 0;
+  need_coarse_alignment_ = true;
+}
+
+bool SmallGicpRelocalizationNode::expireConfirmation()
+{
+  if (!confirmation_started_at_ ||
+    std::chrono::duration<double>(std::chrono::steady_clock::now() -
+      *confirmation_started_at_).count() < confirmation_timeout_s_) {
+    return false;
+  }
+  invalidateRecovery();
+  return true;
+}
+
 ConfirmationDecision SmallGicpRelocalizationNode::evaluateCandidateConfirmation(
   const Eigen::Isometry3d & candidate, const rclcpp::Time & scan_time,
   const Eigen::Isometry3d & odom_to_base) const
@@ -1267,6 +1304,13 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
 {
   const auto covariance =
     registrationCovariance(attempt.information, attempt.registration_error, attempt.num_inliers);
+  if (expireConfirmation()) {
+    publishObservation(
+      scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
+      "confirmation episode expired", attempt.num_inliers, attempt.registration_error,
+      source_points, Eigen::Isometry3d::Identity(), covariance);
+    return;
+  }
 
   if (log_registration_details_) {
     RCLCPP_INFO(
@@ -1287,11 +1331,10 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       attempt.stage.c_str(), attempt.reject_reason.c_str(), attempt.converged ? "true" : "false",
       attempt.num_inliers, min_inliers_, attempt.registration_error, attempt.overlap_ratio,
       max_registration_error_);
-    pending_confirmation_.reset();
-    pending_confirmation_count_ = 0;
+    clearConfirmation();
     need_coarse_alignment_ = true;
     publishObservation(
-      false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
+      scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
       attempt.reject_reason.empty() ? "rejected" : attempt.reject_reason, attempt.num_inliers,
       attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
     return;
@@ -1300,8 +1343,11 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   // 确认与接受都必须锚定同一扫描时刻的 odom 位姿；拿不到就不能推进确认状态。
   const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
   if (!odom_to_robot_base) {
+    clearConfirmation();
+    last_hypothesis_.reset();
+    last_hypothesis_time_.reset();
     publishObservation(
-      false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
+      scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
       "odom->robot_base unavailable at observation time", attempt.num_inliers,
       attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
     return;
@@ -1312,6 +1358,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   sample.map_to_odom = candidate;
   sample.odom_to_base = *odom_to_robot_base;
   sample.scan_time_s = scan_time.seconds();
+  sample.last_counted_scan_time_s = sample.scan_time_s;
 
   // 记录本帧假设，供下一帧候选 motion 一致性软约束使用。
   last_hypothesis_ = sample;
@@ -1321,11 +1368,13 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
     if (!pending_confirmation_) {
       pending_confirmation_ = sample;
       pending_confirmation_count_ = 1;
+      confirmation_started_at_ = std::chrono::steady_clock::now();
     } else {
       const ConfirmationDecision decision =
         evaluateCandidateConfirmation(candidate, scan_time, *odom_to_robot_base);
       if (decision.consistent) {
         ++pending_confirmation_count_;
+        pending_confirmation_->last_counted_scan_time_s = sample.scan_time_s;
       } else {
         RCLCPP_WARN(
           this->get_logger(),
@@ -1343,7 +1392,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
     }
     if (pending_confirmation_count_ < confirmation_count_) {
       publishObservation(
-        false,
+        scan_time, false,
         ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_PENDING_CONFIRMATION,
         "awaiting consistent GICP confirmation", attempt.num_inliers, attempt.registration_error,
         source_points, candidate * *odom_to_robot_base, covariance);
@@ -1359,8 +1408,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   if (auto current_robot_base_to_odom = getCurrentRobotBaseToOdom()) {
     last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
   }
-  pending_confirmation_.reset();
-  pending_confirmation_count_ = 0;
+  clearConfirmation();
   has_accepted_alignment_ = true;
   // 接受后 seed 变了，格网 cursor 必须从新 seed 的中心重新开始。
   multi_guess_cursor_ = 0;
@@ -1376,7 +1424,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   publishObservation(
-    true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
+    scan_time, true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
     "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
     result_t_ * *odom_to_robot_base, covariance);
 }
@@ -1424,7 +1472,8 @@ void SmallGicpRelocalizationNode::publishTransform()
 }
 
 void SmallGicpRelocalizationNode::publishObservation(
-  bool accepted, std::uint8_t status, const std::string & message, std::size_t inliers,
+  const rclcpp::Time & scan_time, bool accepted, std::uint8_t status,
+  const std::string & message, std::size_t inliers,
   double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
   const std::array<double, 36> & covariance)
 {
@@ -1451,7 +1500,7 @@ void SmallGicpRelocalizationNode::publishObservation(
   }
 
   Observation observation;
-  observation.header.stamp = has_received_scan_ ? last_scan_time_ : now();
+  observation.header.stamp = scan_time;
   observation.header.frame_id = map_frame_;
   observation.child_frame_id = robot_base_frame_;
   observation.sequence = ++observation_sequence_;
@@ -1484,9 +1533,7 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
 {
   // Invalidate even when TF lookup below fails: old work cannot answer a new reset.
-  relocalization_generation_.invalidate();
-  cancel_multi_guess_.store(true);
-  clearAccumulation();
+  invalidateRecovery();
   RCLCPP_INFO(
     this->get_logger(), "Received initial pose: [x: %f, y: %f, z: %f]", msg->pose.pose.position.x,
     msg->pose.pose.position.y, msg->pose.pose.position.z);
@@ -1506,11 +1553,6 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
     Eigen::Isometry3d map_to_odom = map_to_robot_base * robot_base_to_odom;
 
     previous_result_t_ = result_t_ = map_to_odom;
-    pending_confirmation_.reset();
-    pending_confirmation_count_ = 0;
-    last_hypothesis_.reset();
-    last_hypothesis_time_.reset();
-    multi_guess_cursor_ = 0;
     initial_pose_override_time_ = this->now();
     need_coarse_alignment_ = true;
     has_accepted_alignment_ = false;
@@ -1538,7 +1580,7 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
     msg->header.frame_id, map_frame_, msg->header.stamp.sec, msg->header.stamp.nanosec,
     received_at.nanoseconds(), last_status_stamp_ns_, msg->epoch, localization_epoch_,
     msg->state == LS::STATE_TRACKING, status_stale_skip_registration_s_, max_scan_future_s_);
-  if (!rejection.empty() || msg->state > LS::STATE_LOST) {
+  if (!rejection.empty() || !isKnownLocalizationState<LS>(msg->state)) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 5000, "Rejecting localization status: %s",
       rejection.empty() ? "unknown state" : rejection.c_str());
@@ -1547,27 +1589,30 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   last_status_stamp_ns_ =
     static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec;
   const std::uint8_t previous = localization_state_;
+  const bool epoch_changed = localization_epoch_ != msg->epoch;
   localization_state_ = msg->state;
   localization_epoch_ = msg->epoch;
   observation_silence_sec_ = msg->observation_silence_sec;
   last_status_receive_time_ = received_at;
 
-  const bool entered_recovery =
-    previous == LS::STATE_TRACKING &&
-    (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED);
-  if (entered_recovery) {
-    relocalization_generation_.invalidate();
-    cancel_multi_guess_.store(true);
-    clearAccumulation();
-    need_coarse_alignment_ = true;
-    pending_confirmation_.reset();
-    pending_confirmation_count_ = 0;
-    multi_guess_cursor_ = 0;
-    RCLCPP_WARN(
-      this->get_logger(),
-      "Localization left TRACKING (state=%u epoch=%s silence=%.2f) - forcing coarse recovery",
-      static_cast<unsigned>(localization_state_), std::to_string(localization_epoch_).c_str(),
-      observation_silence_sec_);
+  // RELOCALIZING continues pending evidence; CONFIRMED ends that episode once.
+  const bool state_changed = previous != localization_state_;
+  const bool recovery_boundary = state_changed &&
+    (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED ||
+     localization_state_ == LS::STATE_UNINITIALIZED || localization_state_ == LS::STATE_BOOTSTRAP ||
+     localization_state_ == LS::STATE_CONFIRMED ||
+     (previous == LS::STATE_RELOCALIZING && localization_state_ == LS::STATE_TRACKING));
+  if (localization_state_ == LS::STATE_RELOCALIZING) {
+    recovery_from_lost_ = previous == LS::STATE_LOST ||
+      (previous == LS::STATE_RELOCALIZING && recovery_from_lost_);
+  } else {
+    recovery_from_lost_ = localization_state_ == LS::STATE_LOST;
+  }
+  if (epoch_changed || recovery_boundary) {
+    invalidateRecovery();
+  }
+  if (localization_state_ == LS::STATE_TRACKING || localization_state_ == LS::STATE_CONFIRMED) {
+    need_coarse_alignment_ = !has_accepted_alignment_;
   }
 }
 
@@ -1595,6 +1640,9 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
     (!last_status_receive_time_ ||
      (status_stale_skip_registration_s_ > 0.0 &&
       (this->now() - *last_status_receive_time_).seconds() > status_stale_skip_registration_s_))) {
+    if (pending_confirmation_) {
+      invalidateRecovery();
+    }
     return false;
   }
 
@@ -1670,8 +1718,11 @@ std::optional<Eigen::Isometry3d> SmallGicpRelocalizationNode::getOdomToRobotBase
   const rclcpp::Time & stamp) const
 {
   try {
+    // Zero-wait only. A positive TF timeout needs the node's executor to arm the
+    // wait timer; async completion and unit tests call this off-spin and would
+    // otherwise block forever when the target frame is missing.
     auto transform = tf_buffer_->lookupTransform(
-      odom_frame_, robot_base_frame_, stamp, rclcpp::Duration::from_seconds(0.1));
+      odom_frame_, robot_base_frame_, stamp, rclcpp::Duration::from_seconds(0.0));
     return tf2::transformToEigen(transform.transform);
   } catch (const tf2::TransformException &) {
     return std::nullopt;

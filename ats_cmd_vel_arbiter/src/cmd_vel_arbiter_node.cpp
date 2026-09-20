@@ -5,10 +5,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 #include "ats_cmd_vel_arbiter/cmd_vel_arbiter.hpp"
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
+#include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -27,6 +29,14 @@ public:
     selected_topic_ = declare_parameter<std::string>("selected_cmd_vel_topic", "/cmd_vel/selected");
     execution_command_topic_ = declare_parameter<std::string>(
       "execution_command_topic", "/planner/execution_command");
+    planner_status_topic_ = declare_parameter<std::string>(
+      "planner_status_topic", "/planner/status");
+    map_ready_topic_ = declare_parameter<std::string>(
+      "map_ready_topic", "/rog_map_adapter/ready");
+    if (map_ready_topic_.empty() || planner_status_topic_.empty()) {
+      throw std::invalid_argument("AUTO requires map_ready_topic and planner_status_topic");
+    }
+    const double map_ready_timeout = declare_parameter<double>("map_ready_timeout", 5.0);
     emergency_stop_topic_ = declare_parameter<std::string>(
       "emergency_stop_topic", "/planner/emergency_stop");
     link_health_topic_ = declare_parameter<std::string>("link_health_topic", "/serial/link_up");
@@ -43,6 +53,8 @@ public:
     config.execution_command_timeout = std::chrono::milliseconds(
       static_cast<int>(execution_command_timeout_s_ * 1000.0));
     config.link_timeout = std::chrono::milliseconds(require_serial_link_ ? link_timeout_ms : 0);
+    config.map_ready_timeout = std::chrono::milliseconds(
+      static_cast<int>(map_ready_timeout * 1000.0));
     arbiter_.setConfig(config);
     if (!require_serial_link_) {
       arbiter_.onSerialLinkUp(std::chrono::steady_clock::now());
@@ -59,6 +71,12 @@ public:
       create_subscription<ats_navigation_interfaces::msg::ExecutionCommand>(
         execution_command_topic_, rclcpp::QoS(1).reliable().transient_local(),
         std::bind(&CmdVelArbiterNode::onExecutionCommand, this, std::placeholders::_1));
+    planner_status_sub_ = create_subscription<ats_navigation_interfaces::msg::PlannerStatus>(
+      planner_status_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&CmdVelArbiterNode::onPlannerStatus, this, std::placeholders::_1));
+    map_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+      map_ready_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&CmdVelArbiterNode::onMapReady, this, std::placeholders::_1));
     emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
       emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local(),
       std::bind(&CmdVelArbiterNode::onEmergencyStop, this, std::placeholders::_1));
@@ -103,11 +121,12 @@ private:
     const auto age = std::chrono::nanoseconds((receipt - stamp).nanoseconds());
     std::lock_guard<std::mutex> lock(mutex_);
     const bool accepted = arbiter_.onExecutionCommand(
-      msg->mode, msg->manager_incarnation, msg->command_sequence, age,
+      msg->mode, msg->manager_incarnation, msg->command_sequence,
+      msg->localization_epoch, msg->map_generation, age,
       std::chrono::steady_clock::now());
     if (!accepted) {
       // Do not wait for the control timer to withdraw a rejected AUTO command.
-      selected_pub_->publish(geometry_msgs::msg::Twist{});
+      publishSelection(std::chrono::steady_clock::now());
     }
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
@@ -119,6 +138,32 @@ private:
       static_cast<long long>(stamp.nanoseconds()),
       static_cast<long long>(receipt.nanoseconds()),
       static_cast<long long>(age.count()), arbiter_.autoAuthorized() ? 1 : 0);
+  }
+
+  void onPlannerStatus(const ats_navigation_interfaces::msg::PlannerStatus::SharedPtr msg)
+  {
+    using Status = ats_navigation_interfaces::msg::PlannerStatus;
+    if (msg->state == Status::STATE_ACCEPTED || msg->header.frame_id.empty() ||
+      msg->header.stamp.sec < 0 || msg->header.stamp.nanosec >= 1000000000U)
+    {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    arbiter_.onPlannerStatus(
+      msg->localization_epoch, msg->map_generation,
+      rclcpp::Time(msg->header.stamp).nanoseconds(),
+      msg->state == Status::STATE_REFERENCE_READY && msg->failure_reason == Status::FAILURE_NONE,
+      msg->state == Status::STATE_FAILED || msg->failure_reason != Status::FAILURE_NONE,
+      msg->failure_reason == Status::FAILURE_MAP_UNREADY);
+    publishSelection(std::chrono::steady_clock::now());
+  }
+
+  void onMapReady(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto receipt = std::chrono::steady_clock::now();
+    arbiter_.onMapReady(msg->data, receipt);
+    publishSelection(receipt);
   }
 
   void onEmergencyStop(const std_msgs::msg::Bool::SharedPtr msg)
@@ -136,7 +181,12 @@ private:
   void onTimer()
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto output = arbiter_.tick(std::chrono::steady_clock::now());
+    publishSelection(std::chrono::steady_clock::now());
+  }
+
+  void publishSelection(std::chrono::steady_clock::time_point now)
+  {
+    const auto output = arbiter_.tick(now);
     geometry_msgs::msg::Twist twist;
     twist.linear.x = output.vx;
     twist.linear.y = output.vy;
@@ -148,6 +198,8 @@ private:
   std::string auto_topic_;
   std::string selected_topic_;
   std::string execution_command_topic_;
+  std::string planner_status_topic_;
+  std::string map_ready_topic_;
   std::string emergency_stop_topic_;
   std::string link_health_topic_;
   bool require_serial_link_{true};
@@ -159,6 +211,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr auto_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::ExecutionCommand>::SharedPtr
     execution_command_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr planner_status_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr link_health_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
