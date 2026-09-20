@@ -29,8 +29,11 @@ public:
     selected_topic_ = declare_parameter<std::string>("selected_cmd_vel_topic", "/cmd_vel/selected");
     execution_command_topic_ = declare_parameter<std::string>(
       "execution_command_topic", "/planner/execution_command");
+    // Must match MINCO/MPC (/minco/planning_status). The old /planner/status
+    // default left DualMap without REFERENCE_READY, so every MODE_EXECUTE was
+    // rejected (recovery232: MPC accepted=1, arbiter accepted=0).
     planner_status_topic_ = declare_parameter<std::string>(
-      "planner_status_topic", "/planner/status");
+      "planner_status_topic", "/minco/planning_status");
     map_ready_topic_ = declare_parameter<std::string>(
       "map_ready_topic", "/rog_map_adapter/ready");
     if (map_ready_topic_.empty() || planner_status_topic_.empty()) {

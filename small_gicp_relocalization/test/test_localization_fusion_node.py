@@ -232,6 +232,27 @@ class TestLocalizationFusionNode(unittest.TestCase):
                 and status.observation_sequence == 101
             )
         )
+        # Incremental GICP confirmation must not demote TRACKING to RELOCALIZING.
+        status_index = len(self.statuses)
+        pending_while_tracking = self.publish_odometry(0.12)
+        self.assertTrue(self.spin_until(lambda: any(
+            msg.header.stamp == pending_while_tracking.header.stamp
+            for msg in self.localizations
+        )))
+        self.publish_observation(
+            pending_while_tracking.header.stamp, 102, 1.12, accepted=False,
+            status=RelocalizationObservation.STATUS_PENDING_CONFIRMATION, quality=0.0,
+        )
+        self.assertTrue(self.wait_for_status(
+            lambda status: status.state == LocalizationStatus.STATE_TRACKING
+            and status.observation_sequence == 101,
+            start_index=status_index,
+        ))
+        self.assertFalse(any(
+            status.state == LocalizationStatus.STATE_RELOCALIZING
+            for status in self.statuses[status_index:]
+        ), "pending confirmation while map-locked must keep TRACKING")
+
         self.assertTrue(
             self.spin_until(
                 lambda: any(

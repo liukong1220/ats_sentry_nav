@@ -213,6 +213,17 @@ public:
   }
 
 private:
+  static bool localizationStateAllowsPlanning(std::uint8_t state)
+  {
+    using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+    // CONFIRMED: post-accept hold with map-frame evidence.
+    // DEGRADED: soft quality loss / consecutive rejects; map-odom still held.
+    // LOST/BOOTSTRAP/RELOCALIZING/UNINITIALIZED remain fail-closed.
+    return state == LS::STATE_TRACKING || state == LS::STATE_CONFIRMED ||
+           state == LS::STATE_DEGRADED;
+  }
+
+
   void onLocalizationStatus(
       const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
           message) {
@@ -230,9 +241,7 @@ private:
     if (!require_localization_status_) {
       return;
     }
-    if (epoch_changed || message->state !=
-                             ats_navigation_interfaces::msg::
-                                 LocalizationStatus::STATE_TRACKING) {
+    if (epoch_changed || !localizationStateAllowsPlanning(message->state)) {
       if (request_pending_) {
         projection_client_->remove_pending_request(active_request_id_);
         request_pending_ = false;
@@ -252,8 +261,7 @@ private:
       return true;
     }
     return has_localization_status_ && last_localization_status_signal_ &&
-           localization_state_ == ats_navigation_interfaces::msg::
-                                      LocalizationStatus::STATE_TRACKING &&
+           localizationStateAllowsPlanning(localization_state_) &&
            std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                          *last_localization_status_signal_)
                    .count() <= localization_status_timeout_sec_;

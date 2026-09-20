@@ -280,6 +280,7 @@ protected:
   std::uint64_t generation() const { return node_->relocalization_generation_.current(); }
   int pendingCount() const { return node_->pending_confirmation_count_; }
   bool accepted() const { return node_->has_accepted_alignment_; }
+  double previousResultX() const { return node_->previous_result_t_.translation().x(); }
   bool latticeAllowed() const { return node_->preferMultiGuess(); }
   std::uint64_t sequence() const { return node_->observation_sequence_; }
   std::uint64_t staleResults() const { return node_->stale_async_result_count_; }
@@ -458,6 +459,68 @@ TEST_F(SmallGicpRelocalizationFrameTest, ConfirmationRetainsFirstGeometryAndEpis
   expectAnchor(1.4, 1.4);
   EXPECT_EQ(episodeStart(), started);  // Geometry restart is not a fresh episode.
 }
+
+TEST_F(SmallGicpRelocalizationFrameTest, ColdLostMismatchRetainsLatticeOrigin)
+{
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_LOST);
+  attempt(1000000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  expectAnchor(1.0, 1.0);
+  observePublications();
+  // Far from the first pending anchor while LOST and never accepted: must not
+  // adopt the mismatch as the new pending seed (that recenters multi_guess).
+  attempt(1200000000LL, 0.50);
+  expectPublication(1200000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ColdBootstrapMismatchRetainsLatticeOrigin)
+{
+  createConfirmationNode(2);
+  // BOOTSTRAP does not open preferMultiGuess(), but a never-accepted node must
+  // still refuse to adopt a mismatch as the pending seed.
+  receiveStatus(1000000000LL, Status::STATE_BOOTSTRAP);
+  attempt(1000000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  expectAnchor(1.0, 1.0);
+  observePublications();
+  attempt(1200000000LL, 0.50);
+  expectPublication(1200000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, PostAcceptLostMismatchRetainsLatticeOrigin)
+{
+  createConfirmationNode(2);
+  // Earn an accepted alignment first (TRACKING-style confirmation adopts).
+  attempt(1000000000LL);
+  attempt(1200000000LL);
+  EXPECT_TRUE(accepted());
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_DOUBLE_EQ(previousResultX(), 0.0);
+
+  // odometry_stale LOST must not let a mismatched multi_guess candidate
+  // rewrite pending and recenter the lattice seed away from last accept.
+  receiveStatus(1400000000LL, Status::STATE_LOST);
+  attempt(1400000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  expectAnchor(1.4, 1.4);
+  observePublications();
+  attempt(1600000000LL, 0.50);
+  expectPublication(1600000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  EXPECT_TRUE(accepted());
+  EXPECT_DOUBLE_EQ(previousResultX(), 0.0);
+}
+
+
+
 
 TEST_F(SmallGicpRelocalizationFrameTest, SteadyTimeoutRejectsConfirmationWithPausedRosClock)
 {

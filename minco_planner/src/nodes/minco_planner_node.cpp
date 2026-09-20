@@ -120,8 +120,11 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   rclcpp::SubscriptionOptions health_options;
   health_options.callback_group = health_callback_group_;
 
+  // Match adapter TRANSIENT_LOCAL publication. VOLATILE missed the first
+  // /rc_esdf/planning_grid under DualMap-era ready races (recovery231:
+  // ready=1 + snapshot log, but MINCO kept MAP_UNREADY / zero plans).
   grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-    grid_topic_, rclcpp::QoS(1).reliable(),
+    grid_topic_, rclcpp::QoS(1).reliable().transient_local(),
     std::bind(&MincoPlannerNode::onGrid, this, std::placeholders::_1), map_options);
   if (!goal_topic_.empty()) {
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(

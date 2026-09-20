@@ -764,6 +764,17 @@ private:
     tryCommitReference();
   }
 
+  static bool localizationStateAllowsPlanning(std::uint8_t state)
+  {
+    // CONFIRMED: post-accept hold. DEGRADED: soft quality loss with map-frame
+    // still held. Excluding DEGRADED races DualMap ready during GICP reject
+    // flaps (recovery230: ready=1 for ~0.3s then 700x not-tracking, 0 commits).
+    return state == LocalizationStatus::STATE_TRACKING ||
+           state == LocalizationStatus::STATE_CONFIRMED ||
+           state == LocalizationStatus::STATE_DEGRADED;
+  }
+
+
   void onLocalizationStatus(const LocalizationStatus::SharedPtr message) {
     // When localization is not required (Gazebo), still bookkeep epoch/state so
     // goal.localization_epoch matches adapter snapshots. Do not run the
@@ -779,13 +790,13 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const bool previously_healthy =
-          localization_status_ == LocalizationStatus::STATE_TRACKING;
+          localizationStateAllowsPlanning(localization_status_);
       const bool epoch_changed =
           localization_epoch_ && *localization_epoch_ != message->epoch;
       last_localization_status_signal_ = std::chrono::steady_clock::now();
       localization_status_ = message->state;
       localization_epoch_ = message->epoch;
-      const bool healthy = message->state == LocalizationStatus::STATE_TRACKING;
+      const bool healthy = localizationStateAllowsPlanning(message->state);
       if (active_goal_ && (!healthy || epoch_changed || !previously_healthy)) {
         candidate_reference_.reset();
         planner_ready_status_.reset();
@@ -1631,7 +1642,7 @@ private:
         std::chrono::steady_clock::now() - *last_localization_status_signal_ <=
         secondsToDuration(localization_status_timeout_sec_);
     return lease_ok &&
-           localization_status_ == LocalizationStatus::STATE_TRACKING &&
+           localizationStateAllowsPlanning(localization_status_) &&
            odom_tf_healthy_;
   }
 
