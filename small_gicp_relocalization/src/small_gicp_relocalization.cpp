@@ -446,7 +446,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     "GICP coarse-fine ready: mode=%s accumulate_frames=%d fine=%s coarse_first_only=%s "
     "fine_max_corr=%.3f min_overlap=%.3f follow_status=%s auto_multi_guess_on_lost=%s "
     "height_filter=%s confirmation=%d(min_interval=%.3fs motion_tol=%.2fm/%.2frad) "
-    "multi_guess_budget=%.2fs/%d ambiguity_margin=%.3f(sep=%.2fm/%.2frad)",
+    "multi_guess_budget=%.2fs/%d ambiguity_margin=%.3f(sep=%.2fm/%.2frad) "
+    "relax_sim=%s",
     registration_mode_.c_str(), accumulate_frames_, fine_alignment_enabled_ ? "true" : "false",
     coarse_first_window_only_ ? "true" : "false", std::sqrt(static_cast<double>(fine_max_dist_sq_)),
     min_overlap_ratio_, follow_localization_status_ ? "true" : "false",
@@ -454,7 +455,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     confirmation_count_, confirmation_min_interval_s_, confirmation_motion_translation_tolerance_,
     confirmation_motion_yaw_tolerance_, multi_guess_time_budget_s_,
     multi_guess_max_candidates_per_scan_, ambiguity_.min_score_margin, ambiguity_.min_separation_xy,
-    ambiguity_.min_separation_yaw);
+    ambiguity_.min_separation_yaw, relax_convergence_for_sim_ ? "true" : "false");
+
   RCLCPP_INFO(
     this->get_logger(),
     "scan input gate: expected_frame='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
@@ -594,12 +596,20 @@ bool SmallGicpRelocalizationNode::inInitialPoseForceWindow() const
                                           initial_pose_force_registration_window_s_;
 }
 
-/// 仿真放宽只在 /initialpose force window 内有效，并且只允许放过 optimizer 的
-/// converged 标志。窗口结束后恢复完整严格门；有限误差、overlap、信息矩阵与
-/// transform finite 永不可绕过。
+/// 仿真放宽只允许放过 optimizer 的 converged 标志；有限误差、overlap、信息矩阵与
+/// transform finite 永不可绕过。适用范围：/initialpose force window，以及首次
+/// accept 之前的冷启动（含 confirmation_recheck）。Gazebo194 在 5s force window
+/// 结束后 confirmation_recheck 因 converged=false 卡住（inliers~800/overlap~0.46），
+/// sim_relax 计数为 0。首次 accept 后恢复严格门。
 bool SmallGicpRelocalizationNode::simRelaxAllowed() const
 {
-  return relax_convergence_for_sim_ && inInitialPoseForceWindow();
+  if (!relax_convergence_for_sim_) {
+    return false;
+  }
+  if (inInitialPoseForceWindow()) {
+    return true;
+  }
+  return !has_accepted_alignment_;
 }
 
 bool SmallGicpRelocalizationNode::preferMultiGuess() const
@@ -622,12 +632,19 @@ bool SmallGicpRelocalizationNode::preferMultiGuess() const
     }
     return need_coarse_alignment_ || !has_accepted_alignment_;
   }
-  // Auto multi_guess ONLY for LOST. DEGRADED keeps seeded coarse+fine.
+  // Auto multi_guess for LOST recovery. Also keep multi_guess through cold
+  // start before the first accept: Gazebo health often passes on DEGRADED=3
+  // ("awaiting first accepted"), and LOST-only auto multi_guess previously
+  // fell through to coarse+fine (gazebo195: 84x not converged, sim_relax=0
+  // on that path still needs relax_convergence_for_sim=true).
   if (!auto_multi_guess_on_lost_ || !follow_localization_status_) {
     return false;
   }
   if (in_initial_pose_force_window) {
     return false;
+  }
+  if (!has_accepted_alignment_) {
+    return true;
   }
   return localization_state_ == LS::STATE_LOST ||
          (localization_state_ == LS::STATE_RELOCALIZING && recovery_from_lost_);
@@ -1440,17 +1457,32 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   // 确认与接受都必须锚定同一扫描时刻的 odom 位姿；拿不到就不能推进确认状态。
-  const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
+  auto odom_to_robot_base = getOdomToRobotBase(scan_time);
   if (!odom_to_robot_base) {
-    clearConfirmation();
-    last_hypothesis_.reset();
-    last_hypothesis_time_.reset();
+    // Exact-stamp zero-wait lookups often miss under Gazebo TF jitter; fall back
+    // to the latest pose rather than wiping an open confirmation episode.
+    if (auto robot_base_to_odom = getCurrentRobotBaseToOdom()) {
+      odom_to_robot_base = robot_base_to_odom->inverse();
+    }
+  }
+
+  if (!odom_to_robot_base) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "GICP observation missing odom->robot_base (pending=%s stage=%s); retaining episode",
+      pending_confirmation_ ? "true" : "false", attempt.stage.c_str());
+    if (!pending_confirmation_) {
+      clearConfirmation();
+      last_hypothesis_.reset();
+      last_hypothesis_time_.reset();
+    }
     publishObservation(
       scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_NO_ODOM,
       "odom->robot_base unavailable at observation time", attempt.num_inliers,
       attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
     return;
   }
+
 
   const Eigen::Isometry3d candidate = attempt.transform;
   ConfirmationSample sample;
@@ -1510,7 +1542,11 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       pending_confirmation_ = sample;
       pending_confirmation_count_ = 1;
       confirmation_started_at_ = std::chrono::steady_clock::now();
-      // Latch at episode open under recovery states even after a prior accept.
+      RCLCPP_INFO(
+        this->get_logger(),
+        "Confirmation pending opened: count=1/%d stage=%s", confirmation_count_,
+        attempt.stage.c_str());
+
       // odometry_stale LOST (recovery180) reopened confirmation with
       // has_accepted_alignment_=true; mismatch then adopted a bad pending and
       // recentered multi_guess (seed yaw ~π). Retain last trusted pose until a
@@ -1577,8 +1613,12 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
   clearConfirmation();
   has_accepted_alignment_ = true;
+  RCLCPP_INFO(
+    this->get_logger(), "GICP alignment accepted: stage=%s inliers=%zu error=%.6f",
+    attempt.stage.c_str(), attempt.num_inliers, attempt.registration_error);
   // 接受后 seed 变了，格网 cursor 必须从新 seed 的中心重新开始。
   multi_guess_cursor_ = 0;
+
   if (coarse_first_window_only_ && fine_alignment_enabled_) {
     using LS = ats_navigation_interfaces::msg::LocalizationStatus;
     if (!follow_localization_status_) {
@@ -1763,21 +1803,34 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   last_status_receive_time_ = received_at;
 
   // RELOCALIZING continues pending evidence; CONFIRMED ends that episode once.
+  // BOOTSTRAP/DEGRADED without a prior accept are the normal cold-start fusion
+  // states while confirmation is still open — invalidating on those flaps
+  // aborted every pending episode in Gazebo193 (gated=1 x66, never accept).
   const bool state_changed = previous != localization_state_;
+  const bool pre_accept_pending = pending_confirmation_ && !has_accepted_alignment_;
   const bool recovery_boundary = state_changed &&
-    (localization_state_ == LS::STATE_LOST || localization_state_ == LS::STATE_DEGRADED ||
-     localization_state_ == LS::STATE_UNINITIALIZED || localization_state_ == LS::STATE_BOOTSTRAP ||
+    ((localization_state_ == LS::STATE_LOST && !pre_accept_pending) ||
+     localization_state_ == LS::STATE_UNINITIALIZED ||
      localization_state_ == LS::STATE_CONFIRMED ||
-     (previous == LS::STATE_RELOCALIZING && localization_state_ == LS::STATE_TRACKING));
+     (localization_state_ == LS::STATE_DEGRADED && has_accepted_alignment_) ||
+     (previous == LS::STATE_RELOCALIZING && localization_state_ == LS::STATE_TRACKING) ||
+     (!pre_accept_pending &&
+      (localization_state_ == LS::STATE_BOOTSTRAP || localization_state_ == LS::STATE_DEGRADED)));
+
   if (localization_state_ == LS::STATE_RELOCALIZING) {
     recovery_from_lost_ = previous == LS::STATE_LOST ||
       (previous == LS::STATE_RELOCALIZING && recovery_from_lost_);
   } else {
     recovery_from_lost_ = localization_state_ == LS::STATE_LOST;
   }
-  if (epoch_changed || recovery_boundary) {
+  // Epoch bumps alone must not abort an open cold-start confirmation episode.
+  // gazebo196: 50x confirmation_recheck gated=1 but 0 accepts / 0 Confirmation
+  // restart — each pending count=1 was wiped by epoch_changed invalidate before
+  // the second consistent sample could land.
+  if ((epoch_changed && !pre_accept_pending) || recovery_boundary) {
     invalidateRecovery();
   }
+
   if (localization_state_ == LS::STATE_TRACKING || localization_state_ == LS::STATE_CONFIRMED) {
     need_coarse_alignment_ = !has_accepted_alignment_;
   }
@@ -1801,16 +1854,17 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
   }
 
   // After a process stall, cached TRACKING can be older than fusion's LOST.
-  // Wait for a fresh /localization/status before registering.
+  // Wait for a fresh /localization/status before opening new lattice work.
+  // Do NOT wipe an open confirmation episode: Gazebo odom floods make status
+  // stamps non-monotonic ("stamp is not increasing"), so last_status_receive
+  // stops advancing and a 1s stale timer previously invalidateRecovery()'d
+  // every pending (gazebo193).
   if (
     follow_localization_status_ &&
     (!last_status_receive_time_ ||
      (status_stale_skip_registration_s_ > 0.0 &&
       (this->now() - *last_status_receive_time_).seconds() > status_stale_skip_registration_s_))) {
-    if (pending_confirmation_) {
-      invalidateRecovery();
-    }
-    return false;
+    return pending_confirmation_ && pending_confirmation_count_ > 0;
   }
 
   if (inInitialPoseForceWindow()) {
@@ -1820,6 +1874,7 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
   if (pending_confirmation_) {
     return true;
   }
+
 
   // Until the first accepted alignment, keep trying (needed for multi_guess / cold start).
   if (!has_accepted_alignment_) {

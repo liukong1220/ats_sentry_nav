@@ -300,6 +300,12 @@ protected:
     node_->cold_start_prior_max_xy_m_ = max_xy_m;
     node_->cold_start_prior_max_yaw_rad_ = max_yaw_rad;
   }
+  void setSimRelax(bool enabled) { node_->relax_convergence_for_sim_ = enabled; }
+  void clearInitialPoseOverride() { node_->initial_pose_override_time_.reset(); }
+  void setAcceptedAlignment(bool accepted) { node_->has_accepted_alignment_ = accepted; }
+  bool inForceWindow() const { return node_->inInitialPoseForceWindow(); }
+  bool simRelax() const { return node_->simRelaxAllowed(); }
+
 
   void expectAnchor(double first, double counted)
   {
@@ -565,6 +571,75 @@ TEST_F(SmallGicpRelocalizationFrameTest, PendingOwnsRegistrationPathAfterLeaving
   EXPECT_FALSE(accepted());
   EXPECT_TRUE(latticeAllowed());
 }
+
+TEST_F(SmallGicpRelocalizationFrameTest, PreAcceptPendingSurvivesBootstrapAndStaleStatus)
+{
+  // gazebo193: fusion BOOTSTRAP/LOST flaps and non-monotonic status stamps
+  // previously invalidateRecovery()'d every pending before confirmation_count.
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_LOST);
+  attempt(1000000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+
+  receiveStatus(1100000000LL, Status::STATE_BOOTSTRAP);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_TRUE(episodeStart());
+
+  receiveStatus(1200000000LL, Status::STATE_LOST);
+  EXPECT_EQ(pendingCount(), 1);
+
+  receiveStatus(1300000000LL, Status::STATE_DEGRADED);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, SimRelaxCoversPreAcceptOutsideForceWindow)
+{
+  // gazebo194: relax_convergence_for_sim was true but sim_relax never fired after
+  // the 5s /initialpose window; confirmation_recheck died on converged=false.
+  createConfirmationNode(2);
+  setSimRelax(true);
+  clearInitialPoseOverride();
+  EXPECT_FALSE(inForceWindow());
+  EXPECT_FALSE(accepted());
+  EXPECT_TRUE(simRelax());
+
+  setAcceptedAlignment(true);
+  EXPECT_FALSE(simRelax());
+
+  setAcceptedAlignment(false);
+  setSimRelax(false);
+  EXPECT_FALSE(simRelax());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ColdStartDegradedPrefersMultiGuess)
+{
+  // gazebo195: health passed on DEGRADED=3 before first accept; LOST-only
+  // auto multi_guess fell through to coarse+fine (84x not converged).
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_DEGRADED);
+  EXPECT_FALSE(accepted());
+  EXPECT_TRUE(latticeAllowed());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, PreAcceptPendingSurvivesEpochChange)
+{
+  // gazebo196: fusion epoch bumps invalidated every pending before count=2.
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_LOST, 1);
+  attempt(1000000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+
+  receiveStatus(1100000000LL, Status::STATE_DEGRADED, 2);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_TRUE(episodeStart());
+  EXPECT_FALSE(accepted());
+}
+
+
+
+
+
 
 
 
