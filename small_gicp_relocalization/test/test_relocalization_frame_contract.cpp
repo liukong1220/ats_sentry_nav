@@ -295,6 +295,12 @@ protected:
   }
   void runRegistrationTimer() { node_->performRegistration(); }
   void removeOdometry() { node_->robot_base_frame_ = "unavailable_robot_body"; }
+  void setColdStartPrior(double max_xy_m, double max_yaw_rad)
+  {
+    node_->cold_start_prior_max_xy_m_ = max_xy_m;
+    node_->cold_start_prior_max_yaw_rad_ = max_yaw_rad;
+  }
+
   void expectAnchor(double first, double counted)
   {
     ASSERT_TRUE(node_->pending_confirmation_);
@@ -518,6 +524,51 @@ TEST_F(SmallGicpRelocalizationFrameTest, PostAcceptLostMismatchRetainsLatticeOri
   EXPECT_TRUE(accepted());
   EXPECT_DOUBLE_EQ(previousResultX(), 0.0);
 }
+
+TEST_F(SmallGicpRelocalizationFrameTest, ColdStartPriorRejectsFarHypothesisBeforePending)
+{
+  // straight189 accepted a yaw~-2.3 local minimum before first STATUS_ACCEPTED,
+  // poisoning the planning grid. Cold-start hypotheses must stay in the
+  // init_pose basin until the first accept.
+  createConfirmationNode(2);
+  setColdStartPrior(1.0, 0.60);
+  observePublications();
+  attempt(1000000000LL, 1.50);
+  expectPublication(1000000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(accepted());
+  EXPECT_FALSE(episodeStart());
+
+  attempt(1200000000LL, 0.20);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, PendingOwnsRegistrationPathAfterLeavingLost)
+{
+  // straight190: pending opened under LOST, fusion moved to RELOCALIZING,
+  // preferMultiGuess went false, fine_only reject wiped pending.
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_LOST);
+  attempt(1000000000LL);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_TRUE(latticeAllowed());
+
+  receiveStatus(1100000000LL, Status::STATE_RELOCALIZING);
+  EXPECT_TRUE(latticeAllowed());
+
+  observePublications();
+  attempt(1200000000LL, 0.0, false);
+  expectPublication(1200000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_TRUE(episodeStart());
+  EXPECT_FALSE(accepted());
+  EXPECT_TRUE(latticeAllowed());
+}
+
+
+
+
 
 
 

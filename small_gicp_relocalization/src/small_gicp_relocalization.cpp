@@ -200,6 +200,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("auto_multi_guess_on_lost", true);
   this->declare_parameter("force_registration_when_lost", true);
   this->declare_parameter("status_stale_skip_registration_s", 1.0);
+  this->declare_parameter("cold_start_prior_max_xy_m", 1.0);
+  this->declare_parameter("cold_start_prior_max_yaw_rad", 0.60);
   this->declare_parameter("height_filter.enable", false);
   this->declare_parameter("height_filter.min_z", -0.5);
   this->declare_parameter("height_filter.max_z", 2.5);
@@ -306,7 +308,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("auto_multi_guess_on_lost", auto_multi_guess_on_lost_);
   this->get_parameter("force_registration_when_lost", force_registration_when_lost_);
   this->get_parameter("status_stale_skip_registration_s", status_stale_skip_registration_s_);
+  this->get_parameter("cold_start_prior_max_xy_m", cold_start_prior_max_xy_m_);
+  this->get_parameter("cold_start_prior_max_yaw_rad", cold_start_prior_max_yaw_rad_);
   status_stale_skip_registration_s_ = std::max(0.0, status_stale_skip_registration_s_);
+  cold_start_prior_max_xy_m_ = std::max(0.0, cold_start_prior_max_xy_m_);
+  cold_start_prior_max_yaw_rad_ = std::max(0.0, cold_start_prior_max_yaw_rad_);
   max_scan_age_s_ = std::max(0.0, max_scan_age_s_);
   max_scan_future_s_ = std::max(0.0, max_scan_future_s_);
   scan_min_range_m_ = std::max(0.0, scan_min_range_m_);
@@ -599,6 +605,12 @@ bool SmallGicpRelocalizationNode::simRelaxAllowed() const
 bool SmallGicpRelocalizationNode::preferMultiGuess() const
 {
   using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+  // Pending confirmation owns the registration path: refine that hypothesis only.
+  // Leaving LOST for RELOCALIZING/BOOTSTRAP must not fall through to fine_only,
+  // which previously cleared pending on reject (straight190 @ t≈5.7s).
+  if (pending_confirmation_ && pending_confirmation_count_ > 0) {
+    return true;
+  }
   // Only suppress lattice search while the /initialpose force window is active.
   // A stale initial_pose_override_time_ must NOT permanently disable LOST recovery.
   const bool in_initial_pose_force_window = inInitialPoseForceWindow();
@@ -826,6 +838,75 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     return outcome;
   }
 
+  // Confirmation must re-hit the SAME pending hypothesis on a new scan.
+  // Expanding the LOST lattice here rediscovers unrelated local minima
+  // (straight186: dyaw~0.7-1.4 Confirmation restart) and prevents accept.
+  if (request.confirmation_recheck) {
+    const auto start = std::chrono::steady_clock::now();
+    GicpRegistration local_register;
+    outcome.lattice.generated = 1;
+    outcome.lattice.min_x = request.seed.translation().x();
+    outcome.lattice.max_x = request.seed.translation().x();
+    outcome.lattice.min_y = request.seed.translation().y();
+    outcome.lattice.max_y = request.seed.translation().y();
+    outcome.lattice.max_radius = 0.0;
+    outcome.lattice.rings = 0;
+    outcome.evaluated = 1;
+    outcome.skipped = 0;
+    outcome.wrapped = false;
+    outcome.next_cursor = request.cursor;
+
+    const float corr =
+      fine_alignment_enabled_ ? fine_max_dist_sq_ : max_dist_sq_;
+    const int iters =
+      fine_alignment_enabled_ ? fine_max_iterations_ : coarse_max_iterations_;
+    RegistrationAttempt attempt = alignOnceOn(
+      request.seed, corr, iters, request.source, request.source_tree, local_register);
+    attempt.stage = "confirmation_recheck";
+    if (fine_alignment_enabled_) {
+      ++outcome.refined;
+    }
+    const bool accepted =
+      passesQualityGates(attempt, request.allow_unconverged, GateStage::kAccept);
+    const CandidateEvidence evidence =
+      attemptEvidence(attempt, request.seed, request.reference, request.current_odom_to_base);
+    attempt.motion_residual = evidence.motion_residual;
+    attempt.prior_deviation = evidence.prior_deviation;
+    const CandidateScore score = scoreCandidate(evidence, score_weights_);
+    attempt.score = accepted ? score.total : std::numeric_limits<double>::infinity();
+    // Fine alignment from the pending seed can still walk into a neighboring
+    // basin (straight187: dxy~0.5 while confirmation_tol=0.15). That must not
+    // count as a confirmation sample — it would clear the lattice pending.
+    if (accepted && std::isfinite(attempt.score)) {
+      const double dxy = (attempt.transform.translation() - request.seed.translation()).head<2>().norm();
+      const double dyaw = yawDistance(attempt.transform, request.seed);
+      if (dxy > confirmation_translation_tolerance_ || dyaw > confirmation_yaw_tolerance_) {
+        attempt.ok = false;
+        attempt.reject_reason = "confirmation_recheck drifted from pending seed";
+        attempt.score = std::numeric_limits<double>::infinity();
+        outcome.best = attempt;
+      } else {
+        ++outcome.gated;
+        outcome.best = attempt;
+        outcome.selection.has_best = true;
+        outcome.selection.best_index = 0;
+        outcome.selection.best_score = attempt.score;
+        outcome.selection.alternative_score = std::numeric_limits<double>::infinity();
+        outcome.selection.score_margin = std::numeric_limits<double>::infinity();
+        outcome.selection.ambiguous = false;
+      }
+    } else {
+      outcome.best = attempt;
+      outcome.best.ok = false;
+      if (outcome.best.reject_reason.empty()) {
+        outcome.best.reject_reason = "confirmation_recheck failed quality gates";
+      }
+    }
+    outcome.elapsed_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return outcome;
+  }
+
   const auto candidates =
     buildLayeredCandidateLattice(request.seed, latticeConfig(), &outcome.lattice);
   const std::size_t total = candidates.size();
@@ -1009,7 +1090,10 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
   outcome.elapsed_s =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-  if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+  // Budget exhaustion may interrupt further screening, but must not discard
+  // candidates that already passed the accept gate on this scan.
+  if (retained.empty() &&
+      multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
     outcome.budget_exhausted = true;
     outcome.best.ok = false;
     outcome.best.reject_reason = "multi_guess budget_exhausted";
@@ -1042,12 +1126,10 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
   writeCandidateDiagnostics(diagnostics);
   outcome.elapsed_s =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  // align() cannot be interrupted. Never admit a result completed past budget,
-  // including an earlier good candidate followed by an over-budget refinement.
+  // align() cannot be interrupted. Mark over-budget, but keep a completed gated
+  // best so confirmation can progress (straight186: gated>=1 + budget_exhausted).
   if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
     outcome.budget_exhausted = true;
-    outcome.best.ok = false;
-    outcome.best.reject_reason = "multi_guess budget_exhausted";
   }
   if (cancel_flag.load()) {
     outcome.best.ok = false;
@@ -1149,9 +1231,8 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
   request.screen_source_tree = screen_source_tree_;
   request.seed = previous_result_t_;
   request.cursor = multi_guess_cursor_;
-  // 有待确认假设时，本帧必须先复核同一假设：确认要求连续扫描上独立命中同一解，
-  // 而 cursor 会把候选带到搜索窗的其它区域，命中只能靠巧合。种子优先的分层顺序
-  // 把该假设放在第 0 位，它仍要独立通过完整验收门与 odometry 运动一致性。
+  // Pending confirmation must refine THAT hypothesis only. Cursor/lattice search
+  // would evaluate unrelated cells and fail confirmation transform matching.
   if (pending_confirmation_ && pending_confirmation_count_ > 0) {
     request.seed = pending_confirmation_->map_to_odom;
     request.cursor = 0;
@@ -1236,6 +1317,17 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
     outcome.selection.ambiguous ? "true" : "false");
 
   if (cancelled) {
+    return;
+  }
+  // Pending confirmation owns the episode: only confirmation_recheck may advance
+  // or reject it. A late lattice worker started before pending was set would
+  // otherwise land ~0.55 m away and clear the hypothesis (straight188).
+  if (pending_confirmation_ && !outcome.confirmation_recheck) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "Dropped non-recheck multi_guess while confirmation pending "
+      "(generated=%zu gated=%zu)",
+      outcome.lattice.generated, outcome.gated);
     return;
   }
   handleRegistrationAttempt(outcome.best, scan_time, source_points);
@@ -1332,8 +1424,14 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       attempt.stage.c_str(), attempt.reject_reason.c_str(), attempt.converged ? "true" : "false",
       attempt.num_inliers, min_inliers_, attempt.registration_error, attempt.overlap_ratio,
       max_registration_error_);
-    clearConfirmation();
-    need_coarse_alignment_ = true;
+    // Any failed attempt while a confirmation episode is open must retain the
+    // pending hypothesis. fine_only/coarse+fine rejects after fusion left LOST
+    // previously called clearConfirmation and aborted a prior-valid pending
+    // (straight190: pending@3.9s then fine_only wipe@5.7s).
+    if (!pending_confirmation_) {
+      clearConfirmation();
+      need_coarse_alignment_ = true;
+    }
     publishObservation(
       scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
       attempt.reject_reason.empty() ? "rejected" : attempt.reject_reason, attempt.num_inliers,
@@ -1365,21 +1463,58 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   last_hypothesis_ = sample;
   last_hypothesis_time_ = scan_time;
 
+  if (!has_accepted_alignment_ &&
+      (cold_start_prior_max_xy_m_ > 0.0 || cold_start_prior_max_yaw_rad_ > 0.0)) {
+    Eigen::Isometry3d prior = Eigen::Isometry3d::Identity();
+    if (!init_pose_.empty() && init_pose_.size() >= 6) {
+      prior.translation() << init_pose_[0], init_pose_[1], init_pose_[2];
+      prior.linear() =
+        (Eigen::AngleAxisd(init_pose_[5], Eigen::Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(init_pose_[4], Eigen::Vector3d::UnitY()) *
+         Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()))
+          .toRotationMatrix();
+    }
+    const double dxy = (candidate.translation() - prior.translation()).head<2>().norm();
+    const double dyaw = yawDistance(candidate, prior);
+    if ((cold_start_prior_max_xy_m_ > 0.0 && dxy > cold_start_prior_max_xy_m_) ||
+        (cold_start_prior_max_yaw_rad_ > 0.0 && dyaw > cold_start_prior_max_yaw_rad_)) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Reject cold-start GICP off init prior: dxy=%.3f dyaw=%.3f limits=%.3f/%.3f stage=%s",
+        dxy, dyaw, cold_start_prior_max_xy_m_, cold_start_prior_max_yaw_rad_,
+        attempt.stage.c_str());
+      if (!(pending_confirmation_ && attempt.stage == "confirmation_recheck")) {
+        clearConfirmation();
+        need_coarse_alignment_ = true;
+      }
+      publishObservation(
+        scan_time, false,
+        ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
+        "cold-start hypothesis outside init_pose prior", attempt.num_inliers,
+        attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
+      return;
+    }
+  }
+
   if (confirmation_count_ > 1) {
     if (!pending_confirmation_) {
+      using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+      // Latch BEFORE installing pending: preferMultiGuess() is true while a
+      // confirmation episode is open (straight190 ownership), so evaluating it
+      // after assignment would force lattice-hold on every cold open and break
+      // UNINITIALIZED adopt semantics (ConfirmationRetainsFirstGeometry...).
+      pending_holds_lattice_origin_ =
+        preferMultiGuess() || localization_state_ == LS::STATE_LOST ||
+        localization_state_ == LS::STATE_RELOCALIZING ||
+        localization_state_ == LS::STATE_BOOTSTRAP;
       pending_confirmation_ = sample;
       pending_confirmation_count_ = 1;
       confirmation_started_at_ = std::chrono::steady_clock::now();
-      using LS = ats_navigation_interfaces::msg::LocalizationStatus;
       // Latch at episode open under recovery states even after a prior accept.
       // odometry_stale LOST (recovery180) reopened confirmation with
       // has_accepted_alignment_=true; mismatch then adopted a bad pending and
       // recentered multi_guess (seed yaw ~π). Retain last trusted pose until a
       // full confirmation succeeds. UNINITIALIZED/TRACKING still adopt.
-      pending_holds_lattice_origin_ =
-        preferMultiGuess() || localization_state_ == LS::STATE_LOST ||
-        localization_state_ == LS::STATE_RELOCALIZING ||
-        localization_state_ == LS::STATE_BOOTSTRAP;
     } else {
       const ConfirmationDecision decision =
         evaluateCandidateConfirmation(candidate, scan_time, *odom_to_robot_base);
@@ -1400,14 +1535,21 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
           // Seeded UNINITIALIZED confirmation still adopts the new sample
           // (ConfirmationRetainsFirstGeometryAndEpisodeDeadline).
           if (pending_holds_lattice_origin_) {
-            clearConfirmation();
+            // confirmation_recheck is a re-hit of the SAME hypothesis: retain
+            // the pending anchor and wait for the next scan (straight187).
+            // Far lattice mismatches still clear so a bad pending cannot stick.
+            if (attempt.stage != "confirmation_recheck") {
+              clearConfirmation();
+              need_coarse_alignment_ = true;
+            }
             publishObservation(
               scan_time, false,
               ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
-              "recovery confirmation mismatch; retaining lattice origin", attempt.num_inliers,
-              attempt.registration_error, source_points, Eigen::Isometry3d::Identity(),
-              covariance);
-            need_coarse_alignment_ = true;
+              attempt.stage == "confirmation_recheck"
+                ? "confirmation_recheck mismatch; retaining pending hypothesis"
+                : "recovery confirmation mismatch; retaining lattice origin",
+              attempt.num_inliers, attempt.registration_error, source_points,
+              Eigen::Isometry3d::Identity(), covariance);
             return;
           }
           pending_confirmation_ = sample;

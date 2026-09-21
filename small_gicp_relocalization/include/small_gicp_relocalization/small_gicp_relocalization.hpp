@@ -256,6 +256,11 @@ private:
   std::uint64_t multi_guess_sweep_{0};
   bool need_coarse_alignment_{true};
   bool has_accepted_alignment_{false};
+  // Before the first accepted alignment, reject map->odom hypotheses that leave
+  // the configured init_pose basin (straight189 accepted yaw~-2.3 and poisoned
+  // the planning grid free-space check at the nominal goal).
+  double cold_start_prior_max_xy_m_{1.0};
+  double cold_start_prior_max_yaw_rad_{0.60};
 
   // 组合评分与歧义拒绝。权重/阈值由候选分布决定，min_score_margin<=0 表示门未启用。
   CandidateScoreWeights score_weights_;
