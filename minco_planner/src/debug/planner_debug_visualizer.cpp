@@ -34,12 +34,12 @@ geometry_msgs::msg::Point makePoint(double x, double y, double z)
 }  // namespace
 
 visualization_msgs::msg::MarkerArray PlannerDebugVisualizer::buildMarkers(
-  const nav_msgs::msg::Path & raw_path,
+  const nav_msgs::msg::Path & frontend_path,
   const ReferenceTrajectory & trajectory,
   const FootprintSafetyResult & safety) const
 {
   visualization_msgs::msg::MarkerArray markers;
-  const auto header = trajectory.header.frame_id.empty() ? raw_path.header : trajectory.header;
+  const auto header = trajectory.header.frame_id.empty() ? frontend_path.header : trajectory.header;
 
   visualization_msgs::msg::Marker clear;
   clear.header = header;
@@ -48,27 +48,27 @@ visualization_msgs::msg::MarkerArray PlannerDebugVisualizer::buildMarkers(
   clear.action = visualization_msgs::msg::Marker::DELETEALL;
   markers.markers.push_back(clear);
 
-  visualization_msgs::msg::Marker raw;
-  raw.header = raw_path.header;
-  raw.ns = "minco_planner_raw";
-  raw.id = 1;
-  raw.type = visualization_msgs::msg::Marker::LINE_STRIP;
-  raw.action = visualization_msgs::msg::Marker::ADD;
-  raw.scale.x = 0.035;
-  raw.color = color(0.1F, 0.55F, 1.0F, 0.9F);
-  for (const auto & pose : raw_path.poses) {
-    raw.points.push_back(pose.pose.position);
+  visualization_msgs::msg::Marker frontend;
+  frontend.header = frontend_path.header;
+  frontend.ns = "minco_planner_frontend";
+  frontend.id = 1;
+  frontend.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  frontend.action = visualization_msgs::msg::Marker::ADD;
+  frontend.scale.x = 0.035;
+  frontend.color = color(0.1F, 1.0F, 0.1F, 0.9F);
+  for (const auto & pose : frontend_path.poses) {
+    frontend.points.push_back(pose.pose.position);
   }
-  markers.markers.push_back(raw);
+  markers.markers.push_back(frontend);
 
   visualization_msgs::msg::Marker reference;
   reference.header = trajectory.header;
-  reference.ns = "minco_planner_reference";
+  reference.ns = "minco_planner_final_reference";
   reference.id = 2;
   reference.type = visualization_msgs::msg::Marker::LINE_STRIP;
   reference.action = visualization_msgs::msg::Marker::ADD;
   reference.scale.x = 0.045;
-  reference.color = color(0.15F, 0.9F, 0.35F, 0.95F);
+  reference.color = color(1.0F, 0.08F, 0.08F, 0.95F);
   for (const auto & point : trajectory.points) {
     reference.points.push_back(makePoint(point.x, point.y, 0.05));
   }
