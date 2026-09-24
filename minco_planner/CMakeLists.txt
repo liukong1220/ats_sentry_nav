@@ -65,6 +65,9 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_minco_trajectory_optimizer ${PROJECT_NAME})
 
+  ament_add_gtest(test_planner_debug_visualizer test/test_planner_debug_visualizer.cpp)
+  target_link_libraries(test_planner_debug_visualizer ${PROJECT_NAME})
+
   ament_add_gtest(test_yaw_spline_planner test/test_yaw_spline_planner.cpp)
   target_link_libraries(test_yaw_spline_planner ${PROJECT_NAME})
 

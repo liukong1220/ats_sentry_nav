@@ -1154,6 +1154,7 @@ void MincoPlannerNode::planGoal(
       }
     }
   }
+  bool esdf_fallback_used = false;
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
     // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
     MincoOptimizationTrace fallback_trace;
@@ -1170,6 +1171,7 @@ void MincoPlannerNode::planGoal(
           get_logger(),
           "RC-ESDF outer candidate had %zu footprint collisions; using the safe JPS-MINCO baseline.",
           safety.collisions.size());
+        esdf_fallback_used = true;
         reference = std::move(fallback_reference);
         safety = fallback_safety;
         selected_trace = std::move(fallback_trace);
@@ -1202,6 +1204,7 @@ void MincoPlannerNode::planGoal(
       repair_stats.strict_clearance_m, repair_stats.fallback_clearance_m,
       repair_stats.effective_search_radius_m);
   }
+  bool local_repair_used = false;
   if (repair_changed) {
     // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
     MincoOptimizationTrace repair_trace;
@@ -1218,6 +1221,7 @@ void MincoPlannerNode::planGoal(
         "trajectory and falling back to the existing footprint rejection path.");
       reference = std::move(pre_repair_reference);
     } else {
+      local_repair_used = true;
       reference = std::move(repaired);
       reference.header.stamp = now();
       planYaw(reference, *map_snapshot, start_yaw, goal_yaw);
@@ -1316,9 +1320,6 @@ void MincoPlannerNode::planGoal(
   }
   if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
     esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
-  }
-  if (marker_pub_) {
-    marker_pub_->publish(visualizer_.buildMarkers(search_result.path, reference, safety));
   }
   if (!reference.valid()) {
     RCLCPP_ERROR(get_logger(), "Rejecting an invalid MINCO reference trajectory.");
@@ -1467,6 +1468,12 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
+  if (marker_pub_) {
+    // Marker publication follows the immutable-snapshot commit, so the red
+    // curve is exactly the safety-validated reference handed to MPC.
+    marker_pub_->publish(visualizer_.buildMarkers(
+      selected_trace.preprocessed_guide, reference, safety));
+  }
 
   std::ostringstream durations;
   durations.setf(std::ios::fixed);
@@ -1481,8 +1488,9 @@ void MincoPlannerNode::planGoal(
     get_logger(),
     "planned generation=%llu snapshot_publication=%llu raw_points=%zu preprocessed_points=%zu "
     "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
+    "footprint_collisions=%zu swept_collisions=%zu "
     "collision_indices=%s occupancy_digest=%s content_digest=%s grid_topic=%s validation_frame=%s "
-    "escape_prefix_end=%zu "
+    "fallback=%d local_repair=%d optimization_failure_reason=%s escape_prefix_end=%zu "
     "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
     "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
     "curvature_tv=%.3f curvature_sign_changes=%zu local_scaled=%d uniform_scaled=%d "
@@ -1491,9 +1499,12 @@ void MincoPlannerNode::planGoal(
     static_cast<unsigned long long>(map_publication_sequence), search_result.path.poses.size(),
     selected_trace.preprocessed_guide.poses.size(), selected_trace.esdf_refined_guide.poses.size(),
     reference.points.size(), reference.totalLength(), reference.totalTime(), safety.collisions.size(),
-    telemetry.gate_collision_indices.c_str(), telemetry.occupancy_digest.c_str(),
-    telemetry.content_digest.c_str(), telemetry.grid_topic.c_str(),
+    quality.footprint_collision_count, quality.swept_collision_count,
+    telemetry.gate_collision_indices.c_str(),
+    telemetry.occupancy_digest.c_str(), telemetry.content_digest.c_str(), telemetry.grid_topic.c_str(),
     telemetry.validation_frame.c_str(),
+    esdf_fallback_used ? 1 : 0, local_repair_used ? 1 : 0,
+    selected_trace.failure_reason.empty() ? "none" : selected_trace.failure_reason.c_str(),
     escape_decision.prefix_end,
     search_result.expanded_nodes, static_cast<unsigned int>(yaw_authority),
     quality.minimum_center_clearance, quality.minimum_footprint_clearance, quality.length_ratio,

@@ -15,7 +15,7 @@ class PlannerDebugVisualizer
 {
 public:
   visualization_msgs::msg::MarkerArray buildMarkers(
-    const nav_msgs::msg::Path & raw_path,
+    const nav_msgs::msg::Path & frontend_path,
     const ReferenceTrajectory & trajectory,
     const FootprintSafetyResult & safety) const;
 };
