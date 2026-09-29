@@ -64,6 +64,19 @@ struct MincoTrajectoryOptimizerParams
   double guide_smoothing_fidelity = 0.02;
   double guide_smoothing_max_deviation = 0.50;
   double guide_smoothing_min_clearance = 0.42;
+  // 稀疏 MINCO 航点。加密引导点全部作为硬插值约束时，S3 只能逐点穿过 0.30 m 折线，
+  // 最终参考就是"直线 + 小圆角"。开启后在 ESDF 修正后的加密引导上按约 guide_sparse_spacing
+  // 弧长取少量航点，解出 MINCO 后逐段检查：采样点 ESDF 中心净空不低于最近引导点
+  // min(原净空, guide_smoothing_min_clearance) - clearance_tolerance、偏离该段引导不超过
+  // guide_sparse_max_deviation、矩形足迹（参考 yaw 或切向）不碰撞；违例段二分插入引导点。
+  // 迭代耗尽仍违例则退回加密引导（历史行为）。最终安全仍由节点矩形足迹门禁裁定。
+  // 0 = 关闭（历史行为）。
+  double guide_sparse_spacing = 0.0;
+  double guide_sparse_max_deviation = 0.30;
+  double guide_sparse_clearance_tolerance = 0.02;
+  int guide_sparse_max_iterations = 16;
+  // 稀疏段曲率上限 [1/m]，超过则该段二分插点；0 = 不限。
+  double guide_sparse_max_curvature = 0.0;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
   double esdf_obstacle_trust_region = 0.10;
