@@ -445,4 +445,73 @@ TEST(MincoTrajectoryOptimizer, GuideDensifyBoundsLCornerCut)
   EXPECT_LE(dense_dev, sparse_dev + 1e-6);
 }
 
+// 按弧长重采样后的最大 Menger 曲率；时间采样在起停处点距趋零，会放大数值噪声。
+double maxArcCurvature(const minco_planner::ReferenceTrajectory & trajectory, double spacing)
+{
+  std::vector<Eigen::Vector2d> points;
+  for (const auto & point : trajectory.points) {
+    const Eigen::Vector2d current(point.x, point.y);
+    if (points.empty() || (current - points.back()).norm() >= spacing) {
+      points.push_back(current);
+    }
+  }
+  double maximum = 0.0;
+  for (std::size_t index = 1; index + 1U < points.size(); ++index) {
+    const Eigen::Vector2d first = points[index] - points[index - 1U];
+    const Eigen::Vector2d second = points[index + 1U] - points[index];
+    const double denominator =
+      first.norm() * second.norm() * (points[index + 1U] - points[index - 1U]).norm();
+    if (denominator > 1e-9) {
+      maximum = std::max(
+        maximum, std::abs(2.0 * (first.x() * second.y() - first.y() * second.x()) / denominator));
+    }
+  }
+  return maximum;
+}
+
+TEST(MincoTrajectoryOptimizer, GuideSmoothingRoundsDenseLCornerAndKeepsEndpoints)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = "map";
+  grid.info.resolution = 0.05;
+  grid.info.width = 120;
+  grid.info.height = 120;
+  grid.info.origin.position.x = -2.0;
+  grid.info.origin.position.y = -2.0;
+  grid.data.assign(static_cast<std::size_t>(grid.info.width * grid.info.height), 0);
+  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
+  esdf.configureRollingWindow(false, 0.0, 0.0);
+  esdf.updateGrid(grid, 50, true);
+
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.reference_speed = 1.5;
+  params.sample_spacing = 0.05;
+  params.max_velocity = 2.0;
+  params.max_acceleration = 2.5;
+  params.max_jerk = 12.0;
+  params.esdf_obstacle_optimization_enabled = false;
+  params.geometry_preprocessor.footprint_aware_shortcut_enabled = false;
+  params.geometry_preprocessor.fillet_radius = 0.0;
+  params.guide_control_point_spacing = 0.30;
+  minco_planner::MincoTrajectoryOptimizer polyline(params);
+  const auto polyline_trajectory = polyline.optimize(makeLPath(), &esdf);
+  params.guide_smoothing_iterations = 80;
+  minco_planner::MincoTrajectoryOptimizer smoothed(params);
+  const auto smoothed_trajectory = smoothed.optimize(makeLPath(), &esdf);
+
+  ASSERT_FALSE(polyline_trajectory.empty());
+  ASSERT_FALSE(smoothed_trajectory.empty());
+  const auto & first = makeLPath().poses.front().pose.position;
+  const auto & last = makeLPath().poses.back().pose.position;
+  EXPECT_NEAR(smoothed_trajectory.points.front().x, first.x, 1e-8);
+  EXPECT_NEAR(smoothed_trajectory.points.front().y, first.y, 1e-8);
+  EXPECT_NEAR(smoothed_trajectory.points.back().x, last.x, 1e-8);
+  EXPECT_NEAR(smoothed_trajectory.points.back().y, last.y, 1e-8);
+  const double polyline_curvature = maxArcCurvature(polyline_trajectory, 0.05);
+  const double smoothed_curvature = maxArcCurvature(smoothed_trajectory, 0.05);
+  EXPECT_LT(smoothed_curvature, 0.5 * polyline_curvature);
+  // 偏离受 max_deviation 约束，不会把拐角抄近路抄穿。
+  EXPECT_LT(maxPolylineDeviation(smoothed_trajectory), params.guide_smoothing_max_deviation + 0.10);
+}
+
 }  // namespace

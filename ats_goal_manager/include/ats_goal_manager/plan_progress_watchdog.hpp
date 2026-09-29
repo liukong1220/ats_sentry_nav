@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
+#include <vector>
 
 namespace ats_goal_manager
 {
@@ -334,6 +337,44 @@ private:
   std::optional<Clock::time_point> ego_blocked_since_;
   bool ego_escape_active_{false};
 };
+
+// 沿已提交参考的剩余弧长，作为进度看门狗的"距离"。直线距离在绕行路线上会先变大
+// （RMUC 红点目标要先向南、向西绕墙，远离目标十余米），把正常跟随误判成停滞。
+// 投影只在 [hint_index, hint_index + 前向窗口弧长] 内单调推进，避免回环路线上跳到
+// 更靠后的一段而虚报进度；hint_index 由调用方跨周期保存，换参考时归零。
+// xs/ys 长度不一致或少于两点时返回 NaN（上游按"无可执行计划"处理）。
+inline double remainingReferenceArcLength(
+  const std::vector<double> & xs, const std::vector<double> & ys,
+  double x, double y, std::size_t & hint_index, double forward_window_m = 3.0)
+{
+  const std::size_t count = xs.size();
+  if (count < 2 || ys.size() != count || !std::isfinite(x) || !std::isfinite(y)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  hint_index = std::min(hint_index, count - 1);
+  std::size_t best = hint_index;
+  double best_d2 = std::numeric_limits<double>::infinity();
+  double window = 0.0;
+  for (std::size_t i = hint_index; i < count; ++i) {
+    if (i > hint_index) {
+      window += std::hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
+      if (window > forward_window_m) {
+        break;
+      }
+    }
+    const double d2 = (xs[i] - x) * (xs[i] - x) + (ys[i] - y) * (ys[i] - y);
+    if (d2 < best_d2) {
+      best_d2 = d2;
+      best = i;
+    }
+  }
+  hint_index = best;
+  double remaining = std::sqrt(best_d2);
+  for (std::size_t i = best + 1; i < count; ++i) {
+    remaining += std::hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
+  }
+  return remaining;
+}
 
 }  // namespace ats_goal_manager
 

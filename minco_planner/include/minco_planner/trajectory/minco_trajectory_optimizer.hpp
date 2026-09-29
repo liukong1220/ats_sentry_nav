@@ -52,6 +52,18 @@ struct MincoTrajectoryOptimizerParams
   // Zero keeps the historical sparse-waypoint MINCO interpolation. Deployed
   // profiles densify the guide so S3 pieces cannot cut an L-corner into a wall.
   double guide_control_point_spacing = 0.0;
+  // 加密后的引导点先做受净空约束的弹性带平滑，再交给 ESDF 修正与 MINCO。
+  // 加密点是 MINCO 的硬插值约束，不平滑就会把 JPS/倒角折线原样保留成折角。
+  // 每轮 x += alpha*(邻点中点 - x) + fidelity*(原引导 - x)：前者拉直，后者把偏离
+  // 以连续方式拉回（平衡时拐角被抹成半径约 spacing*sqrt(alpha/(2*fidelity)) 的弧，
+  // 不会像硬截断那样在截断处再造一个折角）。0 次迭代 = 历史行为。另有两道硬约束：
+  // 偏离原引导不超过 max_deviation；ESDF 中心净空不低于 min(原净空, min_clearance)，
+  // 即不会把任何点推得比原引导更靠近障碍。首尾点固定，最终安全仍由矩形足迹门禁裁定。
+  int guide_smoothing_iterations = 0;
+  double guide_smoothing_alpha = 0.5;
+  double guide_smoothing_fidelity = 0.02;
+  double guide_smoothing_max_deviation = 0.50;
+  double guide_smoothing_min_clearance = 0.42;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
   double esdf_obstacle_trust_region = 0.10;

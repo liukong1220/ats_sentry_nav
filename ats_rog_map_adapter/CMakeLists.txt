@@ -14,6 +14,7 @@ find_package(ats_navigation_interfaces REQUIRED)
 find_package(ats_rog_map_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -27,7 +28,7 @@ target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 ament_target_dependencies(${PROJECT_NAME}_core
-  ats_rog_map_interfaces geometry_msgs nav_msgs tf2 tf2_geometry_msgs ats_rc_esdf
+  ats_rog_map_interfaces geometry_msgs nav_msgs sensor_msgs tf2 tf2_geometry_msgs ats_rc_esdf
 )
 
 add_executable(ats_rog_map_adapter_node src/ats_rog_map_adapter_node.cpp)

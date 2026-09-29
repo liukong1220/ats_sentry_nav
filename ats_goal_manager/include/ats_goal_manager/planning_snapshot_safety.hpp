@@ -171,6 +171,28 @@ inline PlanningSnapshotSafetyResult checkPlanningSnapshotFootprint(
   return result;
 }
 
+// 擦边接触判定，与 minco_planner escapePrefixContactShallow 同一口径：足迹每边内缩
+// max_contact_depth_m 后完全无冲突，即车体压进占据格的深度不超过该值。规划器只在这一
+// 条件下提交逃逸轨迹，watchdog 若仍按原足迹急停，就会把唯一能驱动执行器的轨迹掐掉，
+// 车永远停在原位（RMUC 多目标第 2 轮 (4.847,-0.800) 每 2 s 提交一次逃逸、每次被急停）。
+// 深度上界 <= 0 时恒为 false，保持原 fail-closed 行为。
+inline bool planningSnapshotContactShallow(
+  const ats_navigation_interfaces::msg::PlanningMapSnapshot & snapshot,
+  const geometry_msgs::msg::Pose & pose,
+  const PlanningSnapshotSafetyParams & params, double max_contact_depth_m)
+{
+  if (!(max_contact_depth_m > 0.0) || !std::isfinite(max_contact_depth_m)) {
+    return false;
+  }
+  PlanningSnapshotSafetyParams shrunk = params;
+  shrunk.footprint_length -= 2.0 * max_contact_depth_m;
+  shrunk.footprint_width -= 2.0 * max_contact_depth_m;
+  if (shrunk.footprint_length <= 0.0 || shrunk.footprint_width <= 0.0) {
+    return false;
+  }
+  return checkPlanningSnapshotFootprint(snapshot, pose, shrunk).footprint_safe;
+}
+
 }  // namespace ats_goal_manager
 
 #endif  // ATS_GOAL_MANAGER__PLANNING_SNAPSHOT_SAFETY_HPP_

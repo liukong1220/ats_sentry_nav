@@ -222,6 +222,27 @@ TEST(PlannerStatusState, RejectsObsoleteEpochGenerationAndRequest)
   EXPECT_TRUE(state.update(ready));
 }
 
+TEST(PlannerStatusState, NewGoalRestartsPlanRequestSequence)
+{
+  minco_planner::PlannerStatusState state;
+  auto ready = makeReadyStatus();
+  ASSERT_TRUE(state.update(ready));
+  ASSERT_TRUE(state.invalidate(6, ready.FAILURE_SNAPSHOT_CHANGED, ready.header.stamp));
+  // GoalManager restarts plan_request_sequence at 1 for each new goal.
+  auto next_goal = ready;
+  ++next_goal.goal_id;
+  next_goal.plan_request_sequence = 1;
+  next_goal.map_generation = 7;
+  ASSERT_TRUE(state.update(next_goal));
+  EXPECT_EQ(state.latest->goal_id, next_goal.goal_id);
+  EXPECT_EQ(state.latest->state, ready.STATE_REFERENCE_READY);
+  // Map generation stays globally monotonic across goals.
+  auto stale_map = next_goal;
+  ++stale_map.goal_id;
+  stale_map.map_generation = 6;
+  EXPECT_FALSE(state.update(stale_map));
+}
+
 TEST(PlannerStatusState, SerializesEqualAndBackwardClockStamps)
 {
   minco_planner::PlannerStatusState state;

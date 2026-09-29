@@ -302,6 +302,10 @@ private:
         0.0, declare_parameter<double>("terminal_angular_velocity_tolerance", 0.10));
     terminal_dwell_sec_ = std::max(
         0.0, declare_parameter<double>("terminal_dwell_sec", 0.30));
+    // 可选：进度看门狗用"沿已提交参考的剩余弧长"代替到目标的直线距离。
+    // 默认 false 保持原判据；RMUC 仿真 profile 打开（绕行路线直线距离先增后减）。
+    progress_along_reference_ =
+      declare_parameter<bool>("progress_along_reference", false);
     PlanProgressWatchdogParams progress_params;
     progress_params.progress_min_delta_m = std::max(
       0.0, declare_parameter<double>("progress_min_delta_m", 0.10));
@@ -330,6 +334,11 @@ private:
       0.0, declare_parameter<double>("footprint_width", 0.55));
     planning_snapshot_safety_params_.footprint_safety_margin = std::max(
       0.0, declare_parameter<double>("footprint_safety_margin", 0.05));
+    // 与 minco_planner escape_from_contact_max_contact_depth 同一口径。0 保持
+    // fail-closed；> 0 时车体压进占据格不超过该深度的擦边接触不再急停，交给
+    // 规划器的有界逃逸与 stall/replan 预算处理。
+    ego_contact_max_depth_m_ = std::max(
+      0.0, declare_parameter<double>("ego_contact_max_depth", 0.0));
   }
 
   rclcpp_action::GoalResponse
@@ -907,6 +916,41 @@ private:
     odom_tf_healthy_ = true;
   }
 
+  // 调用方持有 mutex_。未启用、无活动 command 或坐标系不一致时退回直线距离。
+  // 参考轨迹在 planning_frame(odom)下,current_pose_ 在 goal_frame(map)下;只比
+  // current_pose_ 会恒判不一致而退回直线距离(domain 87 红点目标绕行时直线距离
+  // 增大,转弯途中被误判停滞急停)。按参考的坐标系挑同系位姿。
+  double progressDistanceLocked(double straight_distance) {
+    if (!progress_along_reference_ || !active_execution_command_ || !has_current_pose_) {
+      return straight_distance;
+    }
+    const std::string & reference_frame = active_execution_command_->reference.header.frame_id;
+    const geometry_msgs::msg::PoseStamped * pose = nullptr;
+    if (has_current_planning_pose_ &&
+      current_planning_pose_.header.frame_id == reference_frame)
+    {
+      pose = &current_planning_pose_;
+    } else if (current_pose_.header.frame_id == reference_frame) {
+      pose = &current_pose_;
+    }
+    if (pose == nullptr) {
+      return straight_distance;
+    }
+    const auto & poses = active_execution_command_->reference.poses;
+    std::vector<double> xs;
+    std::vector<double> ys;
+    xs.reserve(poses.size());
+    ys.reserve(poses.size());
+    for (const auto & pose : poses) {
+      xs.push_back(pose.pose.position.x);
+      ys.push_back(pose.pose.position.y);
+    }
+    const double along = remainingReferenceArcLength(
+      xs, ys, pose->pose.position.x, pose->pose.position.y,
+      progress_reference_hint_);
+    return std::isfinite(along) ? along : straight_distance;
+  }
+
   void tryCommitReference() {
     std::optional<std::uint64_t> stale_candidate_goal;
     std::uint64_t candidate_publication_sequence = 0;
@@ -1029,11 +1073,13 @@ private:
     if (planning_snapshot_) {
       progress_identity.source_generation = planning_snapshot_->source_generation;
     }
+    progress_reference_hint_ = 0;
     if (has_current_pose_) {
       progress_watchdog_.observeReference(
         progress_identity,
-        std::hypot(active_goal_->target.pose.position.x - current_pose_.pose.position.x,
-                   active_goal_->target.pose.position.y - current_pose_.pose.position.y));
+        progressDistanceLocked(
+          std::hypot(active_goal_->target.pose.position.x - current_pose_.pose.position.x,
+                     active_goal_->target.pose.position.y - current_pose_.pose.position.y)));
     }
     RCLCPP_INFO(
       get_logger(),
@@ -1264,8 +1310,20 @@ private:
             gate.robot_inside_map = snapshot_safety.inside_map;
             gate.robot_cell_free = snapshot_safety.robot_cell_free;
             gate.footprint_safe = snapshot_safety.footprint_safe;
+            if (!gate.footprint_safe && snapshot_safety.robot_cell_free && snapshot_pose &&
+              planningSnapshotContactShallow(
+                *planning_snapshot_, *snapshot_pose, planning_snapshot_safety_params_,
+                ego_contact_max_depth_m_))
+            {
+              gate.footprint_safe = true;
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Progress watchdog shallow contact: depth<=%.3f m pose=(%.3f, %.3f)",
+                ego_contact_max_depth_m_, snapshot_pose->position.x,
+                snapshot_pose->position.y);
+            }
             gate.has_current_reference = active_execution_command_.has_value();
-            gate.distance_to_goal_m = distance;
+            gate.distance_to_goal_m = progressDistanceLocked(distance);
             gate.identity.goal_id = active_goal_->id;
             gate.identity.localization_epoch = active_goal_->localization_epoch;
             gate.identity.map_generation = active_execution_command_ ?
@@ -1897,6 +1955,8 @@ private:
   double execution_command_stamp_backdate_sec_{0.02};
   double goal_position_tolerance_{0.08};
   double progress_hold_distance_m_{0.08};
+  bool progress_along_reference_{false};
+  std::size_t progress_reference_hint_{0};
   double goal_yaw_tolerance_{0.15};
   double terminal_linear_velocity_tolerance_{0.05};
   double terminal_angular_velocity_tolerance_{0.10};
@@ -1955,6 +2015,7 @@ private:
   bool odom_tf_healthy_{false};
   PlanProgressWatchdog progress_watchdog_;
   PlanningSnapshotSafetyParams planning_snapshot_safety_params_;
+  double ego_contact_max_depth_m_{0.0};
 
   rclcpp::Publisher<PlannerGoal>::SharedPtr planner_goal_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_;

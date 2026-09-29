@@ -18,12 +18,17 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
   this->declare_parameter<std::string>("odom_frame", "odom");
   this->declare_parameter<std::string>("base_frame", "");
   this->declare_parameter<std::string>("lidar_frame", "");
+  // Height of base_frame above the ground plane. The odom origin is anchored at
+  // the ground point below base_frame, so odom z=0 is the floor rather than the
+  // gimbal / lidar mount height consumed by ROGMap projection and the planners.
+  this->declare_parameter<double>("base_frame_height", 0.0);
 
   this->get_parameter("state_estimation_topic", state_estimation_topic_);
   this->get_parameter("registered_scan_topic", registered_scan_topic_);
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("base_frame", base_frame_);
   this->get_parameter("lidar_frame", lidar_frame_);
+  this->get_parameter("base_frame_height", base_frame_height_);
 
   base_frame_to_lidar_initialized_ = false;
 
@@ -71,7 +76,9 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
         base_frame_, lidar_frame_, msg->header.stamp, rclcpp::Duration::from_seconds(0.5));
       tf2::Transform tf_base_frame_to_lidar;
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
-      tf_odom_to_lidar_odom_ = tf_base_frame_to_lidar;
+      const tf2::Transform tf_odom_to_base_frame(
+        tf2::Quaternion::getIdentity(), tf2::Vector3(0.0, 0.0, base_frame_height_));
+      tf_odom_to_lidar_odom_ = tf_odom_to_base_frame * tf_base_frame_to_lidar;
       base_frame_to_lidar_initialized_ = true;
     } catch (tf2::TransformException & ex) {
       RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());

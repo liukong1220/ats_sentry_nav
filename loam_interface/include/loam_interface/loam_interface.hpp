@@ -52,6 +52,7 @@ private:
   std::string registered_scan_topic_;
   std::string odom_frame_;
   std::string lidar_frame_;
+  double base_frame_height_{0.0};
   std::string base_frame_;
 
   bool base_frame_to_lidar_initialized_;

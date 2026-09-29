@@ -206,6 +206,9 @@ void MincoPlannerNode::declareAndLoadParams()
     "emergency_stop_heartbeat_period_sec", emergency_stop_heartbeat_period_sec_);
   declare_parameter<double>("runtime_safety_recheck_hz", runtime_safety_recheck_hz_);
   declare_parameter<double>("runtime_safety_horizon_sec", runtime_safety_horizon_sec_);
+  declare_parameter<bool>(
+    "retain_safe_reference_on_snapshot_change", retain_safe_reference_on_snapshot_change_);
+  declare_parameter<double>("retain_reference_horizon_sec", retain_reference_horizon_sec_);
   declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   declare_parameter<bool>("force_body_yaw_follow", force_body_yaw_follow_);
   declare_parameter<std::string>("global_frame", global_frame_);
@@ -225,6 +228,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<int>(
     "escape_from_contact_max_prefix_points",
     static_cast<int>(escape_prefix_params_.max_prefix_points));
+  declare_parameter<double>(
+    "escape_from_contact_max_contact_depth", escape_prefix_params_.max_contact_depth_m);
   declare_parameter<bool>(
     "goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
   declare_parameter<double>(
@@ -285,6 +290,15 @@ void MincoPlannerNode::declareAndLoadParams()
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
   declare_parameter<double>(
     "guide_control_point_spacing", optimizer_params.guide_control_point_spacing);
+  declare_parameter<int>(
+    "guide_smoothing_iterations", optimizer_params.guide_smoothing_iterations);
+  declare_parameter<double>("guide_smoothing_alpha", optimizer_params.guide_smoothing_alpha);
+  declare_parameter<double>(
+    "guide_smoothing_fidelity", optimizer_params.guide_smoothing_fidelity);
+  declare_parameter<double>(
+    "guide_smoothing_max_deviation", optimizer_params.guide_smoothing_max_deviation);
+  declare_parameter<double>(
+    "guide_smoothing_min_clearance", optimizer_params.guide_smoothing_min_clearance);
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
@@ -369,6 +383,9 @@ void MincoPlannerNode::declareAndLoadParams()
   runtime_safety_recheck_hz_ = std::max(0.1, runtime_safety_recheck_hz_);
   get_parameter("runtime_safety_horizon_sec", runtime_safety_horizon_sec_);
   runtime_safety_horizon_sec_ = std::max(0.0, runtime_safety_horizon_sec_);
+  get_parameter(
+    "retain_safe_reference_on_snapshot_change", retain_safe_reference_on_snapshot_change_);
+  get_parameter("retain_reference_horizon_sec", retain_reference_horizon_sec_);
   get_parameter("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   body_yaw_follow_clearance_ = std::max(0.0, body_yaw_follow_clearance_);
   get_parameter("force_body_yaw_follow", force_body_yaw_follow_);
@@ -391,6 +408,8 @@ void MincoPlannerNode::declareAndLoadParams()
     escape_prefix_params_.max_prefix_points =
       static_cast<std::size_t>(std::max(0, escape_max_prefix_points));
   }
+  get_parameter(
+    "escape_from_contact_max_contact_depth", escape_prefix_params_.max_contact_depth_m);
   get_parameter("goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
   get_parameter(
     "goal_admission_position_tolerance", goal_pose_admission_params_.position_tolerance_m);
@@ -443,6 +462,13 @@ void MincoPlannerNode::declareAndLoadParams()
     "esdf_obstacle_control_point_spacing", optimizer_params.esdf_obstacle_control_point_spacing);
   get_parameter(
     "guide_control_point_spacing", optimizer_params.guide_control_point_spacing);
+  get_parameter("guide_smoothing_iterations", optimizer_params.guide_smoothing_iterations);
+  get_parameter("guide_smoothing_alpha", optimizer_params.guide_smoothing_alpha);
+  get_parameter("guide_smoothing_fidelity", optimizer_params.guide_smoothing_fidelity);
+  get_parameter(
+    "guide_smoothing_max_deviation", optimizer_params.guide_smoothing_max_deviation);
+  get_parameter(
+    "guide_smoothing_min_clearance", optimizer_params.guide_smoothing_min_clearance);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
   get_parameter("esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);
@@ -715,6 +741,24 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     RCLCPP_ERROR(get_logger(), "Rejected an invalid planning grid.");
     return;
   }
+  // 可选：安全语义变化的新 snapshot 若仍让已提交参考的完整剩余段通过同一套矩形足迹
+  // 门禁（含提交门同源的擦边逃逸规则），就把参考改绑到新 generation 继续执行，而不是
+  // 每次地图刷新都作废参考、急停、等 GoalManager 重派。判定在锁外对不可变 snapshot
+  // 完成，锁内再核对参考身份未变；任何不一致都回到原先的作废路径（fail-closed）。
+  std::optional<ActiveSafetyReference> retain_candidate;
+  if (retain_safe_reference_on_snapshot_change_) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (active_safety_reference_ && latest_map_snapshot_ && safety_state_.plan_safe &&
+      !snapshot->hasSameSafetyContent(*latest_map_snapshot_))
+    {
+      retain_candidate = active_safety_reference_;
+    }
+  }
+  const bool retain_verdict = retain_candidate &&
+    retain_candidate->trajectory.header.frame_id == snapshot->grid.header.frame_id &&
+    remainingReferenceSafeOn(retain_candidate->trajectory, snapshot->grid);
+  bool retained_reference = false;
+  std::uint64_t retained_reference_goal = 0;
   bool retained_identical_snapshot = false;
   std::uint64_t retained_generation = 0;
   std::string retained_digest;
@@ -734,10 +778,25 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       retained_generation = latest_map_snapshot_->generation;
       retained_digest = latest_map_snapshot_->safety_content_digest;
     } else {
-      active_safety_reference_.reset();
+      retained_reference = retain_verdict && replaces_existing_snapshot &&
+        active_safety_reference_ && safety_state_.plan_safe &&
+        safety_state_.mapSnapshotUsable(snapshot->generation) &&
+        active_safety_reference_->goal_id == retain_candidate->goal_id &&
+        active_safety_reference_->localization_epoch == retain_candidate->localization_epoch &&
+        active_safety_reference_->plan_request_sequence ==
+          retain_candidate->plan_request_sequence &&
+        active_safety_reference_->map_generation == retain_candidate->map_generation &&
+        active_safety_reference_->trajectory.header.stamp ==
+          retain_candidate->trajectory.header.stamp;
+      if (retained_reference) {
+        active_safety_reference_->map_generation = snapshot->generation;
+        retained_reference_goal = active_safety_reference_->goal_id;
+      } else {
+        active_safety_reference_.reset();
+      }
       next_map_generation_ = snapshot->generation;
       latest_map_snapshot_ = snapshot;
-      if (replaces_existing_snapshot) {
+      if (replaces_existing_snapshot && !retained_reference) {
         // A safety-semantic change creates a new immutable map identity.  The
         // old reference cannot execute even though the source heartbeat stays
         // healthy; a fresh plan must bind this exact local generation.
@@ -751,6 +810,24 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       }
       publishEmergencyStop(safety_state_.emergencyStopRequired());
     }
+  }
+  if (retain_candidate && !retained_reference && !retained_identical_snapshot) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Could not retain committed reference goal=%llu across snapshot change "
+      "(verdict=%d horizon=%.2f s); invalidating for replan on generation=%llu.",
+      static_cast<unsigned long long>(retain_candidate->goal_id),
+      static_cast<int>(retain_verdict), retain_reference_horizon_sec_,
+      static_cast<unsigned long long>(snapshot->generation));
+  }
+  if (retained_reference) {
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Retained committed reference goal=%llu across snapshot change: remaining trajectory "
+      "passes the footprint gate on generation=%llu.",
+      static_cast<unsigned long long>(retained_reference_goal),
+      static_cast<unsigned long long>(snapshot->generation));
+    return;
   }
   if (retained_identical_snapshot) {
     RCLCPP_INFO_THROTTLE(
@@ -796,6 +873,33 @@ void MincoPlannerNode::onMapReadyWatchdog()
   }
 }
 
+bool MincoPlannerNode::remainingReferenceSafeOn(
+  const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid)
+{
+  if (trajectory.points.size() < 2) {
+    return false;
+  }
+  const rclcpp::Time reference_stamp(trajectory.header.stamp);
+  const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
+  // 保留窗口必须覆盖运行期复检窗口,否则改绑后下一拍复检就可能作废。
+  const double horizon_end = retain_reference_horizon_sec_ > 0.0 ?
+    elapsed + std::max(retain_reference_horizon_sec_, runtime_safety_horizon_sec_) :
+    std::numeric_limits<double>::infinity();
+  const ReferenceTrajectory remaining = remainingReferenceWindow(
+    trajectory, elapsed, horizon_end);
+  if (remaining.points.size() < 2) {
+    return false;
+  }
+  const FootprintSafetyResult safety = safety_checker_.check(remaining, grid);
+  if (safety.safe) {
+    return true;
+  }
+  const EscapePrefixDecision escape =
+    evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
+  return escapePrefixContactShallow(
+    remaining, escape, footprint_params_, grid, escape_prefix_params_);
+}
+
 void MincoPlannerNode::onRuntimeSafetyRecheck()
 {
   std::optional<ActiveSafetyReference> active_reference;
@@ -819,27 +923,12 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   const rclcpp::Time reference_stamp(active_reference->trajectory.header.stamp);
   const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
   const double horizon_end = elapsed + runtime_safety_horizon_sec_;
-  std::size_t first_index = active_reference->trajectory.points.size();
-  for (std::size_t i = 0; i < active_reference->trajectory.points.size(); ++i) {
-    if (active_reference->trajectory.points[i].t >= elapsed) {
-      first_index = i == 0 ? 0 : i - 1;
-      break;
-    }
-  }
-  if (first_index >= active_reference->trajectory.points.size() - 1) {
+  const ReferenceTrajectory remaining =
+    remainingReferenceWindow(active_reference->trajectory, elapsed, horizon_end);
+  if (remaining.points.size() < 2) {
     return;
   }
 
-  ReferenceTrajectory remaining;
-  remaining.header = active_reference->trajectory.header;
-  for (std::size_t i = first_index; i < active_reference->trajectory.points.size(); ++i) {
-    remaining.points.push_back(active_reference->trajectory.points[i]);
-    if (active_reference->trajectory.points[i].t >= horizon_end &&
-      remaining.points.size() >= 2)
-    {
-      break;
-    }
-  }
   const FootprintSafetyResult safety = safety_checker_.check(remaining, snapshot->grid);
   if (safety.safe) {
     return;
@@ -850,7 +939,9 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   // 才放行；车一旦沿轨迹驶离，head_offset 增大，这个放行自然停止生效。
   const EscapePrefixDecision runtime_escape =
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
-  if (runtime_escape.allowed) {
+  if (escapePrefixContactShallow(
+      remaining, runtime_escape, footprint_params_, snapshot->grid, escape_prefix_params_))
+  {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "Keeping an escape-from-contact reference under the runtime swept gate: collisions=%zu "
@@ -1327,9 +1418,71 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
-  const EscapePrefixDecision escape_decision = safety.safe ?
+  EscapePrefixDecision escape_decision = safety.safe ?
     EscapePrefixDecision{} :
     evaluateEscapePrefix(reference.points, safety.collisions, escape_prefix_params_);
+  if (escape_decision.allowed &&
+    !escapePrefixContactShallow(
+      reference, escape_decision, footprint_params_, planning_grid, escape_prefix_params_))
+  {
+    // 前缀压进占据格超过深度上界：不是擦边接触，照旧 fail-closed。
+    escape_decision.prefix_end = 0U;
+    escape_decision.allowed = false;
+  }
+  // 贴障起步时 yaw 规划在起点就转向，角点扫进障碍，逃逸前缀的深度/扫掠两道上界都拒绝它。
+  // 换成"先保持起点 yaw 平移驶离再追回原 yaw"的候选，重新过同一套门禁与逃逸判据；
+  // 几何路径和终端 yaw 不变。只在逃逸开关打开且冲突紧贴起点时尝试。
+  if (!safety.safe && !escape_decision.allowed && escape_prefix_params_.enabled &&
+    !safety.collisions.empty() &&
+    std::min_element(
+      safety.collisions.begin(), safety.collisions.end(),
+      [](const CollisionSample & a, const CollisionSample & b) {
+        return a.trajectory_index < b.trajectory_index;
+      })->trajectory_index == 0U)
+  {
+    std::ostringstream tried;
+    for (const double hold_length : {0.20, escape_prefix_params_.max_prefix_length_m}) {
+      ReferenceTrajectory candidate;
+      if (!holdStartYawForEscape(
+          reference, hold_length, terminal_yaw_relocation_params_.yaw_rate_limit, &candidate))
+      {
+        tried << hold_length << ":build_failed;";
+        continue;
+      }
+      annotateClearance(candidate, *map_snapshot);
+      const FootprintSafetyResult candidate_safety =
+        safety_checker_.check(candidate, planning_grid);
+      EscapePrefixDecision candidate_escape = candidate_safety.safe ?
+        EscapePrefixDecision{} :
+        evaluateEscapePrefix(candidate.points, candidate_safety.collisions, escape_prefix_params_);
+      if (candidate_escape.allowed &&
+        !escapePrefixContactShallow(
+          candidate, candidate_escape, footprint_params_, planning_grid, escape_prefix_params_))
+      {
+        candidate_escape.prefix_end = 0U;
+        candidate_escape.allowed = false;
+      }
+      if (!candidate_safety.safe && !candidate_escape.allowed) {
+        tried << hold_length << ":collisions=" << candidate_safety.collisions.size() <<
+          ",prefix_end=" << candidate_escape.candidate_prefix_end <<
+          ",yaw_sweep=" << candidate_escape.prefix_yaw_sweep_rad << ';';
+        continue;
+      }
+      RCLCPP_WARN(
+        get_logger(),
+        "Escape yaw hold accepted: hold_length=%.2f m safe=%d collisions=%zu prefix_end=%zu.",
+        hold_length, candidate_safety.safe ? 1 : 0, candidate_safety.collisions.size(),
+        candidate_escape.prefix_end);
+      reference = std::move(candidate);
+      safety = candidate_safety;
+      escape_decision = candidate_escape;
+      break;
+    }
+    if (!safety.safe && !escape_decision.allowed) {
+      RCLCPP_WARN(
+        get_logger(), "Escape yaw hold exhausted: %s", tried.str().c_str());
+    }
+  }
   if (!safety.safe && !publish_unsafe_trajectory_ && escape_decision.allowed) {
     // 车此刻就压在冲突区里，冲突集证明这条轨迹在有界前缀内驶出障碍并且不再驶回。
     // 继续拒绝只会让唯一能挪走车的执行器拿不到轨迹，参见 escape_prefix.hpp 的说明。
@@ -1583,7 +1736,9 @@ bool MincoPlannerNode::lookupStartPose(
     start.header = transform.header;
     start.pose.position.x = transform.transform.translation.x;
     start.pose.position.y = transform.transform.translation.y;
-    start.pose.position.z = transform.transform.translation.z;
+    // The planning grid is a 2D ground plane: the robot_frame height (gimbal /
+    // lidar mount) must not lift the JPS/MINCO start above the grid.
+    start.pose.position.z = grid.info.origin.position.z;
     start.pose.orientation = transform.transform.rotation;
     return true;
   } catch (const tf2::TransformException & ex) {
@@ -1616,12 +1771,16 @@ bool MincoPlannerNode::transformGoalToGrid(
   if (input.header.frame_id.empty() || input.header.frame_id == target_frame) {
     output = input;
     output.header.frame_id = target_frame;
+    output.pose.position.z = grid.info.origin.position.z;
     return true;
   }
   try {
     const auto transform = tf_buffer_->lookupTransform(
       target_frame, input.header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
     tf2::doTransform(input, output, transform);
+    // Start/goal poses arrive at the localization frame height; project them
+    // onto the 2D planning grid plane so every path vertex stays on the ground.
+    output.pose.position.z = grid.info.origin.position.z;
     return true;
   } catch (const tf2::TransformException & exception) {
     RCLCPP_WARN(

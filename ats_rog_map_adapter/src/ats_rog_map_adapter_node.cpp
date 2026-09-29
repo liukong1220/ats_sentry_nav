@@ -23,6 +23,8 @@
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/u_int64.hpp"
 #include "tf2_ros/buffer.h"
@@ -80,6 +82,8 @@ public:
       "signed_distance_grid_topic", "/rc_esdf/signed_distance_grid");
     footprint_clearance_grid_topic_ = declare_parameter<std::string>(
       "footprint_clearance_grid_topic", "/rc_esdf/footprint_clearance_grid");
+    // 仅用于 RViz 的彩色 ESDF 点云（障碍/足迹禁入带/净空梯度/地形风险）；空字符串关闭。
+    esdf_cloud_topic_ = declare_parameter<std::string>("esdf_cloud_topic", "");
     ready_topic_ = declare_parameter<std::string>("ready_topic", "/rog_map_adapter/ready");
     generation_topic_ = declare_parameter<std::string>(
       "generation_topic", "/rog_map_adapter/generation");
@@ -189,6 +193,10 @@ public:
       signed_distance_grid_topic_, output_qos);
     footprint_clearance_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
       footprint_clearance_grid_topic_, output_qos);
+    if (!esdf_cloud_topic_.empty()) {
+      esdf_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        esdf_cloud_topic_, rclcpp::QoS(1).reliable().transient_local());
+    }
     ready_pub_ = create_publisher<std_msgs::msg::Bool>(ready_topic_, output_qos);
     generation_pub_ = create_publisher<std_msgs::msg::UInt64>(generation_topic_, output_qos);
     map_status_pub_ =
@@ -663,6 +671,10 @@ private:
       0.5 * footprint_width_ + footprint_safety_margin_);
     footprint_clearance_grid_pub_->publish(
       encodeDistanceGrid(fusion.planning_grid, signed_distance, footprint_radius));
+    if (esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U) {
+      esdf_cloud_pub_->publish(
+        encodeEsdfCloud(fusion.planning_grid, signed_distance, footprint_radius));
+    }
     std_msgs::msg::UInt64 generation;
     generation.data = response.generation;
     generation_pub_->publish(generation);
@@ -752,6 +764,70 @@ private:
     return encoded;
   }
 
+  // 每个已知格一个点，RGB 编码：硬障碍品红；足迹外接半径内（中心不可达带）橙粉；
+  // 其外 0.25 m 过渡为浅黄；再往外按距离从青绿渐变到近白。0..99 的地形风险按
+  // 风险值向淡紫混色，让坡面/台阶在自由区也可见。未知格不画。
+  sensor_msgs::msg::PointCloud2 encodeEsdfCloud(
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & distance_field,
+    double footprint_radius) const
+  {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header = grid.header;
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
+    const std::size_t size = std::min(grid.data.size(), distance_field.size());
+    std::size_t known = 0;
+    for (std::size_t index = 0; index < size; ++index) {
+      known += grid.data[index] >= 0 ? 1U : 0U;
+    }
+    modifier.resize(known);
+    sensor_msgs::PointCloud2Iterator<float> it_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> it_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> it_z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_r(cloud, "r");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_g(cloud, "g");
+    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_b(cloud, "b");
+    const auto & info = grid.info;
+    const auto lerp = [](double a, double b, double t) {return a + (b - a) * t;};
+    for (std::size_t index = 0; index < size; ++index) {
+      const int value = grid.data[index];
+      if (value < 0) {
+        continue;
+      }
+      const double column = static_cast<double>(index % info.width) + 0.5;
+      const double row = static_cast<double>(index / info.width) + 0.5;
+      *it_x = static_cast<float>(info.origin.position.x + column * info.resolution);
+      *it_y = static_cast<float>(info.origin.position.y + row * info.resolution);
+      *it_z = static_cast<float>(info.origin.position.z - 0.02);
+      double r = 0.0;
+      double g = 0.0;
+      double b = 0.0;
+      const double distance = std::isfinite(distance_field[index]) ? distance_field[index] : 0.0;
+      if (value >= fusion_params_.terrain_obstacle_value_threshold || distance <= 0.0) {
+        r = 225.0; g = 0.0; b = 120.0;
+      } else if (distance < footprint_radius) {
+        r = 245.0; g = 150.0; b = 125.0;
+      } else if (distance < footprint_radius + 0.25) {
+        const double t = (distance - footprint_radius) / 0.25;
+        r = lerp(250.0, 170.0, t); g = lerp(215.0, 240.0, t); b = lerp(140.0, 190.0, t);
+      } else {
+        const double t = std::clamp(
+          (distance - footprint_radius - 0.25) / std::max(0.1, signed_distance_max_m_), 0.0, 1.0);
+        r = lerp(150.0, 235.0, t); g = lerp(235.0, 250.0, t); b = lerp(200.0, 245.0, t);
+      }
+      if (value > 0 && value < fusion_params_.terrain_obstacle_value_threshold) {
+        const double risk = std::clamp(static_cast<double>(value) / 99.0, 0.0, 1.0);
+        const double w = 0.25 + 0.6 * risk;
+        r = lerp(r, 205.0, w); g = lerp(g, 150.0, w); b = lerp(b, 230.0, w);
+      }
+      *it_r = static_cast<std::uint8_t>(std::lround(r));
+      *it_g = static_cast<std::uint8_t>(std::lround(g));
+      *it_b = static_cast<std::uint8_t>(std::lround(b));
+      ++it_x; ++it_y; ++it_z; ++it_r; ++it_g; ++it_b;
+    }
+    return cloud;
+  }
+
   void publishBlockedGrid(const nav_msgs::msg::OccupancyGrid & source)
   {
     if (source.info.width == 0 || source.info.height == 0 || source.data.empty()) {
@@ -815,6 +891,7 @@ private:
   std::string planning_grid_owner_;
   std::string signed_distance_grid_topic_;
   std::string footprint_clearance_grid_topic_;
+  std::string esdf_cloud_topic_;
   std::string ready_topic_;
   std::string generation_topic_;
   std::string map_status_topic_;
@@ -872,6 +949,7 @@ private:
       SharedPtr localization_status_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr signed_distance_grid_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_cloud_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr footprint_clearance_grid_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
