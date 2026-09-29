@@ -11,6 +11,7 @@
 #include <Eigen/Core>
 
 #include "minco_planner/safety/footprint_samples.hpp"
+#include "minco_planner/trajectory/minco_joint_optimizer.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
@@ -300,211 +301,6 @@ std::vector<Point> smoothGuideWithEsdf(
   return waypoints;
 }
 
-double distanceToGuideSpan(
-  const Point & point, const std::vector<Point> & guide, std::size_t first, std::size_t last)
-{
-  double best = std::numeric_limits<double>::infinity();
-  for (std::size_t index = first; index < last; ++index) {
-    const Point segment = guide[index + 1U] - guide[index];
-    const double length_squared = segment.squaredNorm();
-    const double fraction = length_squared > 1e-12 ?
-      std::clamp((point - guide[index]).dot(segment) / length_squared, 0.0, 1.0) : 0.0;
-    best = std::min(best, (point - (guide[index] + fraction * segment)).norm());
-  }
-  if (first == last) {
-    best = (point - guide[first]).norm();
-  }
-  return best;
-}
-
-/**
- * @brief 在加密平滑引导上挑稀疏 MINCO 航点，违例段二分插点直到净空/偏离全部满足。
- * @return 稀疏航点；迭代耗尽仍违例返回空（调用方退回加密引导）。
- * @note 每段的净空要求取该段引导点 min(自身 ESDF 净空, guide_smoothing_min_clearance)
- *       的最小值再减容差，即 MINCO 曲线不会比它替代的那段引导更贴障碍。
- */
-std::vector<Point> sparsifyGuideWithMinco(
-  const std::vector<Point> & guide,
-  const MincoTrajectoryOptimizerParams & params,
-  const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
-  const Eigen::Matrix<double, 2, 3> & head_state,
-  const ReferenceTrajectory * footprint_orientation,
-  const nav_msgs::msg::OccupancyGrid * planning_grid,
-  const FootprintSafetyChecker * safety_checker)
-{
-  const double spacing = params.guide_sparse_spacing;
-  const bool use_esdf = esdf && esdf->available();
-  const bool footprint_available =
-    planning_grid && safety_checker && !planning_grid->data.empty();
-  // 无 ESDF 的 JPS-MINCO 兜底候选保持历史加密引导，不抽稀。
-  if (spacing <= 1e-6 || guide.size() < 3U || !use_esdf) {
-    return {};
-  }
-  const double clearance_floor = std::max(0.0, params.guide_smoothing_min_clearance);
-  // 允许为负：窄处要求稀疏曲线比引导更远离障碍，做不到就二分到相邻引导点（即退化为加密引导）。
-  const double tolerance = params.guide_sparse_clearance_tolerance;
-  const double maximum_deviation = std::max(0.02, params.guide_sparse_max_deviation);
-  const double maximum_curvature = std::max(0.0, params.guide_sparse_max_curvature);
-  std::vector<double> required(guide.size(), 0.0);
-  std::vector<double> arc(guide.size(), 0.0);
-  for (std::size_t index = 0; index < guide.size(); ++index) {
-    const double clearance = esdf->getDistance(guide[index].x(), guide[index].y());
-    required[index] = std::isfinite(clearance) ? std::min(clearance, clearance_floor) : 0.0;
-    if (index > 0U) {
-      arc[index] = arc[index - 1U] + (guide[index] - guide[index - 1U]).norm();
-    }
-  }
-  std::vector<std::size_t> selected{0U};
-  for (std::size_t index = 1; index + 1U < guide.size(); ++index) {
-    if (arc[index] - arc[selected.back()] >= spacing &&
-      arc.back() - arc[index] >= 0.5 * spacing)
-    {
-      selected.push_back(index);
-    }
-  }
-  selected.push_back(guide.size() - 1U);
-
-  Eigen::Matrix<double, 2, 3> head = head_state;
-  const Point first_direction = guide[1] - guide[0];
-  if (first_direction.norm() > 1e-6) {
-    const Point direction = first_direction.normalized();
-    const double along = head.col(1).dot(direction);
-    if (along < 0.0) {
-      head.col(1) -= direction * along;
-    }
-  }
-  const MincoTimeAllocator time_allocator = makeTimeAllocator(params);
-  for (int iteration = 0; iteration < std::max(1, params.guide_sparse_max_iterations);
-    ++iteration)
-  {
-    std::vector<Point> waypoints;
-    waypoints.reserve(selected.size());
-    for (const std::size_t index : selected) {
-      waypoints.push_back(guide[index]);
-    }
-    const MincoTimeAllocation allocation = time_allocator.allocate(waypoints, head.col(1).norm());
-    MincoS3 minco;
-    if (!allocation.valid || !solveMinco(waypoints, allocation.durations, minco, head)) {
-      return {};
-    }
-    // 足迹门禁：用参考 yaw（有则插值，否则切向）检查每段矩形足迹，碰撞段同样二分。
-    std::vector<bool> piece_blocked(static_cast<std::size_t>(minco.pieceCount()), false);
-    const bool footprint_check = footprint_available;
-    if (footprint_check) {
-      double total_duration = 0.0;
-      for (int piece = 0; piece < minco.pieceCount(); ++piece) {
-        total_duration += minco.pieceDuration(piece);
-      }
-      ReferenceTrajectory candidate;
-      candidate.header = planning_grid->header;
-      std::vector<std::size_t> sample_piece;
-      double elapsed = 0.0;
-      for (int piece = 0; piece < minco.pieceCount(); ++piece) {
-        const double duration = minco.pieceDuration(piece);
-        const std::size_t span_first = selected[static_cast<std::size_t>(piece)];
-        const std::size_t span_last = selected[static_cast<std::size_t>(piece) + 1U];
-        const int steps = std::max(
-          4, static_cast<int>(std::ceil((arc[span_last] - arc[span_first]) / 0.05)) + 2);
-        for (int step = (piece == 0 ? 0 : 1); step <= steps; ++step) {
-          const double local = duration * step / steps;
-          const MincoSample sample = minco.sample(piece, local);
-          ReferencePoint point;
-          point.x = sample.position.x();
-          point.y = sample.position.y();
-          point.t = elapsed + local;
-          if (footprint_orientation && !footprint_orientation->empty()) {
-            point.yaw = interpolateReferenceYaw(
-              *footprint_orientation, total_duration > 1e-9 ? point.t / total_duration : 0.0);
-          } else {
-            point.yaw = sample.velocity.norm() > 1e-6 ?
-              std::atan2(sample.velocity.y(), sample.velocity.x()) :
-              (candidate.points.empty() ? 0.0 : candidate.points.back().yaw);
-          }
-          candidate.points.push_back(point);
-          sample_piece.push_back(static_cast<std::size_t>(piece));
-        }
-        elapsed += duration;
-      }
-      const FootprintSafetyResult footprint = safety_checker->check(candidate, *planning_grid);
-      for (const CollisionSample & collision : footprint.collisions) {
-        const std::size_t index = std::min(collision.trajectory_index, sample_piece.size() - 1U);
-        piece_blocked[sample_piece[index]] = true;
-      }
-    }
-    std::vector<std::size_t> refined{selected.front()};
-    bool violated = false;
-    for (int piece = 0; piece < minco.pieceCount(); ++piece) {
-      const std::size_t first = selected[static_cast<std::size_t>(piece)];
-      const std::size_t last = selected[static_cast<std::size_t>(piece) + 1U];
-      const double duration = minco.pieceDuration(piece);
-      const int steps = std::max(
-        4, static_cast<int>(std::ceil((arc[last] - arc[first]) / 0.05)));
-      bool piece_ok = !piece_blocked[static_cast<std::size_t>(piece)];
-      for (int step = 1; step < steps && piece_ok; ++step) {
-        const MincoSample piece_sample = minco.sample(piece, duration * step / steps);
-        const Point position = piece_sample.position;
-        const double speed = piece_sample.velocity.norm();
-        if (maximum_curvature > 0.0 && speed > 0.1 &&
-          std::abs(piece_sample.velocity.x() * piece_sample.acceleration.y() -
-          piece_sample.velocity.y() * piece_sample.acceleration.x()) /
-          (speed * speed * speed) > maximum_curvature)
-        {
-          piece_ok = false;
-          break;
-        }
-        // 逐点对比最近引导点的净空：稀疏曲线不得比它替代的引导更贴障碍。
-        std::size_t nearest = first;
-        double nearest_distance = std::numeric_limits<double>::infinity();
-        for (std::size_t index = first; index <= last; ++index) {
-          const double distance = (guide[index] - position).squaredNorm();
-          if (distance < nearest_distance) {
-            nearest_distance = distance;
-            nearest = index;
-          }
-        }
-        const double clearance = esdf->getDistance(position.x(), position.y());
-        piece_ok = std::isfinite(clearance) && clearance >= required[nearest] - tolerance &&
-          distanceToGuideSpan(position, guide, first, last) <= maximum_deviation;
-      }
-      if (!piece_ok && last - first > 1U) {
-        refined.push_back((first + last) / 2U);
-        violated = true;
-      }
-      // 相邻引导点之间已无可插点：该段与加密引导等价，交给最终足迹门禁裁决。
-      refined.push_back(last);
-    }
-    // 相邻段弧长比不超过 2：窄处插入的密点两侧若接 1 m 长段，S3 会在密点处甩出钩子。
-    for (bool graded = false; !graded; ) {
-      graded = true;
-      std::vector<std::size_t> smoothed{refined.front()};
-      for (std::size_t piece = 0; piece + 1U < refined.size(); ++piece) {
-        const std::size_t first = refined[piece];
-        const std::size_t last = refined[piece + 1U];
-        const double length = arc[last] - arc[first];
-        double neighbor = std::numeric_limits<double>::infinity();
-        if (piece > 0U) {
-          neighbor = std::min(neighbor, arc[first] - arc[refined[piece - 1U]]);
-        }
-        if (piece + 2U < refined.size()) {
-          neighbor = std::min(neighbor, arc[refined[piece + 2U]] - arc[last]);
-        }
-        if (length > 2.0 * neighbor + 1e-6 && last - first > 1U) {
-          smoothed.push_back((first + last) / 2U);
-          graded = false;
-          violated = true;
-        }
-        smoothed.push_back(last);
-      }
-      refined.swap(smoothed);
-    }
-    if (!violated) {
-      return waypoints;
-    }
-    selected.swap(refined);
-  }
-  return {};
-}
-
 std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
@@ -753,6 +549,40 @@ void findDynamicExtrema(
   }
 }
 
+MincoJointOptimizerParams makeJointParams(const MincoTrajectoryOptimizerParams & params)
+{
+  MincoJointOptimizerParams joint;
+  joint.waypoint_spacing = params.joint_waypoint_spacing;
+  joint.samples_per_piece = params.joint_samples_per_piece;
+  joint.min_piece_time = params.min_segment_time;
+  joint.max_piece_time = params.joint_max_piece_time;
+  joint.energy_weight = params.joint_energy_weight;
+  joint.time_weight = params.joint_time_weight;
+  joint.obstacle_weight = params.joint_obstacle_weight;
+  joint.velocity_weight = params.joint_velocity_weight;
+  joint.acceleration_weight = params.joint_acceleration_weight;
+  joint.lateral_weight = params.joint_lateral_weight;
+  joint.guide_weight = params.joint_guide_weight;
+  joint.max_guide_deviation = params.joint_guide_max_deviation;
+  // 软速度上限不高于巡航速度：联合优化只塑形，不借时间项把车速推过 reference_speed。
+  // 硬上限仍由后续时间缩放按 max_velocity 等裁定。
+  joint.max_velocity = params.max_velocity > 0.0 ?
+    std::min(params.max_velocity, std::max(0.05, params.reference_speed)) :
+    std::max(0.05, params.reference_speed);
+  joint.max_acceleration = params.max_acceleration;
+  joint.max_lateral_acceleration = params.max_lateral_acceleration;
+  joint.center_clearance = params.joint_center_clearance;
+  joint.footprint_clearance = params.joint_footprint_clearance;
+  joint.footprint_length = params.footprint_length;
+  joint.footprint_width = params.footprint_width;
+  joint.footprint_safety_margin = params.footprint_safety_margin;
+  joint.footprint_edge_samples = params.joint_footprint_edge_samples;
+  joint.solver.g_epsilon = params.joint_g_epsilon;
+  joint.solver.max_iterations = params.joint_max_iterations;
+  joint.solver.time_budget_ms = params.joint_time_budget_ms;
+  return joint;
+}
+
 }  // namespace
 
 MincoTrajectoryOptimizer::MincoTrajectoryOptimizer(MincoTrajectoryOptimizerParams params)
@@ -850,13 +680,6 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   if (guide_spacing > 1e-6) {
     waypoints = densifyWaypoints(waypoints, guide_spacing);
   }
-  // 在已做 ESDF/足迹修正的加密引导上抽稀：直段放开让 MINCO 走连续大弧，
-  // 只在窄处保留引导点；失败返回空，沿用加密引导（历史行为）。
-  std::vector<Point> sparse_waypoints = sparsifyGuideWithMinco(
-    waypoints, params_, esdf, head_state, footprint_orientation, planning_grid, safety_checker);
-  if (!sparse_waypoints.empty()) {
-    waypoints = std::move(sparse_waypoints);
-  }
   if (waypoints.size() >= 2U) {
     Point direction = waypoints[1] - waypoints.front();
     const double length = direction.norm();
@@ -874,6 +697,11 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       !std::equal(waypoints.begin(), waypoints.end(), pre_refinement_waypoints.begin(),
       [](const Point & first, const Point & second) {return (first - second).norm() <= 1e-6;});
   }
+  // 整条轨迹联合优化：在加密引导上按弧长重采样内点，时长初值取分配器结果，
+  // 全部内点与全部时长在一个 L-BFGS 问题里同时优化。
+  const std::vector<Point> dense_guide = waypoints;
+  waypoints = MincoJointOptimizer::resampleByArcLength(
+    waypoints, std::max(0.05, params_.joint_waypoint_spacing));
   const MincoTimeAllocator time_allocator = makeTimeAllocator(params_);
   const MincoTimeAllocation initial_allocation = time_allocator.allocate(
     waypoints, head_state.col(1).norm());
@@ -881,7 +709,55 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     finishTrace("time_allocation_invalid");
     return trajectory;
   }
-  Eigen::VectorXd durations = initial_allocation.durations;
+  const MincoJointOptimizer joint_optimizer(makeJointParams(params_));
+  const bool joint_obstacle = esdf && esdf->available() && esdfObstacleOptimizationEnabled();
+  const bool joint_footprint = joint_obstacle && esdfFootprintOptimizationEnabled() &&
+    footprint_orientation && !footprint_orientation->points.empty();
+  JointDistanceQuery distance_query;
+  if (joint_obstacle) {
+    distance_query = [esdf](const Point & position, double & distance, Point & gradient) {
+        ats_rc_esdf::EsdfQueryResult query;
+        if (!esdf->query(position.x(), position.y(), query) || !std::isfinite(query.distance) ||
+          !query.gradient.allFinite())
+        {
+          return false;
+        }
+        distance = query.distance;
+        gradient = query.gradient;
+        return true;
+      };
+  }
+  JointYawQuery yaw_query;
+  if (joint_footprint) {
+    yaw_query = [footprint_orientation](double progress) {
+        return interpolateReferenceYaw(*footprint_orientation, progress);
+      };
+  }
+  const MincoJointResult joint = joint_optimizer.optimize(
+    head_state, waypoints, initial_allocation.durations, distance_query, yaw_query,
+    joint_obstacle ? std::vector<Point>() : dense_guide);
+  if (trace) {
+    trace->joint_piece_count = static_cast<int>(initial_allocation.durations.size());
+    trace->joint_iterations = joint.iterations;
+    trace->joint_evaluations = joint.evaluations;
+    trace->joint_termination = joint.termination;
+    trace->joint_initial_cost = joint.initial_cost;
+    trace->joint_final_cost = joint.final_cost;
+    trace->joint_wall_time_ms = joint.wall_time_ms;
+    trace->joint_constraints_satisfied = joint.constraints_satisfied;
+    trace->joint_max_center_violation = joint.stats.max_center_violation;
+    trace->joint_max_footprint_violation = joint.stats.max_footprint_violation;
+    trace->joint_max_guide_excess = joint.stats.max_guide_excess;
+    trace->joint_max_velocity_excess = joint.stats.max_velocity_excess;
+    trace->joint_max_acceleration_excess = joint.stats.max_acceleration_excess;
+    trace->joint_max_lateral_excess = joint.stats.max_lateral_excess;
+  }
+  if (!joint.solved) {
+    finishTrace("joint_optimization_failed");
+    return trajectory;
+  }
+  waypoints = joint.waypoints;
+  Eigen::VectorXd durations = joint.durations;
   MincoS3 minco;
   if (!solveMinco(waypoints, durations, minco, head_state)) {
     finishTrace("minco_s3_initial_solve_failed");

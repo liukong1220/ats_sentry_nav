@@ -4,6 +4,7 @@
 #define MINCO_PLANNER__MINCO_TRAJECTORY_OPTIMIZER_HPP_
 
 #include <string>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -49,8 +50,8 @@ struct MincoTrajectoryOptimizerParams
   double esdf_obstacle_target_clearance = 0.0;
   int esdf_obstacle_max_iterations = 6;
   double esdf_obstacle_control_point_spacing = 0.30;
-  // Zero keeps the historical sparse-waypoint MINCO interpolation. Deployed
-  // profiles densify the guide so S3 pieces cannot cut an L-corner into a wall.
+  // 引导加密间距 [m]；0 = 不加密。加密后的引导供 ESDF 修正、弹性带平滑和
+  // 联合优化重采样使用（联合优化本身按 joint_waypoint_spacing 取内点）。
   double guide_control_point_spacing = 0.0;
   // 加密后的引导点先做受净空约束的弹性带平滑，再交给 ESDF 修正与 MINCO。
   // 加密点是 MINCO 的硬插值约束，不平滑就会把 JPS/倒角折线原样保留成折角。
@@ -64,19 +65,35 @@ struct MincoTrajectoryOptimizerParams
   double guide_smoothing_fidelity = 0.02;
   double guide_smoothing_max_deviation = 0.50;
   double guide_smoothing_min_clearance = 0.42;
-  // 稀疏 MINCO 航点。加密引导点全部作为硬插值约束时，S3 只能逐点穿过 0.30 m 折线，
-  // 最终参考就是"直线 + 小圆角"。开启后在 ESDF 修正后的加密引导上按约 guide_sparse_spacing
-  // 弧长取少量航点，解出 MINCO 后逐段检查：采样点 ESDF 中心净空不低于最近引导点
-  // min(原净空, guide_smoothing_min_clearance) - clearance_tolerance、偏离该段引导不超过
-  // guide_sparse_max_deviation、矩形足迹（参考 yaw 或切向）不碰撞；违例段二分插入引导点。
-  // 迭代耗尽仍违例则退回加密引导（历史行为）。最终安全仍由节点矩形足迹门禁裁定。
-  // 0 = 关闭（历史行为）。
-  double guide_sparse_spacing = 0.0;
-  double guide_sparse_max_deviation = 0.30;
-  double guide_sparse_clearance_tolerance = 0.02;
-  int guide_sparse_max_iterations = 16;
-  // 稀疏段曲率上限 [1/m]，超过则该段二分插点；0 = 不限。
-  double guide_sparse_max_curvature = 0.0;
+  // 整条轨迹 MINCO 联合优化（唯一的最终轨迹生成器，见 minco_joint_optimizer.hpp）。
+  // 在上面 ESDF 修正并再加密的引导上按弧长每 joint_waypoint_spacing 取一个内点，
+  // 以全部内点 q 与全部段时长 T=exp(τ) 为变量，一次 L-BFGS 最小化
+  // jerk 能量 + 时间 + 中心/足迹 ESDF 罚（无 ESDF 时改为引导管道罚）
+  // + 速度/加速度/横向加速度罚（三次铰链）。
+  // 数值失败 fail-closed（返回空轨迹）；残差不直接判失败，交给时间缩放与矩形足迹门禁。
+  double joint_waypoint_spacing = 1.0;
+  int joint_samples_per_piece = 16;
+  double joint_max_piece_time = 3.0;
+  double joint_energy_weight = 1.0;
+  double joint_time_weight = 20.0;
+  double joint_obstacle_weight = 1e6;
+  double joint_velocity_weight = 1e3;
+  double joint_acceleration_weight = 1e3;
+  double joint_lateral_weight = 1e3;
+  // 无 ESDF 时的引导管道：没有障碍信息（ESDF 不可用或 ESDF 修正关闭，如 JPS 无 ESDF
+  // 候选）时，轨迹偏离加密引导折线超过 joint_guide_max_deviation [m] 按三次铰链罚，
+  // 防止联合优化在无障碍信息下抄近路；有 ESDF 时由障碍项负责，不加管道。<= 0 关闭。
+  double joint_guide_weight = 1e6;
+  double joint_guide_max_deviation = 0.10;
+  // 中心点 ESDF 净空目标，部署时与 jps_safe_distance 对齐。
+  double joint_center_clearance = 0.42;
+  // 足迹采样点（已含 safety_margin）的 ESDF 净空目标；只在有 yaw 参考时生效。
+  double joint_footprint_clearance = 0.03;
+  // 每条足迹边在两角点之间的采样数，1 = 边中点。
+  int joint_footprint_edge_samples = 1;
+  double joint_g_epsilon = 1e-5;
+  int joint_max_iterations = 200;
+  double joint_time_budget_ms = 15.0;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
   double esdf_obstacle_trust_region = 0.10;
@@ -136,6 +153,21 @@ struct MincoOptimizationTrace
   double peak_acceleration = 0.0;
   double peak_jerk = 0.0;
   double solver_wall_time_ms = 0.0;
+  // 整条轨迹联合优化诊断。
+  int joint_piece_count = 0;
+  int joint_iterations = 0;
+  int joint_evaluations = 0;
+  std::string joint_termination;
+  double joint_initial_cost = 0.0;
+  double joint_final_cost = 0.0;
+  double joint_wall_time_ms = 0.0;
+  bool joint_constraints_satisfied = false;
+  double joint_max_center_violation = 0.0;
+  double joint_max_footprint_violation = 0.0;
+  double joint_max_guide_excess = 0.0;
+  double joint_max_velocity_excess = 0.0;
+  double joint_max_acceleration_excess = 0.0;
+  double joint_max_lateral_excess = 0.0;
 };
 
 class MincoTrajectoryOptimizer

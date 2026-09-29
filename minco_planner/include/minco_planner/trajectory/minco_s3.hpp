@@ -99,6 +99,37 @@ public:
     return true;
   }
 
+  // 用已有 LU 解 A^T x = b：A^T = U^T L^T，先对 U^T 前代，再对单位下三角 L^T 回代。
+  // 联合优化的伴随梯度每次迭代只需这一次转置求解。必须先 factorizeLu()。
+  template<typename Derived>
+  bool solveAdj(Eigen::MatrixBase<Derived> & right_hand_side) const
+  {
+    for (int column = 0; column < size_; ++column) {
+      const int min_row = std::max(0, column - upper_bandwidth_);
+      for (int row = min_row; row < column; ++row) {
+        if (operator()(row, column) != 0.0) {
+          right_hand_side.row(column) -=
+            operator()(row, column) * right_hand_side.row(row);
+        }
+      }
+      const double pivot = operator()(column, column);
+      if (std::abs(pivot) <= 1e-12) {
+        return false;
+      }
+      right_hand_side.row(column) /= pivot;
+    }
+    for (int column = size_ - 1; column >= 0; --column) {
+      const int max_row = std::min(column + lower_bandwidth_, size_ - 1);
+      for (int row = column + 1; row <= max_row; ++row) {
+        if (operator()(row, column) != 0.0) {
+          right_hand_side.row(column) -=
+            operator()(row, column) * right_hand_side.row(row);
+        }
+      }
+    }
+    return true;
+  }
+
 private:
   int size_ = 0;
   int lower_bandwidth_ = 0;
@@ -247,6 +278,125 @@ public:
   bool valid() const {return valid_;}
   int pieceCount() const {return static_cast<int>(piece_durations_.size());}
   double pieceDuration(int piece) const {return piece_durations_(piece);}
+  // 6N x 2，第 6i+k 行是第 i 段 t^k 的系数。
+  const Eigen::MatrixX2d & coefficients() const {return coefficients_;}
+
+  /**
+   * @brief jerk 能量 \f$ \sum_i \int_0^{T_i} \|p'''(t)\|^2 dt \f$（逐段解析积分）。
+   * @note p''' = 6c3 + 24c4 t + 60c5 t^2，展开后各项系数与 GCOPTER MINCO_S3NU 一致。
+   */
+  double getEnergy() const
+  {
+    double energy = 0.0;
+    for (int i = 0; i < pieceCount(); ++i) {
+      const double t1 = piece_durations_(i);
+      const double t2 = t1 * t1;
+      const double t3 = t2 * t1;
+      const double t4 = t2 * t2;
+      const double t5 = t4 * t1;
+      const Eigen::Vector2d c3 = coefficients_.row(6 * i + 3).transpose();
+      const Eigen::Vector2d c4 = coefficients_.row(6 * i + 4).transpose();
+      const Eigen::Vector2d c5 = coefficients_.row(6 * i + 5).transpose();
+      energy += 36.0 * c3.squaredNorm() * t1 + 144.0 * c4.dot(c3) * t2 +
+        192.0 * c4.squaredNorm() * t3 + 240.0 * c5.dot(c3) * t3 +
+        720.0 * c5.dot(c4) * t4 + 720.0 * c5.squaredNorm() * t5;
+    }
+    return energy;
+  }
+
+  // 能量对系数的偏导（T 固定），只有 c3..c5 非零。
+  void getEnergyPartialGradByCoeffs(Eigen::MatrixX2d & gradient) const
+  {
+    gradient.setZero(6 * pieceCount(), 2);
+    for (int i = 0; i < pieceCount(); ++i) {
+      const double t1 = piece_durations_(i);
+      const double t2 = t1 * t1;
+      const double t3 = t2 * t1;
+      const double t4 = t2 * t2;
+      const double t5 = t4 * t1;
+      const auto c3 = coefficients_.row(6 * i + 3);
+      const auto c4 = coefficients_.row(6 * i + 4);
+      const auto c5 = coefficients_.row(6 * i + 5);
+      gradient.row(6 * i + 3) = 72.0 * c3 * t1 + 144.0 * c4 * t2 + 240.0 * c5 * t3;
+      gradient.row(6 * i + 4) = 144.0 * c3 * t2 + 384.0 * c4 * t3 + 720.0 * c5 * t4;
+      gradient.row(6 * i + 5) = 240.0 * c3 * t3 + 720.0 * c4 * t4 + 1440.0 * c5 * t5;
+    }
+  }
+
+  // 能量对段时长的偏导（系数固定）。
+  void getEnergyPartialGradByTimes(Eigen::VectorXd & gradient) const
+  {
+    gradient.setZero(pieceCount());
+    for (int i = 0; i < pieceCount(); ++i) {
+      const double t1 = piece_durations_(i);
+      const double t2 = t1 * t1;
+      const double t3 = t2 * t1;
+      const double t4 = t2 * t2;
+      const Eigen::Vector2d c3 = coefficients_.row(6 * i + 3).transpose();
+      const Eigen::Vector2d c4 = coefficients_.row(6 * i + 4).transpose();
+      const Eigen::Vector2d c5 = coefficients_.row(6 * i + 5).transpose();
+      gradient(i) = 36.0 * c3.squaredNorm() + 288.0 * c4.dot(c3) * t1 +
+        576.0 * c4.squaredNorm() * t2 + 720.0 * c5.dot(c3) * t2 +
+        2880.0 * c5.dot(c4) * t3 + 3600.0 * c5.squaredNorm() * t4;
+    }
+  }
+
+  /**
+   * @brief 伴随法把 \f$ \partial J/\partial c \f$（T 固定）与 \f$ \partial J/\partial T \f$
+   *        （c 固定）反传成对内点 q 与时长 T 的全导数。
+   * @param partial_grad_by_coeffs 6N x 2；函数内部会被 A^{-T} 就地覆盖。
+   * @param partial_grad_by_times  N。
+   * @param grad_by_points         输出 2 x (N-1)。
+   * @param grad_by_times          输出 N。
+   * @note A(T)c = b(q)：设 G = A^{-T} ∂J/∂c，则 ∂J/∂b = G，q_i 只出现在 b 的第 6i+5 行；
+   *       ∂J/∂T_i = ∂J/∂T_i|_c - G^T (∂A/∂T_i) c。每次调用只做一次 A^T 求解。
+   */
+  bool propagateGrad(
+    Eigen::MatrixX2d & partial_grad_by_coeffs,
+    const Eigen::VectorXd & partial_grad_by_times,
+    Eigen::MatrixXd & grad_by_points,
+    Eigen::VectorXd & grad_by_times) const
+  {
+    const int piece_count = pieceCount();
+    if (!valid_ || partial_grad_by_coeffs.rows() != 6 * piece_count ||
+      partial_grad_by_times.size() != piece_count)
+    {
+      return false;
+    }
+    if (!system_.solveAdj(partial_grad_by_coeffs)) {
+      return false;
+    }
+    const Eigen::MatrixX2d & adjoint = partial_grad_by_coeffs;
+    grad_by_points.resize(2, piece_count - 1);
+    grad_by_times = partial_grad_by_times;
+    for (int i = 0; i < piece_count; ++i) {
+      const double t1 = piece_durations_(i);
+      const double t2 = t1 * t1;
+      const double t3 = t2 * t1;
+      const double t4 = t2 * t2;
+      const auto c = coefficients_.block<6, 2>(6 * i, 0);
+      // 段末 p'、p''、p''' 恰是位置/速度/加速度连续行对 T 的导数。
+      const Eigen::RowVector2d velocity = c.row(1) + 2.0 * t1 * c.row(2) +
+        3.0 * t2 * c.row(3) + 4.0 * t3 * c.row(4) + 5.0 * t4 * c.row(5);
+      const Eigen::RowVector2d acceleration = 2.0 * c.row(2) + 6.0 * t1 * c.row(3) +
+        12.0 * t2 * c.row(4) + 20.0 * t3 * c.row(5);
+      const Eigen::RowVector2d jerk = 6.0 * c.row(3) + 24.0 * t1 * c.row(4) +
+        60.0 * t2 * c.row(5);
+      if (i < piece_count - 1) {
+        const Eigen::RowVector2d snap = 24.0 * c.row(4) + 120.0 * t1 * c.row(5);
+        const Eigen::RowVector2d crackle = 120.0 * c.row(5);
+        grad_by_times(i) -= adjoint.row(6 * i + 3).dot(snap) +
+          adjoint.row(6 * i + 4).dot(crackle) +
+          adjoint.row(6 * i + 5).dot(velocity) + adjoint.row(6 * i + 6).dot(velocity) +
+          adjoint.row(6 * i + 7).dot(acceleration) + adjoint.row(6 * i + 8).dot(jerk);
+        grad_by_points.col(i) = adjoint.row(6 * i + 5).transpose();
+      } else {
+        grad_by_times(i) -= adjoint.row(6 * i + 3).dot(velocity) +
+          adjoint.row(6 * i + 4).dot(acceleration) + adjoint.row(6 * i + 5).dot(jerk);
+      }
+    }
+    return grad_by_times.allFinite() && grad_by_points.allFinite();
+  }
 
 private:
   BandedSystem system_;

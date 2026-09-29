@@ -52,8 +52,8 @@ TEST(TrajectoryQualityEvaluator, SafeStraightPathDoesNotTriggerEsdfRefinement)
   esdf.configureRollingWindow(false, 0.0, 0.0);
   esdf.updateGrid(grid, 50, true);
   minco_planner::MincoTrajectoryOptimizerParams params;
-  // Match the executed Gazebo profile. A free two-point guide must stay a
-  // single geometric segment and still pass the full v/a/j gate.
+  // Match the executed Gazebo profile. A free two-point guide must not be
+  // refined by ESDF, and the joint optimizer resamples it every 1 m.
   params.reference_speed = 1.5;
   params.max_velocity = 2.0;
   params.max_acceleration = 2.5;
@@ -67,7 +67,11 @@ TEST(TrajectoryQualityEvaluator, SafeStraightPathDoesNotTriggerEsdfRefinement)
   EXPECT_FALSE(trace.esdf_geometry_refined);
   EXPECT_EQ(trace.preprocessed_guide.poses.size(), 2U);
   EXPECT_EQ(trace.esdf_refined_guide.poses.size(), 2U);
-  EXPECT_EQ(trace.segment_durations.size(), 1U);
+  EXPECT_EQ(trace.segment_durations.size(), 2U);
+  EXPECT_EQ(trace.joint_piece_count, 2);
+  for (const auto & point : trajectory.points) {
+    EXPECT_NEAR(point.y, 0.0, 1e-6);
+  }
   EXPECT_LE(trace.peak_velocity, params.max_velocity + 1e-6);
   EXPECT_LE(trace.peak_acceleration, params.max_acceleration + 1e-6);
   EXPECT_LE(trace.peak_jerk, params.max_jerk + 1e-6);

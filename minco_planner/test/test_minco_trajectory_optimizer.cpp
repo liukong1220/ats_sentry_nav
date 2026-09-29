@@ -181,7 +181,9 @@ TEST(MincoTrajectoryOptimizer, ProducesFiniteOmnidirectionalDerivatives)
   }
 }
 
-TEST(MincoTrajectoryOptimizer, UniformFallbackClosesCoupledDynamicLimits)
+// 联合优化带软速度/加速度罚，是否还需要整体时间缩放取决于残差；这里只验证
+// 最终轨迹闭合耦合的动力学上限，不再要求必然走整体缩放分支。
+TEST(MincoTrajectoryOptimizer, CoupledLongPathClosesDynamicLimits)
 {
   minco_planner::MincoTrajectoryOptimizerParams params;
   params.reference_speed = 1.5;
@@ -199,10 +201,9 @@ TEST(MincoTrajectoryOptimizer, UniformFallbackClosesCoupledDynamicLimits)
   const auto trajectory = optimizer.optimize(
     makeCoupledLongPath(), nullptr, nullptr, nullptr, nullptr, nullptr, &trace);
 
-  ASSERT_FALSE(trajectory.empty());
+  ASSERT_FALSE(trajectory.empty()) << trace.failure_reason;
   EXPECT_FALSE(trace.local_time_scaled);
-  EXPECT_TRUE(trace.uniform_time_scaled) << trace.peak_velocity << ", " <<
-    trace.peak_acceleration << ", " << trace.peak_jerk;
+  EXPECT_FALSE(trace.joint_termination.empty());
   EXPECT_LE(trace.peak_velocity, params.max_velocity + 1e-6);
   EXPECT_LE(trace.peak_acceleration, params.max_acceleration + 1e-6);
   EXPECT_LE(trace.peak_jerk, params.max_jerk + 1e-6);
@@ -278,6 +279,9 @@ TEST(MincoTrajectoryOptimizer, UsesYawAwareFootprintToIncreaseEdgeClearance)
   params.footprint_length = 0.60;
   params.footprint_width = 0.40;
   params.footprint_safety_margin = 0.0;
+  // 联合优化的足迹净空目标与上面迭代修正一致；中心目标低于足迹半宽以免中心项主导。
+  params.joint_center_clearance = 0.40;
+  params.joint_footprint_clearance = 0.40;
   minco_planner::MincoTrajectoryOptimizer optimizer(params);
   ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
   populateFootprintEdgeObstacleEsdf(esdf);
@@ -419,7 +423,9 @@ double maxPolylineDeviation(const minco_planner::ReferenceTrajectory & trajector
   return peak;
 }
 
-TEST(MincoTrajectoryOptimizer, GuideDensifyBoundsLCornerCut)
+// 没有 ESDF 时联合优化没有障碍信息，引导管道把拐角内切限制在
+// joint_guide_max_deviation 附近（三次铰链是软约束，允许少量超出）。
+TEST(MincoTrajectoryOptimizer, GuideTubeBoundsLCornerCutWithoutEsdf)
 {
   minco_planner::MincoTrajectoryOptimizerParams params;
   params.reference_speed = 1.5;
@@ -435,14 +441,16 @@ TEST(MincoTrajectoryOptimizer, GuideDensifyBoundsLCornerCut)
   const auto sparse_trajectory = sparse.optimize(makeLPath());
   params.guide_control_point_spacing = 0.30;
   minco_planner::MincoTrajectoryOptimizer dense(params);
-  const auto dense_trajectory = dense.optimize(makeLPath());
+  minco_planner::MincoOptimizationTrace trace;
+  const auto dense_trajectory = dense.optimize(
+    makeLPath(), nullptr, nullptr, nullptr, nullptr, nullptr, &trace);
 
   ASSERT_FALSE(sparse_trajectory.empty());
   ASSERT_FALSE(dense_trajectory.empty());
-  const double sparse_dev = maxPolylineDeviation(sparse_trajectory);
-  const double dense_dev = maxPolylineDeviation(dense_trajectory);
-  EXPECT_LT(dense_dev, 0.08);
-  EXPECT_LE(dense_dev, sparse_dev + 1e-6);
+  // 联合优化只看 K=16 的离散采样点，时间缩放后的密采样允许略大一点的超出。
+  EXPECT_LT(maxPolylineDeviation(sparse_trajectory), params.joint_guide_max_deviation + 0.08);
+  EXPECT_LT(maxPolylineDeviation(dense_trajectory), params.joint_guide_max_deviation + 0.08);
+  EXPECT_LT(trace.joint_max_guide_excess, 0.05);
 }
 
 // 按弧长重采样后的最大 Menger 曲率；时间采样在起停处点距趋零，会放大数值噪声。
@@ -512,111 +520,6 @@ TEST(MincoTrajectoryOptimizer, GuideSmoothingRoundsDenseLCornerAndKeepsEndpoints
   EXPECT_LT(smoothed_curvature, 0.5 * polyline_curvature);
   // 偏离受 max_deviation 约束，不会把拐角抄近路抄穿。
   EXPECT_LT(maxPolylineDeviation(smoothed_trajectory), params.guide_smoothing_max_deviation + 0.10);
-}
-
-
-nav_msgs::msg::OccupancyGrid makeFreeGrid()
-{
-  nav_msgs::msg::OccupancyGrid grid;
-  grid.header.frame_id = "map";
-  grid.info.resolution = 0.05;
-  grid.info.width = 120;
-  grid.info.height = 120;
-  grid.info.origin.position.x = -2.0;
-  grid.info.origin.position.y = -2.0;
-  grid.data.assign(static_cast<std::size_t>(grid.info.width * grid.info.height), 0);
-  return grid;
-}
-
-minco_planner::MincoTrajectoryOptimizerParams makeSmoothedGuideParams()
-{
-  minco_planner::MincoTrajectoryOptimizerParams params;
-  params.reference_speed = 1.5;
-  params.sample_spacing = 0.05;
-  params.max_velocity = 2.0;
-  params.max_acceleration = 2.5;
-  params.max_jerk = 12.0;
-  params.esdf_obstacle_optimization_enabled = false;
-  params.geometry_preprocessor.footprint_aware_shortcut_enabled = false;
-  params.geometry_preprocessor.fillet_radius = 0.0;
-  params.guide_control_point_spacing = 0.30;
-  params.guide_smoothing_iterations = 80;
-  return params;
-}
-
-double minimumTrajectoryClearance(
-  const minco_planner::ReferenceTrajectory & trajectory,
-  const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf)
-{
-  double minimum = std::numeric_limits<double>::infinity();
-  for (const auto & point : trajectory.points) {
-    minimum = std::min(minimum, esdf.getDistance(point.x, point.y));
-  }
-  return minimum;
-}
-
-TEST(MincoTrajectoryOptimizer, SparseGuideWaypointsProduceSmootherCurveThanDenseGuide)
-{
-  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
-  esdf.configureRollingWindow(false, 0.0, 0.0);
-  esdf.updateGrid(makeFreeGrid(), 50, true);
-
-  auto params = makeSmoothedGuideParams();
-  minco_planner::MincoTrajectoryOptimizer dense(params);
-  const auto dense_trajectory = dense.optimize(makeLPath(), &esdf);
-  params.guide_sparse_spacing = 1.0;
-  minco_planner::MincoTrajectoryOptimizer sparse(params);
-  const auto sparse_trajectory = sparse.optimize(makeLPath(), &esdf);
-
-  ASSERT_FALSE(dense_trajectory.empty());
-  ASSERT_FALSE(sparse_trajectory.empty());
-  const auto & first = makeLPath().poses.front().pose.position;
-  const auto & last = makeLPath().poses.back().pose.position;
-  EXPECT_NEAR(sparse_trajectory.points.front().x, first.x, 1e-8);
-  EXPECT_NEAR(sparse_trajectory.points.front().y, first.y, 1e-8);
-  EXPECT_NEAR(sparse_trajectory.points.back().x, last.x, 1e-8);
-  EXPECT_NEAR(sparse_trajectory.points.back().y, last.y, 1e-8);
-  EXPECT_LT(
-    maxArcCurvature(sparse_trajectory, 0.05), maxArcCurvature(dense_trajectory, 0.05));
-  // 稀疏曲线仍被限制在平滑引导附近：平滑偏离 + 稀疏偏离。
-  EXPECT_LT(
-    maxPolylineDeviation(sparse_trajectory),
-    params.guide_smoothing_max_deviation + params.guide_sparse_max_deviation + 0.05);
-}
-
-TEST(MincoTrajectoryOptimizer, SparseGuideWaypointsKeepClearanceOfReplacedGuide)
-{
-  auto grid = makeFreeGrid();
-  // 拐角内侧障碍：稀疏 MINCO 抄近路会贴上去，必须靠二分插点拉回。
-  for (std::uint32_t row = 0; row < grid.info.height; ++row) {
-    for (std::uint32_t column = 0; column < grid.info.width; ++column) {
-      const double x = grid.info.origin.position.x + (column + 0.5) * grid.info.resolution;
-      const double y = grid.info.origin.position.y + (row + 0.5) * grid.info.resolution;
-      if (x > 1.6 && x < 2.3 && y > 0.7 && y < 1.6) {
-        grid.data[row * grid.info.width + column] = 100;
-      }
-    }
-  }
-  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
-  esdf.configureRollingWindow(false, 0.0, 0.0);
-  esdf.updateGrid(grid, 50, true);
-
-  auto params = makeSmoothedGuideParams();
-  params.guide_smoothing_min_clearance = 0.40;
-  minco_planner::MincoTrajectoryOptimizer dense(params);
-  const auto dense_trajectory = dense.optimize(makeLPath(), &esdf);
-  params.guide_sparse_spacing = 1.0;
-  minco_planner::MincoTrajectoryOptimizer sparse(params);
-  const auto sparse_trajectory = sparse.optimize(makeLPath(), &esdf);
-
-  ASSERT_FALSE(dense_trajectory.empty());
-  ASSERT_FALSE(sparse_trajectory.empty());
-  const double dense_clearance = minimumTrajectoryClearance(dense_trajectory, esdf);
-  const double sparse_clearance = minimumTrajectoryClearance(sparse_trajectory, esdf);
-  EXPECT_GE(
-    sparse_clearance,
-    std::min(dense_clearance, params.guide_smoothing_min_clearance) -
-    params.guide_sparse_clearance_tolerance - 0.03);
 }
 
 }  // namespace
