@@ -249,6 +249,57 @@ double minimumSampleClearance(
   return minimum;
 }
 
+/**
+ * @brief 对加密引导点做受 ESDF 净空约束的弹性带平滑。
+ * @note 每轮把内部点向相邻两点中点拉 alpha 倍、向原引导点拉 fidelity 倍；候选点
+ *       偏离原引导超过 max_deviation 则投影回半径内，ESDF 净空低于
+ *       min(原净空, min_clearance) 则保持上一轮位置。首尾点不动。
+ */
+std::vector<Point> smoothGuideWithEsdf(
+  const std::vector<Point> & input_waypoints,
+  const MincoTrajectoryOptimizerParams & params,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf)
+{
+  const int iterations = std::max(0, params.guide_smoothing_iterations);
+  if (iterations == 0 || input_waypoints.size() < 3U || !esdf || !esdf->available()) {
+    return input_waypoints;
+  }
+  const double alpha = std::clamp(params.guide_smoothing_alpha, 0.0, 1.0);
+  const double fidelity = std::clamp(params.guide_smoothing_fidelity, 0.0, 1.0 - alpha);
+  const double maximum_deviation = std::max(0.0, params.guide_smoothing_max_deviation);
+  const double clearance_floor = std::max(0.0, params.guide_smoothing_min_clearance);
+  std::vector<double> required(input_waypoints.size(), 0.0);
+  for (std::size_t index = 0; index < input_waypoints.size(); ++index) {
+    const double original = esdf->getDistance(input_waypoints[index].x(), input_waypoints[index].y());
+    required[index] = std::isfinite(original) ? std::min(original, clearance_floor) : clearance_floor;
+  }
+  std::vector<Point> waypoints = input_waypoints;
+  std::vector<Point> next = waypoints;
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    bool moved = false;
+    for (std::size_t index = 1; index + 1U < waypoints.size(); ++index) {
+      const Point target = 0.5 * (waypoints[index - 1U] + waypoints[index + 1U]);
+      Point candidate = waypoints[index] + alpha * (target - waypoints[index]) +
+        fidelity * (input_waypoints[index] - waypoints[index]);
+      candidate = input_waypoints[index] + limitNorm(
+        candidate - input_waypoints[index], maximum_deviation);
+      const double clearance = esdf->getDistance(candidate.x(), candidate.y());
+      if (!std::isfinite(clearance) || clearance + 1e-6 < required[index]) {
+        next[index] = waypoints[index];
+        continue;
+      }
+      moved = moved || (candidate - waypoints[index]).norm() > 1e-6;
+      next[index] = candidate;
+    }
+    waypoints.swap(next);
+    next = waypoints;
+    if (!moved) {
+      break;
+    }
+  }
+  return waypoints;
+}
+
 std::vector<Point> refineWaypointsWithEsdf(
   const std::vector<Point> & input_waypoints,
   const MincoTrajectoryOptimizerParams & params,
@@ -588,6 +639,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   if (guide_spacing > 1e-6) {
     waypoints = densifyWaypoints(waypoints, guide_spacing);
   }
+  waypoints = smoothGuideWithEsdf(waypoints, params_, esdf);
   const std::vector<Point> pre_refinement_waypoints = waypoints;
   waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation, head_state);
   if (guide_spacing > 1e-6) {

@@ -71,6 +71,31 @@ minco_planner::EscapePrefixParams enabledParams()
   return params;
 }
 
+// 平移逃逸候选：前 hold 弧长内 yaw 保持起点值，之后限速追回原 yaw，末点 yaw 不变。
+TEST(EscapePrefix, HoldStartYawTranslatesBeforeTurning)
+{
+  minco_planner::ReferenceTrajectory trajectory;
+  trajectory.points = makeLine(40);
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    trajectory.points[i].yaw = std::min(1.0, 0.1 * static_cast<double>(i));
+  }
+  minco_planner::ReferenceTrajectory candidate;
+  ASSERT_TRUE(minco_planner::holdStartYawForEscape(trajectory, 0.20, 2.5, &candidate));
+  ASSERT_EQ(candidate.points.size(), trajectory.points.size());
+  for (std::size_t i = 0; i <= 4U; ++i) {
+    EXPECT_DOUBLE_EQ(candidate.points[i].yaw, 0.0);
+    EXPECT_DOUBLE_EQ(candidate.points[i].x, trajectory.points[i].x);
+  }
+  EXPECT_NEAR(candidate.points.back().yaw, 1.0, 1e-9);
+  for (std::size_t i = 1; i < candidate.points.size(); ++i) {
+    EXPECT_LE(std::fabs(candidate.points[i].yaw - candidate.points[i - 1U].yaw), 0.25 + 1e-9);
+  }
+
+  // 末点 yaw 追不回（轨迹太短、限速太低）时不产生候选。
+  EXPECT_FALSE(minco_planner::holdStartYawForEscape(trajectory, 0.20, 0.1, &candidate));
+  EXPECT_FALSE(minco_planner::holdStartYawForEscape(trajectory, 0.0, 2.5, &candidate));
+}
+
 }  // namespace
 
 // 这是本修复要解决的实测死锁：domain 147 goal 2 在 176 s 内产生 89 次拒绝，全部落在
@@ -289,4 +314,55 @@ TEST(EscapePrefix, NonFiniteGeometryIsRejected)
   const auto decision = minco_planner::evaluateEscapePrefix(nan_yaw, {at(0)}, params);
   EXPECT_FALSE(decision.allowed);
   EXPECT_EQ(decision.prefix_end, 0U);
+}
+
+// 接触深度上界：RMUC (4,0.5) 目标里车贴着立柱过报边沿停住，footprint 只压进 0.002 m，
+// 每条从当前位姿出发的轨迹都在 index 0 被拒。深度上界把放行限制在擦边接触：
+// 同一条驶离轨迹，压进 0.07 m 时 0.10 m 上界放行、0.05 m 上界拒绝。
+TEST(EscapePrefix, ContactDepthBoundSeparatesGrazingFromPenetration)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.info.resolution = 0.1;
+  grid.info.width = 60;
+  grid.info.height = 40;
+  grid.info.origin.position.x = -2.0;
+  grid.info.origin.position.y = -2.0;
+  grid.info.origin.orientation.w = 1.0;
+  grid.data.assign(60 * 40, 0);
+  // 单格障碍 x∈[-0.3,-0.2) y∈[0.2,0.3)：车尾左侧在 x/y 两个方向都压进 >= 0.07 m。
+  grid.data[22 * 60 + 17] = 100;
+
+  minco_planner::FootprintSafetyParams footprint;
+  footprint.length = 0.60;
+  footprint.width = 0.50;
+  footprint.safety_margin = 0.02;
+  footprint.obstacle_value_threshold = 100;
+
+  minco_planner::ReferenceTrajectory trajectory;
+  trajectory.header.frame_id = "map";
+  trajectory.points = makeLine(40);
+  const auto safety =
+    minco_planner::FootprintSafetyChecker(footprint).check(trajectory, grid);
+  ASSERT_FALSE(safety.safe);
+  ASSERT_EQ(safety.collisions.front().trajectory_index, 0U);
+
+  auto params = enabledParams();
+  const auto decision =
+    minco_planner::evaluateEscapePrefix(trajectory.points, safety.collisions, params);
+  ASSERT_TRUE(decision.allowed);
+
+  // 0 保持旧行为。
+  EXPECT_TRUE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+  params.max_contact_depth_m = 0.10;
+  EXPECT_TRUE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+  params.max_contact_depth_m = 0.05;
+  EXPECT_FALSE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+
+  minco_planner::EscapePrefixDecision rejected;
+  params.max_contact_depth_m = 0.10;
+  EXPECT_FALSE(minco_planner::escapePrefixContactShallow(
+    trajectory, rejected, footprint, grid, params));
 }

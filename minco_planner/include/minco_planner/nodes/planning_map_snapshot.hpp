@@ -70,8 +70,11 @@ struct PlannerStatusState
         return false;
       }
       if (status.localization_epoch == latest->localization_epoch) {
+        // plan_request_sequence is scoped to one goal: GoalManager restarts it
+        // at 1 for every new goal, so it is ordered only within a goal_id.
         if (status.map_generation < latest->map_generation ||
-          status.plan_request_sequence < latest->plan_request_sequence)
+          (status.goal_id == latest->goal_id &&
+          status.plan_request_sequence < latest->plan_request_sequence))
         {
           return false;
         }

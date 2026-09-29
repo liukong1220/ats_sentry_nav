@@ -114,6 +114,8 @@ private:
       bool report_status,
       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
   void onRuntimeSafetyRecheck();
+  bool remainingReferenceSafeOn(
+    const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid);
   void publishEmergencyStop(bool stop);
   void
   publishPlannerStatus(std::uint64_t goal_id, std::uint64_t localization_epoch,
@@ -169,6 +171,10 @@ private:
   double emergency_stop_heartbeat_period_sec_ = 0.1;
   double runtime_safety_recheck_hz_ = 10.0;
   double runtime_safety_horizon_sec_ = 1.0;
+  bool retain_safe_reference_on_snapshot_change_ = false;
+  // 保留判定的前向时间窗(s)。<=0 表示检查完整剩余段(原行为)。远端冲突留给
+  // 10 Hz 运行期复检在逼近时作废,避免远处地图抖动让车每 2 s 急停重规划。
+  double retain_reference_horizon_sec_ = 0.0;
   double body_yaw_follow_clearance_ = 0.55;
   bool force_body_yaw_follow_ = false;
   /// Preferred graph-search clearance (circumscribed all-yaw footprint radius).

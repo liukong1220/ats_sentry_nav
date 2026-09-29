@@ -84,6 +84,28 @@ TEST(PlanningSnapshotSafety, RejectsOutsideUnknownAndOccupiedRobotCells)
   EXPECT_FALSE(occupied.footprint_safe);
 }
 
+TEST(PlanningSnapshotSafety, ShallowContactToleratesOnlyBoundedDepth)
+{
+  ats_goal_manager::PlanningSnapshotSafetyParams params;
+  params.footprint_length = 2.0;
+  params.footprint_width = 2.0;
+  params.footprint_safety_margin = 0.0;
+  auto snapshot = makeSnapshot();
+  // 占据格 x in [5,6)。车心 x=4.05 时足迹 [3.05,5.05]，压进 0.05 m。
+  for (int y = 0; y < 8; ++y) {
+    snapshot.occupancy[static_cast<std::size_t>(y) * 8U + 5U] = 100;
+    snapshot.signed_distance_m[static_cast<std::size_t>(y) * 8U + 5U] = -1.0F;
+  }
+  const auto pose = poseAt(4.05, 3.5);
+  EXPECT_FALSE(
+    ats_goal_manager::checkPlanningSnapshotFootprint(snapshot, pose, params).footprint_safe);
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotContactShallow(snapshot, pose, params, 0.0));
+  EXPECT_TRUE(ats_goal_manager::planningSnapshotContactShallow(snapshot, pose, params, 0.1));
+  // 压进 0.4 m 时 0.1 m 深度上界不放行。
+  EXPECT_FALSE(
+    ats_goal_manager::planningSnapshotContactShallow(snapshot, poseAt(4.4, 3.5), params, 0.1));
+}
+
 TEST(PlanningSnapshotSafety, HonorsMapOriginYawForFootprintChecks)
 {
   auto snapshot = makeSnapshot();

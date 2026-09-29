@@ -56,6 +56,11 @@ struct EscapePrefixParams
   // domain 195 实测：原地转向脱离栅格过报接触时，18 个点只对应 0.029 m 弧长，
   // 12 的旧上界会把这类唯一可行的脱离轨迹判负，进而 livelock 到目标超时。
   std::size_t max_prefix_points = 64;
+  // 接触深度上界。> 0 时前缀必须在"每边内缩该深度"的矩形足迹下完全无冲突，
+  // 即车体压进占据格的深度不超过它；这把放行限制在量化/过报量级的擦边接触，
+  // 深压进障碍或沿薄障碍穿行的前缀在内缩足迹下仍然冲突而被拒。
+  // 0 保持旧行为（不做深度检查），仅用于兼容已有 profile。
+  double max_contact_depth_m = 0.0;
 };
 
 struct EscapePrefixDecision
@@ -158,6 +163,85 @@ inline EscapePrefixDecision evaluateEscapePrefix(
     decision.prefix_end = 0U;
   }
   return decision;
+}
+
+// 在 evaluateEscapePrefix 放行之后调用：前缀 [0, prefix_end] 用每边内缩
+// max_contact_depth_m 的足迹重检，必须无冲突。深度上界 <= 0 时不做检查。
+inline bool escapePrefixContactShallow(
+  const ReferenceTrajectory & trajectory,
+  const EscapePrefixDecision & decision,
+  const FootprintSafetyParams & footprint,
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const EscapePrefixParams & params)
+{
+  if (!decision.allowed) {
+    return false;
+  }
+  if (!(params.max_contact_depth_m > 0.0)) {
+    return true;
+  }
+  FootprintSafetyParams shrunk = footprint;
+  shrunk.length -= 2.0 * params.max_contact_depth_m;
+  shrunk.width -= 2.0 * params.max_contact_depth_m;
+  if (shrunk.length <= 0.0 || shrunk.width <= 0.0 ||
+    decision.prefix_end >= trajectory.points.size())
+  {
+    return false;
+  }
+  ReferenceTrajectory prefix;
+  prefix.header = trajectory.header;
+  prefix.points.assign(
+    trajectory.points.begin(),
+    trajectory.points.begin() + static_cast<std::ptrdiff_t>(decision.prefix_end + 1U));
+  return FootprintSafetyChecker(shrunk).check(prefix, grid).safe;
+}
+
+// 平移逃逸候选。贴着障碍时 yaw 规划在起点就开始转向，矩形足迹的角点随转向扫进
+// 障碍，接触只会更深，深度与 yaw 扫掠两道上界都会拒绝它。这里构造同一条几何路径的
+// 另一种 yaw 时序：前 hold_length_m 弧长内保持起点 yaw 纯平移驶离，之后按 yaw_rate_limit
+// 限速追回原 yaw 序列。末点 yaw 追不回原值时返回 false，不改变原轨迹的终端朝向语义。
+// 候选本身不被信任，调用方必须重新过同一套矩形足迹门禁与逃逸判据。
+inline bool holdStartYawForEscape(
+  const ReferenceTrajectory & trajectory, double hold_length_m, double yaw_rate_limit,
+  ReferenceTrajectory * candidate)
+{
+  if (candidate == nullptr || trajectory.points.size() < 2U || !(hold_length_m > 0.0) ||
+    !(yaw_rate_limit > 0.0))
+  {
+    return false;
+  }
+  *candidate = trajectory;
+  auto & points = candidate->points;
+  const double start_yaw = points.front().yaw;
+  if (!std::isfinite(start_yaw)) {
+    return false;
+  }
+  double length = 0.0;
+  double previous_yaw = start_yaw;
+  bool holding = true;
+  for (std::size_t i = 1U; i < points.size(); ++i) {
+    const double dx = points[i].x - points[i - 1U].x;
+    const double dy = points[i].y - points[i - 1U].y;
+    const double original_yaw = trajectory.points[i].yaw;
+    if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(original_yaw)) {
+      return false;
+    }
+    length += std::hypot(dx, dy);
+    holding = holding && length <= hold_length_m;
+    const double dt = std::max(1e-3, points[i].t - points[i - 1U].t);
+    double delta = 0.0;
+    if (!holding) {
+      const double max_delta = yaw_rate_limit * dt;
+      delta = std::clamp(
+        std::remainder(original_yaw - previous_yaw, 2.0 * M_PI), -max_delta, max_delta);
+    }
+    points[i].yaw = std::remainder(previous_yaw + delta, 2.0 * M_PI);
+    points[i].yaw_rate = delta / dt;
+    previous_yaw = points[i].yaw;
+  }
+  points.back().yaw_rate = 0.0;
+  return std::fabs(std::remainder(points.back().yaw - trajectory.points.back().yaw, 2.0 * M_PI)) <=
+         1e-3;
 }
 
 }  // namespace minco_planner

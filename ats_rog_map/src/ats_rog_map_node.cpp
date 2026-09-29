@@ -582,15 +582,22 @@ private:
     const rog_map::Vec3f & local_min, const rog_map::Vec3f & local_max,
     const rog_map::Vec3f & visualization_min, const rog_map::Vec3f & visualization_max,
     const rog_map::Vec3f & update_min, const rog_map::Vec3f & update_max, const double resolution,
-    const rclcpp::Time & stamp)
+    const rclcpp::Time & stamp, const bool show_visualization_range)
   {
     visualization_msgs::msg::MarkerArray markers;
     const float line_width = static_cast<float>(std::max(0.02, 0.4 * resolution));
     appendBoundsMarker(
       markers, local_min, local_max, "rog_map_local_map", "Local Map Range", 0,
       1.0F, 0.50F, 0.0F, 0.95F, line_width, stamp);
+    // The purple box only describes the /rog_map/viz voxel window. Without a
+    // voxel subscriber it would sit on top of the green update box, so emit
+    // DELETE (inverted box) to keep the bounds display to what is drawn.
+    const rog_map::Vec3f hidden_min = rog_map::Vec3f::Constant(1.0);
+    const rog_map::Vec3f hidden_max = rog_map::Vec3f::Constant(-1.0);
     appendBoundsMarker(
-      markers, visualization_min, visualization_max, "rog_map_visualization", "Visualization Range", 1,
+      markers, show_visualization_range ? visualization_min : hidden_min,
+      show_visualization_range ? visualization_max : hidden_max,
+      "rog_map_visualization", "Visualization Range", 1,
       0.50F, 0.0F, 1.0F, 0.90F, line_width, stamp);
     appendBoundsMarker(
       markers, update_min, update_max, "rog_map_local_update", "Raycast Update Range", 2,
@@ -677,7 +684,8 @@ private:
       if (snapshot.publish_bounds) {
         snapshot.bounds_markers = makeBoundsMarkers(
           local_box_min, local_box_max, visualization_box_min, visualization_box_max,
-          update_box_min, update_box_max, map_->getResolution(), snapshot.map_stamp);
+          update_box_min, update_box_max, map_->getResolution(), snapshot.map_stamp,
+          snapshot.publish_viz);
       }
       if (snapshot.publish_viz) {
         const auto viz_collect_started = std::chrono::steady_clock::now();
