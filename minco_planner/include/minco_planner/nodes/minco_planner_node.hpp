@@ -164,8 +164,8 @@ private:
   bool planner_manages_emergency_stop_ = true;
   int obstacle_value_threshold_ = 50;
   bool unknown_is_obstacle_ = true;
-  double footprint_length_ = 0.70;
-  double footprint_width_ = 0.55;
+  double footprint_length_ = 0.58;
+  double footprint_width_ = 0.58;
   double footprint_safety_margin_ = 0.05;
   double map_ready_timeout_sec_ = 3.0;
   double emergency_stop_heartbeat_period_sec_ = 0.1;

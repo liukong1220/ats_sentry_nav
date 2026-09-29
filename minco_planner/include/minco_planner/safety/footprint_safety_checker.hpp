@@ -13,8 +13,8 @@ namespace minco_planner
 
 struct FootprintSafetyParams
 {
-  double length = 0.70;
-  double width = 0.55;
+  double length = 0.58;
+  double width = 0.58;
   double safety_margin = 0.05;
   int obstacle_value_threshold = 50;
   bool unknown_is_obstacle = false;

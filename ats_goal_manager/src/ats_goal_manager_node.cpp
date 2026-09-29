@@ -329,9 +329,9 @@ private:
     require_planning_snapshot_ =
       declare_parameter<bool>("require_planning_snapshot", false);
     planning_snapshot_safety_params_.footprint_length = std::max(
-      0.0, declare_parameter<double>("footprint_length", 0.70));
+      0.0, declare_parameter<double>("footprint_length", 0.58));
     planning_snapshot_safety_params_.footprint_width = std::max(
-      0.0, declare_parameter<double>("footprint_width", 0.55));
+      0.0, declare_parameter<double>("footprint_width", 0.58));
     planning_snapshot_safety_params_.footprint_safety_margin = std::max(
       0.0, declare_parameter<double>("footprint_safety_margin", 0.05));
     // 与 minco_planner escape_from_contact_max_contact_depth 同一口径。0 保持

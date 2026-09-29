@@ -55,6 +55,6 @@ ats_goal_manager:
     # 同一预算也覆盖 kWaitingForMap:瞬时故障反复挂起时每轮重派都会清掉
     # waiting_since,map_wait_timeout_sec 因此永不到期(domain 168/169)。
     no_executable_plan_timeout_sec: 30.0
-    footprint_length: 0.70
-    footprint_width: 0.55
+    footprint_length: 0.58
+    footprint_width: 0.58
     footprint_safety_margin: 0.05

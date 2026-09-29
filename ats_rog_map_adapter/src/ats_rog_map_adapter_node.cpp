@@ -117,8 +117,8 @@ public:
       0.0, declare_parameter<double>("input_sync_tolerance_sec", 1.0));
     signed_distance_max_m_ = std::max(
       1e-3, declare_parameter<double>("signed_distance_max_m", 2.0));
-    footprint_length_ = std::max(0.0, declare_parameter<double>("footprint_length", 0.70));
-    footprint_width_ = std::max(0.0, declare_parameter<double>("footprint_width", 0.55));
+    footprint_length_ = std::max(0.0, declare_parameter<double>("footprint_length", 0.58));
+    footprint_width_ = std::max(0.0, declare_parameter<double>("footprint_width", 0.58));
     footprint_safety_margin_ = std::max(
       0.0, declare_parameter<double>("footprint_safety_margin", 0.05));
     robot_frame_ = declare_parameter<std::string>("robot_frame", "gimbal_yaw_odom");
