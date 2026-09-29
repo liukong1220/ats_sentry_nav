@@ -195,6 +195,8 @@ private:
   /// 目标净空介于内切半宽与全 yaw 外接圆之间时必然扫过不可行 yaw 带,门禁正确
   /// 拒绝后规划器会每周期复现同一条被拒轨迹直到超时。开关关闭即完全保持旧行为。
   bool terminal_yaw_relocation_enabled_ = true;
+  // 足迹优化 yaw 不动点补解轮数（0 = 关闭）。
+  int footprint_yaw_refinement_rounds_ = 2;
   /// 逐个试的转向位置个数上界,只在轨迹已被判不安全时才会消耗。
   int terminal_yaw_relocation_max_candidates_ = 6;
   TerminalYawRelocationParams terminal_yaw_relocation_params_{};

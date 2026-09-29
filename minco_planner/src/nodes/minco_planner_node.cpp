@@ -366,6 +366,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<bool>(
     "terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   declare_parameter<int>(
+    "footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
+  declare_parameter<int>(
     "terminal_yaw_relocation_max_candidates", terminal_yaw_relocation_max_candidates_);
   declare_parameter<double>(
     "terminal_yaw_relocation_window_length",
@@ -544,6 +546,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
+  get_parameter("footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
+  footprint_yaw_refinement_rounds_ = std::max(0, footprint_yaw_refinement_rounds_);
   get_parameter(
     "terminal_yaw_relocation_max_candidates", terminal_yaw_relocation_max_candidates_);
   terminal_yaw_relocation_max_candidates_ = std::max(
@@ -1264,6 +1268,34 @@ void MincoPlannerNode::planGoal(
   FootprintSafetyResult center_safety = safety_checker_.check(center_reference, planning_grid);
   ReferenceTrajectory reference = center_reference;
   FootprintSafetyResult safety = center_safety;
+  // 足迹罚项用的是上一条轨迹的 yaw，而 planYaw 会按新轨迹重算 yaw：两者不一致时，
+  // 角点可落进薄墙尖（优化器看不到、门禁拒绝）。用刚算出的 yaw 作参考再解，
+  // 直到门禁通过或轮数用尽；每轮结果都过同一矩形门禁，不放宽任何判据，
+  // 碰撞数变多即停并保留上一轮。
+  const auto refineFootprintYaw = [&](
+    const nav_msgs::msg::Path & guide, ReferenceTrajectory & candidate,
+    FootprintSafetyResult & candidate_safety, MincoOptimizationTrace & candidate_trace) {
+      for (int round = 0; !candidate_safety.safe && round < footprint_yaw_refinement_rounds_;
+        ++round)
+      {
+        MincoOptimizationTrace refined_trace;
+        ReferenceTrajectory refined = optimizer_.optimize(
+          guide, clearance_esdf.get(), &candidate, seed_ptr, &planning_grid, &safety_checker_,
+          &refined_trace);
+        if (!refined.valid()) {
+          return;
+        }
+        refined.header.stamp = now();
+        planYaw(refined, *map_snapshot, start_yaw, goal_yaw);
+        FootprintSafetyResult refined_safety = safety_checker_.check(refined, planning_grid);
+        if (refined_safety.collisions.size() > candidate_safety.collisions.size()) {
+          return;
+        }
+        candidate = std::move(refined);
+        candidate_safety = std::move(refined_safety);
+        candidate_trace = std::move(refined_trace);
+      }
+    };
   if (optimizer_.esdfFootprintOptimizationEnabled()) {
     MincoOptimizationTrace footprint_trace;
     ReferenceTrajectory footprint_reference = optimizer_.optimize(
@@ -1274,6 +1306,8 @@ void MincoPlannerNode::planGoal(
       planYaw(footprint_reference, *map_snapshot, start_yaw, goal_yaw);
       FootprintSafetyResult footprint_safety = safety_checker_.check(
         footprint_reference, planning_grid);
+      refineFootprintYaw(
+        search_result.path, footprint_reference, footprint_safety, footprint_trace);
       if (footprint_safety.safe || !center_safety.safe) {
         reference = std::move(footprint_reference);
         safety = std::move(footprint_safety);
@@ -1354,10 +1388,12 @@ void MincoPlannerNode::planGoal(
       reference = std::move(pre_repair_reference);
     } else {
       local_repair_used = true;
+      const nav_msgs::msg::Path repair_guide = toPath(reference);
       reference = std::move(repaired);
       reference.header.stamp = now();
       planYaw(reference, *map_snapshot, start_yaw, goal_yaw);
       safety = safety_checker_.check(reference, planning_grid);
+      refineFootprintYaw(repair_guide, reference, safety, repair_trace);
       selected_trace = std::move(repair_trace);
     }
   }
