@@ -299,6 +299,15 @@ void MincoPlannerNode::declareAndLoadParams()
     "guide_smoothing_max_deviation", optimizer_params.guide_smoothing_max_deviation);
   declare_parameter<double>(
     "guide_smoothing_min_clearance", optimizer_params.guide_smoothing_min_clearance);
+  declare_parameter<double>("guide_sparse_spacing", optimizer_params.guide_sparse_spacing);
+  declare_parameter<double>(
+    "guide_sparse_max_deviation", optimizer_params.guide_sparse_max_deviation);
+  declare_parameter<double>(
+    "guide_sparse_clearance_tolerance", optimizer_params.guide_sparse_clearance_tolerance);
+  declare_parameter<int>(
+    "guide_sparse_max_iterations", optimizer_params.guide_sparse_max_iterations);
+  declare_parameter<double>(
+    "guide_sparse_max_curvature", optimizer_params.guide_sparse_max_curvature);
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
@@ -469,6 +478,12 @@ void MincoPlannerNode::declareAndLoadParams()
     "guide_smoothing_max_deviation", optimizer_params.guide_smoothing_max_deviation);
   get_parameter(
     "guide_smoothing_min_clearance", optimizer_params.guide_smoothing_min_clearance);
+  get_parameter("guide_sparse_spacing", optimizer_params.guide_sparse_spacing);
+  get_parameter("guide_sparse_max_deviation", optimizer_params.guide_sparse_max_deviation);
+  get_parameter(
+    "guide_sparse_clearance_tolerance", optimizer_params.guide_sparse_clearance_tolerance);
+  get_parameter("guide_sparse_max_iterations", optimizer_params.guide_sparse_max_iterations);
+  get_parameter("guide_sparse_max_curvature", optimizer_params.guide_sparse_max_curvature);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
   get_parameter("esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);
@@ -613,6 +628,12 @@ void MincoPlannerNode::declareAndLoadParams()
   astar_params_cache_ = astar_params;
   jps_params_cache_ = jps_params;
   optimizer_.setParams(optimizer_params);
+  // 稀疏航点候选经 planYaw 后仍撞足迹时，用关闭稀疏化的同参优化器重算（历史加密引导），
+  // 保证开启稀疏化不会比关闭时更差。
+  MincoTrajectoryOptimizerParams dense_optimizer_params = optimizer_params;
+  dense_optimizer_params.guide_sparse_spacing = 0.0;
+  dense_optimizer_.setParams(dense_optimizer_params);
+  optimizer_params_sparse_enabled_ = optimizer_params.guide_sparse_spacing > 1e-6;
   yaw_planner_.setParams(yaw_params);
   // 缓存一份给目标位姿准入用，保证两者的矩形几何完全一致。
   footprint_params_ = footprint_params;
@@ -1221,6 +1242,22 @@ void MincoPlannerNode::planGoal(
   const double goal_yaw = tf2::getYaw(goal.pose.orientation);
   planYaw(center_reference, *map_snapshot, start_yaw, goal_yaw);
   FootprintSafetyResult center_safety = safety_checker_.check(center_reference, planning_grid);
+  if (!center_safety.safe && optimizer_params_sparse_enabled_) {
+    MincoOptimizationTrace dense_trace;
+    ReferenceTrajectory dense_reference = dense_optimizer_.optimize(
+      search_result.path, clearance_esdf.get(), nullptr, seed_ptr, &planning_grid,
+      &safety_checker_, &dense_trace);
+    if (dense_reference.valid()) {
+      dense_reference.header.stamp = now();
+      planYaw(dense_reference, *map_snapshot, start_yaw, goal_yaw);
+      FootprintSafetyResult dense_safety = safety_checker_.check(dense_reference, planning_grid);
+      if (dense_safety.safe || dense_safety.collisions.size() < center_safety.collisions.size()) {
+        center_reference = std::move(dense_reference);
+        center_safety = std::move(dense_safety);
+        selected_trace = std::move(dense_trace);
+      }
+    }
+  }
   ReferenceTrajectory reference = center_reference;
   FootprintSafetyResult safety = center_safety;
   if (optimizer_.esdfFootprintOptimizationEnabled()) {
@@ -1228,11 +1265,31 @@ void MincoPlannerNode::planGoal(
     ReferenceTrajectory footprint_reference = optimizer_.optimize(
       search_result.path, clearance_esdf.get(), &center_reference, seed_ptr, &planning_grid,
       &safety_checker_, &footprint_trace);
+    FootprintSafetyResult footprint_safety;
     if (footprint_reference.valid()) {
       footprint_reference.header.stamp = now();
       planYaw(footprint_reference, *map_snapshot, start_yaw, goal_yaw);
-      FootprintSafetyResult footprint_safety = safety_checker_.check(
-        footprint_reference, planning_grid);
+      footprint_safety = safety_checker_.check(footprint_reference, planning_grid);
+    }
+    if ((!footprint_reference.valid() || !footprint_safety.safe) &&
+      optimizer_params_sparse_enabled_)
+    {
+      MincoOptimizationTrace dense_trace;
+      ReferenceTrajectory dense_reference = dense_optimizer_.optimize(
+        search_result.path, clearance_esdf.get(), &center_reference, seed_ptr, &planning_grid,
+        &safety_checker_, &dense_trace);
+      if (dense_reference.valid()) {
+        dense_reference.header.stamp = now();
+        planYaw(dense_reference, *map_snapshot, start_yaw, goal_yaw);
+        FootprintSafetyResult dense_safety = safety_checker_.check(dense_reference, planning_grid);
+        if (!footprint_reference.valid() || dense_safety.safe) {
+          footprint_reference = std::move(dense_reference);
+          footprint_safety = std::move(dense_safety);
+          footprint_trace = std::move(dense_trace);
+        }
+      }
+    }
+    if (footprint_reference.valid()) {
       if (footprint_safety.safe || !center_safety.safe) {
         reference = std::move(footprint_reference);
         safety = std::move(footprint_safety);
@@ -1249,7 +1306,7 @@ void MincoPlannerNode::planGoal(
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled()) {
     // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
     MincoOptimizationTrace fallback_trace;
-    ReferenceTrajectory fallback_reference = optimizer_.optimize(
+    ReferenceTrajectory fallback_reference = dense_optimizer_.optimize(
       search_result.path, nullptr, nullptr, seed_ptr, &planning_grid, &safety_checker_,
       &fallback_trace);
     if (fallback_reference.valid()) {
@@ -1299,7 +1356,7 @@ void MincoPlannerNode::planGoal(
   if (repair_changed) {
     // 局部修复只改变几何引导线，必须重新求 MINCO、yaw 和最终矩形足迹安全性。
     MincoOptimizationTrace repair_trace;
-    ReferenceTrajectory repaired = optimizer_.optimize(
+    ReferenceTrajectory repaired = dense_optimizer_.optimize(
       toPath(reference), clearance_esdf.get(), &reference, seed_ptr, &planning_grid,
       &safety_checker_, &repair_trace);
     if (!repaired.valid()) {

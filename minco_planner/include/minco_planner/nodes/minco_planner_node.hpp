@@ -202,6 +202,8 @@ private:
   GridAstar astar_;
   GridJps jps_;
   MincoTrajectoryOptimizer optimizer_;
+  MincoTrajectoryOptimizer dense_optimizer_;
+  bool optimizer_params_sparse_enabled_ = false;
   YawSplinePlanner yaw_planner_;
   /// 提交门使用的矩形足迹参数副本。目标位姿准入必须用同一份参数，否则"终点可行"
   /// 与"轨迹可行"会用两套几何判定。
