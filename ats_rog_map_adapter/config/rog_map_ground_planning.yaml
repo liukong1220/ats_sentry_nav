@@ -48,8 +48,8 @@ ats_rog_map_adapter:
     unknown_is_obstacle: true
     input_timeout_sec: 2.0
     signed_distance_max_m: 2.0
-    footprint_length: 0.70
-    footprint_width: 0.55
+    footprint_length: 0.58
+    footprint_width: 0.58
     footprint_safety_margin: 0.05
     robot_frame: gimbal_yaw_odom
     # Disabled in P2: a yaw-free circle would clear unknown outside the rectangular footprint.

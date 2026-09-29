@@ -56,8 +56,8 @@ struct MincoJointOptimizerParams
   // 足迹采样点（已含 safety_margin 的矩形边界）ESDF 净空目标 [m]；
   // 只在提供 yaw 参考时启用。
   double footprint_clearance = 0.03;
-  double footprint_length = 0.70;
-  double footprint_width = 0.55;
+  double footprint_length = 0.58;
+  double footprint_width = 0.58;
   double footprint_safety_margin = 0.05;
   // 每条边在两角点之间的等分采样数，1 = 只取边中点。
   int footprint_edge_samples = 1;

@@ -107,8 +107,8 @@ struct MincoTrajectoryOptimizerParams
   double esdf_footprint_trigger_clearance = 0.0;
   double esdf_footprint_target_clearance = 0.0;
   double esdf_footprint_sample_spacing = 0.10;
-  double footprint_length = 0.70;
-  double footprint_width = 0.55;
+  double footprint_length = 0.58;
+  double footprint_width = 0.58;
   double footprint_safety_margin = 0.05;
 
   // 重规划时用当前车速播种 MINCO 首端状态所允许的上限（见 InitialKinematicState）。
