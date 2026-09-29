@@ -21,6 +21,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/safety/local_collision_repair.cpp
   src/safety/goal_pose_admission.cpp
   src/trajectory/minco_time_allocator.cpp
+  src/trajectory/minco_joint_optimizer.cpp
   src/trajectory/minco_trajectory_optimizer.cpp
   src/trajectory/path_geometry_preprocessor.cpp
   src/trajectory/terminal_yaw_relocation.cpp
@@ -64,6 +65,9 @@ if(BUILD_TESTING)
     test/test_minco_trajectory_optimizer.cpp
   )
   target_link_libraries(test_minco_trajectory_optimizer ${PROJECT_NAME})
+
+  ament_add_gtest(test_minco_joint_optimizer test/test_minco_joint_optimizer.cpp)
+  target_link_libraries(test_minco_joint_optimizer ${PROJECT_NAME})
 
   ament_add_gtest(test_planner_debug_visualizer test/test_planner_debug_visualizer.cpp)
   target_link_libraries(test_planner_debug_visualizer ${PROJECT_NAME})

@@ -3,6 +3,8 @@
 ## GCOPTER MINCO
 
 `include/minco_planner/trajectory/minco_s3.hpp` is adapted from GCOPTER MINCO.
+`include/minco_planner/trajectory/lbfgs.hpp` is a rewrite whose algorithm structure
+(two-loop recursion, Lewis-Overton line search) follows GCOPTER `lbfgs.hpp`.
 
 MIT License
 
