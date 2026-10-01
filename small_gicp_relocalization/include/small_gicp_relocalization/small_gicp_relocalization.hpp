@@ -172,7 +172,7 @@ private:
   RegistrationAttempt runCoarseFineAlignment(
     const Eigen::Isometry3d & initial_guess, bool allow_unconverged);
   MultiGuessOutcome runMultiGuessAlignmentOn(
-    const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag) const;
+    const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag);
   CandidateHardGates hardGates(bool allow_unconverged) const;
   bool passesQualityGates(
     RegistrationAttempt & attempt, bool allow_unconverged, GateStage stage) const;
@@ -207,6 +207,8 @@ private:
   double max_registration_error_;
   bool relax_convergence_for_sim_{false};
   bool log_registration_details_;
+  // 详细配准日志默认节流，避免每帧点云刷屏；CSV 诊断仍保持逐候选记录。
+  std::uint64_t log_throttle_ms_{2000};
   bool publish_tf_;
   int confirmation_count_;
   double confirmation_translation_tolerance_;

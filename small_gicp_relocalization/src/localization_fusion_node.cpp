@@ -201,7 +201,7 @@ public:
     }
     RCLCPP_INFO(
       get_logger(),
-      "Localization fusion ready: odom='%s' localization='%s' observation='%s' status='%s'",
+      "【定位融合就绪】里程计='%s' 定位='%s' 重定位观测='%s' 状态='%s'",
       odom_topic_.c_str(), localization_topic_.c_str(), observation_topic_.c_str(),
       status_topic_.c_str());
   }
@@ -552,7 +552,7 @@ private:
       odom_history_count_drops_ += dropped;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
-        "Odometry history sample cap reached: retained=%zu count_cap_drops=%llu",
+        "【定位历史裁剪】里程计历史达到样本上限：保留=%zu 按数量丢弃=%llu",
         odom_history_.size(), static_cast<unsigned long long>(odom_history_count_drops_));
     }
   }
