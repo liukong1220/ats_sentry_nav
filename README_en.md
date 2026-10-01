@@ -16,46 +16,51 @@ https://github.com/user-attachments/assets/ae4c19a0-4c73-46a0-95bd-909734da2a42
 
 ## 1. Overview
 
-This project is based on the [NAV2 Navigation Framework](https://github.com/ros-navigation/navigation2) and references the design of [autonomous_exploration_development_environment](https://github.com/HongbiaoZ/autonomous_exploration_development_environment/tree/humble).
+> The Chinese [README.md](./README.md) is the maintained reference. This page only summarizes the current stack.
 
-- Coordinate Transformation：
+This repository started from the PolarBear RoboMaster 2025 sentry navigation project. The current ATS runtime is Nav2-free: no Nav2 servers, costmaps or BT navigator are launched, and goals enter the ATS `NavigateToPose` action (`/ats_navigate_to_pose`).
 
-    This project has optimized coordinate transformation logic significantly, considering the implicit transformation between the radar origin `lidar_odom` and the chassis origin `odom`.
+- Localization: [point_lio](./point_lio/) provides odometry and `/registered_scan`; [small_gicp_relocalization](./small_gicp_relocalization/) maintains `map -> odom` against a prior PCD. [loam_interface](./loam_interface/) and [sensor_scan_generation](./sensor_scan_generation/) adapt the point cloud and TF chain.
 
-    The Livox mid360 is mounted on the large-yaw stage and uses [point_lio](https://github.com/SMBU-PolarBear-Robotics-Team/point_lio/tree/RM2025_SMBU_auto_sentry) as odometry, [small_gicp](https://github.com/SMBU-PolarBear-Robotics-Team/small_gicp_relocalization) for localization, and [loam_interface](./loam_interface/) transforms PointCloud from the `lidar_odom` frame into the navigation `odom` frame. [sensor_scan_generation](./sensor_scan_generation/) then republishes the scan chain and maintains both `odom -> base_footprint` and `odom -> gimbal_yaw_odom`, where `gimbal_yaw_odom` is the large-yaw reference frame used by navigation.
+- Mapping: `ats_rog_map` (probabilistic occupancy, inflation, 3D ESDF, numeric ground projection) and `ats_rog_map_adapter`, which fuses ROGMap, terrain and the static map into `/rc_esdf/planning_grid`.
 
-    ![frames_2025_03_26](https://raw.githubusercontent.com/LihanChen2004/picx-images-hosting/master/frames_2025_03_26.67xmq3djvx.webp)
+- Planning and control pipeline:
 
-- Path Planning：
+    ```text
+    ats_goal_manager -> minco_planner -> ats_swerve_mpc -> cmd_vel_arbiter -> /cmd_vel/selected -> chassis
+    ```
 
-    The NAV2 default Global Planner is used as the global path planner, with `nav2_mppi_controller::MPPIController` as the local controller.
+    `minco_planner` runs JPS/A* graph search, path preprocessing, whole-trajectory joint MINCO optimization (waypoints and durations in one time-budgeted L-BFGS problem), clearance-aware yaw planning with local time scaling, and a rectangular footprint gate (discrete + swept) with local repair stages. `ats_goal_manager` reviews and commits the candidate reference. `ats_swerve_mpc` is a constrained iLQR swerve MPC that keeps lateral motion. On the real robot `fake_vel_transform` and `sentry_chassis_vel_transform` sit between the MPC and the arbiter. The vehicle footprint is 0.58 x 0.58 m.
 
-- Namespace:
-
-    To facilitate the expansion to multi-robot systems, this project uses namespaces. ROS-related nodes, topics, actions, etc., are prefixed with namespaces. To view the TF tree, use the command `ros2 run rqt_tf_tree rqt_tf_tree --ros-args -r /tf:=tf -r /tf_static:=tf_static -r __ns:=/red_standard_robot1`.
-
-- LiDAR:
-
-    The Livox mid360 is mounted at an incline on the chassis.
-
-    Current full simulation work is based on MuJoCo. Historical Ignition/Gazebo point cloud conversion is no longer part of the active simulation path.
+- Simulation: full simulation uses MuJoCo (`ats_mujoco_sim`, outside this repository).
 
 - File Structure
 
     ```txt
     .
-    ├── fake_vel_transform                  # Virtual velocity reference frame to handle gimbal scanning mode, see sub-repository README
-    ├── livox_ros_driver2                   # Livox driver
-    ├── loam_interface                      # Point_lio and other odometry interfaces
-    ├── ats_teleop_twist_joy                 # Gamepad control
-    ├── ats_nav_bringup                  # Launch files
-    ├── ats_sentry_nav                   # This repository's package description
-    ├── point_lio                           # Odometry
-    ├── pointcloud_to_laserscan             # Convert terrain_map to LaserScan type to represent obstacles (only launched in SLAM mode)
-    ├── sensor_scan_generation              # Point cloud related coordinate transformation
-    ├── small_gicp_relocalization           # Localization
-    ├── terrain_analysis                    # Terrain analysis within a 4m range of the vehicle, writing obstacle height above ground into the PointCloud intensity field.
-    └── terrain_analysis_ext                # Terrain analysis beyond a 4m range of the vehicle, writing obstacle height above ground into the PointCloud intensity field.
+    ├── ats_navigation_interfaces       # Action, status, authorization and atomic snapshot schemas
+    ├── ats_rog_map_interfaces          # ROGMap numeric projection service
+    ├── ats_rog_map                     # Occupancy, inflation, 3D ESDF, ground projection
+    ├── ats_rog_map_adapter             # 2.5D conservative fusion, owner of /rc_esdf/planning_grid
+    ├── ats_rc_esdf                     # 2D signed distance / static map fusion
+    ├── minco_planner                   # JPS/A*, MINCO joint optimization, yaw, footprint gate
+    ├── ats_goal_manager                # NavigateToPose action, commit review, execution authorization
+    ├── ats_swerve_mpc                  # Omnidirectional SE(2) MPC (iLQR; OSQP shadow for diagnostics)
+    ├── ats_cmd_vel_arbiter             # Manual/autonomy velocity arbitration -> /cmd_vel/selected
+    ├── ats_nav_bringup                 # Localization/navigation launch files, maps, RViz
+    ├── ats_teleop_twist_joy            # Gamepad control
+    ├── ats_sentry_nav                  # Aggregate package
+    ├── fake_vel_transform              # Gimbal-yaw velocity frame compatibility layer
+    ├── sentry_chassis_vel_transform    # Chassis velocity frame adapter (imported via dependencies.repos)
+    ├── livox_ros_driver2               # Livox driver
+    ├── loam_interface                  # Odometry point cloud interface
+    ├── point_lio                       # Odometry
+    ├── pointcloud_to_laserscan         # PointCloud to LaserScan conversion
+    ├── sensor_scan_generation          # Point cloud related coordinate transformation
+    ├── small_gicp_relocalization       # Relocalization and localization fusion
+    ├── terrain_analysis                # Near-field terrain analysis
+    ├── terrain_analysis_ext            # Far-field terrain analysis
+    └── third_party/osqp                # OSQP source used by ats_swerve_mpc
     ```
 
 ## 2. Quick Start
@@ -126,15 +131,15 @@ rosdep install -r --from-paths src --ignore-src --rosdistro $ROS_DISTRO -y
 ```
 
 ```bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --base-paths src --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
+
+Always restrict the build to `--base-paths src`. A single package builds with `colcon build --base-paths src --packages-select <pkg>`.
 
 > [!NOTE]
 > We highly recommend building your workspace using the symlink-install option since ats_sentry_nav extensively utilizes launch_file and YAML resources. This option installs symbolic links to those non-compiled source files meaning that you don't need to rebuild again and again when you're for example tweaking a parameter file. Instead, your changes take effect immediately and you just need to restart your application.
 
 ### 2.3 Running
-
-You can start the project with the following commands. Use the `Nav2 Goal` plugin in RViz to publish goal pose.
 
 #### 2.3.1 Simulation
 
@@ -144,62 +149,20 @@ Full simulation uses MuJoCo:
 ros2 launch ats_mujoco_sim mujoco_navigation.launch.py
 ```
 
-Fast behavior-tree or Nav2 loopback testing uses the workspace-level loopback launch files in `ats_sentry_bringup`.
-
 #### 2.3.2 Physical Robot
 
-SLAM mode：
+The real-robot entry is owned by the workspace-level `ats_sentry_bringup` package and uses `src/ats_sentry_bringup/params/node_params.yaml` as the single parameter source:
 
 ```bash
-ros2 launch ats_nav_bringup rm_navigation_reality_launch.py \
-slam:=True \
-use_robot_state_pub:=True
+ros2 launch ats_sentry_bringup real_robot_navigation.launch.py world:=rmuc_2026 use_rviz:=true
 ```
 
-Save map：`ros2 run nav2_map_server map_saver_cli -f <YOUR_MAP_NAME>  --ros-args -r __ns:=/red_standard_robot1`
-
-Navigation mode:
-
-Remember to change the `world` parameter to the actual map name.
-
-```bash
-ros2 launch ats_nav_bringup rm_navigation_reality_launch.py \
-world:=<YOUR_WORLD_NAME> \
-slam:=False \
-use_robot_state_pub:=True
-```
+Send goals to the `/ats_navigate_to_pose` action (`ats_navigation_interfaces/action/NavigateToPose`). This drives the robot; only run it in a restricted low-speed area with a working physical emergency stop.
 
 ### 2.4 Launch Arguments
 
-Launch arguments are largely common to both simulation and physical robot. However, there is a group of arguments that apply only to hardware or only to the simulator. Below is a legend to the tables with all launch arguments.
-
-| Symbol | Meaning                      |
-| ------ | ---------------------------- |
-| 🤖      | Available for physical robot |
-| 🖥️      | Available in simulation      |
-
-| Available | Argument | Description | Type  | Default |
-|-|-|-|-|-|
-| 🤖 🖥️ | `namespace` | Top-level namespace | string | "red_standard_robot1" |
-| 🤖🖥️ | `use_sim_time` | Use simulation clock if True | bool | Simulation: True; Reality: False |
-| 🤖 🖥️ | `slam` | Whether run a SLAM. If True, it will disable small_gicp and send static tf (map->odom). Then automatically save the pcd_file in [./point_lio/PCD/](./point_lio/PCD/)| bool | False |
-| 🤖 🖥️ | `world` | In simulation, available options are `rmul_2024` or `rmuc_2024` or `rmul_2025` or `rmuc_2025` | string | "rmuc_2025" |
-|  |  | In reality, the `world` parameter name is the same as the file names of the grid map and prior pointcloud map | string | "" |
-| 🤖 🖥️ | `map` | Full path to map file to load. The path is constructed based on the `world` parameter | string | Simulation: [rmuc_2025.yaml](./ats_nav_bringup/map/simulation/rmuc_2025.yaml); Reality: AUTO_FILL |
-| 🤖 🖥️ | `prior_pcd_file` | Full path to prior pcd file to load. The path is constructed based on the `world` parameter | string | Simulation: [rmuc_2025.pcd](./ats_nav_bringup//pcd/reality/); Reality: AUTO_FILL |
-| 🤖 🖥️ | `params_file` | Full path to the ROS2 parameters file to use for all launched nodes | string | Simulation: [nav2_params.yaml](./ats_nav_bringup/config/simulation/nav2_params.yaml); Reality: [nav2_params.yaml](./ats_nav_bringup/config/reality/nav2_params.yaml) |
-| 🤖🖥️ | `rviz_config_file` | Full path to the RViz config file to use | string | [nav2_default_view.rviz](./ats_nav_bringup/rviz/nav2_default_view.rviz) |
-| 🤖 🖥️ | `autostart` | Automatically startup the nav2 stack | bool | True |
-| 🤖 🖥️ | `use_composition` | Whether to use composed bringup | bool | True |
-| 🤖 🖥️ | `use_respawn` | Whether to respawn if a node crashes. Applied when composition is disabled. | bool | False |
-| 🤖🖥️ | `use_rviz` | Whether to start RViz | bool | True |
-| 🤖 | `use_robot_state_pub` | Whether to start the robot state publisher <br> 1. In full MuJoCo simulation, the simulator publishes the robot state and TF information needed by the test chain. <br> 2. In reality, it is **recommended** to use an independent package to publish the robot's TF information. For example, the serial module [standard_robot_pp_ros2](https://github.com/SMBU-PolarBear-Robotics-Team/standard_robot_pp_ros2) provides `gimbal_yaw_odom` (large yaw), `gimbal_yaw` (small yaw), and `gimbal_pitch` joint states, in which case `use_robot_state_pub` should be set to False. <br> If there is no complete robot system or only the navigation module (this repo) is tested, `use_robot_state_pub` can be set to True. In this case, the navigation module will publish static robot joint pose data to maintain the TF tree. <br> *Note: It is necessary to clone and compile [ats_robot_description](https://github.com/SMBU-PolarBear-Robotics-Team/ats_robot_description.git) additionally* | bool | False |
-
-> [!TIP]
-> For more details about this project and the deployment guide for the physical robot, please visit the [Wiki](https://github.com/SMBU-PolarBear-Robotics-Team/ats_sentry_nav/wiki).
+Use `--show-args` for the authoritative list. `ats_nav_bringup/launch/rm_navigation_reality_launch.py` currently declares: `namespace`, `assets_dir`, `world`, `use_sim_time`, `use_respawn`, `use_robot_state_pub`, `use_rviz`, `rviz_force_software`, `launch_joy_teleop`, `launch_small_gicp_relocalization`, `launch_localization_fusion`, `launch_fake_vel_transform`, `launch_chassis_vel_transform`, `chassis_vel_output_topic`, `launch_cmd_vel_arbiter`, `require_gimbal_status`, `log_level`.
 
 ### 2.5 Joy teleop
 
-By default, PS4 controller support is enabled. The key mapping can be found in the `teleop_twist_joy_node` section of [nav2_params.yaml](./ats_nav_bringup/config/simulation/nav2_params.yaml).
-
-![teleop_twist_joy.gif](https://raw.githubusercontent.com/LihanChen2004/picx-images-hosting/master/teleop_twist_joy.5j4aav3v3p.gif)
+Gamepad support is off by default (`launch_joy_teleop:=False`). The key mapping is in the `ats_teleop_twist_joy_node` section of `node_params.yaml`.

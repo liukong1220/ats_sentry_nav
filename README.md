@@ -39,9 +39,11 @@
 - ROGMap 概率占据、膨胀、三维 ESDF 与数值地面投影；
 - terrain、静态图和 ROGMap 的 2.5D 保守融合；
 - RC-ESDF signed distance、unknown、gradient 与地图边界语义；
-- JPS 路径搜索、MINCO S3 轨迹优化、独立 yaw 与局部碰撞修复；
+- JPS/A* 图搜索、整条轨迹 MINCO 联合优化、clearance-aware 独立 yaw、局部时间缩放与
+  矩形足迹安全链；
 - 自研 Goal Manager action 生命周期和执行授权；
-- 保留横移自由度的全向 SE2 MPC。
+- 保留横移自由度的全向 SE2 MPC（约束 iLQR）；
+- `cmd_vel_arbiter` 手动/自主速度仲裁，唯一输出 `/cmd_vel/selected`。
 
 本仓库不把 ROGMap 当作定位器。`point_lio` 继续提供 `/localization` 与
 `/registered_scan`，ROGMap 只负责环境表示和规划地图数据。
@@ -75,11 +77,21 @@ adapter 融合 ROGMap、terrain/slope 和静态图后，成为
 `/rc_esdf/planning_grid` 的唯一发布者。细静态图降采样按输出单元覆盖范围保守聚合，
 保留 resolution、origin、origin yaw、unknown 和 occupied 语义。
 
-### JPS、MINCO S3 与完整 footprint 安全链
+### JPS、MINCO 联合优化与矩形 footprint 安全链
 
-`minco_planner` 使用 JPS 生成几何路径，随后执行非均匀时间五阶 MINCO S3
-轨迹优化。yaw 独立于平移轨迹规划，最终候选经过 footprint gate；局部冲突可进入
-Local Collision Repair，修复后的几何仍需重新生成并验证轨迹。
+`minco_planner` 的处理链：
+
+```text
+目标位姿准入 -> JPS/A* 图搜索（净空梯子）-> 路径预处理 -> 整条轨迹 MINCO 联合优化
+（全部内点 q 与段时长 T 一次 L-BFGS，带时间预算）-> planYaw（clearance_aware yaw、
+轮速与窄通道转向局部放慢）-> 矩形足迹门禁（逐点 + 扫掠）
+```
+
+`clearance_aware` yaw 在开阔区朝向目标，在窄通道内（进入/退出阈值滞回）对齐路径切线；
+可选正方形 4 阶切线对称、窄段间隙桥接和 yaw 角加速度限制。门禁不通过时依次尝试足迹 yaw
+不动点补解、无 ESDF 基线兜底、局部碰撞修复、终端 yaw 重定位和（默认关闭的）脱困前缀，每个结果都重新经过
+同一门禁。车辆足迹为 `0.58 x 0.58 m`。参数与各阶段说明见
+[minco_planner/README.md](./minco_planner/README.md)。
 
 一次规划内，JPS、二维 RC-ESDF、MINCO clearance、footprint gate 与 repair 共用同一个
 MINCO 本地不可变 snapshot。ROGMap source generation、adapter publication sequence 和
@@ -87,14 +99,18 @@ MINCO local snapshot generation 是三个不同编号域，当前不会把它们
 
 ### 全向 SE2 MPC 与唯一速度链
 
-控制状态是世界系 `[x, y, yaw]`，MPC 输出是车体系 `[vx, vy, wz]`。实现保留
-四舵轮横移能力，不引入差速、ICR 或 `vy=0` 约束。
+控制状态是世界系 `[x, y, yaw]`，MPC 输出是车体系 `[vx, vy, wz]`。正式控制器为约束 iLQR，
+同时约束车体速度/加速度与逐轮轮速、舵角速率；OSQP LTV-QP 只有诊断用的 `qp_shadow` 模式。
+实现保留四舵轮横移能力，不引入差速、ICR 或 `vy=0` 约束。
 
-正式速度链只有一个 owner：
+速度链每一段只有一个 owner。实机默认：
 
 ```text
-ats_swerve_mpc -> /cmd_vel/autonomy_raw -> cmd_vel_arbiter -> /cmd_vel/selected -> chassis input
+ats_swerve_mpc -> /cmd_vel/autonomy_raw -> fake_vel_transform -> /cmd_vel/autonomy_gimbal
+  -> chassis_vel_transform -> /cmd_vel/autonomy -> cmd_vel_arbiter -> /cmd_vel/selected -> chassis input
 ```
+
+MuJoCo 不启动两个 transform，arbiter 直接订阅 `/cmd_vel/autonomy_raw`。
 
 失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度。
 急停会清空 MPC tracker，旧 reference 不会因 ready 恢复而自动复活。
@@ -119,9 +135,11 @@ P3 运行链已经使用该授权；P4 的 candidate digest 关联字段已定�
 | `terrain_analysis` / `terrain_analysis_ext` | 近远场地形与可通行语义 | adapter 的 terrain/slope 来源 |
 | `ats_rog_map_adapter` | ROGMap、terrain、slope、静态图保守融合 | planning grid 唯一 owner |
 | `ats_rc_esdf` | 中立二维 signed distance、unknown、gradient、静态图融合算法 | planner 数值地图后端 |
-| `minco_planner` | JPS、MINCO S3、yaw、footprint、repair | 规划候选 producer |
+| `minco_planner` | JPS/A*、MINCO 联合优化、yaw、局部时间缩放、footprint 门禁与修复 | 规划候选 producer |
 | `ats_goal_manager` | ATS action、目标状态机、提交复核、急停、执行授权 | 导航 action server |
-| `ats_swerve_mpc` | 全向 SE2 MPC、授权/急停/定位 watchdog | `/cmd_vel/autonomy_raw` 唯一 producer |
+| `ats_swerve_mpc` | 全向 SE2 MPC（iLQR）、授权/急停/定位 watchdog | `/cmd_vel/autonomy_raw` 唯一 producer |
+| `fake_vel_transform` / `sentry_chassis_vel_transform` | 云台 yaw 与底盘速度 frame 兼容层（后者由 `dependencies.repos` 外置） | 实机默认启用，MuJoCo 不启动 |
+| `ats_cmd_vel_arbiter` | 手动优先、自动执行租约、急停、链路心跳与超时仲裁 | `/cmd_vel/selected` 唯一 producer |
 | `ats_navigation_interfaces` | action、状态、授权及 P4 原子 schema | 跨模块接口权威 |
 | `ats_nav_bringup` | 定位与导航子系统 launch、地图及 RViz 资源 | 被根 bringup 编排 |
 
@@ -180,9 +198,13 @@ MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
   --packages-select \
     ats_navigation_interfaces ats_rog_map_interfaces ats_rc_esdf \
     ats_rog_map ats_rog_map_adapter minco_planner ats_goal_manager \
-    ats_swerve_mpc ats_nav_bringup ats_sentry_nav \
+    ats_swerve_mpc ats_cmd_vel_arbiter ats_nav_bringup ats_sentry_nav \
   --parallel-workers 6
 ```
+
+单包构建：`colcon build --base-paths src --packages-select <pkg>`。`ats_swerve_mpc` 内置 OSQP，
+其 QDLDL 依赖已由 FetchContent 缓存在 `build/ats_swerve_mpc/_deps`；重新配置时不要使用
+`-UFETCHCONTENT_SOURCE_DIR_QDLDL`。
 
 ### 启动前检查
 
@@ -254,13 +276,15 @@ ros2 action send_goal --feedback \
 | `/rc_esdf/planning_grid` | `nav_msgs/msg/OccupancyGrid` | adapter -> MINCO/behavior/RViz | RELIABLE + TRANSIENT_LOCAL；唯一 owner |
 | `/rog_map_adapter/ready` | `std_msgs/msg/Bool` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL；持续 heartbeat/lease，不是永久 ready |
 | `/rog_map_adapter/status` | `ats_navigation_interfaces/msg/PlanningMapStatus` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL |
+| `/rog_map_adapter/planning_snapshot` | `ats_navigation_interfaces/msg/PlanningMapSnapshot` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL；实机 profile `require_planning_snapshot: true` |
 | `/ats_goal_manager/planner_goal` | `ats_navigation_interfaces/msg/PlannerGoal` | Goal Manager -> MINCO | 目标和 epoch 身份 |
 | `/minco/planning_status` | `ats_navigation_interfaces/msg/PlannerStatus` | MINCO -> Goal Manager | 规划结果与 snapshot generation |
 | `/minco/reference_path_candidate` | `nav_msgs/msg/Path` | MINCO -> Goal Manager | 未提交候选 reference |
 | `/minco/reference_path` | `nav_msgs/msg/Path` | Goal Manager -> MPC/RViz | 已提交、统一重定时的 reference |
 | `/planner/emergency_stop` | `std_msgs/msg/Bool` | Goal Manager -> MPC/底盘安全链 | RELIABLE + TRANSIENT_LOCAL，带 heartbeat |
 | `/planner/execution_command` | `ats_navigation_interfaces/msg/ExecutionCommand` | Goal Manager -> MPC/arbiter | RELIABLE + TRANSIENT_LOCAL；自动源唯一执行授权 |
-| `/cmd_vel/autonomy_raw` | `geometry_msgs/msg/Twist` | MPC -> velocity transform 或 arbiter | 车体系 `[vx, vy, wz]` |
+| `/cmd_vel/autonomy_raw` | `geometry_msgs/msg/Twist` | MPC -> `fake_vel_transform`（实机）或 arbiter（MuJoCo） | 车体系 `[vx, vy, wz]` |
+| `/cmd_vel/autonomy` | `geometry_msgs/msg/Twist` | `chassis_vel_transform` -> arbiter | 实机 arbiter 的自主输入 |
 | `/cmd_vel/selected` | `geometry_msgs/msg/Twist` | arbiter -> 唯一最终 velocity bridge | 手动优先、自动源需新鲜 lease |
 
 ### 数值地图服务
@@ -306,7 +330,7 @@ src/ats_sentry_bringup/params/node_params.yaml
 | `small_gicp_relocalization` | 重定位、fusion、状态与 timeout |
 | `ats_rog_map` | 地图尺寸、分辨率、概率、膨胀、输入 QoS、projection |
 | `ats_rog_map_adapter` | 高度带、terrain/static 融合、unknown、deadline、lease |
-| `minco_planner` | JPS、MINCO、yaw、clearance、footprint、repair |
+| `minco_planner` | JPS、MINCO 联合优化、yaw、局部时间缩放、clearance、footprint、repair |
 | `ats_goal_manager` | action、goal tolerance、heartbeat、提交复核、执行授权 |
 | `ats_swerve_mpc` | SE2 模型、horizon、权重、约束、watchdog、输出 topic |
 
@@ -327,7 +351,7 @@ flowchart LR
     Terrain["terrain / slope"] --> Adapter
     Projection --> Adapter
     Adapter --> Grid["/rc_esdf/planning_grid"]
-    Grid --> Planner["JPS + MINCO S3 + yaw + footprint/repair"]
+    Grid --> Planner["JPS + MINCO joint opt + yaw + footprint gate"]
     Goal["/ats_navigate_to_pose"] --> Manager["Goal Manager"]
     Manager --> Planner
     Planner --> Manager
@@ -335,7 +359,9 @@ flowchart LR
     Exec --> MPC["omnidirectional SE2 MPC"]
     Odom --> MPC
     MPC --> Raw["/cmd_vel/autonomy_raw"]
-    Raw --> Arbiter["cmd_vel arbiter"]
+    Raw --> VT["fake_vel / chassis_vel transform（实机）"]
+    VT --> Arbiter["cmd_vel arbiter"]
+    Raw -. MuJoCo .-> Arbiter
     Arbiter --> Cmd["/cmd_vel/selected"]
     Cmd --> Bridge["unique velocity bridge"]
     Bridge --> Chassis["swerve chassis"]
@@ -367,14 +393,20 @@ src/ats_sentry_bringup/rviz/sentry_default_view.rviz
 
 ### 单元与包级测试
 
+先按单包构建，再在对应构建目录用 `ctest` 运行 GTest：
+
 ```bash
-colcon test --base-paths src --packages-select \
-  ats_rc_esdf ats_rog_map ats_rog_map_adapter minco_planner \
-  ats_goal_manager ats_swerve_mpc
-colcon test-result --test-result-base build --verbose
+cd /home/ats/ATS_2026_snetry_test
+colcon build --base-paths src --packages-select minco_planner
+cd build/minco_planner
+ctest -R '^test_' --output-on-failure
 ```
 
-最近一次 S1/P4 准备阶段记录的证据：
+`minco_planner` 的 copyright、cpplint、clang_format 等 ament lint 测试是已知历史失败，完整
+`ctest` 不是全绿；功能结论只能基于 `test_*` GTest。`ats_swerve_mpc`、`ats_cmd_vel_arbiter` 等
+包同样在 `build/<pkg>` 下运行 `ctest`。
+
+S1/P4 准备阶段的历史证据（早于速度仲裁迁移和 58 x 58 cm 足迹切换）：
 
 - **已构建**：8 个目标包按正式 `colcon --base-paths src --symlink-install` 方式通过；
 - **已通过定向测试**：MINCO atomic/snapshot/footprint GTest、Goal Manager epoch、
@@ -399,11 +431,11 @@ colcon test-result --test-result-base build --verbose
 
 | 项目 | 当前状态 | 边界 |
 | :--- | :--- | :--- |
-| `PlanningMapSnapshot.msg` | 已定义、原子契约 GTest 已通过 | adapter 尚未在正式运行链发布并替代旧 grid/status 组合 |
+| `PlanningMapSnapshot.msg` | adapter 已发布 `/rog_map_adapter/planning_snapshot`，Goal Manager 用于提交复核 | MINCO 仍消费 `/rc_esdf/planning_grid`，尚未替代旧 grid/status 组合 |
 | `PlannerCandidate.msg` | 已定义、候选关联契约 GTest 已通过 | MINCO 尚未在正式运行链输出原子 candidate |
 | `ExecutionCommand` candidate correlation 字段 | 已加入 schema | 正式运行时字段仍为零，consumer 继续执行 P3 授权规则 |
 | adapter -> MINCO -> Goal Manager -> MPC -> serial | 未完成 P4 迁移 | 不得宣称 digest/serial 原子链已上线 |
-| 连续 swept footprint | 未完成 | 现有证据是离散保守采样，不是连续体证明 |
+| 连续 swept footprint | 未完成 | 门禁为逐点 + 相邻点自适应细分的扫掠采样，不是连续体证明 |
 | 实车动力学、制动与 HIL | 未执行 | MuJoCo 参数和结果不能作为 ATS 实测性能 |
 
 下一阶段应先完成原子 schema 的端到端运行迁移、重启/乱序/digest mismatch 故障回放，再进入
@@ -419,15 +451,20 @@ ats_sentry_nav/
 ├── ats_rog_map/                 # 概率地图、膨胀、3D ESDF、projection
 ├── ats_rog_map_adapter/         # 地面投影与 2.5D 保守融合
 ├── ats_rc_esdf/                 # 中立 RC-ESDF 与静态图融合算法
-├── minco_planner/               # JPS、MINCO S3、yaw、footprint、repair
+├── minco_planner/               # JPS/A*、MINCO 联合优化、yaw、footprint 门禁与修复
 ├── ats_goal_manager/            # ATS action 与执行提交状态机
-├── ats_swerve_mpc/              # 全向 SE2 MPC
+├── ats_swerve_mpc/              # 全向 SE2 MPC（iLQR + OSQP shadow）
+├── ats_cmd_vel_arbiter/         # 手动/自主速度仲裁，/cmd_vel/selected 唯一 owner
 ├── ats_nav_bringup/             # 导航/定位 launch、地图、RViz
 ├── point_lio/                   # LiDAR-Inertial odometry
 ├── small_gicp_relocalization/   # 重定位与 localization fusion
 ├── terrain_analysis*/           # 地形与 traversability
 ├── fake_vel_transform/          # 云台 yaw 速度 frame 兼容层
+├── sentry_chassis_vel_transform/ # 底盘速度 frame 适配（dependencies.repos 外置）
+├── loam_interface/              # 里程计点云 frame 接口
 ├── sensor_scan_generation/      # 点云/TF 链适配
+├── ats_teleop_twist_joy/        # 手柄遥控
+├── third_party/osqp/            # ats_swerve_mpc 使用的 OSQP 源码
 ├── dependencies.repos           # standalone 外置源码依赖
 └── ats_sentry_nav/              # 导航聚合包
 ```

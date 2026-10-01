@@ -34,12 +34,14 @@ cd ..
 2. Build
 
     ```zsh
-    colcon build --symlink-install -DCMAKE_BUILD_TYPE=release
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
     ```
 
 ## Usage
 
-1. Set prior pointcloud file in [launch file](launch/small_gicp_relocalization_launch.py)
+1. Pass the prior pointcloud with the required `prior_pcd_file` launch argument of
+   [launch file](launch/small_gicp_relocalization_launch.py); a missing or unreadable
+   file aborts the launch
 
 2. Set the coordinate-frame contract
 
@@ -54,7 +56,8 @@ cd ..
 3. Run
 
     ```zsh
-    ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py
+    ros2 launch small_gicp_relocalization small_gicp_relocalization_launch.py \
+      prior_pcd_file:=/absolute/path/to/the_matching_world.pcd
     ```
 
 ## Runtime input contract
