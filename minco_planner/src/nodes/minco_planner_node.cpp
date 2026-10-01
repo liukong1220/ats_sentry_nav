@@ -361,6 +361,22 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("yaw_rate_limit", yaw_params.yaw_rate_limit);
   declare_parameter<double>("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
   declare_parameter<double>("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
+  declare_parameter<int>("yaw_tangent_symmetry_order", yaw_params.tangent_symmetry_order);
+  declare_parameter<double>("yaw_narrow_gap_bridge_time", yaw_params.narrow_gap_bridge_time);
+  declare_parameter<double>("yaw_acceleration_limit", yaw_params.yaw_acceleration_limit);
+  declare_parameter<double>(
+    "wheel_speed_time_scaling_limit", wheel_speed_time_scaling_params_.wheel_speed_limit);
+  declare_parameter<double>(
+    "wheel_speed_time_scaling_offset_x", wheel_speed_time_scaling_params_.wheel_offset_x);
+  declare_parameter<double>(
+    "wheel_speed_time_scaling_offset_y", wheel_speed_time_scaling_params_.wheel_offset_y);
+  declare_parameter<double>(
+    "wheel_speed_time_scaling_change_rate", wheel_speed_time_scaling_params_.scale_change_rate);
+  declare_parameter<double>(
+    "narrow_turn_speed_limit", wheel_speed_time_scaling_params_.narrow_turn_speed_limit);
+  declare_parameter<double>(
+    "narrow_turn_yaw_rate_threshold",
+    wheel_speed_time_scaling_params_.narrow_turn_yaw_rate_threshold);
   declare_parameter<double>(
     "terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   declare_parameter<bool>(
@@ -544,6 +560,23 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
   get_parameter("narrow_clearance_exit", yaw_params.narrow_clearance_exit);
+  get_parameter("yaw_tangent_symmetry_order", yaw_params.tangent_symmetry_order);
+  get_parameter("yaw_narrow_gap_bridge_time", yaw_params.narrow_gap_bridge_time);
+  get_parameter("yaw_acceleration_limit", yaw_params.yaw_acceleration_limit);
+  get_parameter("wheel_speed_time_scaling_limit", wheel_speed_time_scaling_params_.wheel_speed_limit);
+  get_parameter(
+    "wheel_speed_time_scaling_offset_x", wheel_speed_time_scaling_params_.wheel_offset_x);
+  get_parameter(
+    "wheel_speed_time_scaling_offset_y", wheel_speed_time_scaling_params_.wheel_offset_y);
+  get_parameter(
+    "wheel_speed_time_scaling_change_rate", wheel_speed_time_scaling_params_.scale_change_rate);
+  get_parameter(
+    "narrow_turn_speed_limit", wheel_speed_time_scaling_params_.narrow_turn_speed_limit);
+  get_parameter(
+    "narrow_turn_yaw_rate_threshold",
+    wheel_speed_time_scaling_params_.narrow_turn_yaw_rate_threshold);
+  // 窄通道判据与 yaw 规划共用进入阈值，两者对"窄"的定义一致。
+  wheel_speed_time_scaling_params_.narrow_turn_clearance = yaw_params.narrow_clearance_enter;
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   get_parameter("footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
@@ -655,6 +688,18 @@ void MincoPlannerNode::declareAndLoadParams()
   astar_params_cache_ = astar_params;
   jps_params_cache_ = jps_params;
   optimizer_.setParams(optimizer_params);
+  // 4 阶对称（切线 ±pi/2 等价）只对正方形足迹成立；非正方形时 ±pi/2 会把长边横进
+  // 通道，这里回退到 2 阶，fail-closed。
+  const bool square_footprint = std::abs(footprint_length_ - footprint_width_) <= 1e-3;
+  if (yaw_params.tangent_symmetry_order != 2 &&
+    !(yaw_params.tangent_symmetry_order == 4 && square_footprint))
+  {
+    RCLCPP_WARN(
+      get_logger(),
+      "yaw_tangent_symmetry_order=%d is invalid for footprint %.3f x %.3f m; using 2.",
+      yaw_params.tangent_symmetry_order, footprint_length_, footprint_width_);
+    yaw_params.tangent_symmetry_order = 2;
+  }
   yaw_planner_.setParams(yaw_params);
   // 缓存一份给目标位姿准入用，保证两者的矩形几何完全一致。
   footprint_params_ = footprint_params;
@@ -1779,6 +1824,10 @@ void MincoPlannerNode::planYaw(
   // footprint 净空当输入构成循环依赖,而 annotateClearance 恰好是 yaw 相关的。
   annotatePositionClearance(trajectory, snapshot);
   yaw_planner_.apply(trajectory, start_yaw, goal_yaw);
+  // yaw 定下后才知道平移与转向叠加的轮速；超出底盘能力的局部放慢时间，位置和 yaw 不变。
+  applyWheelSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
+  // 窄通道边平移边转向时再放慢，压低 MPC 横向/yaw 跟踪误差；同样只改时间。
+  applyNarrowTurnTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 下游(yaw authority、轨迹质量评估、planned 记录)读的是 yaw 相关的 footprint 净空,
   // 所以 yaw 定下来之后再覆盖回 footprint 净空,对外语义不变。
   annotateClearance(trajectory, snapshot);

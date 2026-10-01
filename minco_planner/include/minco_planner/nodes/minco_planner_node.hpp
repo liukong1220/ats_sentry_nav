@@ -26,6 +26,7 @@
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
 #include "minco_planner/trajectory/terminal_yaw_relocation.hpp"
 #include "minco_planner/trajectory/trajectory_quality_evaluator.hpp"
+#include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
 #include "minco_planner/trajectory/yaw_authority_policy.hpp"
 #include "minco_planner/trajectory/yaw_spline_planner.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -205,6 +206,7 @@ private:
   GridJps jps_;
   MincoTrajectoryOptimizer optimizer_;
   YawSplinePlanner yaw_planner_;
+  WheelSpeedTimeScalingParams wheel_speed_time_scaling_params_{};
   /// 提交门使用的矩形足迹参数副本。目标位姿准入必须用同一份参数，否则"终点可行"
   /// 与"轨迹可行"会用两套几何判定。
   FootprintSafetyParams footprint_params_{};
