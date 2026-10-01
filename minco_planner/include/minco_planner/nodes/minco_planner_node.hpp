@@ -4,6 +4,7 @@
 #define MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,7 +70,7 @@ private:
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal,
     bool goal_pose_footprint_verified,
-    double & used_clearance) const;
+    double & used_clearance);
   void onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   void onMapReady(const std_msgs::msg::Bool::SharedPtr msg);
   void onMapReadyWatchdog();
@@ -83,16 +84,16 @@ private:
                 const geometry_msgs::msg::PoseStamped * frozen_start = nullptr,
                 const InitialKinematicState * initial_state = nullptr);
   bool lookupStartPose(
-    const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const;
+    const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start);
   bool resolveStartPose(
     const nav_msgs::msg::OccupancyGrid & grid,
     const geometry_msgs::msg::PoseStamped * frozen_start,
-    geometry_msgs::msg::PoseStamped & start) const;
+    geometry_msgs::msg::PoseStamped & start);
   bool transformGoalToGrid(
     const nav_msgs::msg::OccupancyGrid & grid,
-    const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const;
+    const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output);
   bool transformPathToGlobal(
-    const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output) const;
+    const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output);
   nav_msgs::msg::Path toPath(const ReferenceTrajectory & trajectory) const;
   void annotatePositionClearance(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
@@ -169,6 +170,8 @@ private:
   double footprint_width_ = 0.58;
   double footprint_safety_margin_ = 0.05;
   double map_ready_timeout_sec_ = 3.0;
+  // 运行日志默认每 2 s 最多输出一次；结构化关键字仍保留，便于回归脚本解析。
+  std::uint64_t log_throttle_ms_{2000};
   double emergency_stop_heartbeat_period_sec_ = 0.1;
   double runtime_safety_recheck_hz_ = 10.0;
   double runtime_safety_horizon_sec_ = 1.0;

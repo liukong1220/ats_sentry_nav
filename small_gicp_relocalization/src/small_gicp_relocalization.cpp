@@ -126,6 +126,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("max_registration_error", -1.0);
   this->declare_parameter("relax_convergence_for_sim", false);
   this->declare_parameter("log_registration_details", true);
+  this->declare_parameter("log_throttle_ms", 2000);
   this->declare_parameter("publish_tf", true);
   this->declare_parameter("confirmation_count", 2);
   this->declare_parameter("confirmation_timeout_s", 10.0);
@@ -216,6 +217,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("max_registration_error", max_registration_error_);
   this->get_parameter("relax_convergence_for_sim", relax_convergence_for_sim_);
   this->get_parameter("log_registration_details", log_registration_details_);
+  std::int64_t configured_log_throttle_ms = static_cast<std::int64_t>(log_throttle_ms_);
+  this->get_parameter("log_throttle_ms", configured_log_throttle_ms);
+  log_throttle_ms_ = static_cast<std::uint64_t>(
+    std::clamp<std::int64_t>(configured_log_throttle_ms, 250, 60000));
   this->get_parameter("publish_tf", publish_tf_);
   this->get_parameter("confirmation_count", confirmation_count_);
   this->get_parameter("confirmation_timeout_s", confirmation_timeout_s_);
@@ -372,7 +377,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   }
   if (registration_mode_ != "multi_guess" && registration_mode_ != "initial_guess") {
     RCLCPP_WARN(
-      this->get_logger(), "Invalid registration_mode='%s'; defaulting to initial_guess",
+      this->get_logger(), "【重定位参数告警】registration_mode='%s' 无效，已回退为 initial_guess",
       registration_mode_.c_str());
     registration_mode_ = "initial_guess";
   }
@@ -443,7 +448,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   RCLCPP_INFO(
     this->get_logger(),
-    "GICP coarse-fine ready: mode=%s accumulate_frames=%d fine=%s coarse_first_only=%s "
+    "【GICP重定位就绪】模式=%s accumulate_frames=%d fine=%s coarse_first_only=%s "
     "fine_max_corr=%.3f min_overlap=%.3f follow_status=%s auto_multi_guess_on_lost=%s "
     "height_filter=%s confirmation=%d(min_interval=%.3fs motion_tol=%.2fm/%.2frad) "
     "multi_guess_budget=%.2fs/%d ambiguity_margin=%.3f(sep=%.2fm/%.2frad) "
@@ -459,7 +464,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   RCLCPP_INFO(
     this->get_logger(),
-    "scan input gate: expected_frame='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
+    "【重定位输入门】期望坐标系='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
     "valid_ratio=%.2f accumulation_limit=%zu points/%d frames",
     odom_frame_.c_str(), max_scan_age_s_, max_scan_future_s_, scan_min_range_m_, scan_max_range_m_,
     scan_min_z_m_, scan_max_z_m_, min_scan_valid_ratio_, max_accumulated_points_,
@@ -471,17 +476,17 @@ SmallGicpRelocalizationNode::~SmallGicpRelocalizationNode() { cancelAsyncMultiGu
 bool SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
 {
   if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_name, *global_map_) < 0) {
-    RCLCPP_ERROR(this->get_logger(), "Couldn't read PCD file: %s", file_name.c_str());
+    RCLCPP_ERROR(this->get_logger(), "【重定位地图错误】无法读取 PCD 文件：%s", file_name.c_str());
     return false;
   }
   if (global_map_->empty()) {
-    RCLCPP_ERROR(this->get_logger(), "Global map PCD is empty: %s", file_name.c_str());
+    RCLCPP_ERROR(this->get_logger(), "【重定位地图错误】全局 PCD 地图为空：%s", file_name.c_str());
     return false;
   }
   // The prior is already expressed in map_frame_; mechanical sensor extrinsics
   // must never shift it. Registration estimates T_map_odom from odom-frame scans.
   RCLCPP_INFO(
-    this->get_logger(), "Loaded global map: frame='%s' points=%zu",
+    this->get_logger(), "【重定位地图加载】坐标系='%s' points=%zu",
     map_frame_.c_str(), global_map_->size());
   return true;
 }
@@ -564,7 +569,7 @@ void SmallGicpRelocalizationNode::recordDroppedScan(const std::string & reason)
   ++dropped_scan_count_;
   RCLCPP_WARN_THROTTLE(
     this->get_logger(), *this->get_clock(), 2000,
-    "Dropped registered_scan (%s); dropped=%s stale=%s invalid=%s accepted=%s "
+    "【重定位点云丢弃】registered_scan（%s); dropped=%s stale=%s invalid=%s accepted=%s "
     "trimmed_windows=%s sampled_points=%s evicted_frames=%s",
     reason.c_str(), std::to_string(dropped_scan_count_).c_str(),
     std::to_string(stale_scan_count_).c_str(), std::to_string(invalid_scan_count_).c_str(),
@@ -830,7 +835,7 @@ void SmallGicpRelocalizationNode::writeCandidateDiagnostics(const std::string & 
   std::ofstream stream(multi_guess_candidate_log_path_, std::ios::app);
   if (!stream) {
     RCLCPP_ERROR(
-      this->get_logger(), "Cannot open candidate diagnostics file '%s'",
+      this->get_logger(), "【重定位诊断错误】无法打开候选诊断文件 '%s'",
       multi_guess_candidate_log_path_.c_str());
     return;
   }
@@ -842,7 +847,7 @@ void SmallGicpRelocalizationNode::writeCandidateDiagnostics(const std::string & 
 
 SmallGicpRelocalizationNode::MultiGuessOutcome
 SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
-  const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag) const
+  const MultiGuessRequest & request, const std::atomic<bool> & cancel_flag)
 {
   MultiGuessOutcome outcome;
   outcome.generation = request.generation;
@@ -945,9 +950,9 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     request.screen_source && request.screen_source_tree ? request.screen_source_tree
                                                         : request.source_tree;
 
-  RCLCPP_WARN(
-    this->get_logger(),
-    "multi_guess sweep=%s cursor=%zu/%zu budget=%zu/%.2fs seed=(%.3f,%.3f,%.3f) "
+  RCLCPP_WARN_THROTTLE(
+    this->get_logger(), *this->get_clock(), log_throttle_ms_,
+    "【重定位多猜测】扫描=%s cursor=%zu/%zu budget=%zu/%.2fs seed=(%.3f,%.3f,%.3f) "
     "coverage x=[%.2f,%.2f] y=[%.2f,%.2f] max_radius=%.2f rings=%zu "
     "screen_points=%zu source_points=%zu",
     std::to_string(request.sweep).c_str(), cursor, total, budget_count, multi_guess_time_budget_s_,
@@ -983,9 +988,9 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         << yawOf(attempt.transform) << ',' << verdict << '\n';
     diagnostics += row.str();
     if (multi_guess_log_candidates_) {
-      RCLCPP_INFO(
-        this->get_logger(),
-        "candidate[%zu] stage=%s guess=(%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f) inliers=%zu "
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), log_throttle_ms_,
+        "【重定位候选%zu】阶段=%s guess=(%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f) inliers=%zu "
         "overlap=%.3f error=%.6f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f %s",
         index, attempt.stage.c_str(), guess.translation().x(), guess.translation().y(),
         yawOf(guess), attempt.transform.translation().x(), attempt.transform.translation().y(),
@@ -1321,9 +1326,9 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
       ++multi_guess_sweep_;
     }
   }
-  RCLCPP_WARN(
-    this->get_logger(),
-    "multi_guess done: generated=%zu screened=%zu refined=%zu gated=%zu skipped=%zu "
+  RCLCPP_WARN_THROTTLE(
+    this->get_logger(), *this->get_clock(), log_throttle_ms_,
+    "【重定位多猜测完成】生成=%zu screened=%zu refined=%zu gated=%zu skipped=%zu "
     "next_cursor=%zu "
     "wrapped=%s budget_exhausted=%s elapsed=%.3fs best_score=%.4f second=%.4f margin=%.4f "
     "ambiguous=%s",
@@ -1340,9 +1345,9 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
   // or reject it. A late lattice worker started before pending was set would
   // otherwise land ~0.55 m away and clear the hypothesis (straight188).
   if (pending_confirmation_ && !outcome.confirmation_recheck) {
-    RCLCPP_WARN(
-      this->get_logger(),
-      "Dropped non-recheck multi_guess while confirmation pending "
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【重定位丢弃】确认待定期间丢弃非复核 multi_guess "
       "(generated=%zu gated=%zu)",
       outcome.lattice.generated, outcome.gated);
     return;
@@ -1350,7 +1355,9 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
   handleRegistrationAttempt(outcome.best, scan_time, source_points);
   })) {
     ++stale_async_result_count_;
-    RCLCPP_WARN(this->get_logger(), "Dropped stale multi_guess result (count=%s)",
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【重定位丢弃】丢弃过期 multi_guess 结果（累计=%s）",
       std::to_string(stale_async_result_count_).c_str());
   }
 }
@@ -1423,9 +1430,9 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   if (log_registration_details_) {
-    RCLCPP_INFO(
-      this->get_logger(),
-      "GICP result: stage=%s ok=%s converged=%s iterations=%zu inliers=%zu error=%.6f "
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【GICP结果】阶段=%s 成功=%s 收敛=%s 迭代=%zu inliers=%zu error=%.6f "
       "overlap=%.3f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f source_points=%zu",
       attempt.stage.c_str(), attempt.ok ? "true" : "false", attempt.converged ? "true" : "false",
       attempt.iterations, attempt.num_inliers, attempt.registration_error, attempt.overlap_ratio,
@@ -1434,10 +1441,10 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   if (!attempt.ok) {
-    RCLCPP_WARN(
-      this->get_logger(),
-      "Reject GICP result: stage=%s reason=%s converged=%s inliers=%zu/%d error=%.6f "
-      "overlap=%.3f max_error=%.6f",
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【GICP拒绝】阶段=%s reason=%s converged=%s 内点=%zu/%d 误差=%.6f "
+      "重叠率=%.3f 最大误差=%.6f",
       attempt.stage.c_str(), attempt.reject_reason.c_str(), attempt.converged ? "true" : "false",
       attempt.num_inliers, min_inliers_, attempt.registration_error, attempt.overlap_ratio,
       max_registration_error_);
@@ -1467,9 +1474,9 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   if (!odom_to_robot_base) {
-    RCLCPP_WARN(
-      this->get_logger(),
-      "GICP observation missing odom->robot_base (pending=%s stage=%s); retaining episode",
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【重定位观测缺失】找不到 odom->robot_base（pending=%s stage=%s），保留当前确认过程",
       pending_confirmation_ ? "true" : "false", attempt.stage.c_str());
     if (!pending_confirmation_) {
       clearConfirmation();
@@ -1506,13 +1513,14 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
          Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()))
           .toRotationMatrix();
     }
-    const double dxy = (candidate.translation() - prior.translation()).head<2>().norm();
+    const double dxy =
+      (candidate.translation() - prior.translation()).head<2>().norm();
     const double dyaw = yawDistance(candidate, prior);
     if ((cold_start_prior_max_xy_m_ > 0.0 && dxy > cold_start_prior_max_xy_m_) ||
         (cold_start_prior_max_yaw_rad_ > 0.0 && dyaw > cold_start_prior_max_yaw_rad_)) {
-      RCLCPP_WARN(
-        this->get_logger(),
-        "Reject cold-start GICP off init prior: dxy=%.3f dyaw=%.3f limits=%.3f/%.3f stage=%s",
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), log_throttle_ms_,
+        "【GICP拒绝】冷启动结果偏离初始先验：dxy=%.3f dyaw=%.3f 限值=%.3f/%.3f 阶段=%s",
         dxy, dyaw, cold_start_prior_max_xy_m_, cold_start_prior_max_yaw_rad_,
         attempt.stage.c_str());
       if (!(pending_confirmation_ && attempt.stage == "confirmation_recheck")) {
@@ -1542,9 +1550,9 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       pending_confirmation_ = sample;
       pending_confirmation_count_ = 1;
       confirmation_started_at_ = std::chrono::steady_clock::now();
-      RCLCPP_INFO(
-        this->get_logger(),
-        "Confirmation pending opened: count=1/%d stage=%s", confirmation_count_,
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), log_throttle_ms_,
+        "【重定位确认待定】计数=1/%d stage=%s", confirmation_count_,
         attempt.stage.c_str());
 
       // odometry_stale LOST (recovery180) reopened confirmation with
@@ -1558,9 +1566,9 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
         ++pending_confirmation_count_;
         pending_confirmation_->last_counted_scan_time_s = sample.scan_time_s;
       } else {
-        RCLCPP_WARN(
-          this->get_logger(),
-          "Confirmation restart: %s (dxy=%.3f dyaw=%.3f motion_dxy=%.3f motion_dyaw=%.3f)",
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), log_throttle_ms_,
+          "【重定位确认重启】%s (dxy=%.3f dyaw=%.3f motion_dxy=%.3f motion_dyaw=%.3f)",
           decision.reason.c_str(), decision.translation_delta, decision.yaw_delta,
           decision.motion_translation, decision.motion_yaw);
         // 时间戳不递增/间隔不足意味着这是同一扫描窗口，不能重置锚点后重复计数。
@@ -1597,7 +1605,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       publishObservation(
         scan_time, false,
         ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_PENDING_CONFIRMATION,
-        "awaiting consistent GICP confirmation", attempt.num_inliers, attempt.registration_error,
+        "等待连续一致的 GICP 确认", attempt.num_inliers, attempt.registration_error,
         source_points, candidate * *odom_to_robot_base, covariance);
       if (coarse_first_window_only_ && fine_alignment_enabled_) {
         need_coarse_alignment_ = false;
@@ -1613,8 +1621,9 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
   clearConfirmation();
   has_accepted_alignment_ = true;
-  RCLCPP_INFO(
-    this->get_logger(), "GICP alignment accepted: stage=%s inliers=%zu error=%.6f",
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), log_throttle_ms_,
+    "【GICP对齐接受】阶段=%s inliers=%zu error=%.6f",
     attempt.stage.c_str(), attempt.num_inliers, attempt.registration_error);
   // 接受后 seed 变了，格网 cursor 必须从新 seed 的中心重新开始。
   multi_guess_cursor_ = 0;
@@ -1655,8 +1664,7 @@ void SmallGicpRelocalizationNode::publishTransform()
       tf_stamp = current_time + rclcpp::Duration::from_seconds(transform_future_offset_s_);
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "small_gicp tf stamp falls behind current time by %.3fs, clamping map->odom stamp to "
-        "now().",
+        "【重定位时间修正】small_gicp TF 时间落后当前时间 %.3fs，map->odom 时间戳已限制为当前时间。",
         lag_s);
     }
   }
@@ -1700,9 +1708,9 @@ void SmallGicpRelocalizationNode::publishObservation(
     effective_accepted = false;
     effective_status = Observation::STATUS_INVALID;
     effective_message = "non-finite registration error must never be accepted";
-    RCLCPP_ERROR(
-      this->get_logger(),
-      "Blocked acceptance with non-finite registration error (%f); reporting STATUS_INVALID",
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【GICP拒绝】配准误差为非有限值（%f），报告 STATUS_INVALID",
       error);
   }
 
@@ -1741,8 +1749,10 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
 {
   // Invalidate even when TF lookup below fails: old work cannot answer a new reset.
   invalidateRecovery();
-  RCLCPP_INFO(
-    this->get_logger(), "Received initial pose: [x: %f, y: %f, z: %f]", msg->pose.pose.position.x,
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), log_throttle_ms_,
+    "【重定位初始位姿】收到 [x: %f, y: %f, z: %f]",
+    msg->pose.pose.position.x,
     msg->pose.pose.position.y, msg->pose.pose.position.z);
 
   Eigen::Isometry3d map_to_robot_base = Eigen::Isometry3d::Identity();
@@ -1769,8 +1779,8 @@ void SmallGicpRelocalizationNode::initialPoseCallback(
       last_registration_robot_base_to_odom_ = *current_robot_base_to_odom;
     }
   } catch (tf2::TransformException & ex) {
-    RCLCPP_WARN(
-      this->get_logger(), "Could not transform initial pose from %s to %s: %s",
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_, "【重定位初始位姿失败】无法从 %s 转换到 %s：%s",
       robot_base_frame_.c_str(), odom_frame_.c_str(), ex.what());
   }
 }
@@ -1789,7 +1799,7 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
     msg->state == LS::STATE_TRACKING, status_stale_skip_registration_s_, max_scan_future_s_);
   if (!rejection.empty() || !isKnownLocalizationState<LS>(msg->state)) {
     RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 5000, "Rejecting localization status: %s",
+      this->get_logger(), *this->get_clock(), 5000, "【重定位状态拒绝】%s",
       rejection.empty() ? "unknown state" : rejection.c_str());
     return;
   }

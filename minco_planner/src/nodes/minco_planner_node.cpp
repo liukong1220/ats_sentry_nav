@@ -182,7 +182,7 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   publishEmergencyStop(true);
 
   RCLCPP_INFO(
-    get_logger(), "minco_planner ready: grid='%s' goal='%s' request='%s' raw='%s' reference='%s'",
+    get_logger(), "【规划器就绪】栅格='%s' 目标='%s' 请求='%s' 原始路径='%s' 参考路径='%s'",
     grid_topic_.c_str(), goal_topic_.c_str(), goal_request_topic_.c_str(), raw_path_topic_.c_str(),
     reference_path_topic_.c_str());
 }
@@ -202,6 +202,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("map_ready_topic", map_ready_topic_);
   declare_parameter<std::string>("emergency_stop_topic", emergency_stop_topic_);
   declare_parameter<double>("map_ready_timeout_sec", map_ready_timeout_sec_);
+  declare_parameter<std::int64_t>("log_throttle_ms", static_cast<std::int64_t>(log_throttle_ms_));
   declare_parameter<double>(
     "emergency_stop_heartbeat_period_sec", emergency_stop_heartbeat_period_sec_);
   declare_parameter<double>("runtime_safety_recheck_hz", runtime_safety_recheck_hz_);
@@ -415,6 +416,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("emergency_stop_topic", emergency_stop_topic_);
   get_parameter("map_ready_timeout_sec", map_ready_timeout_sec_);
   map_ready_timeout_sec_ = std::max(0.1, map_ready_timeout_sec_);
+  std::int64_t configured_log_throttle_ms = static_cast<std::int64_t>(log_throttle_ms_);
+  get_parameter("log_throttle_ms", configured_log_throttle_ms);
+  log_throttle_ms_ = static_cast<std::uint64_t>(
+    std::clamp<std::int64_t>(configured_log_throttle_ms, 250, 60000));
   get_parameter(
     "emergency_stop_heartbeat_period_sec", emergency_stop_heartbeat_period_sec_);
   emergency_stop_heartbeat_period_sec_ = std::max(0.02, emergency_stop_heartbeat_period_sec_);
@@ -611,8 +616,7 @@ void MincoPlannerNode::declareAndLoadParams()
   if (jps_params.safe_distance + 1e-6 < all_yaw_footprint_radius) {
     RCLCPP_WARN(
       get_logger(),
-      "Raising preferred graph-search clearance from %.3f m to rectangular all-yaw footprint "
-      "radius %.3f m.",
+      "【规划参数修正】图搜索优选净空由 %.3f m 提高到矩形全航向足迹半径 %.3f m。",
       jps_params.safe_distance, all_yaw_footprint_radius);
     jps_params.safe_distance = all_yaw_footprint_radius;
   }
@@ -643,11 +647,11 @@ void MincoPlannerNode::declareAndLoadParams()
   // "按 snapshot 解析"的,不要让这行 INFO 被当成实际生效值。
   RCLCPP_INFO(
     get_logger(),
-    "Graph-search clearance ladder: preferred=%.3f m floor=%.3f m (%s) relaxation=%s",
+    "【图搜索净空梯度】优选=%.3f m 下限=%.3f m（%s）放宽=%s",
     preferred_search_clearance_, search_clearance_floor_,
     search_clearance_floor_configured_
-      ? "configured" : "inscribed radius; grid allowance added per snapshot",
-    clearance_relaxation_enabled_ ? "on" : "off");
+      ? "显式配置" : "内切半径；每个快照另加栅格量化余量",
+    clearance_relaxation_enabled_ ? "开启" : "关闭");
   astar_params.safe_distance = jps_params.safe_distance;
   astar_params.min_safe_distance = search_clearance_floor_;
   get_parameter("local_repair_enabled", repair_params.enabled);
@@ -675,9 +679,8 @@ void MincoPlannerNode::declareAndLoadParams()
     // search_radius 是用户对引导点位移的上界,由配置负责,不由代码覆盖。
     RCLCPP_WARN(
       get_logger(),
-      "local_repair_search_radius=%.3f m is below the footprint-consistent clearance floor "
-      "(inscribed=%.3f m): local collision repair cannot select any candidate cell and will "
-      "never change a rejected trajectory.",
+      "【局部修复参数告警】搜索半径 %.3f m 小于足迹一致净空下限（内切半径=%.3f m）；"
+      "无法选出候选栅格，拒绝轨迹不会被修复。",
       repair_params.search_radius, repair_params.inscribed_radius_m);
   }
 
@@ -696,7 +699,7 @@ void MincoPlannerNode::declareAndLoadParams()
   {
     RCLCPP_WARN(
       get_logger(),
-      "yaw_tangent_symmetry_order=%d is invalid for footprint %.3f x %.3f m; using 2.",
+      "【航向参数告警】yaw_tangent_symmetry_order=%d 不适用于足迹 %.3f x %.3f m，已回退为 2。",
       yaw_params.tangent_symmetry_order, footprint_length_, footprint_width_);
     yaw_params.tangent_symmetry_order = 2;
   }
@@ -712,7 +715,7 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal,
   bool goal_pose_footprint_verified,
-  double & used_clearance) const
+  double & used_clearance)
 {
   // 显式配置的下限按用户意图使用;自动下限必须补上栅格量化余量,否则梯子会稳定产出
   // footprint gate 必然拒绝的路径,把"窄通道不可通行"表现成目标超时。
@@ -723,9 +726,8 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
       preferred_search_clearance_);
   RCLCPP_INFO_ONCE(
     get_logger(),
-    "Graph-search clearance floor resolved to %.3f m (inscribed=%.3f m grid_resolution=%.3f m "
-    "quantization_allowance=%.3f m): a path admitted below this cannot pass the rectangular "
-    "footprint gate on this grid.",
+    "【图搜索净空生效】下限=%.3f m（内切半径=%.3f m 栅格分辨率=%.3f m 量化余量=%.3f m）；"
+    "低于此值的路径无法通过矩形足迹门禁。",
     effective_floor, inscribed_footprint_radius_, planning_grid.info.resolution,
     gridQuantizationAllowance(planning_grid.info.resolution));
   std::vector<double> ladder {preferred_search_clearance_};
@@ -739,8 +741,9 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
     if (search_algorithm_ == "jps") {
       attempt = jps_.planWithClearance(planning_grid, start, goal, clearance);
       if (!attempt.success && astar_fallback_) {
-        RCLCPP_WARN(
-          get_logger(), "JPS failed at clearance %.3f m (%s); falling back to A*.",
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【规划回退】jps failed: clearance=%.3f m reason=%s，改用 A*。",
           clearance, attempt.reason.c_str());
         attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
       }
@@ -750,10 +753,9 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
     if (attempt.success) {
       used_clearance = clearance;
       if (clearance + 1e-6 < preferred_search_clearance_) {
-        RCLCPP_WARN(
-          get_logger(),
-          "Graph search succeeded only after relaxing clearance %.3f m -> %.3f m; the yaw-aware "
-          "footprint gate remains authoritative.",
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【规划净空放宽】图搜索从 %.3f m 放宽到 %.3f m 后成功；最终仍以航向感知足迹门禁为准。",
           preferred_search_clearance_, clearance);
       }
       return attempt;
@@ -793,11 +795,10 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
     }
     if (attempt.success) {
       used_clearance = effective_floor;
-      RCLCPP_WARN(
-        get_logger(),
-        "Graph search succeeded only after relaxing the endpoint clearance floor %.3f m -> %.3f m; "
-        "the goal pose already passed the rectangular footprint gate and that gate remains "
-        "authoritative for the trajectory.",
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【终点净空放宽】终点下限从 %.3f m 放宽到 %.3f m 后成功；目标已通过矩形足迹门禁，"
+        "轨迹安全仍由该门禁最终裁定。",
         effective_floor, relaxed_endpoint_min);
       return attempt;
     }
@@ -825,7 +826,7 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       invalidateMapLocked();
       publishEmergencyStop(true);
     }
-    RCLCPP_ERROR(get_logger(), "Rejected an invalid planning grid.");
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), log_throttle_ms_, "【规划栅格错误】收到无效规划栅格，已拒绝并急停。");
     return;
   }
   // 可选：安全语义变化的新 snapshot 若仍让已提交参考的完整剩余段通过同一套矩形足迹
@@ -855,7 +856,9 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       candidate_health_epoch != map_health_epoch_ ||
       candidate_generation != next_map_generation_ + 1)
     {
-      RCLCPP_WARN(get_logger(), "Discarded a planning grid built across a map-health change.");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【规划栅格丢弃】地图健康状态在构建期间变化，已丢弃本次栅格。");
       return;
     }
     const bool replaces_existing_snapshot = latest_map_snapshot_ != nullptr;
@@ -899,10 +902,10 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     }
   }
   if (retain_candidate && !retained_reference && !retained_identical_snapshot) {
-    RCLCPP_WARN(
-      get_logger(),
-      "Could not retain committed reference goal=%llu across snapshot change "
-      "(verdict=%d horizon=%.2f s); invalidating for replan on generation=%llu.",
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【参考轨迹失效】地图快照变化后无法保留目标=%llu 的已提交参考（判定=%d 前视窗=%.2f s），"
+      "将在 generation=%llu 上重新规划。",
       static_cast<unsigned long long>(retain_candidate->goal_id),
       static_cast<int>(retain_verdict), retain_reference_horizon_sec_,
       static_cast<unsigned long long>(snapshot->generation));
@@ -910,8 +913,7 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   if (retained_reference) {
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "Retained committed reference goal=%llu across snapshot change: remaining trajectory "
-      "passes the footprint gate on generation=%llu.",
+      "【参考轨迹保留】目标=%llu 跨地图快照变化继续执行，剩余轨迹通过 generation=%llu 的足迹门禁。",
       static_cast<unsigned long long>(retained_reference_goal),
       static_cast<unsigned long long>(snapshot->generation));
     return;
@@ -919,8 +921,8 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   if (retained_identical_snapshot) {
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 5000,
-      "Retained immutable planning snapshot generation=%llu for identical safety content "
-      "digest=%s; adapter publication/source generations remain heartbeat evidence.",
+      "【快照复用】安全内容未变，继续使用不可变规划快照 generation=%llu digest=%s；"
+      "adapter/source generation 仍仅作为心跳证据。",
       static_cast<unsigned long long>(retained_generation), retained_digest.c_str());
     return;
   }
@@ -956,7 +958,9 @@ void MincoPlannerNode::onMapReadyWatchdog()
     publishEmergencyStop(safety_state_.emergencyStopRequired());
   }
   if (timed_out) {
-    RCLCPP_ERROR(get_logger(), "Planning-map ready heartbeat timed out.");
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【地图租约超时】规划地图 ready 心跳超时，已进入急停。");
   }
 }
 
@@ -1031,8 +1035,7 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "Keeping an escape-from-contact reference under the runtime swept gate: collisions=%zu "
-      "head_offset=%.3f m prefix_end=%zu prefix_length=%.3f m.",
+      "【接触脱困】运行期扫掠门禁下保留脱困参考：冲突=%zu 起始偏移=%.3f m 前缀末端=%zu 长度=%.3f m。",
       runtime_escape.collision_count, runtime_escape.head_offset_m,
       runtime_escape.prefix_end, runtime_escape.prefix_length_m);
     return;
@@ -1063,9 +1066,9 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   const std::size_t collision_index = has_collision ?
     std::min(safety.collisions.front().trajectory_index, remaining.points.size() - 1U) : 0U;
   const ReferencePoint & collision_reference = remaining.points[collision_index];
-  RCLCPP_ERROR(
-    get_logger(),
-    "Runtime swept footprint rejected goal=%llu candidate_generation=%llu "
+  RCLCPP_ERROR_THROTTLE(
+    get_logger(), *get_clock(), log_throttle_ms_,
+    "【运行期安全拒绝】扫掠足迹拒绝 goal=%llu candidate_generation=%llu "
     "current_generation=%llu collisions=%zu discrete_samples=%zu swept_samples=%zu "
     "first_index=%zu first_swept=%d first_collision=(%.3f,%.3f) "
     "remaining_start=(%.3f,%.3f,%.3f) reference_center=(%.3f,%.3f,%.3f).",
@@ -1165,7 +1168,8 @@ void MincoPlannerNode::planGoal(
     map_ready = map_snapshot && safety_state_.mapSnapshotUsable(map_snapshot->generation);
   }
   if (!map_ready || !map_snapshot) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "No traversability grid received yet.");
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【等待地图】尚未收到可通行栅格，规划保持急停。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_MAP_UNREADY, 0);
     return;
   }
@@ -1180,7 +1184,8 @@ void MincoPlannerNode::planGoal(
 
   geometry_msgs::msg::PoseStamped start;
   if (!resolveStartPose(planning_grid, frozen_start, start)) {
-    RCLCPP_WARN(get_logger(), "Cannot plan because start pose lookup failed.");
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【规划失败】无法获取起点位姿，等待 TF 恢复。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_START_TF,
       map_snapshot->generation);
     return;
@@ -1193,7 +1198,8 @@ void MincoPlannerNode::planGoal(
   }
   geometry_msgs::msg::PoseStamped goal_in_grid;
   if (!transformGoalToGrid(planning_grid, goal, goal_in_grid)) {
-    RCLCPP_WARN(get_logger(), "Cannot plan because goal transform failed.");
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【规划失败】目标位姿转换失败，等待 TF 恢复。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_GOAL_TF,
       map_snapshot->generation);
     return;
@@ -1217,18 +1223,18 @@ void MincoPlannerNode::planGoal(
     if (!admission.feasible) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "Goal pose admission found no feasible pose inside the success tolerance: "
-        "goal=(%.3f, %.3f, yaw=%.3f) candidates=%zu; keeping the commanded goal.",
+        "【目标准入】成功容差内没有可行位姿：目标=(%.3f, %.3f, yaw=%.3f) "
+        "候选数=%zu；保留原目标。",
         goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
         admission.candidates_checked);
     }
     goal_pose_footprint_verified = admission.feasible;
     if (admission.feasible && admission.relocated) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Goal pose admitted inside tolerance: commanded=(%.3f, %.3f, yaw=%.3f) "
-        "admitted=(%.3f, %.3f, yaw=%.3f) position_deviation=%.3f m yaw_deviation=%.3f rad "
-        "extra_margin=%d candidates=%zu.",
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【目标准入】在成功容差内找到可行位姿：原目标=(%.3f, %.3f, yaw=%.3f) "
+        "采用=(%.3f, %.3f, yaw=%.3f) 位置偏差=%.3f m 航向偏差=%.3f rad "
+        "额外净空=%d 候选数=%zu。",
         goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
         admission.x, admission.y, admission.yaw, admission.position_deviation_m,
         admission.yaw_deviation_rad, admission.used_preferred_margin ? 1 : 0,
@@ -1248,8 +1254,9 @@ void MincoPlannerNode::planGoal(
     runGraphSearch(
     planning_grid, start, goal, goal_pose_footprint_verified, used_clearance);
   if (!search_result.success) {
-    RCLCPP_WARN(
-      get_logger(), "%s failed: %s expanded=%d clearance=%.3f m",
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【规划失败】%s failed: %s expanded=%d clearance=%.3f m",
       search_algorithm_.c_str(), search_result.reason.c_str(),
       search_result.expanded_nodes, used_clearance);
     const std::uint8_t failure_reason =
@@ -1287,9 +1294,9 @@ void MincoPlannerNode::planGoal(
       }
       durations << selected_trace.segment_durations[index];
     }
-    RCLCPP_ERROR(
-      get_logger(),
-      "MINCO candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【MINCO拒绝】candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
       "raw_points=%zu preprocessed_points=%zu esdf_refined_points=%zu peak_v=%.3f "
       "peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f joint_termination=%s joint_iterations=%d "
       "joint_wall_ms=%.3f segment_durations=[%s]",
@@ -1358,9 +1365,9 @@ void MincoPlannerNode::planGoal(
         safety = std::move(footprint_safety);
         selected_trace = std::move(footprint_trace);
       } else {
-        RCLCPP_WARN(
-          get_logger(),
-          "Footprint-aware RC-ESDF candidate had %zu collisions; keeping safe center ESDF candidate.",
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【足迹候选回退】RC-ESDF 足迹候选有 %zu 个冲突，改用安全的中心 ESDF 候选。",
           footprint_safety.collisions.size());
       }
     }
@@ -1378,9 +1385,9 @@ void MincoPlannerNode::planGoal(
       const FootprintSafetyResult fallback_safety = safety_checker_.check(
         fallback_reference, planning_grid);
       if (fallback_safety.safe) {
-        RCLCPP_WARN(
-          get_logger(),
-          "RC-ESDF outer candidate had %zu footprint collisions; using the safe JPS-MINCO baseline.",
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【足迹候选回退】RC-ESDF 外层候选有 %zu 个足迹冲突，改用安全的 JPS-MINCO 基线。",
           safety.collisions.size());
         esdf_fallback_used = true;
         reference = std::move(fallback_reference);
@@ -1403,9 +1410,9 @@ void MincoPlannerNode::planGoal(
   if (!safety.safe) {
     // repair() 自身没有 logger。没有这一行时无法区分"没尝试""挑不出候选格"
     // 和"挑出来但位移可忽略",domain 169 的 89 次连续拒绝就完全没有痕迹。
-    RCLCPP_WARN(
-      get_logger(),
-      "Local collision repair: changed=%d points=%zu strict=%zu fallback=%zu "
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【局部碰撞修复】changed=%d points=%zu strict=%zu fallback=%zu "
       "no_candidate=%zu negligible=%zu endpoint_protected=%zu strict_clearance=%.3f "
       "fallback_clearance=%.3f search_radius=%.3f m.",
       repair_changed ? 1 : 0, repair_stats.collision_points,
@@ -1426,10 +1433,9 @@ void MincoPlannerNode::planGoal(
       // 退回修复前轨迹,交给下面既有的 footprint 拒绝路径。那条路径报
       // FAILURE_FOOTPRINT(瞬时,等下一次 snapshot 重规划),而 FAILURE_REPAIR
       // 会让目标直接失败——修复只是一次尝试,失败不该比没尝试更严重。
-      RCLCPP_WARN(
-        get_logger(),
-        "Local collision repair produced an invalid MINCO trajectory; keeping the pre-repair "
-        "trajectory and falling back to the existing footprint rejection path.");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【局部碰撞修复失败】修复后 MINCO 轨迹无效，保留修复前轨迹并进入既有足迹拒绝路径。");
       reference = std::move(pre_repair_reference);
     } else {
       local_repair_used = true;
@@ -1481,9 +1487,9 @@ void MincoPlannerNode::planGoal(
         last_conflict = std::max(last_conflict, collision.trajectory_index);
       }
     }
-    RCLCPP_WARN(
-      get_logger(),
-      "Terminal yaw relocation trying: tail_start=%zu window_start=%zu candidates=[%s] "
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【终端航向重定位】尝试：tail_start=%zu window_start=%zu candidates=[%s] "
       "conflict_span=[%zu,%zu] collisions=%zu.",
       tail_start, window_start, candidate_list.str().c_str(), first_conflict, last_conflict,
       original_collisions);
@@ -1508,10 +1514,10 @@ void MincoPlannerNode::planGoal(
         rejected << rotation_index << ":footprint;";
         continue;
       }
-      RCLCPP_WARN(
-        get_logger(),
-        "Terminal yaw relocation accepted: rotation_index=%zu tail_start=%zu "
-        "window_start=%zu candidates=%zu built=%zu cleared_collisions=%zu points=%zu.",
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【终端航向重定位成功】rotation_index=%zu tail_start=%zu "
+        "window_start=%zu candidates=%zu built=%zu cleared_collisions=%zu points=%zu。",
         rotation_index, tail_start, window_start, candidates.size(), built, original_collisions,
         candidate.points.size());
       reference = std::move(candidate);
@@ -1519,10 +1525,10 @@ void MincoPlannerNode::planGoal(
       break;
     }
     if (!safety.safe) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Terminal yaw relocation exhausted: tail_start=%zu window_start=%zu candidates=[%s] "
-        "built=%zu collisions=%zu rejected=%s; keeping the existing footprint rejection path.",
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【终端航向重定位失败】tail_start=%zu window_start=%zu candidates=[%s] "
+        "built=%zu collisions=%zu rejected=%s；保留现有足迹拒绝路径。",
         tail_start, window_start, candidate_list.str().c_str(), built, original_collisions,
         rejected.str().c_str());
     }
@@ -1535,7 +1541,7 @@ void MincoPlannerNode::planGoal(
     esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
   }
   if (!reference.valid()) {
-    RCLCPP_ERROR(get_logger(), "Rejecting an invalid MINCO reference trajectory.");
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), log_throttle_ms_, "【MINCO拒绝】参考轨迹无效，保持急停。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
       map_snapshot->generation);
     return;
@@ -1590,9 +1596,9 @@ void MincoPlannerNode::planGoal(
           ",yaw_sweep=" << candidate_escape.prefix_yaw_sweep_rad << ';';
         continue;
       }
-      RCLCPP_WARN(
-        get_logger(),
-        "Escape yaw hold accepted: hold_length=%.2f m safe=%d collisions=%zu prefix_end=%zu.",
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【脱困航向保持】接受：长度=%.2f m safe=%d 冲突=%zu 前缀末端=%zu。",
         hold_length, candidate_safety.safe ? 1 : 0, candidate_safety.collisions.size(),
         candidate_escape.prefix_end);
       reference = std::move(candidate);
@@ -1601,23 +1607,24 @@ void MincoPlannerNode::planGoal(
       break;
     }
     if (!safety.safe && !escape_decision.allowed) {
-      RCLCPP_WARN(
-        get_logger(), "Escape yaw hold exhausted: %s", tried.str().c_str());
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_, "【脱困航向保持失败】已尝试：%s", tried.str().c_str());
     }
   }
   if (!safety.safe && !publish_unsafe_trajectory_ && escape_decision.allowed) {
     // 车此刻就压在冲突区里，冲突集证明这条轨迹在有界前缀内驶出障碍并且不再驶回。
     // 继续拒绝只会让唯一能挪走车的执行器拿不到轨迹，参见 escape_prefix.hpp 的说明。
-    RCLCPP_WARN(
-      get_logger(),
-      "Committing an escape-from-contact MINCO trajectory: collisions=%zu head_offset=%.3f m "
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【提交脱困轨迹】MINCO 轨迹驶离接触区：冲突=%zu 起始偏移=%.3f m "
       "prefix_end=%zu prefix_length=%.3f m prefix_yaw_sweep=%.3f rad.",
       escape_decision.collision_count, escape_decision.head_offset_m,
       escape_decision.prefix_end, escape_decision.prefix_length_m,
       escape_decision.prefix_yaw_sweep_rad);
   } else if (!safety.safe && !publish_unsafe_trajectory_) {
     if (safety.collisions.empty()) {
-      RCLCPP_ERROR(get_logger(), "Rejecting MINCO trajectory because safety validation failed.");
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_, "【MINCO拒绝】安全校验失败，未发布不安全轨迹。");
     } else {
       const CollisionSample & first_collision = safety.collisions.front();
       // 只报冲突数和一个 footprint 采样坐标无法区分三种完全不同的失败:车此刻就压在
@@ -1638,9 +1645,9 @@ void MincoPlannerNode::planGoal(
       }
       const ReferencePoint & first_center =
         reference.points[std::min(first_collision.trajectory_index, reference.points.size() - 1U)];
-      RCLCPP_ERROR(
-        get_logger(),
-        "Rejecting unsafe MINCO trajectory with %zu footprint collisions "
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【MINCO拒绝】足迹冲突=%zu，未发布不安全轨迹 "
         "(discrete=%zu swept=%zu) first_index=%zu last_index=%zu points=%zu "
         "first_sample=(%.3f, %.3f) first_center=(%.3f, %.3f, yaw=%.3f) "
         "start=(%.3f, %.3f, yaw=%.3f) raw_points=%zu preprocessed_points=%zu "
@@ -1663,14 +1670,14 @@ void MincoPlannerNode::planGoal(
       // 全 yaw 半径。所以必须把实际栅格打出来,否则无法
       // 区分 ROG 投影、terrain 硬障碍与 slope 障碍。两个
       // 窗口分别覆盖轨迹起点和首个冲突点。
-      RCLCPP_ERROR(
-        get_logger(), "Rejection grid window at start: %s",
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_, "【拒绝栅格窗口】起点：%s",
         describeGridWindow(
           planning_grid, reference.points.front().x, reference.points.front().y, 0.6,
           obstacle_value_threshold_, unknown_is_obstacle_).c_str());
       if (first_collision.trajectory_index != 0U) {
-        RCLCPP_ERROR(
-          get_logger(), "Rejection grid window at first collision: %s",
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_, "【拒绝栅格窗口】首个冲突点：%s",
           describeGridWindow(
             planning_grid, first_center.x, first_center.y, 0.6,
             obstacle_value_threshold_, unknown_is_obstacle_).c_str());
@@ -1691,8 +1698,8 @@ void MincoPlannerNode::planGoal(
     }
   }
   if (!quality.finite || !quality.strictly_monotonic_time) {
-    RCLCPP_ERROR(
-      get_logger(), "Rejecting MINCO trajectory with non-finite derivatives or non-monotonic time.");
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【MINCO拒绝】导数包含非有限值或时间不单调。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
       map_snapshot->generation);
     return;
@@ -1700,9 +1707,9 @@ void MincoPlannerNode::planGoal(
   // Nominal commits only: escape-from-contact may need a short lateral shove.
   // d21 gen173 committed length_ratio=5.496 lateral=7.424 and drove north of spawn.
   if (safety.safe && !admitsCommitGeometry(quality, commit_geometry_limits_)) {
-    RCLCPP_ERROR(
-      get_logger(),
-      "Rejecting MINCO detour before commit: length_ratio=%.3f (max=%.3f) "
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【MINCO拒绝】绕行轨迹提交前未通过几何约束：length_ratio=%.3f (max=%.3f) "
       "lateral=%.3f m (max=%.3f m) path_length=%.2f direct=%.2f.",
       quality.length_ratio, commit_geometry_limits_.max_length_ratio,
       quality.max_lateral_deviation, commit_geometry_limits_.max_lateral_deviation_m,
@@ -1713,8 +1720,8 @@ void MincoPlannerNode::planGoal(
   }
   nav_msgs::msg::Path control_reference;
   if (!transformPathToGlobal(toPath(reference), control_reference)) {
-    RCLCPP_ERROR(
-      get_logger(), "Cannot publish MINCO reference because the control-frame transform failed.");
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【参考发布失败】控制坐标系转换失败，未发布 MINCO 参考。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REFERENCE_TF,
       map_snapshot->generation);
     return;
@@ -1736,8 +1743,8 @@ void MincoPlannerNode::planGoal(
                                  control_reference, reference, goal_id, localization_epoch,
                                  plan_request_sequence, map_publication_sequence, yaw_authority,
                                  report_status, telemetry)) {
-    RCLCPP_WARN(
-      get_logger(), "Discarded generation %llu because the planning map changed or became stale.",
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【参考提交丢弃】generation=%llu 因规划地图变化或过期而丢弃，等待重规划。",
       static_cast<unsigned long long>(map_snapshot->generation));
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_SNAPSHOT_CHANGED,
       map_snapshot->generation);
@@ -1759,9 +1766,10 @@ void MincoPlannerNode::planGoal(
     }
     durations << quality.segment_durations[index];
   }
-  RCLCPP_INFO(
-    get_logger(),
-    "planned generation=%llu snapshot_publication=%llu raw_points=%zu preprocessed_points=%zu "
+  RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), log_throttle_ms_,
+    "【规划完成】planned generation=%llu snapshot_publication=%llu "
+    "raw_points=%zu preprocessed_points=%zu "
     "esdf_refined_points=%zu reference_points=%zu length=%.2f time=%.2f collisions=%zu "
     "footprint_collisions=%zu swept_collisions=%zu "
     "collision_indices=%s occupancy_digest=%s content_digest=%s grid_topic=%s validation_frame=%s "
@@ -1866,7 +1874,7 @@ std::vector<Eigen::Vector2d> MincoPlannerNode::footprintSamples(
 }
 
 bool MincoPlannerNode::lookupStartPose(
-  const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start) const
+  const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start)
 {
   try {
     const auto transform = tf_buffer_->lookupTransform(
@@ -1881,9 +1889,10 @@ bool MincoPlannerNode::lookupStartPose(
     start.pose.orientation = transform.transform.rotation;
     return true;
   } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN(
-      get_logger(), "TF lookup %s -> %s failed: %s", global_frame_.c_str(), robot_frame_.c_str(),
-      ex.what());
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【TF失败】查询 %s -> %s 失败：%s",
+      global_frame_.c_str(), robot_frame_.c_str(), ex.what());
     return false;
   }
 }
@@ -1891,7 +1900,7 @@ bool MincoPlannerNode::lookupStartPose(
 bool MincoPlannerNode::resolveStartPose(
   const nav_msgs::msg::OccupancyGrid & grid,
   const geometry_msgs::msg::PoseStamped * frozen_start,
-  geometry_msgs::msg::PoseStamped & start) const
+  geometry_msgs::msg::PoseStamped & start)
 {
   if (frozen_start == nullptr || frozen_start->header.frame_id.empty()) {
     return lookupStartPose(grid, start);
@@ -1904,7 +1913,7 @@ bool MincoPlannerNode::resolveStartPose(
 
 bool MincoPlannerNode::transformGoalToGrid(
   const nav_msgs::msg::OccupancyGrid & grid,
-  const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output) const
+  const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output)
 {
   const std::string target_frame = grid.header.frame_id.empty() ? global_frame_ : grid.header.frame_id;
   if (input.header.frame_id.empty() || input.header.frame_id == target_frame) {
@@ -1922,15 +1931,16 @@ bool MincoPlannerNode::transformGoalToGrid(
     output.pose.position.z = grid.info.origin.position.z;
     return true;
   } catch (const tf2::TransformException & exception) {
-    RCLCPP_WARN(
-      get_logger(), "TF lookup %s -> %s failed: %s", input.header.frame_id.c_str(),
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【TF失败】查询 %s -> %s 失败：%s", input.header.frame_id.c_str(),
       target_frame.c_str(), exception.what());
     return false;
   }
 }
 
 bool MincoPlannerNode::transformPathToGlobal(
-  const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output) const
+  const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output)
 {
   const std::string source_frame =
     input.header.frame_id.empty() ? global_frame_ : input.header.frame_id;
@@ -1958,8 +1968,8 @@ bool MincoPlannerNode::transformPathToGlobal(
     }
     return true;
   } catch (const tf2::TransformException & exception) {
-    RCLCPP_WARN(
-      get_logger(), "TF lookup %s -> %s failed for MINCO reference: %s",
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_, "【TF失败】MINCO 参考查询 %s -> %s 失败：%s",
       source_frame.c_str(), global_frame_.c_str(), exception.what());
     return false;
   }
@@ -2088,7 +2098,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     return false;
   }
   if (!planner_manages_emergency_stop_ && !candidate_reference_path_pub_) {
-    RCLCPP_ERROR(get_logger(), "P3 planner has no candidate reference publisher.");
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), log_throttle_ms_, "【规划器配置错误】P3 模式没有候选参考发布器。");
     return false;
   }
   nav_msgs::msg::Path committed_reference = reference_path;

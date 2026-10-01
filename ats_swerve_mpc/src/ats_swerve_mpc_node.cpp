@@ -24,7 +24,7 @@ Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
           name, {defaults(0), defaults(1), defaults(2)});
   if (values.size() != 3) {
     RCLCPP_WARN(node.get_logger(),
-                "Parameter '%s' must contain exactly 3 values.", name.c_str());
+                "【参数错误】参数 '%s' 必须包含 3 个值。", name.c_str());
     return defaults;
   }
   return Eigen::Vector3d(values[0], values[1], values[2]);
@@ -287,7 +287,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   } else {
     emergency_stop_watchdog_enabled_ = false;
     fail_stop_engaged_.store(false);
-    RCLCPP_WARN(get_logger(), "Emergency-stop input is explicitly disabled.");
+    RCLCPP_WARN(get_logger(), "【安全配置】急停输入被显式关闭。");
   }
   if (!localization_status_topic_.empty()) {
     localization_status_sub_ =
@@ -335,7 +335,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
               command_topic_.c_str(), controller_->config().horizon,
               controller_->config().dt, control_rate_hz_);
   RCLCPP_INFO(get_logger(),
-              "LTV-QP solver_mode=%s（qp_shadow 仅诊断，iLQR 保持唯一输出 owner）",
+              "【求解器配置】solver_mode=%s（qp_shadow 仅诊断，iLQR 保持唯一输出 owner）",
               solver_mode_.c_str());
 }
 
@@ -520,7 +520,7 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
   if (execution_command_enabled_) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "Ignoring legacy Path because ExecutionCommand owns MPC authorization.");
+      "【参考丢弃】ExecutionCommand 已拥有 MPC 授权，忽略旧版 Path。");
     return;
   }
   installPath(*message);
@@ -535,17 +535,17 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
   if (require_localization_status_ && !localization_tracking_.load()) {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
-        "Ignoring trajectory while localization is not TRACKING.");
+        "【参考丢弃】定位未处于 TRACKING，忽略参考轨迹。");
     return false;
   }
   if (message.poses.size() < 2) {
-    RCLCPP_WARN(get_logger(), "Ignoring trajectory with fewer than two poses.");
+    RCLCPP_WARN(get_logger(), "【参考丢弃】参考轨迹点数少于 2，已忽略。");
     return false;
   }
   if (!frame_id_.empty() && !message.header.frame_id.empty() &&
       message.header.frame_id != frame_id_) {
     RCLCPP_ERROR(get_logger(),
-                 "Ignoring trajectory in frame '%s'; MPC frame is '%s'.",
+                 "【参考丢弃】轨迹坐标系为 '%s'，MPC 期望 '%s'。",
                  message.header.frame_id.c_str(), frame_id_.c_str());
     return false;
   }
@@ -586,7 +586,7 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
          rclcpp::Time(message.header.stamp) <= last_stop_stamp_)) {
       RCLCPP_WARN(
           get_logger(),
-          "Ignoring a trajectory older than the latest emergency stop.");
+          "【参考丢弃】轨迹时间早于最近一次急停，拒绝旧轨迹。");
       return false;
     }
     trajectory_tracker_.setTrajectory(std::move(parsed));
@@ -618,7 +618,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
       message->command_sequence == 0) {
     RCLCPP_ERROR(
         get_logger(),
-        "TRACE execution_command rejected=invalid receipt_ns=%lld",
+        "【执行授权拒绝】TRACE execution_command rejected=invalid receipt_ns=%lld",
         static_cast<long long>(receipt.nanoseconds()));
     engageFailStop();
     return;
@@ -634,7 +634,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
       command_age > rclcpp::Duration::from_seconds(execution_command_timeout_)) {
     RCLCPP_ERROR(
         get_logger(),
-        "TRACE execution_command rejected=timestamp mode=%u incarnation=%llu "
+        "【执行授权拒绝】TRACE execution_command rejected=timestamp mode=%u incarnation=%llu "
         "sequence=%llu stamp_ns=%lld receipt_ns=%lld age_ns=%lld limit_ns=%lld",
         static_cast<unsigned>(message->mode),
         static_cast<unsigned long long>(message->manager_incarnation),
@@ -655,7 +655,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
     if (message->manager_incarnation < last_execution_command_incarnation_) {
       RCLCPP_WARN(
           get_logger(),
-          "TRACE execution_command rejected=old_incarnation incarnation=%llu sequence=%llu "
+          "【执行授权拒绝】TRACE execution_command rejected=old_incarnation incarnation=%llu sequence=%llu "
           "stamp_ns=%lld receipt_ns=%lld active_incarnation=%llu",
           static_cast<unsigned long long>(message->manager_incarnation),
           static_cast<unsigned long long>(message->command_sequence),
@@ -681,7 +681,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
     } else if (message->command_sequence <= last_execution_command_sequence_) {
       RCLCPP_WARN(
           get_logger(),
-          "TRACE execution_command rejected=replay incarnation=%llu sequence=%llu "
+          "【执行授权拒绝】TRACE execution_command rejected=replay incarnation=%llu sequence=%llu "
           "stamp_ns=%lld receipt_ns=%lld last_sequence=%llu",
           static_cast<unsigned long long>(message->manager_incarnation),
           static_cast<unsigned long long>(message->command_sequence),
@@ -734,7 +734,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
   if (stop) {
     RCLCPP_WARN(
         get_logger(),
-        "TRACE execution_command accepted=0 stop=1 mode=%u incarnation=%llu sequence=%llu "
+        "【执行授权停止】TRACE execution_command accepted=0 stop=1 mode=%u incarnation=%llu sequence=%llu "
         "stamp_ns=%lld receipt_ns=%lld goal=%llu map_generation=%llu map_sequence=%llu",
         static_cast<unsigned>(message->mode),
         static_cast<unsigned long long>(message->manager_incarnation),
@@ -750,7 +750,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
   if (install_reference && !installPath(message->reference)) {
     RCLCPP_ERROR(
         get_logger(),
-        "TRACE execution_command rejected=reference_install incarnation=%llu sequence=%llu "
+        "【执行授权拒绝】TRACE execution_command rejected=reference_install incarnation=%llu sequence=%llu "
         "stamp_ns=%lld receipt_ns=%lld goal=%llu poses=%zu",
         static_cast<unsigned long long>(message->manager_incarnation),
         static_cast<unsigned long long>(message->command_sequence),
@@ -762,7 +762,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
   }
   RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "TRACE execution_command accepted=1 incarnation=%llu sequence=%llu "
+      "【执行授权接受】TRACE execution_command accepted=1 incarnation=%llu sequence=%llu "
       "stamp_ns=%lld receipt_ns=%lld goal=%llu epoch=%llu map_generation=%llu "
       "map_sequence=%llu local_generation_authorized=1 content_lineage_pending=1 poses=%zu",
       static_cast<unsigned long long>(message->manager_incarnation),
@@ -1226,7 +1226,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   const auto debug_log_start = std::chrono::steady_clock::now();
   RCLCPP_DEBUG(get_logger(),
-               "MPC vx=%.3f vy=%.3f wz=%.3f cross_track=%.3f "
+               "【MPC调试】vx=%.3f vy=%.3f wz=%.3f cross_track=%.3f "
                "progress_scale=%.2f cost=%.3f "
                "solve=%.2fms",
                last_control_(0), last_control_(1), last_control_(2),
