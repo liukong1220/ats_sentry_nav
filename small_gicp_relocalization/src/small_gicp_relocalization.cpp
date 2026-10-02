@@ -448,11 +448,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   RCLCPP_INFO(
     this->get_logger(),
-    "【GICP重定位就绪】模式=%s accumulate_frames=%d fine=%s coarse_first_only=%s "
-    "fine_max_corr=%.3f min_overlap=%.3f follow_status=%s auto_multi_guess_on_lost=%s "
-    "height_filter=%s confirmation=%d(min_interval=%.3fs motion_tol=%.2fm/%.2frad) "
-    "multi_guess_budget=%.2fs/%d ambiguity_margin=%.3f(sep=%.2fm/%.2frad) "
-    "relax_sim=%s",
+    "【GICP重定位就绪】模式=%s 累积帧=%d 精配准=%s 首窗口粗配准=%s "
+    "精配准最大对应距离=%.3f 最小重叠率=%.3f 跟随状态=%s 丢失时自动多猜测=%s "
+    "高度滤波=%s 确认次数=%d（最小间隔=%.3fs 运动容差=%.2fm/%.2frad） "
+    "多猜测预算=%.2fs/%d 歧义裕量=%.3f（间隔=%.2fm/%.2frad） "
+    "仿真放宽收敛=%s",
     registration_mode_.c_str(), accumulate_frames_, fine_alignment_enabled_ ? "true" : "false",
     coarse_first_window_only_ ? "true" : "false", std::sqrt(static_cast<double>(fine_max_dist_sq_)),
     min_overlap_ratio_, follow_localization_status_ ? "true" : "false",
@@ -464,8 +464,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   RCLCPP_INFO(
     this->get_logger(),
-    "【重定位输入门】期望坐标系='%s' age=%.2fs future=%.2fs range=[%.2f,%.2f] z=[%.2f,%.2f] "
-    "valid_ratio=%.2f accumulation_limit=%zu points/%d frames",
+    "【重定位输入门】期望坐标系='%s' 当前滞后=%.2fs 未来=%.2fs 距离=[%.2f,%.2f] z=[%.2f,%.2f] "
+    "有效比例=%.2f 累积上限=%zu 点/%d 帧",
     odom_frame_.c_str(), max_scan_age_s_, max_scan_future_s_, scan_min_range_m_, scan_max_range_m_,
     scan_min_z_m_, scan_max_z_m_, min_scan_valid_ratio_, max_accumulated_points_,
     max_accumulated_frames_);
@@ -569,8 +569,8 @@ void SmallGicpRelocalizationNode::recordDroppedScan(const std::string & reason)
   ++dropped_scan_count_;
   RCLCPP_WARN_THROTTLE(
     this->get_logger(), *this->get_clock(), 2000,
-    "【重定位点云丢弃】registered_scan（%s); dropped=%s stale=%s invalid=%s accepted=%s "
-    "trimmed_windows=%s sampled_points=%s evicted_frames=%s",
+    "【重定位点云丢弃】registered_scan（%s）；丢弃=%s 过期=%s 无效=%s 已接受=%s "
+    "裁剪窗口=%s 采样点=%s 淘汰帧=%s",
     reason.c_str(), std::to_string(dropped_scan_count_).c_str(),
     std::to_string(stale_scan_count_).c_str(), std::to_string(invalid_scan_count_).c_str(),
     std::to_string(accepted_scan_count_).c_str(),
@@ -952,9 +952,9 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
 
   RCLCPP_WARN_THROTTLE(
     this->get_logger(), *this->get_clock(), log_throttle_ms_,
-    "【重定位多猜测】扫描=%s cursor=%zu/%zu budget=%zu/%.2fs seed=(%.3f,%.3f,%.3f) "
-    "coverage x=[%.2f,%.2f] y=[%.2f,%.2f] max_radius=%.2f rings=%zu "
-    "screen_points=%zu source_points=%zu",
+    "【重定位多猜测】扫描=%s 游标=%zu/%zu 预算=%zu/%.2fs 初值=(%.3f,%.3f,%.3f) "
+    "覆盖范围 x=[%.2f,%.2f] y=[%.2f,%.2f] 最大半径=%.2f 环数=%zu "
+    "筛选点=%zu 输入点=%zu",
     std::to_string(request.sweep).c_str(), cursor, total, budget_count, multi_guess_time_budget_s_,
     request.seed.translation().x(), request.seed.translation().y(), yawOf(request.seed),
     outcome.lattice.min_x, outcome.lattice.max_x, outcome.lattice.min_y, outcome.lattice.max_y,
@@ -990,8 +990,8 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     if (multi_guess_log_candidates_) {
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), log_throttle_ms_,
-        "【重定位候选%zu】阶段=%s guess=(%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f) inliers=%zu "
-        "overlap=%.3f error=%.6f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f %s",
+        "【重定位候选%zu】阶段=%s 初值=(%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f) 内点=%zu "
+        "重叠率=%.3f 误差=%.6f 最小特征值=%.4g 条件数=%.4g 运动=%.3f 先验=%.3f 得分=%.4f %s",
         index, attempt.stage.c_str(), guess.translation().x(), guess.translation().y(),
         yawOf(guess), attempt.transform.translation().x(), attempt.transform.translation().y(),
         yawOf(attempt.transform), attempt.num_inliers, attempt.overlap_ratio,
@@ -1330,8 +1330,8 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
     this->get_logger(), *this->get_clock(), log_throttle_ms_,
     "【重定位多猜测完成】生成=%zu screened=%zu refined=%zu gated=%zu skipped=%zu "
     "next_cursor=%zu "
-    "wrapped=%s budget_exhausted=%s elapsed=%.3fs best_score=%.4f second=%.4f margin=%.4f "
-    "ambiguous=%s",
+    "已回绕=%s 预算耗尽=%s 用时=%.3fs 最佳得分=%.4f 次佳=%.4f 裕量=%.4f "
+    "存在歧义=%s",
     outcome.lattice.generated, outcome.evaluated, outcome.refined, outcome.gated, outcome.skipped,
     outcome.next_cursor, outcome.wrapped ? "true" : "false",
     outcome.budget_exhausted ? "true" : "false", outcome.elapsed_s, outcome.selection.best_score,
@@ -1432,8 +1432,8 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   if (log_registration_details_) {
     RCLCPP_INFO_THROTTLE(
       this->get_logger(), *this->get_clock(), log_throttle_ms_,
-      "【GICP结果】阶段=%s 成功=%s 收敛=%s 迭代=%zu inliers=%zu error=%.6f "
-      "overlap=%.3f min_eig=%.4g cond=%.4g motion=%.3f prior=%.3f score=%.4f source_points=%zu",
+      "【GICP结果】阶段=%s 成功=%s 收敛=%s 迭代=%zu 内点=%zu 误差=%.6f "
+      "重叠率=%.3f 最小特征值=%.4g 条件数=%.4g 运动=%.3f 先验=%.3f 得分=%.4f 输入点=%zu",
       attempt.stage.c_str(), attempt.ok ? "true" : "false", attempt.converged ? "true" : "false",
       attempt.iterations, attempt.num_inliers, attempt.registration_error, attempt.overlap_ratio,
       attempt.min_information_eigenvalue, attempt.information_condition_number,
@@ -1707,7 +1707,7 @@ void SmallGicpRelocalizationNode::publishObservation(
   if (!quality.error_finite && (accepted || status == Observation::STATUS_ACCEPTED)) {
     effective_accepted = false;
     effective_status = Observation::STATUS_INVALID;
-    effective_message = "non-finite registration error must never be accepted";
+    effective_message = "配准误差为非有限值，禁止接受";
     RCLCPP_ERROR_THROTTLE(
       this->get_logger(), *this->get_clock(), log_throttle_ms_,
       "【GICP拒绝】配准误差为非有限值（%f），报告 STATUS_INVALID",
@@ -1800,7 +1800,7 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   if (!rejection.empty() || !isKnownLocalizationState<LS>(msg->state)) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 5000, "【重定位状态拒绝】%s",
-      rejection.empty() ? "unknown state" : rejection.c_str());
+      rejection.empty() ? "未知状态" : rejection.c_str());
     return;
   }
   last_status_stamp_ns_ =

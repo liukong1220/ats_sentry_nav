@@ -245,7 +245,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
         ltv_dimensions, qp_solver_settings_);
     if (!qp_solver_->initialized()) {
       RCLCPP_ERROR(get_logger(),
-                   "OSQP v1.0.0 shadow 后端 setup 失败；保持 iLQR 主链，"
+                   "OSQP v1.0.0 shadow 后端初始化失败；保持 iLQR 主链，"
                    "不生成伪造 QP 结果。");
       qp_solver_.reset();
     }
@@ -335,7 +335,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
               command_topic_.c_str(), controller_->config().horizon,
               controller_->config().dt, control_rate_hz_);
   RCLCPP_INFO(get_logger(),
-              "【求解器配置】solver_mode=%s（qp_shadow 仅诊断，iLQR 保持唯一输出 owner）",
+              "【求解器配置】模式=%s（qp_shadow 仅诊断，iLQR 保持唯一输出所有者）",
               solver_mode_.c_str());
 }
 
@@ -1226,9 +1226,9 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   const auto debug_log_start = std::chrono::steady_clock::now();
   RCLCPP_DEBUG(get_logger(),
-               "【MPC调试】vx=%.3f vy=%.3f wz=%.3f cross_track=%.3f "
-               "progress_scale=%.2f cost=%.3f "
-               "solve=%.2fms",
+               "【MPC调试】vx=%.3f vy=%.3f wz=%.3f 横向误差=%.3f "
+               "进度比例=%.2f 代价=%.3f "
+               "求解=%.2fms",
                last_control_(0), last_control_(1), last_control_(2),
                projection.cross_track_error,
                trajectory_tracker_.progressScale(projection.cross_track_error),
@@ -1405,7 +1405,7 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
   if (telemetry.cycle_sequence % kTelemetrySummaryInterval == 0) {
     RCLCPP_INFO(
         get_logger(),
-        "控制周期 telemetry cycle=%llu mode=%s rate=%.1fHz period=%.3fms "
+        "控制周期遥测 序号=%llu 模式=%s 频率=%.1fHz 周期=%.3fms "
         "qp_status=%s iter=%d qp_wall(update/solve/backend/complete)=%.3f/%.3f/%.3f/%.3fms "
         "callback_p50/p95/p99=%.3f/%.3f/%.3fms "
         "qp_backend_p50/p95/p99=%.3f/%.3f/%.3fms "

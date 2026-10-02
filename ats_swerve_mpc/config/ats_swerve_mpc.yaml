@@ -96,7 +96,7 @@ ats_swerve_mpc:
     # 控制偏离参考的权重，对应车体系 [vx, vy, wz]。
     control_weight: [0.12, 0.12, 0.08]
     # 相邻控制量变化的权重，用于抑制舵轮速度/角速度突变。
-    control_delta_weight: [0.7, 0.7, 0.25]
+    control_delta_weight: [0.70, 0.70, 0.60]
 
     # 车体系前后最大速度（m/s）；实车需按轮速能力重新标定。
     max_vx: 1.5
@@ -109,7 +109,7 @@ ats_swerve_mpc:
     # 车体系横移最大加速度（m/s^2）。
     max_ay: 2.0
     # 最大 yaw 角加速度（rad/s^2）。
-    max_awz: 3.0
+    max_awz: 2.0
     # 底盘中心到前/后轮心的 x 半轴偏置（m），不是完整轮心距。
     wheel_base_x: 0.270
     # 底盘中心到左/右轮心的 y 半轴偏置（m），不是完整轮心距。
