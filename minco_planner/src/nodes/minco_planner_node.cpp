@@ -743,7 +743,7 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
       if (!attempt.success && astar_fallback_) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), log_throttle_ms_,
-          "【规划回退】jps failed: clearance=%.3f m reason=%s，改用 A*。",
+          "【规划回退】JPS 失败（jps failed: clearance=%.3f m reason=%s），改用 A*。",
           clearance, attempt.reason.c_str());
         attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
       }
@@ -1068,10 +1068,10 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   const ReferencePoint & collision_reference = remaining.points[collision_index];
   RCLCPP_ERROR_THROTTLE(
     get_logger(), *get_clock(), log_throttle_ms_,
-    "【运行期安全拒绝】扫掠足迹拒绝 goal=%llu candidate_generation=%llu "
+    "【运行期安全拒绝】扫掠足迹拒绝（goal=%llu candidate_generation=%llu "
     "current_generation=%llu collisions=%zu discrete_samples=%zu swept_samples=%zu "
     "first_index=%zu first_swept=%d first_collision=(%.3f,%.3f) "
-    "remaining_start=(%.3f,%.3f,%.3f) reference_center=(%.3f,%.3f,%.3f).",
+    "remaining_start=(%.3f,%.3f,%.3f) reference_center=(%.3f,%.3f,%.3f)）。",
     static_cast<unsigned long long>(active_reference->goal_id),
     static_cast<unsigned long long>(active_reference->map_generation),
     static_cast<unsigned long long>(snapshot->generation), safety.collisions.size(),
@@ -1256,7 +1256,7 @@ void MincoPlannerNode::planGoal(
   if (!search_result.success) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【规划失败】%s failed: %s expanded=%d clearance=%.3f m",
+      "【规划失败】%s 失败（failed: %s expanded=%d clearance=%.3f m）",
       search_algorithm_.c_str(), search_result.reason.c_str(),
       search_result.expanded_nodes, used_clearance);
     const std::uint8_t failure_reason =
@@ -1296,10 +1296,10 @@ void MincoPlannerNode::planGoal(
     }
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【MINCO拒绝】candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
+      "【MINCO拒绝】候选被拒绝（candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
       "raw_points=%zu preprocessed_points=%zu esdf_refined_points=%zu peak_v=%.3f "
       "peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f joint_termination=%s joint_iterations=%d "
-      "joint_wall_ms=%.3f segment_durations=[%s]",
+      "joint_wall_ms=%.3f segment_durations=[%s]）",
       static_cast<unsigned long long>(map_snapshot->generation),
       static_cast<unsigned long long>(map_publication_sequence),
       selected_trace.failure_reason.empty() ? "unknown" : selected_trace.failure_reason.c_str(),
@@ -1648,12 +1648,12 @@ void MincoPlannerNode::planGoal(
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), log_throttle_ms_,
         "【MINCO拒绝】足迹冲突=%zu，未发布不安全轨迹 "
-        "(discrete=%zu swept=%zu) first_index=%zu last_index=%zu points=%zu "
+        "（discrete=%zu swept=%zu）first_index=%zu last_index=%zu points=%zu "
         "first_sample=(%.3f, %.3f) first_center=(%.3f, %.3f, yaw=%.3f) "
         "start=(%.3f, %.3f, yaw=%.3f) raw_points=%zu preprocessed_points=%zu "
         "esdf_refined_points=%zu escape_allowed=%d "
         "escape_head_offset=%.3f m escape_prefix_end=%zu escape_candidate_prefix_end=%zu "
-        "escape_prefix_length=%.3f m escape_prefix_yaw_sweep=%.3f rad.",
+        "escape_prefix_length=%.3f m escape_prefix_yaw_sweep=%.3f rad）",
         safety.collisions.size(), discrete_collisions, swept_collisions,
         first_collision.trajectory_index, last_collision_index, reference.points.size(),
         first_collision.x, first_collision.y,
@@ -1709,8 +1709,8 @@ void MincoPlannerNode::planGoal(
   if (safety.safe && !admitsCommitGeometry(quality, commit_geometry_limits_)) {
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【MINCO拒绝】绕行轨迹提交前未通过几何约束：length_ratio=%.3f (max=%.3f) "
-      "lateral=%.3f m (max=%.3f m) path_length=%.2f direct=%.2f.",
+      "【MINCO拒绝】绕行轨迹提交前未通过几何约束（length_ratio=%.3f max=%.3f "
+      "lateral=%.3f m max=%.3f m path_length=%.2f direct=%.2f）。",
       quality.length_ratio, commit_geometry_limits_.max_length_ratio,
       quality.max_lateral_deviation, commit_geometry_limits_.max_lateral_deviation_m,
       quality.path_length, quality.direct_length);
