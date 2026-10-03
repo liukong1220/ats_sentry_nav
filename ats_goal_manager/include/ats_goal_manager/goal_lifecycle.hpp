@@ -46,6 +46,13 @@ public:
     return true;
   }
 
+  // 无停车重规划：正在跟踪时用新参考替换旧参考，状态保持 kTracking（不经过需要急停的
+  // kPlanning）。只在 kTracking 下成立。
+  bool referenceReplaced(std::uint64_t goal_id, bool map_ready) const
+  {
+    return active_ && goal_id_ == goal_id && map_ready && state_ == GoalLifecycleState::kTracking;
+  }
+
   bool mapBecameReady(std::uint64_t goal_id)
   {
     if (!mapReady(goal_id)) {

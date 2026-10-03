@@ -25,6 +25,10 @@ struct PathGeometryPreprocessorParams
   // radius so MINCO interpolates an inner arc instead of the vertex.
   double fillet_radius = 0.0;
   int fillet_arc_samples = 1;
+  // 捷径/圆角的中心净空保持（米）；<= 0 关闭。footprint 捷径会选最远的可行点，把居中的
+  // 图搜索路径重新拉成贴着内角的折线（只剩 safety_margin 的余量）。开启后新线段沿途的
+  // 格心净空不得低于 min(该值, 被替换折线沿途的最小净空) - 0.25 格。
+  double shortcut_min_clearance = 0.0;
 };
 
 struct PathGeometryResult
@@ -61,7 +65,19 @@ private:
   std::vector<Eigen::Vector2d> insertInnerCornerFillets(
     const std::vector<Eigen::Vector2d> & waypoints,
     const nav_msgs::msg::OccupancyGrid * planning_grid,
-    const FootprintSafetyChecker * safety_checker) const;
+    const FootprintSafetyChecker * safety_checker,
+    const std::vector<double> & blocked_squared) const;
+  // 折线沿途（按 1/4 格采样）的最小格心净空；无栅格或无距离场时返回 +inf。
+  double polylineClearance(
+    const std::vector<Eigen::Vector2d> & points,
+    const nav_msgs::msg::OccupancyGrid * planning_grid,
+    const std::vector<double> & blocked_squared) const;
+  // 用 replacement 替换 original 是否保持了中心净空（见 shortcut_min_clearance）。
+  bool clearancePreserved(
+    const std::vector<Eigen::Vector2d> & replacement,
+    const std::vector<Eigen::Vector2d> & original,
+    const nav_msgs::msg::OccupancyGrid * planning_grid,
+    const std::vector<double> & blocked_squared) const;
   static nav_msgs::msg::Path makePath(
     const std_msgs::msg::Header & header, const std::vector<Eigen::Vector2d> & points);
 

@@ -117,7 +117,15 @@ private:
       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
+    const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
+    std::string * reason = nullptr);
+  // 车当前推进位置起 runtime_safety_horizon_sec 内的参考在 grid 上是否安全（与运行期复检同判据）。
+  bool runtimeWindowSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid);
+  // 保留检查与运行期复检的窗口锚点：车沿参考的推进（参考时间，秒）。
+  double referenceProgress(
+    const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
+    double elapsed);
   void publishEmergencyStop(bool stop);
   void
   publishPlannerStatus(std::uint64_t goal_id, std::uint64_t localization_epoch,
@@ -179,6 +187,14 @@ private:
   // 保留判定的前向时间窗(s)。<=0 表示检查完整剩余段(原行为)。远端冲突留给
   // 10 Hz 运行期复检在逼近时作废,避免远处地图抖动让车每 2 s 急停重规划。
   double retain_reference_horizon_sec_ = 0.0;
+  // 保留/复检窗口以车沿参考的实际推进为锚点（而非墙钟），默认关闭保持原行为。
+  bool reference_window_from_robot_progress_{false};
+  // 保留检查失败但运行期窗口仍安全时，继续执行并发 FAILURE_REPLAN_ADVISED 请 GoalManager
+  // 无停车重规划；默认关闭保持原行为（作废并急停）。
+  bool replan_advisory_enabled_{false};
+  // 已发过建议的参考（以参考戳标识），每条参考只建议一次；对应的重规划请求保留旧参考守护。
+  std::optional<builtin_interfaces::msg::Time> replan_advised_reference_stamp_;
+  double reference_window_backward_sec_{0.0};
   double body_yaw_follow_clearance_ = 0.55;
   bool force_body_yaw_follow_ = false;
   /// Preferred graph-search clearance (circumscribed all-yaw footprint radius).

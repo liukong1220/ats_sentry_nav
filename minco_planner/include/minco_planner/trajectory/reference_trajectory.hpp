@@ -3,6 +3,7 @@
 #ifndef MINCO_PLANNER__REFERENCE_TRAJECTORY_HPP_
 #define MINCO_PLANNER__REFERENCE_TRAJECTORY_HPP_
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -101,6 +102,45 @@ inline ReferenceTrajectory remainingReferenceWindow(
     }
   }
   return remaining;
+}
+
+// 车沿参考实际推进到的时间：在 t <= time_upper_bound 的折线段上找离 (x, y) 最近的点，返回其
+// 插值时间。MPC 按几何投影跟踪，车常落后于墙钟时间（拐角减速、进度缩放），所以墙钟
+// elapsed 会越过车的真实位置；只在不超过墙钟的部分里搜索，避免回环路径投影到后段。
+// 参考少于两个点时返回 time_upper_bound。
+inline double projectedReferenceTime(
+  const ReferenceTrajectory & trajectory, double x, double y, double time_upper_bound)
+{
+  const auto & points = trajectory.points;
+  if (points.size() < 2) {
+    return time_upper_bound;
+  }
+  double best_distance = std::numeric_limits<double>::infinity();
+  double best_time = std::min(time_upper_bound, points.front().t);
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    const ReferencePoint & a = points[i - 1];
+    const ReferencePoint & b = points[i];
+    if (a.t > time_upper_bound) {
+      break;
+    }
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double length_squared = dx * dx + dy * dy;
+    double u = length_squared > 1e-12 ? ((x - a.x) * dx + (y - a.y) * dy) / length_squared : 0.0;
+    u = std::max(0.0, std::min(1.0, u));
+    const double t = a.t + u * (b.t - a.t);
+    if (t > time_upper_bound) {
+      u = b.t > a.t ? (time_upper_bound - a.t) / (b.t - a.t) : 0.0;
+    }
+    const double px = a.x + u * dx;
+    const double py = a.y + u * dy;
+    const double distance = std::hypot(px - x, py - y);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_time = std::min(time_upper_bound, a.t + u * (b.t - a.t));
+    }
+  }
+  return best_time;
 }
 
 }  // namespace minco_planner

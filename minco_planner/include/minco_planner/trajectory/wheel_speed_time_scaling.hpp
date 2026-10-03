@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include "minco_planner/trajectory/local_time_scaling.hpp"
@@ -28,6 +29,13 @@ struct WheelSpeedTimeScalingParams
   double narrow_turn_speed_limit = 0.0;
   double narrow_turn_clearance = 0.0;
   double narrow_turn_yaw_rate_threshold = 0.2;
+  // 按中心净空限速（m/s）；clearance_speed_min <= 0 关闭。中心净空 <= clearance_speed_low
+  // 时平移速度不超过 clearance_speed_min，在 clearance_speed_low..clearance_speed_high
+  // 之间线性放开，>= clearance_speed_high 不限。离墙越近 MPC 横向误差越要小，而横向
+  // 误差随速度增大；这一项让余量小的位置走得慢。
+  double clearance_speed_min = 0.0;
+  double clearance_speed_low = 0.0;
+  double clearance_speed_high = 0.0;
 };
 
 // 四个舵轮中最大的轮速：轮心速度 = 车体平移速度 + wz x r。vx/vy 为世界系速度。
@@ -99,6 +107,51 @@ inline bool applyNarrowTurnTimeScaling(
       speed > params.narrow_turn_speed_limit)
     {
       factors[i] = params.narrow_turn_speed_limit / speed;
+      limited = true;
+    }
+  }
+  if (!limited) {
+    return false;
+  }
+  return applyLocalTimeScaling(trajectory, factors, params.scale_change_rate);
+}
+
+// 净空 c 处允许的平移速度上限；关闭或净空未知（NaN）时返回 +inf。
+inline double clearanceSpeedLimit(double clearance, const WheelSpeedTimeScalingParams & params)
+{
+  if (params.clearance_speed_min <= 0.0 || !std::isfinite(clearance) ||
+    params.clearance_speed_high <= params.clearance_speed_low)
+  {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (clearance >= params.clearance_speed_high) {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (clearance <= params.clearance_speed_low) {
+    return params.clearance_speed_min;
+  }
+  // 上限按 min / (1 - u) 增长：u 从 0 到 1 时从 min 单调趋于无穷，在 high 处与"不限速"连续衔接。
+  const double u = (clearance - params.clearance_speed_low) /
+    (params.clearance_speed_high - params.clearance_speed_low);
+  return params.clearance_speed_min / std::max(1e-3, 1.0 - u);
+}
+
+// 按中心净空的局部放慢：位置与 yaw 序列不变，只改时间参数化。返回是否修改了轨迹。
+inline bool applyClearanceSpeedTimeScaling(
+  ReferenceTrajectory & trajectory, const WheelSpeedTimeScalingParams & params)
+{
+  const std::size_t count = trajectory.points.size();
+  if (params.clearance_speed_min <= 0.0 || count < 2) {
+    return false;
+  }
+  std::vector<double> factors(count, 1.0);
+  bool limited = false;
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto & point = trajectory.points[i];
+    const double speed = std::hypot(point.vx, point.vy);
+    const double limit = clearanceSpeedLimit(point.clearance, params);
+    if (speed > limit) {
+      factors[i] = limit / speed;
       limited = true;
     }
   }

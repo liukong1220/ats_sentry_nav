@@ -28,6 +28,10 @@ uint8 FAILURE_REFERENCE_TF=10
 uint8 FAILURE_SNAPSHOT_CHANGED=11
 uint8 FAILURE_RUNTIME_UNSAFE=12
 uint8 FAILURE_START_ENCLOSED=13
+# 建议重规划（不是失败）：只与 STATE_ACCEPTED 一起发布，标识的是正在执行的参考。新地图上
+# 该参考在运行期复检窗口之外出现冲突、窗口之内仍安全；车继续执行它，GoalManager 应从当前
+# 位姿发起一次完整重规划并在新参考就绪后替换。MPC 与 arbiter 忽略 STATE_ACCEPTED，不会停车。
+uint8 FAILURE_REPLAN_ADVISED=14
 uint8 failure_reason
 # Planner-selected yaw policy associated with this candidate reference.
 uint8 YAW_AUTHORITY_HOLD_SAFE_STOP=0

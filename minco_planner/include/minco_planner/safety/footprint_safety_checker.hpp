@@ -48,6 +48,7 @@ public:
   explicit FootprintSafetyChecker(FootprintSafetyParams params = FootprintSafetyParams());
 
   void setParams(const FootprintSafetyParams & params);
+  const FootprintSafetyParams & params() const {return params_;}
   FootprintSafetyResult check(
     const ReferenceTrajectory & trajectory,
     const nav_msgs::msg::OccupancyGrid & grid) const;

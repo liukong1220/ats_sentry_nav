@@ -44,6 +44,14 @@ struct GridAstarParams
   /// search down to 0.05 m. Set this to the inscribed footprint half-width, the
   /// clearance below which no body yaw fits at all.
   double min_safe_distance = 0.0;
+  /// 离墙代价权重；<= 0 关闭（纯最短路）。开启后每步代价乘以
+  /// 1 + weight * ((clearance_cost_distance - d) / clearance_cost_distance)^2（d 小于
+  /// clearance_cost_distance 时），d 为该格到最近阻塞格的格心距离。最短路会沿内角贴着
+  /// 安全净空下限走，这一项让路径在通道里居中、优先走更宽的路线。代价不小于步长，
+  /// 欧氏启发仍可采纳。
+  double clearance_cost_weight = 0.0;
+  /// 离墙代价生效的距离上界（米）；超过该距离视为开阔，不再加代价。
+  double clearance_cost_distance = 0.0;
 };
 
 struct GridAstarResult
@@ -89,6 +97,12 @@ private:
     const nav_msgs::msg::OccupancyGrid & grid,
     const GridIndex & index) const;
   bool isTraversable(const nav_msgs::msg::OccupancyGrid & grid, const GridIndex & index) const;
+  bool isTraversable(
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & blocked_squared,
+    const GridIndex & index) const;
+  double clearanceCostFactor(
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & blocked_squared,
+    const GridIndex & index) const;
   GridOccupancyPolicy occupancyPolicy() const;
   std::size_t linearIndex(const nav_msgs::msg::OccupancyGrid & grid, const GridIndex & index) const;
   double heuristic(const GridIndex & from, const GridIndex & to) const;

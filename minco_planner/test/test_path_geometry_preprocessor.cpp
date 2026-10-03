@@ -1,8 +1,10 @@
 // Copyright 2026
 
+#include <algorithm>
 #include <cmath>
 
 #include "gtest/gtest.h"
+#include "minco_planner/planning/grid_clearance.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/trajectory/path_geometry_preprocessor.hpp"
 
@@ -154,3 +156,92 @@ TEST(PathGeometryPreprocessor, InnerFilletKeepsCornerWhenInnerArcHitsOccupied)
 }
 
 }  // namespace
+
+namespace
+{
+// 3 m x 3 m 栅格中一个从北墙伸出的凸角（x=0.5, y 0.1..1.9 m 外的列被占据），
+// 居中路径从左侧 (0.05, 0.25) 绕到右侧 (1.05, 0.25)，在 y=-0.35 处绕过凸角底端。
+nav_msgs::msg::OccupancyGrid makeConvexCornerGrid()
+{
+  auto grid = makeGrid();
+  for (double y = 0.15; y <= 2.85; y += 0.1) {
+    setOccupied(grid, 0.55, y);
+  }
+  return grid;
+}
+
+nav_msgs::msg::Path makeDetourPath()
+{
+  return makePath({
+      {0.05, 0.25}, {0.05, 0.05}, {0.05, -0.15}, {0.15, -0.35}, {0.35, -0.45}, {0.55, -0.45},
+      {0.75, -0.45}, {0.95, -0.35}, {1.05, -0.15}, {1.05, 0.05}, {1.05, 0.25}});
+}
+
+double minimumGridClearance(
+  const nav_msgs::msg::OccupancyGrid & grid, const std::vector<Eigen::Vector2d> & points)
+{
+  minco_planner::GridOccupancyPolicy policy;
+  policy.obstacle_value_threshold = 100;
+  const auto squared = minco_planner::computeBlockedSquaredDistanceCells(grid, policy);
+  double minimum = 1e9;
+  for (std::size_t index = 1; index < points.size(); ++index) {
+    for (int sample = 0; sample <= 20; ++sample) {
+      const Eigen::Vector2d point =
+        points[index - 1] + (points[index] - points[index - 1]) * (sample / 20.0);
+      minimum = std::min(
+        minimum, minco_planner::blockedDistanceAt(grid, squared, point.x(), point.y()));
+    }
+  }
+  return minimum;
+}
+
+minco_planner::FootprintSafetyChecker makeSmallChecker()
+{
+  minco_planner::FootprintSafetyParams params;
+  params.length = 0.2;
+  params.width = 0.2;
+  params.safety_margin = 0.0;
+  params.obstacle_value_threshold = 100;
+  params.unknown_is_obstacle = true;
+  return minco_planner::FootprintSafetyChecker(params);
+}
+}  // namespace
+
+TEST(PathGeometryPreprocessor, ShortcutClearancePreservationKeepsDetourOffCorner)
+{
+  const auto grid = makeConvexCornerGrid();
+  const auto checker = makeSmallChecker();
+  const auto raw = makeDetourPath();
+
+  minco_planner::PathGeometryPreprocessorParams params;
+  const auto taut = minco_planner::PathGeometryPreprocessor(params).preprocess(raw, &grid, &checker);
+  params.shortcut_min_clearance = 0.5;
+  const auto kept = minco_planner::PathGeometryPreprocessor(params).preprocess(raw, &grid, &checker);
+
+  const double taut_clearance = minimumGridClearance(grid, taut.waypoints);
+  const double kept_clearance = minimumGridClearance(grid, kept.waypoints);
+  const double raw_clearance = minimumGridClearance(
+    grid, minco_planner::PathGeometryPreprocessor(
+      minco_planner::PathGeometryPreprocessorParams()).preprocess(raw).waypoints);
+  // 不保持净空时，最远可行捷径把路径拉向凸角；保持后不低于原路径净空（容差 1/4 格）。
+  EXPECT_LT(taut_clearance, raw_clearance - 0.05);
+  EXPECT_GE(kept_clearance, raw_clearance - 0.025 - 1e-9);
+  // 仍然做了化简，没有退化成原始点列。
+  EXPECT_LT(kept.waypoints.size(), raw.poses.size());
+}
+
+TEST(PathGeometryPreprocessor, ShortcutClearanceDisabledByDefault)
+{
+  const auto grid = makeConvexCornerGrid();
+  const auto checker = makeSmallChecker();
+  const auto raw = makeDetourPath();
+  minco_planner::PathGeometryPreprocessorParams defaults;
+  minco_planner::PathGeometryPreprocessorParams explicit_off;
+  explicit_off.shortcut_min_clearance = 0.0;
+  const auto a = minco_planner::PathGeometryPreprocessor(defaults).preprocess(raw, &grid, &checker);
+  const auto b = minco_planner::PathGeometryPreprocessor(explicit_off).preprocess(raw, &grid, &checker);
+  ASSERT_EQ(a.waypoints.size(), b.waypoints.size());
+  for (std::size_t index = 0; index < a.waypoints.size(); ++index) {
+    EXPECT_NEAR((a.waypoints[index] - b.waypoints[index]).norm(), 0.0, 1e-12);
+  }
+}
