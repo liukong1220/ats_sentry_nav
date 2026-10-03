@@ -96,6 +96,40 @@ TEST(LocalizationFusionCore, MeasuresWrappedCorrectionDelta)
   EXPECT_NEAR(delta.yaw, 0.1, 1e-9);
 }
 
+TEST(LocalizationFusionCore, ContinuousBandAppliesWithoutAdvancingEpoch)
+{
+  const tf2::Transform current = makeTransform(1.0, 0.10);
+  // 0.08 m 超过 0.05 m 阈值，但在 0.20 m / 0.10 rad 连续上界内：改 TF、不推进 epoch。
+  const CorrectionUpdate continuous = selectCorrectionUpdate(
+    makeTransform(1.08, 0.12), current, 0.05, 0.05, 0.20, 0.10);
+  EXPECT_TRUE(continuous.apply);
+  EXPECT_TRUE(continuous.continuous);
+  EXPECT_FALSE(continuous.advance_epoch);
+  EXPECT_NEAR(continuous.map_to_odom.getOrigin().x(), 1.08, 1e-9);
+
+  // 超过连续上界：照旧推进 epoch。
+  const CorrectionUpdate large = selectCorrectionUpdate(
+    makeTransform(1.30, 0.12), current, 0.05, 0.05, 0.20, 0.10);
+  EXPECT_TRUE(large.apply);
+  EXPECT_FALSE(large.continuous);
+  EXPECT_TRUE(large.advance_epoch);
+  const CorrectionUpdate large_yaw = selectCorrectionUpdate(
+    makeTransform(1.02, 0.30), current, 0.05, 0.05, 0.20, 0.10);
+  EXPECT_TRUE(large_yaw.advance_epoch);
+
+  // 阈值内：不改 TF。
+  const CorrectionUpdate small = selectCorrectionUpdate(
+    makeTransform(1.02, 0.12), current, 0.05, 0.05, 0.20, 0.10);
+  EXPECT_FALSE(small.apply);
+  EXPECT_FALSE(small.continuous);
+
+  // 默认关闭：与原行为一致。
+  const CorrectionUpdate disabled =
+    selectCorrectionUpdate(makeTransform(1.08, 0.12), current, 0.05, 0.05);
+  EXPECT_TRUE(disabled.advance_epoch);
+  EXPECT_FALSE(disabled.continuous);
+}
+
 TEST(LocalizationFusionCore, AppliesOnlyCorrectionsThatAdvanceEpoch)
 {
   const tf2::Transform current = makeTransform(1.0, 0.10);

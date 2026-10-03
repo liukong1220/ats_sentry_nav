@@ -47,6 +47,8 @@ struct CorrectionUpdate
   CorrectionDelta delta;
   bool apply{false};
   bool advance_epoch{false};
+  // 超过 epoch 阈值但不超过连续修正上界：直接改 map->odom，不推进 epoch。
+  bool continuous{false};
 };
 
 /// Evict by measurement time first, then enforce a hard sample-count bound.
@@ -154,9 +156,14 @@ inline CorrectionDelta correctionDelta(const tf2::Transform & newer, const tf2::
   return delta;
 }
 
+// continuous_max_translation/yaw > 0 时，超过 epoch 阈值但不超过该上界的修正按连续修正应用：
+// map->odom 改变而 epoch 不变。MPC 在 odom 里执行，不受 map->odom 影响；规划器对已提交参考的
+// 复检按当前 TF 重新表达，GoalManager 的位姿门也用当前 TF，所以这类修正不必作废整条参考链。
+// 超过上界（大幅跳变、重新定位）仍推进 epoch，下游照旧停车重建。
 inline CorrectionUpdate selectCorrectionUpdate(
   const tf2::Transform & candidate, const std::optional<tf2::Transform> & current,
-  double translation_threshold, double yaw_threshold)
+  double translation_threshold, double yaw_threshold,
+  double continuous_max_translation = 0.0, double continuous_max_yaw = 0.0)
 {
   CorrectionUpdate update;
   if (!current) {
@@ -168,9 +175,14 @@ inline CorrectionUpdate selectCorrectionUpdate(
 
   update.map_to_odom = *current;
   update.delta = correctionDelta(candidate, *current);
-  update.advance_epoch = update.delta.translation > std::max(0.0, translation_threshold) ||
-                         update.delta.yaw > std::max(0.0, yaw_threshold);
-  update.apply = update.advance_epoch;
+  const bool beyond_threshold = update.delta.translation > std::max(0.0, translation_threshold) ||
+    update.delta.yaw > std::max(0.0, yaw_threshold);
+  const bool continuous_enabled = continuous_max_translation > 0.0 && continuous_max_yaw > 0.0;
+  update.continuous = beyond_threshold && continuous_enabled &&
+    update.delta.translation <= continuous_max_translation &&
+    update.delta.yaw <= continuous_max_yaw;
+  update.advance_epoch = beyond_threshold && !update.continuous;
+  update.apply = beyond_threshold;
   if (update.apply) {
     update.map_to_odom = candidate;
   }

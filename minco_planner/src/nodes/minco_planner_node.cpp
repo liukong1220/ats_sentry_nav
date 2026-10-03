@@ -887,12 +887,15 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     }
   }
   std::string retain_reason;
+  // map->odom 在同一定位 epoch 内的连续修正不作废参考，检查按当前 TF 重新表达的参考。
+  const ReferenceTrajectory retain_aligned = retain_candidate ?
+    alignedToCurrentTf(*retain_candidate) : ReferenceTrajectory();
   const bool retain_verdict = retain_candidate &&
     retain_candidate->trajectory.header.frame_id == snapshot->grid.header.frame_id &&
-    remainingReferenceSafeOn(retain_candidate->trajectory, snapshot->grid, &retain_reason);
+    remainingReferenceSafeOn(retain_aligned, snapshot->grid, &retain_reason);
   // 远端冲突、近端安全：继续执行并建议重规划，交给 10 Hz 运行期复检兜底近端。
   const bool advise_replan = replan_advisory_enabled_ && retain_candidate && !retain_verdict &&
-    runtimeWindowSafeOn(retain_candidate->trajectory, snapshot->grid);
+    runtimeWindowSafeOn(retain_aligned, snapshot->grid);
   std::optional<ActiveSafetyReference> advised_reference;
   bool retained_reference = false;
   std::uint64_t retained_reference_goal = 0;
@@ -1095,6 +1098,53 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
   return shallow;
 }
 
+ReferenceTrajectory MincoPlannerNode::alignedToCurrentTf(
+  const ActiveSafetyReference & reference)
+{
+  if (!reference.control_from_grid) {
+    return reference.trajectory;
+  }
+  geometry_msgs::msg::TransformStamped grid_from_control;
+  try {
+    grid_from_control = tf_buffer_->lookupTransform(
+      reference.trajectory.header.frame_id, reference.control_from_grid->header.frame_id,
+      tf2::TimePointZero, tf2::durationFromSec(0.05));
+  } catch (const tf2::TransformException & exception) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【TF失败】参考复检无法获取当前 %s -> %s：%s；按提交时坐标检查。",
+      reference.control_from_grid->header.frame_id.c_str(),
+      reference.trajectory.header.frame_id.c_str(), exception.what());
+    return reference.trajectory;
+  }
+  tf2::Transform committed;
+  tf2::Transform current;
+  tf2::fromMsg(reference.control_from_grid->transform, committed);
+  tf2::fromMsg(grid_from_control.transform, current);
+  // 栅格坐标下的漂移：map->odom 未变时为恒等。
+  const tf2::Transform drift = current * committed;
+  if (drift.getOrigin().length() < 1e-6 && std::abs(tf2::getYaw(drift.getRotation())) < 1e-6) {
+    return reference.trajectory;
+  }
+  ReferenceTrajectory aligned = reference.trajectory;
+  const double drift_yaw = tf2::getYaw(drift.getRotation());
+  const double c = std::cos(drift_yaw);
+  const double s = std::sin(drift_yaw);
+  for (auto & point : aligned.points) {
+    const tf2::Vector3 moved = drift * tf2::Vector3(point.x, point.y, 0.0);
+    point.x = moved.x();
+    point.y = moved.y();
+    point.yaw = std::atan2(std::sin(point.yaw + drift_yaw), std::cos(point.yaw + drift_yaw));
+    const double vx = point.vx;
+    point.vx = c * vx - s * point.vy;
+    point.vy = s * vx + c * point.vy;
+    const double ax = point.ax;
+    point.ax = c * ax - s * point.ay;
+    point.ay = s * ax + c * point.ay;
+  }
+  return aligned;
+}
+
 bool MincoPlannerNode::runtimeWindowSafeOn(
   const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid)
 {
@@ -1162,11 +1212,11 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   }
   const rclcpp::Time reference_stamp(active_reference->trajectory.header.stamp);
   const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
-  const double progress = referenceProgress(active_reference->trajectory, snapshot->grid, elapsed);
+  const ReferenceTrajectory aligned = alignedToCurrentTf(*active_reference);
+  const double progress = referenceProgress(aligned, snapshot->grid, elapsed);
   const double horizon_end = progress + runtime_safety_horizon_sec_;
   const ReferenceTrajectory remaining = remainingReferenceWindow(
-    active_reference->trajectory, std::max(0.0, progress - reference_window_backward_sec_),
-    horizon_end);
+    aligned, std::max(0.0, progress - reference_window_backward_sec_), horizon_end);
   if (remaining.points.size() < 2) {
     return;
   }
@@ -1919,7 +1969,9 @@ void MincoPlannerNode::planGoal(
     return;
   }
   nav_msgs::msg::Path control_reference;
-  if (!transformPathToGlobal(toPath(reference), control_reference)) {
+  geometry_msgs::msg::TransformStamped control_from_grid;
+  control_from_grid.header.frame_id.clear();
+  if (!transformPathToGlobal(toPath(reference), control_reference, &control_from_grid)) {
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_, "【参考发布失败】控制坐标系转换失败，未发布 MINCO 参考。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REFERENCE_TF,
@@ -1942,7 +1994,9 @@ void MincoPlannerNode::planGoal(
   if (!publishReferenceIfCurrent(map_snapshot, map_health_epoch,
                                  control_reference, reference, goal_id, localization_epoch,
                                  plan_request_sequence, map_publication_sequence, yaw_authority,
-                                 report_status, telemetry)) {
+                                 report_status, telemetry,
+                                 control_from_grid.header.frame_id.empty() ?
+                                 nullptr : &control_from_grid)) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_, "【参考提交丢弃】generation=%llu 因规划地图变化或过期而丢弃，等待重规划。",
       static_cast<unsigned long long>(map_snapshot->generation));
@@ -2142,7 +2196,8 @@ bool MincoPlannerNode::transformGoalToGrid(
 }
 
 bool MincoPlannerNode::transformPathToGlobal(
-  const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output)
+  const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output,
+  geometry_msgs::msg::TransformStamped * used_transform)
 {
   const std::string source_frame =
     input.header.frame_id.empty() ? global_frame_ : input.header.frame_id;
@@ -2157,6 +2212,9 @@ bool MincoPlannerNode::transformPathToGlobal(
   try {
     const auto transform = tf_buffer_->lookupTransform(
       global_frame_, source_frame, tf2::TimePointZero, tf2::durationFromSec(0.1));
+    if (used_transform) {
+      *used_transform = transform;
+    }
     output.header = input.header;
     output.header.frame_id = global_frame_;
     output.poses.clear();
@@ -2283,7 +2341,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     std::uint64_t map_publication_sequence,
     std::uint8_t yaw_authority,
     bool report_status,
-    const PlannerCommitTelemetry & telemetry) {
+    const PlannerCommitTelemetry & telemetry,
+    const geometry_msgs::msg::TransformStamped * control_from_grid) {
   std::lock_guard<std::mutex> lock(map_mutex_);
   const bool heartbeat_fresh = map_ready_topic_.empty() || steadyHeartbeatLeaseValid(
     last_map_ready_signal_, std::chrono::steady_clock::now(), map_ready_timeout_sec_);
@@ -2324,6 +2383,9 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
   active_reference.plan_request_sequence = plan_request_sequence;
   active_reference.map_generation = snapshot->generation;
   active_reference.map_publication_sequence = map_publication_sequence;
+  if (control_from_grid) {
+    active_reference.control_from_grid = *control_from_grid;
+  }
   active_safety_reference_ = std::move(active_reference);
   if (planner_manages_emergency_stop_) {
     // Preserve the P2 stop-clear/reference ordering inside the same map lock.
