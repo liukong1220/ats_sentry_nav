@@ -361,6 +361,106 @@ TEST(YawSplinePlanner, YawAccelerationLimitStretchesSmallTerminalTurn)
   }
 }
 
+namespace
+{
+// 东行 1 m/s、每 0.1 s 一个点：[0, open_points) 开阔，之后 narrow_points 个点窄通道并转为
+// 北行（窄段第一个点起切线为 +pi/2）。
+minco_planner::ReferenceTrajectory makeOpenThenNorthNarrow(int open_points, int narrow_points)
+{
+  minco_planner::ReferenceTrajectory trajectory;
+  double x = 0.0;
+  double y = 0.0;
+  for (int i = 0; i < open_points + narrow_points; ++i) {
+    minco_planner::ReferencePoint point;
+    point.t = 0.1 * i;
+    point.x = x;
+    point.y = y;
+    point.clearance = i < open_points ? 2.0 : 0.2;
+    trajectory.points.push_back(point);
+    if (i + 1 < open_points) {
+      x += 0.1;
+    } else {
+      y += 0.1;
+    }
+  }
+  return trajectory;
+}
+
+minco_planner::YawSplinePlannerParams makeMinimalRotationParams(int symmetry_order)
+{
+  minco_planner::YawSplinePlannerParams params;
+  params.mode = "clearance_aware";
+  params.yaw_rate_limit = 2.0;
+  params.yaw_acceleration_limit = 2.0;
+  params.tangent_symmetry_order = symmetry_order;
+  params.open_area_yaw_mode = "minimal_rotation";
+  return params;
+}
+
+double maxAbsYawRate(const minco_planner::ReferenceTrajectory & trajectory)
+{
+  double result = 0.0;
+  for (const auto & point : trajectory.points) {
+    result = std::max(result, std::abs(point.yaw_rate));
+  }
+  return result;
+}
+}  // namespace
+
+TEST(YawSplinePlanner, MinimalRotationKeepsSquareYawBeforeAxisAlignedNarrowEntry)
+{
+  // 正方形：北行窄通道的切线 +pi/2 与当前 yaw 0 等价，开阔段不必为它转向。
+  auto trajectory = makeOpenThenNorthNarrow(30, 20);
+  minco_planner::YawSplinePlanner planner(makeMinimalRotationParams(4));
+
+  planner.apply(trajectory, 0.0, 2.0);
+
+  for (std::size_t i = 0; i < 30; ++i) {
+    EXPECT_NEAR(trajectory.points[i].yaw, 0.0, 1e-9) << "index " << i;
+  }
+}
+
+TEST(YawSplinePlanner, MinimalRotationPreRotatesRectangleAcrossOpenSegment)
+{
+  // 矩形：开阔段内逐步转到窄通道入口的对齐朝向 +pi/2，入口处已对齐。
+  auto trajectory = makeOpenThenNorthNarrow(30, 20);
+  minco_planner::YawSplinePlanner planner(makeMinimalRotationParams(2));
+
+  planner.apply(trajectory, 0.0, 0.0);
+
+  EXPECT_NEAR(trajectory.points[30].yaw, M_PI_2, 0.1);
+  // 转向分摊到整段开阔区域：0.5 pi 在约 3 s 内，峰值角速度远低于 yaw_rate_limit。
+  double peak_open_rate = 0.0;
+  for (std::size_t i = 1; i < 30; ++i) {
+    peak_open_rate = std::max(peak_open_rate, std::abs(trajectory.points[i].yaw_rate));
+  }
+  EXPECT_LT(peak_open_rate, 1.2);
+}
+
+TEST(YawSplinePlanner, MinimalRotationSpreadsGoalTurnAfterNarrowExit)
+{
+  // 窄通道（东行，yaw 0）之后 3 s 开阔段直到终点，目标朝向 1.2 rad。
+  minco_planner::ReferenceTrajectory trajectory;
+  for (int i = 0; i < 40; ++i) {
+    minco_planner::ReferencePoint point;
+    point.t = 0.1 * i;
+    point.x = 0.1 * i;
+    point.clearance = i < 10 ? 0.2 : 2.0;
+    trajectory.points.push_back(point);
+  }
+  auto goal_heading = trajectory;
+  minco_planner::YawSplinePlanner minimal(makeMinimalRotationParams(4));
+  auto params = makeMinimalRotationParams(4);
+  params.open_area_yaw_mode = "goal_heading";
+  minco_planner::YawSplinePlanner baseline(params);
+
+  minimal.apply(trajectory, 0.0, 1.2);
+  baseline.apply(goal_heading, 0.0, 1.2);
+
+  EXPECT_NEAR(trajectory.points.back().yaw, 1.2, 1e-6);
+  EXPECT_LT(maxAbsYawRate(trajectory), maxAbsYawRate(goal_heading));
+}
+
 TEST(YawSplinePlanner, ClearanceAwareRestoresGoalHeadingAfterNarrowTerminalSegment)
 {
   minco_planner::ReferenceTrajectory trajectory;

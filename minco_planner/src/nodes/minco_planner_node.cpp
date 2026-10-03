@@ -210,6 +210,10 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<bool>(
     "retain_safe_reference_on_snapshot_change", retain_safe_reference_on_snapshot_change_);
   declare_parameter<double>("retain_reference_horizon_sec", retain_reference_horizon_sec_);
+  declare_parameter<bool>(
+    "reference_window_from_robot_progress", reference_window_from_robot_progress_);
+  declare_parameter<double>("reference_window_backward_sec", reference_window_backward_sec_);
+  declare_parameter<bool>("replan_advisory_enabled", replan_advisory_enabled_);
   declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   declare_parameter<bool>("force_body_yaw_follow", force_body_yaw_follow_);
   declare_parameter<std::string>("global_frame", global_frame_);
@@ -259,6 +263,9 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<int>("obstacle_value_threshold", astar_params.obstacle_value_threshold);
   declare_parameter<bool>("unknown_is_obstacle", astar_params.unknown_is_obstacle);
   declare_parameter<bool>("allow_diagonal", astar_params.allow_diagonal);
+  declare_parameter<double>("search_clearance_cost_weight", astar_params.clearance_cost_weight);
+  declare_parameter<double>(
+    "search_clearance_cost_distance", astar_params.clearance_cost_distance);
   GridJpsParams jps_params;
   declare_parameter<int>("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
   declare_parameter<double>("jps_safe_distance", jps_params.safe_distance);
@@ -356,6 +363,8 @@ void MincoPlannerNode::declareAndLoadParams()
     "path_fillet_radius", optimizer_params.geometry_preprocessor.fillet_radius);
   declare_parameter<int>(
     "path_fillet_arc_samples", optimizer_params.geometry_preprocessor.fillet_arc_samples);
+  declare_parameter<double>(
+    "path_shortcut_min_clearance", optimizer_params.geometry_preprocessor.shortcut_min_clearance);
 
   YawSplinePlannerParams yaw_params;
   declare_parameter<std::string>("yaw_mode", yaw_params.mode);
@@ -365,6 +374,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<int>("yaw_tangent_symmetry_order", yaw_params.tangent_symmetry_order);
   declare_parameter<double>("yaw_narrow_gap_bridge_time", yaw_params.narrow_gap_bridge_time);
   declare_parameter<double>("yaw_acceleration_limit", yaw_params.yaw_acceleration_limit);
+  declare_parameter<std::string>("yaw_open_area_mode", yaw_params.open_area_yaw_mode);
   declare_parameter<double>(
     "wheel_speed_time_scaling_limit", wheel_speed_time_scaling_params_.wheel_speed_limit);
   declare_parameter<double>(
@@ -378,6 +388,12 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>(
     "narrow_turn_yaw_rate_threshold",
     wheel_speed_time_scaling_params_.narrow_turn_yaw_rate_threshold);
+  declare_parameter<double>(
+    "clearance_speed_min", wheel_speed_time_scaling_params_.clearance_speed_min);
+  declare_parameter<double>(
+    "clearance_speed_low", wheel_speed_time_scaling_params_.clearance_speed_low);
+  declare_parameter<double>(
+    "clearance_speed_high", wheel_speed_time_scaling_params_.clearance_speed_high);
   declare_parameter<double>(
     "terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   declare_parameter<bool>(
@@ -430,6 +446,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter(
     "retain_safe_reference_on_snapshot_change", retain_safe_reference_on_snapshot_change_);
   get_parameter("retain_reference_horizon_sec", retain_reference_horizon_sec_);
+  get_parameter("reference_window_from_robot_progress", reference_window_from_robot_progress_);
+  get_parameter("replan_advisory_enabled", replan_advisory_enabled_);
+  get_parameter("reference_window_backward_sec", reference_window_backward_sec_);
+  reference_window_backward_sec_ = std::max(0.0, reference_window_backward_sec_);
   get_parameter("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   body_yaw_follow_clearance_ = std::max(0.0, body_yaw_follow_clearance_);
   get_parameter("force_body_yaw_follow", force_body_yaw_follow_);
@@ -483,6 +503,16 @@ void MincoPlannerNode::declareAndLoadParams()
   astar_params.obstacle_value_threshold = obstacle_value_threshold_;
   astar_params.unknown_is_obstacle = unknown_is_obstacle_;
   get_parameter("allow_diagonal", astar_params.allow_diagonal);
+  get_parameter("search_clearance_cost_weight", astar_params.clearance_cost_weight);
+  get_parameter("search_clearance_cost_distance", astar_params.clearance_cost_distance);
+  if (astar_params.clearance_cost_weight > 0.0 && search_algorithm_ == "jps") {
+    // JPS 的跳点剪枝只对均匀代价成立，无法表达离墙代价；开启离墙代价时改用 A*。
+    RCLCPP_WARN(
+      get_logger(),
+      "【规划参数修正】search_clearance_cost_weight=%.3f 需要加权搜索，search_algorithm 由 jps 改为 astar。",
+      astar_params.clearance_cost_weight);
+    search_algorithm_ = "astar";
+  }
   get_parameter("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
   get_parameter("jps_safe_distance", jps_params.safe_distance);
   get_parameter("reference_speed", optimizer_params.reference_speed);
@@ -561,6 +591,8 @@ void MincoPlannerNode::declareAndLoadParams()
     "path_fillet_radius", optimizer_params.geometry_preprocessor.fillet_radius);
   get_parameter(
     "path_fillet_arc_samples", optimizer_params.geometry_preprocessor.fillet_arc_samples);
+  get_parameter(
+    "path_shortcut_min_clearance", optimizer_params.geometry_preprocessor.shortcut_min_clearance);
   get_parameter("yaw_mode", yaw_params.mode);
   get_parameter("yaw_rate_limit", yaw_params.yaw_rate_limit);
   get_parameter("narrow_clearance_enter", yaw_params.narrow_clearance_enter);
@@ -568,6 +600,15 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("yaw_tangent_symmetry_order", yaw_params.tangent_symmetry_order);
   get_parameter("yaw_narrow_gap_bridge_time", yaw_params.narrow_gap_bridge_time);
   get_parameter("yaw_acceleration_limit", yaw_params.yaw_acceleration_limit);
+  get_parameter("yaw_open_area_mode", yaw_params.open_area_yaw_mode);
+  if (yaw_params.open_area_yaw_mode != "goal_heading" &&
+    yaw_params.open_area_yaw_mode != "minimal_rotation")
+  {
+    RCLCPP_WARN(
+      get_logger(), "【航向参数告警】yaw_open_area_mode=%s 无效，已回退为 goal_heading。",
+      yaw_params.open_area_yaw_mode.c_str());
+    yaw_params.open_area_yaw_mode = "goal_heading";
+  }
   get_parameter("wheel_speed_time_scaling_limit", wheel_speed_time_scaling_params_.wheel_speed_limit);
   get_parameter(
     "wheel_speed_time_scaling_offset_x", wheel_speed_time_scaling_params_.wheel_offset_x);
@@ -580,6 +621,9 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter(
     "narrow_turn_yaw_rate_threshold",
     wheel_speed_time_scaling_params_.narrow_turn_yaw_rate_threshold);
+  get_parameter("clearance_speed_min", wheel_speed_time_scaling_params_.clearance_speed_min);
+  get_parameter("clearance_speed_low", wheel_speed_time_scaling_params_.clearance_speed_low);
+  get_parameter("clearance_speed_high", wheel_speed_time_scaling_params_.clearance_speed_high);
   // 窄通道判据与 yaw 规划共用进入阈值，两者对"窄"的定义一致。
   wheel_speed_time_scaling_params_.narrow_turn_clearance = yaw_params.narrow_clearance_enter;
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
@@ -842,9 +886,14 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       retain_candidate = active_safety_reference_;
     }
   }
+  std::string retain_reason;
   const bool retain_verdict = retain_candidate &&
     retain_candidate->trajectory.header.frame_id == snapshot->grid.header.frame_id &&
-    remainingReferenceSafeOn(retain_candidate->trajectory, snapshot->grid);
+    remainingReferenceSafeOn(retain_candidate->trajectory, snapshot->grid, &retain_reason);
+  // 远端冲突、近端安全：继续执行并建议重规划，交给 10 Hz 运行期复检兜底近端。
+  const bool advise_replan = replan_advisory_enabled_ && retain_candidate && !retain_verdict &&
+    runtimeWindowSafeOn(retain_candidate->trajectory, snapshot->grid);
+  std::optional<ActiveSafetyReference> advised_reference;
   bool retained_reference = false;
   std::uint64_t retained_reference_goal = 0;
   bool retained_identical_snapshot = false;
@@ -868,7 +917,7 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       retained_generation = latest_map_snapshot_->generation;
       retained_digest = latest_map_snapshot_->safety_content_digest;
     } else {
-      retained_reference = retain_verdict && replaces_existing_snapshot &&
+      retained_reference = (retain_verdict || advise_replan) && replaces_existing_snapshot &&
         active_safety_reference_ && safety_state_.plan_safe &&
         safety_state_.mapSnapshotUsable(snapshot->generation) &&
         active_safety_reference_->goal_id == retain_candidate->goal_id &&
@@ -881,6 +930,12 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       if (retained_reference) {
         active_safety_reference_->map_generation = snapshot->generation;
         retained_reference_goal = active_safety_reference_->goal_id;
+        if (!retain_verdict && (!replan_advised_reference_stamp_ ||
+          *replan_advised_reference_stamp_ != active_safety_reference_->trajectory.header.stamp))
+        {
+          replan_advised_reference_stamp_ = active_safety_reference_->trajectory.header.stamp;
+          advised_reference = active_safety_reference_;
+        }
       } else {
         active_safety_reference_.reset();
       }
@@ -904,11 +959,36 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   if (retain_candidate && !retained_reference && !retained_identical_snapshot) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【参考轨迹失效】地图快照变化后无法保留目标=%llu 的已提交参考（判定=%d 前视窗=%.2f s），"
+      "【参考轨迹失效】地图快照变化后无法保留目标=%llu 的已提交参考（判定=%d 前视窗=%.2f s 原因=%s），"
       "将在 generation=%llu 上重新规划。",
       static_cast<unsigned long long>(retain_candidate->goal_id),
       static_cast<int>(retain_verdict), retain_reference_horizon_sec_,
+      retain_reason.empty() ? "身份或帧不一致" : retain_reason.c_str(),
       static_cast<unsigned long long>(snapshot->generation));
+  }
+  if (advised_reference) {
+    // 直接发布、不进入 planner_status_state_：它不是该请求的终态，不能被后续作废复用。
+    // STATE_ACCEPTED 不会改变 MPC/arbiter 的地图授权。
+    if (planner_status_pub_) {
+      ats_navigation_interfaces::msg::PlannerStatus status;
+      status.header.stamp = now();
+      status.header.frame_id = global_frame_;
+      status.goal_id = advised_reference->goal_id;
+      status.localization_epoch = advised_reference->localization_epoch;
+      status.plan_request_sequence = advised_reference->plan_request_sequence;
+      status.map_generation = snapshot->generation;
+      status.map_publication_sequence = advised_reference->map_publication_sequence;
+      status.state = ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED;
+      status.failure_reason = ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REPLAN_ADVISED;
+      planner_status_pub_->publish(status);
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "【建议重规划】目标=%llu 的参考在 generation=%llu 上远端冲突（%s），运行期窗口 %.2f s 内仍安全，"
+      "继续执行并请求无停车重规划。",
+      static_cast<unsigned long long>(advised_reference->goal_id),
+      static_cast<unsigned long long>(snapshot->generation),
+      retain_reason.empty() ? "未知" : retain_reason.c_str(), runtime_safety_horizon_sec_);
   }
   if (retained_reference) {
     RCLCPP_INFO_THROTTLE(
@@ -965,19 +1045,68 @@ void MincoPlannerNode::onMapReadyWatchdog()
 }
 
 bool MincoPlannerNode::remainingReferenceSafeOn(
-  const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid)
+  const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
+  std::string * reason)
 {
   if (trajectory.points.size() < 2) {
+    if (reason) {
+      *reason = "参考点不足";
+    }
     return false;
   }
   const rclcpp::Time reference_stamp(trajectory.header.stamp);
   const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
   // 保留窗口必须覆盖运行期复检窗口,否则改绑后下一拍复检就可能作废。
+  const double progress = referenceProgress(trajectory, grid, elapsed);
   const double horizon_end = retain_reference_horizon_sec_ > 0.0 ?
-    elapsed + std::max(retain_reference_horizon_sec_, runtime_safety_horizon_sec_) :
+    progress + std::max(retain_reference_horizon_sec_, runtime_safety_horizon_sec_) :
     std::numeric_limits<double>::infinity();
+  const double window_start = std::max(0.0, progress - reference_window_backward_sec_);
   const ReferenceTrajectory remaining = remainingReferenceWindow(
-    trajectory, elapsed, horizon_end);
+    trajectory, window_start, horizon_end);
+  if (remaining.points.size() < 2) {
+    if (reason) {
+      std::ostringstream text;
+      text << "剩余参考不足两点 墙钟=" << elapsed << "s 起点=" << window_start <<
+        "s 参考时长=" << trajectory.points.back().t << "s";
+      *reason = text.str();
+    }
+    return false;
+  }
+  const FootprintSafetyResult safety = safety_checker_.check(remaining, grid);
+  if (safety.safe) {
+    return true;
+  }
+  const EscapePrefixDecision escape =
+    evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
+  const bool shallow = escapePrefixContactShallow(
+    remaining, escape, footprint_params_, grid, escape_prefix_params_);
+  if (!shallow && reason) {
+    std::ostringstream text;
+    const CollisionSample & first = safety.collisions.front();
+    const ReferencePoint & center =
+      remaining.points[std::min(first.trajectory_index, remaining.points.size() - 1U)];
+    text << "窗口足迹冲突=" << safety.collisions.size() << " 墙钟=" << elapsed << "s 起点=" <<
+      window_start << "s 首冲突序号=" << first.trajectory_index << " 中心=(" << center.x << "," <<
+      center.y << ") 起点位置=(" << remaining.points.front().x << "," <<
+      remaining.points.front().y << ")";
+    *reason = text.str();
+  }
+  return shallow;
+}
+
+bool MincoPlannerNode::runtimeWindowSafeOn(
+  const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid)
+{
+  if (trajectory.points.size() < 2 || trajectory.header.frame_id != grid.header.frame_id) {
+    return false;
+  }
+  const rclcpp::Time reference_stamp(trajectory.header.stamp);
+  const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
+  const double progress = referenceProgress(trajectory, grid, elapsed);
+  const ReferenceTrajectory remaining = remainingReferenceWindow(
+    trajectory, std::max(0.0, progress - reference_window_backward_sec_),
+    progress + runtime_safety_horizon_sec_);
   if (remaining.points.size() < 2) {
     return false;
   }
@@ -989,6 +1118,26 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
   return escapePrefixContactShallow(
     remaining, escape, footprint_params_, grid, escape_prefix_params_);
+}
+
+double MincoPlannerNode::referenceProgress(
+  const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
+  double elapsed)
+{
+  if (!reference_window_from_robot_progress_ ||
+    trajectory.header.frame_id != grid.header.frame_id)
+  {
+    return elapsed;
+  }
+  geometry_msgs::msg::PoseStamped pose;
+  if (!lookupStartPose(grid, pose)) {
+    return elapsed;
+  }
+  // 车沿参考的实际推进（不超过墙钟）。MPC 按几何投影跟踪，拐角减速后车落后于墙钟；
+  // 墙钟窗口会跳过车前方还没走的那段参考（漏检），又把车身后很远的冲突算进"前视窗"。
+  // 保留检查与运行期复检都以它为锚点，窗口语义是"车前方 horizon 秒的参考"。
+  return std::min(elapsed, projectedReferenceTime(
+    trajectory, pose.pose.position.x, pose.pose.position.y, elapsed));
 }
 
 void MincoPlannerNode::onRuntimeSafetyRecheck()
@@ -1013,9 +1162,11 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   }
   const rclcpp::Time reference_stamp(active_reference->trajectory.header.stamp);
   const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
-  const double horizon_end = elapsed + runtime_safety_horizon_sec_;
-  const ReferenceTrajectory remaining =
-    remainingReferenceWindow(active_reference->trajectory, elapsed, horizon_end);
+  const double progress = referenceProgress(active_reference->trajectory, snapshot->grid, elapsed);
+  const double horizon_end = progress + runtime_safety_horizon_sec_;
+  const ReferenceTrajectory remaining = remainingReferenceWindow(
+    active_reference->trajectory, std::max(0.0, progress - reference_window_backward_sec_),
+    horizon_end);
   if (remaining.points.size() < 2) {
     return;
   }
@@ -1142,14 +1293,63 @@ void MincoPlannerNode::planGoal(
     bool report_status,
     const geometry_msgs::msg::PoseStamped * frozen_start,
     const InitialKinematicState * initial_state) {
-  setPlanSafe(false);
+  bool keep_active_reference = false;
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
-    active_safety_reference_.reset();
+    // 由【建议重规划】触发的同目标新请求：旧参考仍在执行，保留它的运行期复检守护与
+    // plan_safe，直到新参考提交（publishReferenceIfCurrent 替换）或本次规划失败。
+    keep_active_reference = replan_advised_reference_stamp_ && active_safety_reference_ &&
+      safety_state_.plan_safe && active_safety_reference_->goal_id == goal_id &&
+      active_safety_reference_->localization_epoch == localization_epoch &&
+      active_safety_reference_->plan_request_sequence < plan_request_sequence &&
+      active_safety_reference_->trajectory.header.stamp == *replan_advised_reference_stamp_;
+    if (!keep_active_reference) {
+      active_safety_reference_.reset();
+    }
+  }
+  if (!keep_active_reference) {
+    setPlanSafe(false);
   }
   const auto fail = [this, goal_id, localization_epoch, plan_request_sequence,
-                     map_publication_sequence, report_status](
+                     map_publication_sequence, report_status, keep_active_reference](
                         std::uint8_t failure_reason, std::uint64_t generation) {
+    if (keep_active_reference) {
+      // 无停车重规划失败：旧参考仍在执行且受 10 Hz 运行期复检守护，不撤销它。失败以
+      // STATE_ACCEPTED 发布（MPC/arbiter 忽略，不停车），GoalManager 清除替换标记；下一次
+      // 地图变化若仍远端冲突会再次建议重规划。旧参考近端失效时运行期复检照常急停。
+      bool still_guarded = false;
+      {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        still_guarded = active_safety_reference_.has_value() && safety_state_.plan_safe;
+        replan_advised_reference_stamp_.reset();
+        if (still_guarded && planner_status_pub_ && report_status) {
+          ats_navigation_interfaces::msg::PlannerStatus status;
+          status.header.stamp = now();
+          status.header.frame_id = global_frame_;
+          status.goal_id = goal_id;
+          status.localization_epoch = localization_epoch;
+          status.plan_request_sequence = plan_request_sequence;
+          status.map_generation = generation != 0 ? generation : next_map_generation_;
+          status.map_publication_sequence = map_publication_sequence;
+          status.state = ats_navigation_interfaces::msg::PlannerStatus::STATE_ACCEPTED;
+          status.failure_reason = failure_reason;
+          planner_status_pub_->publish(status);
+        }
+      }
+      if (still_guarded) {
+        RCLCPP_WARN(
+          get_logger(),
+          "【无停车重规划失败】目标=%llu 请求=%llu 原因=%u，继续执行受运行期复检守护的旧参考。",
+          static_cast<unsigned long long>(goal_id),
+          static_cast<unsigned long long>(plan_request_sequence),
+          static_cast<unsigned>(failure_reason));
+        return;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      active_safety_reference_.reset();
+    }
     setPlanSafe(false);
     if (report_status) {
       publishPlannerStatus(
@@ -1836,6 +2036,8 @@ void MincoPlannerNode::planYaw(
   applyWheelSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 窄通道边平移边转向时再放慢，压低 MPC 横向/yaw 跟踪误差；同样只改时间。
   applyNarrowTurnTimeScaling(trajectory, wheel_speed_time_scaling_params_);
+  // 离墙越近走得越慢（按中心净空），同样只改时间。
+  applyClearanceSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 下游(yaw authority、轨迹质量评估、planned 记录)读的是 yaw 相关的 footprint 净空,
   // 所以 yaw 定下来之后再覆盖回 footprint 净空,对外语义不变。
   annotateClearance(trajectory, snapshot);
@@ -2093,8 +2295,18 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     map_health_epoch == map_health_epoch_ &&
     snapshot->generation == latest_map_snapshot_->generation;
   if (!publish) {
-    safety_state_.plan_safe = false;
-    publishEmergencyStop(true);
+    // 无停车重规划的替换候选过期：正在执行的旧参考仍受运行期复检守护，只在地图
+    // 健康且快照可用时保留它；其余情况照旧撤销。
+    const bool keep_guarded_reference = heartbeat_fresh && latest_map_snapshot_ &&
+      replan_advised_reference_stamp_ && active_safety_reference_ &&
+      active_safety_reference_->goal_id == goal_id &&
+      active_safety_reference_->localization_epoch == localization_epoch &&
+      active_safety_reference_->plan_request_sequence < plan_request_sequence &&
+      safety_state_.mapSnapshotUsable(latest_map_snapshot_->generation);
+    if (!keep_guarded_reference) {
+      safety_state_.plan_safe = false;
+      publishEmergencyStop(true);
+    }
     return false;
   }
   if (!planner_manages_emergency_stop_ && !candidate_reference_path_pub_) {

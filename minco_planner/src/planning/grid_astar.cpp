@@ -120,6 +120,8 @@ GridAstarResult GridAstar::planWithClearance(
 
   const std::size_t cell_count =
     static_cast<std::size_t>(grid.info.width) * static_cast<std::size_t>(grid.info.height);
+  // 一次精确距离变换，同时用于可通行判定（与 hasGridClearance 等价）和离墙代价。
+  const std::vector<double> blocked_squared = computeBlockedSquaredDistanceCells(grid, policy);
   std::vector<double> g_score(cell_count, std::numeric_limits<double>::infinity());
   std::vector<int> parent(cell_count, -1);
   std::vector<uint8_t> closed(cell_count, 0);
@@ -163,7 +165,7 @@ GridAstarResult GridAstar::planWithClearance(
       if (next.x < 0 || next.y < 0 ||
         next.x >= static_cast<int>(grid.info.width) ||
         next.y >= static_cast<int>(grid.info.height) ||
-        !isTraversable(grid, next))
+        !isTraversable(grid, blocked_squared, next))
       {
         continue;
       }
@@ -171,8 +173,8 @@ GridAstarResult GridAstar::planWithClearance(
         // Avoid diagonal corner cutting through two blocked cells. The later
         // footprint checker still verifies body clearance, but the graph search
         // should not create topologically invalid shortcuts.
-        if (!isTraversable(grid, GridIndex {current.x + dx, current.y}) ||
-          !isTraversable(grid, GridIndex {current.x, current.y + dy}))
+        if (!isTraversable(grid, blocked_squared, GridIndex {current.x + dx, current.y}) ||
+          !isTraversable(grid, blocked_squared, GridIndex {current.x, current.y + dy}))
         {
           continue;
         }
@@ -184,7 +186,8 @@ GridAstarResult GridAstar::planWithClearance(
       }
 
       const double step_cost =
-        (dx != 0 && dy != 0) ? params_.diagonal_cost : 1.0;
+        ((dx != 0 && dy != 0) ? params_.diagonal_cost : 1.0) *
+        clearanceCostFactor(grid, blocked_squared, next);
       const double tentative_g = g_score[current_linear] + step_cost;
       if (tentative_g + 1e-9 >= g_score[next_linear]) {
         continue;
@@ -290,6 +293,37 @@ bool GridAstar::isTraversable(
   const GridIndex & index) const
 {
   return hasGridClearance(grid, index.x, index.y, params_.safe_distance, occupancyPolicy());
+}
+
+bool GridAstar::isTraversable(
+  const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & blocked_squared,
+  const GridIndex & index) const
+{
+  if (!isGridCellFree(grid, index.x, index.y, occupancyPolicy())) {
+    return false;
+  }
+  if (!(params_.safe_distance > 0.0)) {
+    return true;
+  }
+  const double radius_cells = params_.safe_distance / grid.info.resolution;
+  return blocked_squared[linearIndex(grid, index)] > radius_cells * radius_cells;
+}
+
+double GridAstar::clearanceCostFactor(
+  const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & blocked_squared,
+  const GridIndex & index) const
+{
+  const double range = params_.clearance_cost_distance;
+  if (!(params_.clearance_cost_weight > 0.0) || !(range > 0.0)) {
+    return 1.0;
+  }
+  const double distance =
+    std::sqrt(blocked_squared[linearIndex(grid, index)]) * grid.info.resolution;
+  if (!(distance < range)) {
+    return 1.0;
+  }
+  const double deficit = (range - distance) / range;
+  return 1.0 + params_.clearance_cost_weight * deficit * deficit;
 }
 
 std::size_t GridAstar::linearIndex(

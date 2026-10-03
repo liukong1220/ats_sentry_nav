@@ -372,3 +372,104 @@ TEST(GridSearchClearance, EndpointRelaxationStopsAtTheInscribedFloor)
   ASSERT_FALSE(result.success);
   EXPECT_EQ(result.reason, "goal occupied");
 }
+
+TEST(GridClearanceField, MatchesBruteForceClearanceRing)
+{
+  auto grid = makeOpenGrid(37, 23);
+  // 不规则障碍 + 一个未知格，覆盖边界、斜向与孤立格。
+  blockRow(grid, 5, 3, 20);
+  block(grid, 30, 15);
+  block(grid, 12, 18);
+  block(grid, 13, 19);
+  grid.data[static_cast<std::size_t>(2) * grid.info.width + 33] = -1;
+  minco_planner::GridOccupancyPolicy policy;
+  policy.obstacle_value_threshold = kThreshold;
+  policy.unknown_is_obstacle = true;
+  const auto squared = minco_planner::computeBlockedSquaredDistanceCells(grid, policy);
+  for (const double radius : {0.0, 0.15, 0.27, 0.3, 0.4187, 0.55}) {
+    const double radius_cells = radius / grid.info.resolution;
+    for (int y = 0; y < static_cast<int>(grid.info.height); ++y) {
+      for (int x = 0; x < static_cast<int>(grid.info.width); ++x) {
+        const bool expected = minco_planner::hasGridClearance(grid, x, y, radius, policy);
+        const bool free = minco_planner::isGridCellFree(grid, x, y, policy);
+        const bool from_field = free &&
+          (!(radius > 0.0) || squared[static_cast<std::size_t>(y) * grid.info.width + x] >
+          radius_cells * radius_cells);
+        ASSERT_EQ(from_field, expected) << "x=" << x << " y=" << y << " r=" << radius;
+      }
+    }
+  }
+}
+
+namespace
+{
+// 2.0 m 宽、6 m 长的东西向走廊，北墙在 y 格 0、南墙在 y 格 21（y=0.05..2.15）；
+// 起终点都贴近北墙（y=1.75）。
+nav_msgs::msg::OccupancyGrid makeCorridorGrid()
+{
+  auto grid = makeOpenGrid(60, 22);
+  blockRow(grid, 0, 0, 59);
+  blockRow(grid, 21, 0, 59);
+  // 走廊中段一个从北墙伸出的凸角，最短路会贴着它的角点绕过。
+  for (int y = 13; y <= 20; ++y) {
+    block(grid, 30, y);
+  }
+  return grid;
+}
+
+double minimumPathClearance(
+  const nav_msgs::msg::OccupancyGrid & grid, const nav_msgs::msg::Path & path)
+{
+  minco_planner::GridOccupancyPolicy policy;
+  policy.obstacle_value_threshold = kThreshold;
+  const auto squared = minco_planner::computeBlockedSquaredDistanceCells(grid, policy);
+  double minimum = 1e9;
+  for (std::size_t i = 1; i + 1 < path.poses.size(); ++i) {
+    minimum = std::min(
+      minimum, minco_planner::blockedDistanceAt(
+        grid, squared, path.poses[i].pose.position.x, path.poses[i].pose.position.y));
+  }
+  return minimum;
+}
+}  // namespace
+
+TEST(GridAstarClearanceCost, CostKeepsPathAwayFromConvexCorner)
+{
+  const auto grid = makeCorridorGrid();
+  minco_planner::GridAstarParams params;
+  params.obstacle_value_threshold = kThreshold;
+  params.safe_distance = 0.3;
+  const auto start = poseAt(0.55, 1.55);
+  const auto goal = poseAt(5.45, 1.55);
+
+  const auto shortest = minco_planner::GridAstar(params).plan(grid, start, goal);
+  ASSERT_TRUE(shortest.success);
+  params.clearance_cost_weight = 4.0;
+  params.clearance_cost_distance = 0.8;
+  const auto centered = minco_planner::GridAstar(params).plan(grid, start, goal);
+  ASSERT_TRUE(centered.success);
+
+  const double shortest_clearance = minimumPathClearance(grid, shortest.path);
+  const double centered_clearance = minimumPathClearance(grid, centered.path);
+  // 最短路贴着凸角走到安全净空下限附近；离墙代价让它多留出空间。
+  EXPECT_LT(shortest_clearance, 0.45);
+  EXPECT_GT(centered_clearance, shortest_clearance + 0.15);
+  // 只是更居中，不是绕远路。
+  EXPECT_LT(centered.length, shortest.length * 1.3);
+}
+
+TEST(GridAstarClearanceCost, DisabledCostKeepsShortestPathLength)
+{
+  const auto grid = makeCorridorGrid();
+  minco_planner::GridAstarParams params;
+  params.obstacle_value_threshold = kThreshold;
+  params.safe_distance = 0.3;
+  const auto start = poseAt(0.55, 1.55);
+  const auto goal = poseAt(5.45, 1.55);
+  const auto baseline = minco_planner::GridAstar(params).plan(grid, start, goal);
+  params.clearance_cost_distance = 0.8;  // 权重为 0：关闭
+  const auto disabled = minco_planner::GridAstar(params).plan(grid, start, goal);
+  ASSERT_TRUE(baseline.success);
+  ASSERT_TRUE(disabled.success);
+  EXPECT_DOUBLE_EQ(disabled.length, baseline.length);
+}

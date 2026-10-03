@@ -233,6 +233,10 @@ private:
     std::optional<std::chrono::steady_clock::time_point> waiting_since;
     bool recovering{false};
     std::uint64_t wait_for_publication_after{0};
+    // 当前已下发执行的参考对应的规划请求序号。
+    std::uint64_t committed_plan_request_sequence{0};
+    // 无停车重规划进行中：旧参考继续执行，expected_plan_request_sequence 指向新请求。
+    bool replacement_pending{false};
   };
 
   void loadParameters() {
@@ -306,6 +310,10 @@ private:
     // 默认 false 保持原判据；RMUC 仿真 profile 打开（绕行路线直线距离先增后减）。
     progress_along_reference_ =
       declare_parameter<bool>("progress_along_reference", false);
+    // 收到 FAILURE_REPLAN_ADVISED 时不急停：旧参考继续执行（仍受 MINCO 10 Hz 运行期复检
+    // 守护），从当前位姿发起完整重规划，新参考就绪后直接替换。默认关闭保持原行为。
+    replan_without_stop_enabled_ =
+      declare_parameter<bool>("replan_without_stop_enabled", false);
     PlanProgressWatchdogParams progress_params;
     progress_params.progress_min_delta_m = std::max(
       0.0, declare_parameter<double>("progress_min_delta_m", 0.10));
@@ -525,6 +533,7 @@ private:
       pending_yaw_authority_request_.reset();
       terminal_converged_since_.reset();
       fail_stop_ = true;
+      active_goal_->replacement_pending = false;
       lifecycle_.start(id, false);
       active_goal_->waiting_since = waiting_since.value_or(
           already_waiting && previous_waiting_since
@@ -549,8 +558,13 @@ private:
         matches =
             active_goal_ && active_goal_->id == message->goal_id &&
             active_goal_->localization_epoch == message->localization_epoch &&
-            active_goal_->expected_plan_request_sequence ==
-              message->plan_request_sequence;
+            (active_goal_->expected_plan_request_sequence ==
+               message->plan_request_sequence ||
+             // 正在执行的参考自己失效（运行期不安全/快照变化）：无论替换是否进行中、
+             // 规划器用哪个请求序号报告，都照原路径急停挂起。
+             (active_execution_command_ &&
+              active_goal_->committed_plan_request_sequence ==
+                message->plan_request_sequence));
         transient_failure =
             matches &&
             (message->failure_reason == PlannerStatus::FAILURE_MAP_UNREADY ||
@@ -634,6 +648,30 @@ private:
       }
       return;
     }
+    if (message->state == PlannerStatus::STATE_ACCEPTED &&
+        message->failure_reason == PlannerStatus::FAILURE_REPLAN_ADVISED) {
+      onReplanAdvised(*message);
+      return;
+    }
+    if (message->state == PlannerStatus::STATE_ACCEPTED &&
+        message->failure_reason != PlannerStatus::FAILURE_NONE) {
+      // 无停车重规划的替换请求失败（规划器以 ACCEPTED 报告，旧参考仍受守护）：
+      // 清除替换标记继续执行，等待下一次建议。
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_goal_ && active_goal_->replacement_pending &&
+          active_goal_->id == message->goal_id &&
+          active_goal_->localization_epoch == message->localization_epoch &&
+          active_goal_->expected_plan_request_sequence == message->plan_request_sequence) {
+        active_goal_->replacement_pending = false;
+        RCLCPP_WARN(
+          get_logger(),
+          "【无停车重规划失败】目标=%llu 请求=%llu 原因=%u，继续执行当前参考。",
+          static_cast<unsigned long long>(message->goal_id),
+          static_cast<unsigned long long>(message->plan_request_sequence),
+          static_cast<unsigned>(message->failure_reason));
+      }
+      return;
+    }
     if (message->state != PlannerStatus::STATE_REFERENCE_READY) {
       return;
     }
@@ -670,6 +708,36 @@ private:
         message->map_publication_sequence);
     }
     tryCommitReference();
+  }
+
+  void onReplanAdvised(const PlannerStatus & message) {
+    std::optional<geometry_msgs::msg::PoseStamped> target;
+    std::uint64_t localization_epoch = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!replan_without_stop_enabled_ || !active_goal_ || active_goal_->cancel_requested ||
+          active_goal_->id != message.goal_id ||
+          active_goal_->localization_epoch != message.localization_epoch ||
+          lifecycle_.state() != GoalLifecycleState::kTracking ||
+          !active_execution_command_ || fail_stop_ ||
+          active_goal_->replacement_pending ||
+          active_goal_->committed_plan_request_sequence != message.plan_request_sequence) {
+        return;
+      }
+      active_goal_->replacement_pending = true;
+      target = active_goal_->target;
+      localization_epoch = active_goal_->localization_epoch;
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "【无停车重规划】目标=%llu 参考远端冲突，继续执行当前参考并从当前位姿重规划。",
+      static_cast<unsigned long long>(message.goal_id));
+    if (!publishPlannerGoal(message.goal_id, localization_epoch, *target)) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_goal_ && active_goal_->id == message.goal_id) {
+        active_goal_->replacement_pending = false;
+      }
+    }
   }
 
   void onCandidateReference(const nav_msgs::msg::Path::SharedPtr message) {
@@ -977,6 +1045,32 @@ private:
       }
     }
     if (stale_candidate_goal) {
+      std::optional<geometry_msgs::msg::PoseStamped> replacement_target;
+      std::uint64_t replacement_epoch = 0;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_goal_ && active_goal_->id == *stale_candidate_goal &&
+            active_goal_->replacement_pending && active_execution_command_ &&
+            lifecycle_.state() == GoalLifecycleState::kTracking) {
+          candidate_reference_.reset();
+          planner_ready_status_.reset();
+          replacement_target = active_goal_->target;
+          replacement_epoch = active_goal_->localization_epoch;
+        }
+      }
+      if (replacement_target) {
+        // 替换候选过期：旧参考仍在执行且受运行期复检守护，直接按最新地图再派一次。
+        RCLCPP_WARN(
+          get_logger(),
+          "【无停车重规划】目标=%llu 的替换候选基于过期地图发布 %llu（当前 %llu），重新派发。",
+          static_cast<unsigned long long>(*stale_candidate_goal),
+          static_cast<unsigned long long>(candidate_publication_sequence),
+          static_cast<unsigned long long>(current_publication_sequence));
+        if (!publishPlannerGoal(*stale_candidate_goal, replacement_epoch, *replacement_target)) {
+          suspendActiveGoal(*stale_candidate_goal);
+        }
+        return;
+      }
       RCLCPP_WARN(
         get_logger(),
         "Rejecting candidate for goal %llu: map publication sequence %llu is stale; current=%llu. "
@@ -1021,7 +1115,14 @@ private:
     // request/ack.  A default mode status with request_sequence=0 is not an
     // authorization for that profile; the Gazebo profile deliberately uses
     // zero because its chassis adapter consumes simulated joint state instead.
-    requestYawAuthorityLocked(*planner_ready_status_);
+    const bool replacing = active_goal_->replacement_pending && active_execution_command_ &&
+      lifecycle_.state() == GoalLifecycleState::kTracking &&
+      active_execution_command_->yaw_authority == yaw_authority &&
+      active_execution_command_->requires_gimbal_lock == requires_gimbal_lock;
+    // 替换且航向权限不变时沿用已确认的云台授权；权限变化走 onPlannerStatus 的保护切换（急停）。
+    if (!replacing) {
+      requestYawAuthorityLocked(*planner_ready_status_);
+    }
     // The Gazebo profile has no serial gimbal-status producer.  In that
     // explicitly selected profile the chassis adapter owns the yaw transform,
     // so a zero request sequence is the deliberate "no gimbal lease"
@@ -1032,7 +1133,11 @@ private:
       fail_stop_ = true;
       return;
     }
-    if (!lifecycle_.referenceReady(active_goal_->id, true)) {
+    if (replacing) {
+      if (!lifecycle_.referenceReplaced(active_goal_->id, true)) {
+        return;
+      }
+    } else if (!lifecycle_.referenceReady(active_goal_->id, true)) {
       return;
     }
 
@@ -1061,6 +1166,14 @@ private:
     fail_stop_ = false;
     active_goal_->recovering = false;
     active_goal_->wait_for_publication_after = 0;
+    active_goal_->committed_plan_request_sequence = planner_ready_status_->plan_request_sequence;
+    if (replacing) {
+      RCLCPP_INFO(
+        get_logger(), "【无停车重规划】目标=%llu 新参考已替换（请求序号=%llu），全程未急停。",
+        static_cast<unsigned long long>(active_goal_->id),
+        static_cast<unsigned long long>(planner_ready_status_->plan_request_sequence));
+    }
+    active_goal_->replacement_pending = false;
     active_execution_command_ = command;
     PlanProgressIdentity progress_identity;
     progress_identity.goal_id = active_goal_->id;
@@ -1983,6 +2096,7 @@ private:
   bool map_status_heartbeat_ready_{false};
   bool map_ready_heartbeat_value_{false};
   bool fail_stop_{true};
+  bool replan_without_stop_enabled_{false};
   std::optional<bool> last_emergency_stop_published_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;

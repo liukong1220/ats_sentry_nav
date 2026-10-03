@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+
+#include "minco_planner/planning/grid_clearance.hpp"
 
 namespace minco_planner
 {
@@ -57,6 +60,16 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
     return result;
   }
 
+  std::vector<double> blocked_squared;
+  if (params_.shortcut_min_clearance > 0.0 && planning_grid && !planning_grid->data.empty() &&
+    planning_grid->info.resolution > 0.0 && safety_checker)
+  {
+    GridOccupancyPolicy policy;
+    policy.obstacle_value_threshold = safety_checker->params().obstacle_value_threshold;
+    policy.unknown_is_obstacle = safety_checker->params().unknown_is_obstacle;
+    blocked_squared = computeBlockedSquaredDistanceCells(*planning_grid, policy);
+  }
+
   std::vector<Eigen::Vector2d> simplified;
   simplified.reserve(unique.size());
   simplified.push_back(unique.front());
@@ -80,7 +93,9 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
     }
     // A short corner may be merged only if the exact directed rectangular
     // shortcut is safe.  Without the immutable grid it is intentionally kept.
-    if (short_segment && shortcutSafe(previous, next, planning_grid, safety_checker)) {
+    if (short_segment && shortcutSafe(previous, next, planning_grid, safety_checker) &&
+      clearancePreserved({previous, next}, {previous, current, next}, planning_grid, blocked_squared))
+    {
       ++result.short_segments_merged;
       continue;
     }
@@ -95,7 +110,27 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
   while (anchor + 1U < simplified.size()) {
     std::size_t next = anchor + 1U;
     if (params_.footprint_aware_shortcut_enabled && planning_grid && safety_checker) {
+      // 被替换折线 anchor..candidate 的净空随 candidate 单调变化，逐段累计即可。
+      std::vector<double> span_clearance(simplified.size(), std::numeric_limits<double>::infinity());
+      if (!blocked_squared.empty()) {
+        for (std::size_t index = anchor + 1U; index < simplified.size(); ++index) {
+          span_clearance[index] = std::min(
+            span_clearance[index - 1U],
+            polylineClearance(
+              {simplified[index - 1U], simplified[index]}, planning_grid, blocked_squared));
+        }
+      }
       for (std::size_t candidate = simplified.size() - 1U; candidate > anchor + 1U; --candidate) {
+        if (!blocked_squared.empty()) {
+          const double required = std::min(params_.shortcut_min_clearance, span_clearance[candidate]) -
+            0.25 * planning_grid->info.resolution;
+          if (polylineClearance(
+              {simplified[anchor], simplified[candidate]}, planning_grid, blocked_squared) + 1e-9 <
+            required)
+          {
+            continue;
+          }
+        }
         if (shortcutSafe(simplified[anchor], simplified[candidate], planning_grid, safety_checker)) {
           next = candidate;
           break;
@@ -109,7 +144,7 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
 
   result.waypoints = std::move(shortcut);
   result.waypoints = insertInnerCornerFillets(
-    result.waypoints, planning_grid, safety_checker);
+    result.waypoints, planning_grid, safety_checker, blocked_squared);
   result.corner_waypoints.assign(result.waypoints.size(), false);
   for (std::size_t index = 1; index + 1U < result.waypoints.size(); ++index) {
     const double turn = normalizedTurn(
@@ -125,7 +160,8 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
 std::vector<Eigen::Vector2d> PathGeometryPreprocessor::insertInnerCornerFillets(
   const std::vector<Eigen::Vector2d> & waypoints,
   const nav_msgs::msg::OccupancyGrid * planning_grid,
-  const FootprintSafetyChecker * safety_checker) const
+  const FootprintSafetyChecker * safety_checker,
+  const std::vector<double> & blocked_squared) const
 {
   const double requested_radius = std::max(0.0, params_.fillet_radius);
   if (requested_radius <= 1e-6 || waypoints.size() < 3U) {
@@ -206,6 +242,13 @@ std::vector<Eigen::Vector2d> PathGeometryPreprocessor::insertInnerCornerFillets(
         }
         previous_point = arc[arc_index];
       }
+      if (safe) {
+        // 圆角切掉的是内角，正是贴墙的一侧：新弧线的净空不得低于原折角两腿。
+        std::vector<Eigen::Vector2d> replacement {filleted.back()};
+        replacement.insert(replacement.end(), arc.begin(), arc.end());
+        safe = clearancePreserved(
+          replacement, {filleted.back(), corner, arc.back()}, planning_grid, blocked_squared);
+      }
       if (!safe) {
         radius *= 0.5;
         continue;
@@ -225,6 +268,46 @@ std::vector<Eigen::Vector2d> PathGeometryPreprocessor::insertInnerCornerFillets(
     filleted.push_back(waypoints.back());
   }
   return filleted;
+}
+
+double PathGeometryPreprocessor::polylineClearance(
+  const std::vector<Eigen::Vector2d> & points,
+  const nav_msgs::msg::OccupancyGrid * planning_grid,
+  const std::vector<double> & blocked_squared) const
+{
+  double minimum = std::numeric_limits<double>::infinity();
+  if (!planning_grid || blocked_squared.empty() || points.empty()) {
+    return minimum;
+  }
+  const double step = 0.25 * planning_grid->info.resolution;
+  minimum = blockedDistanceAt(
+    *planning_grid, blocked_squared, points.front().x(), points.front().y());
+  for (std::size_t index = 1; index < points.size(); ++index) {
+    const Eigen::Vector2d delta = points[index] - points[index - 1U];
+    const int samples = std::max(1, static_cast<int>(std::ceil(delta.norm() / step)));
+    for (int sample = 1; sample <= samples; ++sample) {
+      const Eigen::Vector2d point = points[index - 1U] +
+        delta * (static_cast<double>(sample) / static_cast<double>(samples));
+      minimum = std::min(
+        minimum, blockedDistanceAt(*planning_grid, blocked_squared, point.x(), point.y()));
+    }
+  }
+  return minimum;
+}
+
+bool PathGeometryPreprocessor::clearancePreserved(
+  const std::vector<Eigen::Vector2d> & replacement,
+  const std::vector<Eigen::Vector2d> & original,
+  const nav_msgs::msg::OccupancyGrid * planning_grid,
+  const std::vector<double> & blocked_squared) const
+{
+  if (!planning_grid || blocked_squared.empty()) {
+    return true;
+  }
+  const double required = std::min(
+    params_.shortcut_min_clearance, polylineClearance(original, planning_grid, blocked_squared)) -
+    0.25 * planning_grid->info.resolution;
+  return polylineClearance(replacement, planning_grid, blocked_squared) + 1e-9 >= required;
 }
 
 bool PathGeometryPreprocessor::shortcutSafe(

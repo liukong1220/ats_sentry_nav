@@ -45,3 +45,21 @@ TEST(GoalLifecycle, TerminalTransitionsAlwaysRequireEmergencyStop)
 }
 
 }  // namespace ats_goal_manager
+
+TEST(GoalLifecycle, ReferenceReplacementOnlyWhileTracking)
+{
+  ats_goal_manager::GoalLifecycle lifecycle;
+  lifecycle.start(7, true);
+  // kPlanning：还没有可替换的执行参考。
+  EXPECT_FALSE(lifecycle.referenceReplaced(7, true));
+  ASSERT_TRUE(lifecycle.referenceReady(7, true));
+  // kTracking：替换不改变状态，也不要求急停。
+  EXPECT_TRUE(lifecycle.referenceReplaced(7, true));
+  EXPECT_EQ(lifecycle.state(), ats_goal_manager::GoalLifecycleState::kTracking);
+  EXPECT_FALSE(lifecycle.emergencyStopRequired());
+  // 目标不符或地图不可用都不能替换。
+  EXPECT_FALSE(lifecycle.referenceReplaced(8, true));
+  EXPECT_FALSE(lifecycle.referenceReplaced(7, false));
+  lifecycle.cancel();
+  EXPECT_FALSE(lifecycle.referenceReplaced(7, true));
+}

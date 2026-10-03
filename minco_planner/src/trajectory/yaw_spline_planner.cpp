@@ -125,6 +125,13 @@ void YawSplinePlanner::applyClearanceAware(
       }
       return best;
     };
+  const bool minimal_rotation = params_.open_area_yaw_mode == "minimal_rotation";
+  // 当前开阔段的过渡：yaw 从 open_start_yaw 经五次 smoothstep 到 open_start_yaw + open_delta。
+  double open_start_yaw = 0.0;
+  double open_delta = 0.0;
+  double open_t0 = 0.0;
+  double open_t1 = 0.0;
+
   double previous_yaw = normalizeAngle(initial_yaw);
   double previous_t = trajectory.points.front().t;
   double previous_rate = 0.0;
@@ -135,6 +142,32 @@ void YawSplinePlanner::applyClearanceAware(
   for (std::size_t i = 1; i < point_count; ++i) {
     auto & current = trajectory.points[i];
     double desired_yaw = open_area_yaws[i];
+    if (minimal_rotation && !narrow_flags[i]) {
+      if (i == 1 || narrow_flags[i - 1]) {
+        // 进入开阔段：找下一段窄通道入口，目标取其切线的对齐朝向；没有则为目标朝向。
+        std::size_t run_end = i;
+        while (run_end < point_count && !narrow_flags[run_end]) {
+          ++run_end;
+        }
+        double target = goal_yaw;
+        std::size_t tangent_index = run_end;
+        while (tangent_index < point_count && !std::isfinite(tangent_yaws[tangent_index])) {
+          ++tangent_index;
+        }
+        if (run_end < point_count && tangent_index < point_count) {
+          target = nearest_aligned_yaw(tangent_yaws[tangent_index], previous_yaw);
+        }
+        open_start_yaw = previous_yaw;
+        open_delta = shortestAngularDistance(previous_yaw, target);
+        open_t0 = trajectory.points[i - 1].t;
+        open_t1 = trajectory.points[std::min(run_end, point_count - 1)].t;
+      }
+      const double span = open_t1 - open_t0;
+      const double u = span > 1e-6 ?
+        std::max(0.0, std::min(1.0, (current.t - open_t0) / span)) : 1.0;
+      const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+      desired_yaw = normalizeAngle(open_start_yaw + open_delta * blend);
+    }
     if (narrow_flags[i] && std::isfinite(tangent_yaws[i])) {
       // 窄通道只要求足迹与切线对齐到对称等价：矩形可正向或反向，正方形再加 ±pi/2。
       // 在所有等价朝向中选与上一时刻转角最小的一个，避免贴墙时做不必要的大角度转向

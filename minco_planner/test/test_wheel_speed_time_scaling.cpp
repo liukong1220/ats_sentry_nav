@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <limits>
+
 #include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
 
 namespace
@@ -163,4 +166,49 @@ TEST(WheelSpeedTimeScaling, NarrowTurnIgnoresStraightAndUnannotatedPoints)
   }
   EXPECT_FALSE(minco_planner::applyNarrowTurnTimeScaling(
     turning, minco_planner::WheelSpeedTimeScalingParams()));
+}
+
+TEST(WheelSpeedTimeScaling, ClearanceSpeedLimitIsMonotonicAndContinuous)
+{
+  minco_planner::WheelSpeedTimeScalingParams params;
+  params.clearance_speed_min = 0.6;
+  params.clearance_speed_low = 0.45;
+  params.clearance_speed_high = 0.9;
+  EXPECT_DOUBLE_EQ(minco_planner::clearanceSpeedLimit(0.30, params), 0.6);
+  EXPECT_DOUBLE_EQ(minco_planner::clearanceSpeedLimit(0.45, params), 0.6);
+  double previous = 0.6;
+  for (double c = 0.46; c < 0.9; c += 0.01) {
+    const double limit = minco_planner::clearanceSpeedLimit(c, params);
+    EXPECT_GE(limit, previous);
+    previous = limit;
+  }
+  EXPECT_TRUE(std::isinf(minco_planner::clearanceSpeedLimit(0.9, params)));
+  EXPECT_TRUE(std::isinf(minco_planner::clearanceSpeedLimit(
+    std::numeric_limits<double>::quiet_NaN(), params)));
+}
+
+TEST(WheelSpeedTimeScaling, ClearanceSpeedSlowsOnlyLowClearancePoints)
+{
+  auto trajectory = makeTurningTrajectory(40, 0, 0);
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    trajectory.points[i].clearance = (i >= 18 && i < 22) ? 0.40 : 2.0;
+  }
+  const auto original = trajectory;
+  minco_planner::WheelSpeedTimeScalingParams params;
+  params.clearance_speed_min = 0.6;
+  params.clearance_speed_low = 0.45;
+  params.clearance_speed_high = 0.9;
+  params.scale_change_rate = 2.0;
+
+  EXPECT_TRUE(minco_planner::applyClearanceSpeedTimeScaling(trajectory, params));
+  for (std::size_t i = 18; i < 22; ++i) {
+    EXPECT_LE(std::hypot(trajectory.points[i].vx, trajectory.points[i].vy), 0.6 + 1e-9);
+    EXPECT_DOUBLE_EQ(trajectory.points[i].x, original.points[i].x);
+  }
+  EXPECT_DOUBLE_EQ(trajectory.points.front().vx, 1.5);
+  EXPECT_DOUBLE_EQ(trajectory.points.back().vx, 1.5);
+
+  auto untouched = makeTurningTrajectory(40, 0, 0);
+  EXPECT_FALSE(minco_planner::applyClearanceSpeedTimeScaling(
+    untouched, minco_planner::WheelSpeedTimeScalingParams()));
 }

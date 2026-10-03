@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
 
@@ -108,6 +109,147 @@ inline double measureGridClearance(
   // blocked distance. Step back one epsilon so the returned value round-trips.
   const double nearest = std::sqrt(nearest_blocked_squared) * grid.info.resolution;
   return std::max(0.0, std::min(cap, std::nextafter(nearest, 0.0)));
+}
+
+/// 一维精确平方距离变换（Felzenszwalb & Huttenlocher）。f 为输入代价，d 为输出。
+inline void squaredDistanceTransform1d(
+  const std::vector<double> & f, std::vector<double> & d,
+  std::vector<int> & v, std::vector<double> & z)
+{
+  const int n = static_cast<int>(f.size());
+  d.assign(f.size(), std::numeric_limits<double>::infinity());
+  v.assign(f.size(), 0);
+  z.assign(f.size() + 1U, 0.0);
+  const double inf = std::numeric_limits<double>::infinity();
+  int k = -1;
+  for (int q = 0; q < n; ++q) {
+    if (!std::isfinite(f[q])) {
+      continue;
+    }
+    if (k < 0) {
+      k = 0;
+      v[0] = q;
+      z[0] = -inf;
+      z[1] = inf;
+      continue;
+    }
+    double s = 0.0;
+    while (true) {
+      const int p = v[k];
+      s = ((f[q] + static_cast<double>(q) * q) - (f[p] + static_cast<double>(p) * p)) /
+        (2.0 * (q - p));
+      if (s <= z[k] && k > 0) {
+        --k;
+        continue;
+      }
+      break;
+    }
+    if (s <= z[k]) {
+      // k == 0 且新抛物线完全占优：替换。
+      v[0] = q;
+      z[0] = -inf;
+      z[1] = inf;
+      continue;
+    }
+    ++k;
+    v[k] = q;
+    z[k] = s;
+    z[k + 1] = inf;
+  }
+  if (k < 0) {
+    return;
+  }
+  int j = 0;
+  for (int q = 0; q < n; ++q) {
+    while (z[j + 1] < q) {
+      ++j;
+    }
+    const double offset = static_cast<double>(q - v[j]);
+    d[q] = offset * offset + f[v[j]];
+  }
+}
+
+/// 每个格心到最近"阻塞格"格心的平方距离（单位：格²）。阻塞格与 isGridCellFree 一致，
+/// 栅格外一圈视为阻塞，所以结果与 hasGridClearance 的判据完全等价：
+/// hasGridClearance(x, y, r) <=> isGridCellFree(x, y) && squared[x, y] > (r / res)²。
+inline std::vector<double> computeBlockedSquaredDistanceCells(
+  const nav_msgs::msg::OccupancyGrid & grid, const GridOccupancyPolicy & policy)
+{
+  const int width = static_cast<int>(grid.info.width);
+  const int height = static_cast<int>(grid.info.height);
+  const int padded_width = width + 2;
+  const int padded_height = height + 2;
+  const double inf = std::numeric_limits<double>::infinity();
+  std::vector<double> field(
+    static_cast<std::size_t>(padded_width) * static_cast<std::size_t>(padded_height), inf);
+  for (int y = -1; y <= height; ++y) {
+    for (int x = -1; x <= width; ++x) {
+      if (!isGridCellFree(grid, x, y, policy)) {
+        field[static_cast<std::size_t>(y + 1) * padded_width + static_cast<std::size_t>(x + 1)] =
+          0.0;
+      }
+    }
+  }
+  std::vector<double> line;
+  std::vector<double> out;
+  std::vector<int> v;
+  std::vector<double> z;
+  // 先按列再按行做两遍一维变换，得到精确欧氏平方距离。
+  line.resize(static_cast<std::size_t>(padded_height));
+  for (int x = 0; x < padded_width; ++x) {
+    for (int y = 0; y < padded_height; ++y) {
+      line[static_cast<std::size_t>(y)] =
+        field[static_cast<std::size_t>(y) * padded_width + static_cast<std::size_t>(x)];
+    }
+    squaredDistanceTransform1d(line, out, v, z);
+    for (int y = 0; y < padded_height; ++y) {
+      field[static_cast<std::size_t>(y) * padded_width + static_cast<std::size_t>(x)] =
+        out[static_cast<std::size_t>(y)];
+    }
+  }
+  line.resize(static_cast<std::size_t>(padded_width));
+  for (int y = 0; y < padded_height; ++y) {
+    for (int x = 0; x < padded_width; ++x) {
+      line[static_cast<std::size_t>(x)] =
+        field[static_cast<std::size_t>(y) * padded_width + static_cast<std::size_t>(x)];
+    }
+    squaredDistanceTransform1d(line, out, v, z);
+    for (int x = 0; x < padded_width; ++x) {
+      field[static_cast<std::size_t>(y) * padded_width + static_cast<std::size_t>(x)] =
+        out[static_cast<std::size_t>(x)];
+    }
+  }
+  std::vector<double> result(
+    static_cast<std::size_t>(width) * static_cast<std::size_t>(height), inf);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      result[static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)] =
+        field[static_cast<std::size_t>(y + 1) * padded_width + static_cast<std::size_t>(x + 1)];
+    }
+  }
+  return result;
+}
+
+/// 世界坐标点所在格到最近阻塞格的格心距离（米）；点在栅格外返回 0。
+inline double blockedDistanceAt(
+  const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & squared_cells,
+  double wx, double wy)
+{
+  const double resolution = grid.info.resolution;
+  if (!(resolution > 0.0) || squared_cells.empty()) {
+    return 0.0;
+  }
+  const double gx = (wx - grid.info.origin.position.x) / resolution;
+  const double gy = (wy - grid.info.origin.position.y) / resolution;
+  if (gx < 0.0 || gy < 0.0 || gx >= static_cast<double>(grid.info.width) ||
+    gy >= static_cast<double>(grid.info.height))
+  {
+    return 0.0;
+  }
+  const std::size_t index =
+    static_cast<std::size_t>(std::floor(gy)) * static_cast<std::size_t>(grid.info.width) +
+    static_cast<std::size_t>(std::floor(gx));
+  return std::sqrt(squared_cells[index]) * resolution;
 }
 
 }  // namespace minco_planner
