@@ -139,6 +139,11 @@ public:
     epoch_translation_threshold_ =
       std::max(0.0, declare_parameter<double>("epoch_translation_threshold", 0.05));
     epoch_yaw_threshold_ = std::max(0.0, declare_parameter<double>("epoch_yaw_threshold", 0.05));
+    // 连续修正带上界；0 关闭（保持原行为：超过 epoch 阈值即推进 epoch）。
+    continuous_correction_max_translation_ = std::max(
+      0.0, declare_parameter<double>("continuous_correction_max_translation", 0.0));
+    continuous_correction_max_yaw_ =
+      std::max(0.0, declare_parameter<double>("continuous_correction_max_yaw", 0.0));
     max_correction_translation_ =
       std::max(0.0, declare_parameter<double>("max_correction_translation", 2.0));
     max_correction_yaw_ = std::max(0.0, declare_parameter<double>("max_correction_yaw", 1.0));
@@ -372,7 +377,8 @@ private:
       has_map_to_odom_ ? std::optional<tf2::Transform>(map_to_odom_) : std::nullopt;
     const CorrectionUpdate correction = selectCorrectionUpdate(
       candidate_map_to_odom, current_map_to_odom, epoch_translation_threshold_,
-      epoch_yaw_threshold_);
+      epoch_yaw_threshold_, continuous_correction_max_translation_,
+      continuous_correction_max_yaw_);
     {
       const bool lost = lost_latched_;
       const double max_xy = lost ? lost_max_correction_translation_ : max_correction_translation_;
@@ -406,6 +412,12 @@ private:
     consecutive_rejections_ = 0;
     if (correction.advance_epoch) {
       ++epoch_;
+    } else if (correction.continuous) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "【连续修正】map->odom 修正 平移=%.3f m 航向=%.3f rad，未超过连续上界，epoch=%llu 保持。",
+        correction.delta.translation, correction.delta.yaw,
+        static_cast<unsigned long long>(epoch_));
     }
     if (requires_hold && (!relocalizing_until_ || correction.advance_epoch)) {
       relocalizing_until_ = std::chrono::steady_clock::now() +
@@ -625,6 +637,8 @@ private:
   int max_consecutive_rejections_{3};
   double epoch_translation_threshold_{0.05};
   double epoch_yaw_threshold_{0.05};
+  double continuous_correction_max_translation_{0.0};
+  double continuous_correction_max_yaw_{0.0};
   double max_correction_translation_{2.0};
   double max_correction_yaw_{1.0};
   double lost_max_correction_translation_{5.0};

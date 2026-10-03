@@ -16,6 +16,7 @@
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
 #include "builtin_interfaces/msg/time.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/nodes/planning_map_snapshot.hpp"
 #include "minco_planner/planning/grid_astar.hpp"
@@ -93,7 +94,8 @@ private:
     const nav_msgs::msg::OccupancyGrid & grid,
     const geometry_msgs::msg::PoseStamped & input, geometry_msgs::msg::PoseStamped & output);
   bool transformPathToGlobal(
-    const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output);
+    const nav_msgs::msg::Path & input, nav_msgs::msg::Path & output,
+    geometry_msgs::msg::TransformStamped * used_transform = nullptr);
   nav_msgs::msg::Path toPath(const ReferenceTrajectory & trajectory) const;
   void annotatePositionClearance(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
@@ -114,7 +116,8 @@ private:
       std::uint64_t map_publication_sequence,
       std::uint8_t yaw_authority,
       bool report_status,
-      const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry());
+      const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry(),
+      const geometry_msgs::msg::TransformStamped * control_from_grid = nullptr);
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
@@ -253,8 +256,13 @@ private:
     std::uint64_t plan_request_sequence{0};
     std::uint64_t map_generation{0};
     std::uint64_t map_publication_sequence{0};
+    // 提交时 控制坐标系(global_frame_) <- 栅格坐标系 的变换。MPC 在控制坐标系里执行，
+    // map->odom 修正后车实际走的是 当前(栅格<-控制) * 提交时(控制<-栅格) * trajectory。
+    std::optional<geometry_msgs::msg::TransformStamped> control_from_grid;
   };
   std::optional<ActiveSafetyReference> active_safety_reference_;
+  // 按当前 TF 把已提交参考重新表达到栅格坐标系；TF 不可用或无需变换时原样返回。
+  ReferenceTrajectory alignedToCurrentTf(const ActiveSafetyReference & reference);
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
