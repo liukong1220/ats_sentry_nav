@@ -120,8 +120,15 @@ private:
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr msg)
   {
     const rclcpp::Time receipt = now();
-    const rclcpp::Time stamp(msg->header.stamp, receipt.get_clock_type());
-    const auto age = std::chrono::nanoseconds((receipt - stamp).nanoseconds());
+    // rclcpp::Time throws on a negative sec. A malformed producer stamp must be
+    // an ordinary rejection (negative age), not a process abort of the safety arbiter.
+    const bool stamp_valid = msg->header.stamp.sec >= 0 &&
+      msg->header.stamp.nanosec < 1000000000U;
+    const rclcpp::Time stamp = stamp_valid ?
+      rclcpp::Time(msg->header.stamp, receipt.get_clock_type()) : receipt;
+    const auto age = stamp_valid ?
+      std::chrono::nanoseconds((receipt - stamp).nanoseconds()) :
+      std::chrono::nanoseconds(-1);
     std::lock_guard<std::mutex> lock(mutex_);
     const bool accepted = arbiter_.onExecutionCommand(
       msg->mode, msg->manager_incarnation, msg->command_sequence,
