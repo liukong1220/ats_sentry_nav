@@ -90,3 +90,11 @@ The fusion node applies a separate receive-time gate to accepted observations:
 delayed message from changing `map->odom` merely because the matching odometry
 sample is still present in the history buffer. The existing odometry-history,
 quality, plausibility, confirmation and epoch checks remain authoritative.
+
+For asynchronous multi-guess recovery, the coarse screen uses a sparse cloud and
+therefore has its own `multi_guess.screen_min_inliers` floor (zero selects an
+automatic fraction of the full-cloud `min_inliers`). The scheduler reserves
+`multi_guess.fine_time_reserve_s` before the wall-time budget expires so at least
+one screened candidate can reach full-cloud fine alignment. A screen pass with
+`refined=0` is a scheduling/configuration failure, not evidence that the map has
+no match; the fine-stage quality and confirmation gates remain unchanged.
