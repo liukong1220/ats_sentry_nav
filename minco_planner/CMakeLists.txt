@@ -27,6 +27,7 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/trajectory/terminal_yaw_relocation.cpp
   src/trajectory/trajectory_quality_evaluator.cpp
   src/trajectory/yaw_spline_planner.cpp
+  src/trajectory/tunnel_yaw_alignment.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC include)
@@ -76,6 +77,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_yaw_spline_planner test/test_yaw_spline_planner.cpp)
   target_link_libraries(test_yaw_spline_planner ${PROJECT_NAME})
+
+  ament_add_gtest(test_tunnel_yaw_alignment test/test_tunnel_yaw_alignment.cpp)
+  target_link_libraries(test_tunnel_yaw_alignment ${PROJECT_NAME})
 
   ament_add_gtest(test_wheel_speed_time_scaling test/test_wheel_speed_time_scaling.cpp)
   target_link_libraries(test_wheel_speed_time_scaling ${PROJECT_NAME})
