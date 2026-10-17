@@ -175,10 +175,12 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("multi_guess.step_yaw", 0.785398);
   this->declare_parameter("multi_guess.z_candidates", std::vector<double>{0.0});
   this->declare_parameter("multi_guess.time_budget_s", 1.5);
+  this->declare_parameter("multi_guess.fine_time_reserve_s", 0.35);
   this->declare_parameter("multi_guess.max_candidates_per_scan", 48);
   this->declare_parameter("multi_guess.max_fine_per_scan", 4);
   // coarse 筛选专用的稀疏尺度。<=registered_leaf_size 时不建立独立筛选云。
   this->declare_parameter("multi_guess.screen_leaf_size", 0.0);
+  this->declare_parameter("multi_guess.screen_min_inliers", 0);
   this->declare_parameter("multi_guess.log_candidates", false);
   this->declare_parameter("multi_guess.candidate_log_path", "");
   // 组合评分权重与饱和尺度。各项归一化到 [0,1]，总分范围 [0, sum(weights)]。
@@ -286,10 +288,12 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("multi_guess.step_yaw", multi_guess_step_yaw_);
   this->get_parameter("multi_guess.z_candidates", multi_guess_z_candidates_);
   this->get_parameter("multi_guess.time_budget_s", multi_guess_time_budget_s_);
+  this->get_parameter("multi_guess.fine_time_reserve_s", multi_guess_fine_time_reserve_s_);
   this->get_parameter("multi_guess.max_candidates_per_scan", multi_guess_max_candidates_per_scan_);
   this->get_parameter("multi_guess.max_fine_per_scan", multi_guess_max_fine_per_scan_);
   multi_guess_screen_leaf_size_ =
     static_cast<float>(this->get_parameter("multi_guess.screen_leaf_size").as_double());
+  this->get_parameter("multi_guess.screen_min_inliers", multi_guess_screen_min_inliers_);
   this->get_parameter("multi_guess.log_candidates", multi_guess_log_candidates_);
   this->get_parameter("multi_guess.candidate_log_path", multi_guess_candidate_log_path_);
   this->get_parameter("candidate_score.weight_error", score_weights_.error);
@@ -356,7 +360,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   multi_guess_step_xy_ = std::max(0.05, multi_guess_step_xy_);
   multi_guess_step_yaw_ = std::max(0.05, multi_guess_step_yaw_);
   multi_guess_time_budget_s_ = std::max(0.05, multi_guess_time_budget_s_);
+  multi_guess_fine_time_reserve_s_ = std::clamp(
+    multi_guess_fine_time_reserve_s_, 0.05, std::max(0.05, multi_guess_time_budget_s_ - 0.01));
   multi_guess_max_candidates_per_scan_ = std::max(1, multi_guess_max_candidates_per_scan_);
+  multi_guess_screen_min_inliers_ = std::max(0, multi_guess_screen_min_inliers_);
   score_weights_.error = std::max(0.0, score_weights_.error);
   score_weights_.overlap = std::max(0.0, score_weights_.overlap);
   score_weights_.information = std::max(0.0, score_weights_.information);
@@ -775,6 +782,14 @@ bool SmallGicpRelocalizationNode::passesQualityGates(
   CandidateHardGates gates = hardGates(relax_permitted);
   if (screen_stage) {
     gates = screenStageGates(gates);
+    // The screening cloud is intentionally much sparser than the full source
+    // cloud.  Applying the full-cloud min_inliers (150 in Gazebo) made every
+    // candidate impossible (the 0.70 m screen had about 40--60 points), so
+    // coarse screening uses a separately bounded evidence floor.  Fine-stage
+    // acceptance still uses the configured full-cloud gate unchanged.
+    const int auto_screen_min = std::max(3, min_inliers_ / 4);
+    gates.min_inliers = multi_guess_screen_min_inliers_ > 0
+      ? multi_guess_screen_min_inliers_ : auto_screen_min;
   }
   const std::string reason = candidateRejectReason(evidence, gates);
   if (!reason.empty()) {
@@ -1020,8 +1035,12 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       return outcome;
     }
-    if (outcome.evaluated >= budget_count ||
-        multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+    const auto screening_now = std::chrono::steady_clock::now();
+    const bool reserve_for_fine = !screened.empty() &&
+      screening_now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(multi_guess_fine_time_reserve_s_)) >= deadline;
+    if (outcome.evaluated >= budget_count || reserve_for_fine ||
+        multiGuessDeadlineExpired(screening_now, deadline)) {
       outcome.budget_exhausted = true;
       break;
     }
@@ -1070,7 +1089,10 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
       return outcome;
     }
-    if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+    // A coarse pass may consume the configured wall budget.  The screening
+    // loop reserves time for this first fine pass, so do not discard a valid
+    // screened candidate merely because the reserve boundary was reached.
+    if (i > 0 && multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
       outcome.budget_exhausted = true;
       break;
     }

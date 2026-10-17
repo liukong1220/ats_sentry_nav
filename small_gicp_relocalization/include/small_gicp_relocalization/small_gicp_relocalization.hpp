@@ -203,6 +203,7 @@ private:
   float registered_leaf_size_;
   /// coarse 候选筛选的额外降采样尺度。<=registered_leaf_size_ 时不建立独立筛选云。
   float multi_guess_screen_leaf_size_{0.0f};
+  int multi_guess_screen_min_inliers_{0};
   float max_dist_sq_;
   double max_registration_error_;
   bool relax_convergence_for_sim_{false};
@@ -249,6 +250,9 @@ private:
   std::vector<double> multi_guess_z_candidates_{0.0};
   // 候选调度预算：每次扫描只评估一段，剩余候选由 cursor 延续到下一次扫描。
   double multi_guess_time_budget_s_{1.5};
+  // Keep a bounded wall-time reserve so at least one screened candidate reaches
+  // the fine alignment/acceptance stage.
+  double multi_guess_fine_time_reserve_s_{0.35};
   int multi_guess_max_candidates_per_scan_{48};
   /// 每次扫描允许的 fine 精配准次数上限。筛选只排序，精配准才验收。
   int multi_guess_max_fine_per_scan_{4};

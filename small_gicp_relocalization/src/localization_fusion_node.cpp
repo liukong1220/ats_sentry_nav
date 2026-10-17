@@ -582,7 +582,16 @@ private:
   void publishStatusLocked()
   {
     LocalizationStatus status;
-    status.header.stamp = now();
+    // Several state transitions can be committed from one callback while the
+    // simulated ROS clock is between ticks.  The consumer intentionally has a
+    // strict monotonic admission gate, so publishing the same `now()` stamp
+    // twice would make a valid status stream look like a replay.  Preserve the
+    // ROS clock domain and advance by one nanosecond only within that tick.
+    const auto wall_stamp = now();
+    const auto wall_stamp_ns = wall_stamp.nanoseconds();
+    const auto status_stamp_ns = std::max(wall_stamp_ns, last_status_stamp_ns_ + 1);
+    status.header.stamp = rclcpp::Time(status_stamp_ns, RCL_ROS_TIME);
+    last_status_stamp_ns_ = status_stamp_ns;
     status.header.frame_id = map_frame_;
     status.state = status_;
     status.epoch = epoch_;
@@ -674,6 +683,7 @@ private:
   double last_correction_yaw_{0.0};
   std::uint32_t consecutive_rejections_{0};
   std::uint8_t status_{LocalizationStatus::STATE_UNINITIALIZED};
+  std::int64_t last_status_stamp_ns_{0};
   std::string status_message_{"waiting for odometry"};
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
