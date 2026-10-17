@@ -612,7 +612,11 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message) {
 void AtsSwerveMpcNode::onExecutionCommand(
     const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr message) {
   const rclcpp::Time receipt = now();
-  const rclcpp::Time command_stamp = message ?
+  // rclcpp::Time throws on a negative sec; a malformed stamp must take the same
+  // fail-closed rejection path as an expired one instead of aborting the node.
+  const bool stamp_valid = message && message->header.stamp.sec >= 0 &&
+    message->header.stamp.nanosec < 1000000000U;
+  const rclcpp::Time command_stamp = stamp_valid ?
     rclcpp::Time(message->header.stamp, receipt.get_clock_type()) : receipt;
   if (!message || message->manager_incarnation == 0 ||
       message->command_sequence == 0) {
@@ -630,7 +634,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
   // arbiter sees it.  Keep the MPC gate identical to the arbiter gate so either
   // consumer fails closed on the same clock contract.
   const rclcpp::Duration command_age = receipt - command_stamp;
-  if (command_age.nanoseconds() < 0 ||
+  if (!stamp_valid || command_age.nanoseconds() < 0 ||
       command_age > rclcpp::Duration::from_seconds(execution_command_timeout_)) {
     RCLCPP_ERROR(
         get_logger(),
