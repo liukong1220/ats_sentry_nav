@@ -15,7 +15,8 @@ YawSplinePlanner::YawSplinePlanner(YawSplinePlannerParams params) : params_(para
 void YawSplinePlanner::setParams(const YawSplinePlannerParams & params) { params_ = params; }
 
 void YawSplinePlanner::apply(
-  ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const
+  ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
+  const std::vector<TunnelSegment> * tunnels) const
 {
   if (trajectory.points.empty()) {
     return;
@@ -25,7 +26,7 @@ void YawSplinePlanner::apply(
     return;
   }
   if (params_.mode == "clearance_aware") {
-    applyClearanceAware(trajectory, initial_yaw, goal_yaw);
+    applyClearanceAware(trajectory, initial_yaw, goal_yaw, tunnels);
     return;
   }
   if (params_.mode == "hold") {
@@ -39,7 +40,8 @@ void YawSplinePlanner::apply(
 }
 
 void YawSplinePlanner::applyClearanceAware(
-  ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const
+  ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
+  const std::vector<TunnelSegment> * tunnels) const
 {
   // 开阔区域先平滑朝向目标；只有窄通道才强制朝向路径，保留舵轮横移能力。
   applyGoalHeading(trajectory, initial_yaw, goal_yaw);
@@ -110,13 +112,13 @@ void YawSplinePlanner::applyClearanceAware(
       tangent_yaws[i] = std::atan2(tangent_y, tangent_x);
     }
   }
-  const double period = 2.0 * M_PI / static_cast<double>(symmetry_order);
   // 在所有等价朝向中选与 reference_yaw 转角最小的一个；转角相同时保留靠前的候选。
-  const auto nearest_aligned_yaw = [period, symmetry_order](double tangent, double reference_yaw) {
+  const auto nearest_aligned_yaw = [](double tangent, double reference_yaw, int order) {
+      const double local_period = 2.0 * M_PI / static_cast<double>(order);
       double best = tangent;
       double best_turn = std::abs(shortestAngularDistance(reference_yaw, tangent));
-      for (int k = 1; k < symmetry_order; ++k) {
-        const double candidate = normalizeAngle(tangent + period * k);
+      for (int k = 1; k < order; ++k) {
+        const double candidate = normalizeAngle(tangent + local_period * k);
         const double turn = std::abs(shortestAngularDistance(reference_yaw, candidate));
         if (turn < best_turn) {
           best_turn = turn;
@@ -142,6 +144,24 @@ void YawSplinePlanner::applyClearanceAware(
   for (std::size_t i = 1; i < point_count; ++i) {
     auto & current = trajectory.points[i];
     double desired_yaw = open_area_yaws[i];
+    bool tunnel_alignment = false;
+    if (tunnels != nullptr) {
+      for (const auto & tunnel : *tunnels) {
+        if (tunnel.axis_yaw.empty()) {
+          continue;
+        }
+        const double begin_s = trajectory.points[tunnel.begin].s - params_.tunnel.pre_align_distance;
+        const double end_s = trajectory.points[tunnel.end].s + params_.tunnel.post_release_distance;
+        if (current.s >= begin_s && current.s <= end_s) {
+          const std::size_t local_index =
+            std::min(tunnel.axis_yaw.size() - 1, i >= tunnel.begin ? i - tunnel.begin : 0U);
+          desired_yaw = tunnelAlignedYaw(
+            tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
+          tunnel_alignment = true;
+          break;
+        }
+      }
+    }
     if (minimal_rotation && !narrow_flags[i]) {
       if (i == 1 || narrow_flags[i - 1]) {
         // 进入开阔段：找下一段窄通道入口，目标取其切线的对齐朝向；没有则为目标朝向。
@@ -155,7 +175,7 @@ void YawSplinePlanner::applyClearanceAware(
           ++tangent_index;
         }
         if (run_end < point_count && tangent_index < point_count) {
-          target = nearest_aligned_yaw(tangent_yaws[tangent_index], previous_yaw);
+        target = nearest_aligned_yaw(tangent_yaws[tangent_index], previous_yaw, symmetry_order);
         }
         open_start_yaw = previous_yaw;
         open_delta = shortestAngularDistance(previous_yaw, target);
@@ -168,12 +188,12 @@ void YawSplinePlanner::applyClearanceAware(
       const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
       desired_yaw = normalizeAngle(open_start_yaw + open_delta * blend);
     }
-    if (narrow_flags[i] && std::isfinite(tangent_yaws[i])) {
+    if (!tunnel_alignment && narrow_flags[i] && std::isfinite(tangent_yaws[i])) {
       // 窄通道只要求足迹与切线对齐到对称等价：矩形可正向或反向，正方形再加 ±pi/2。
       // 在所有等价朝向中选与上一时刻转角最小的一个，避免贴墙时做不必要的大角度转向
       // （正方形车沿 -pi/2 切线进南侧墙尖时，yaw 0 本身已对齐，不应再转 90 度）。
       // 转角相同时保留靠前的候选（先正向切线），与原先正/反向二选一的行为一致。
-      desired_yaw = nearest_aligned_yaw(tangent_yaws[i], previous_yaw);
+      desired_yaw = nearest_aligned_yaw(tangent_yaws[i], previous_yaw, symmetry_order);
     }
 
     // 最后按 yaw_rate_limit 裁剪，避免参考轨迹要求舵轮瞬时转向。

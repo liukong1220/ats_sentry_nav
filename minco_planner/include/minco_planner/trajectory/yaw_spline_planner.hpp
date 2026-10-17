@@ -6,6 +6,7 @@
 #include <string>
 
 #include "minco_planner/trajectory/reference_trajectory.hpp"
+#include "minco_planner/trajectory/tunnel_yaw_alignment.hpp"
 
 namespace minco_planner
 {
@@ -33,6 +34,7 @@ struct YawSplinePlannerParams
   std::string open_area_yaw_mode = "goal_heading";
   // 终点独立转向采用零平移采样；每个采样仍进入离散矩形足迹安全 gate。
   double terminal_yaw_sample_period = 0.10;
+  TunnelYawParams tunnel{};
 };
 
 class YawSplinePlanner
@@ -41,14 +43,17 @@ public:
   explicit YawSplinePlanner(YawSplinePlannerParams params = YawSplinePlannerParams());
 
   void setParams(const YawSplinePlannerParams & params);
-  void apply(ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const;
+  void apply(
+    ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
+    const std::vector<TunnelSegment> * tunnels = nullptr) const;
 
 private:
   void applyGoalHeading(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const;
   void applyPathTangent(ReferenceTrajectory & trajectory, double initial_yaw) const;
   void applyClearanceAware(
-    ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw) const;
+    ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
+    const std::vector<TunnelSegment> * tunnels) const;
   void appendTerminalGoalYawTransition(
     ReferenceTrajectory & trajectory, double goal_yaw) const;
   static double normalizeAngle(double angle);

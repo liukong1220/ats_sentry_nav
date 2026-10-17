@@ -228,6 +228,7 @@ private:
   GridJps jps_;
   MincoTrajectoryOptimizer optimizer_;
   YawSplinePlanner yaw_planner_;
+  TunnelYawParams tunnel_yaw_params_{};
   WheelSpeedTimeScalingParams wheel_speed_time_scaling_params_{};
   /// 提交门使用的矩形足迹参数副本。目标位姿准入必须用同一份参数，否则"终点可行"
   /// 与"轨迹可行"会用两套几何判定。

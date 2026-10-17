@@ -396,6 +396,18 @@ void MincoPlannerNode::declareAndLoadParams()
     "clearance_speed_high", wheel_speed_time_scaling_params_.clearance_speed_high);
   declare_parameter<double>(
     "terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
+  declare_parameter<bool>("yaw_tunnel_enabled", yaw_params.tunnel.enabled);
+  declare_parameter<double>("yaw_tunnel_yaw_offset", yaw_params.tunnel.yaw_offset);
+  declare_parameter<double>("yaw_tunnel_clearance_enter", yaw_params.tunnel.clearance_enter);
+  declare_parameter<double>("yaw_tunnel_clearance_exit", yaw_params.tunnel.clearance_exit);
+  declare_parameter<double>("yaw_tunnel_max_width", yaw_params.tunnel.max_width);
+  declare_parameter<double>("yaw_tunnel_axis_window", yaw_params.tunnel.axis_window);
+  declare_parameter<double>(
+    "yaw_tunnel_axis_min_coherence", yaw_params.tunnel.min_coherence);
+  declare_parameter<double>(
+    "yaw_tunnel_pre_align_distance", yaw_params.tunnel.pre_align_distance);
+  declare_parameter<double>(
+    "yaw_tunnel_post_release_distance", yaw_params.tunnel.post_release_distance);
   declare_parameter<bool>(
     "terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   declare_parameter<int>(
@@ -627,6 +639,16 @@ void MincoPlannerNode::declareAndLoadParams()
   // 窄通道判据与 yaw 规划共用进入阈值，两者对"窄"的定义一致。
   wheel_speed_time_scaling_params_.narrow_turn_clearance = yaw_params.narrow_clearance_enter;
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
+  get_parameter("yaw_tunnel_enabled", yaw_params.tunnel.enabled);
+  get_parameter("yaw_tunnel_yaw_offset", yaw_params.tunnel.yaw_offset);
+  get_parameter("yaw_tunnel_clearance_enter", yaw_params.tunnel.clearance_enter);
+  get_parameter("yaw_tunnel_clearance_exit", yaw_params.tunnel.clearance_exit);
+  get_parameter("yaw_tunnel_max_width", yaw_params.tunnel.max_width);
+  get_parameter("yaw_tunnel_axis_window", yaw_params.tunnel.axis_window);
+  get_parameter("yaw_tunnel_axis_min_coherence", yaw_params.tunnel.min_coherence);
+  get_parameter("yaw_tunnel_pre_align_distance", yaw_params.tunnel.pre_align_distance);
+  get_parameter("yaw_tunnel_post_release_distance", yaw_params.tunnel.post_release_distance);
+  tunnel_yaw_params_ = yaw_params.tunnel;
   get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   get_parameter("footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
   footprint_yaw_refinement_rounds_ = std::max(0, footprint_yaw_refinement_rounds_);
@@ -2085,7 +2107,14 @@ void MincoPlannerNode::planYaw(
   // 窄通道判据必须用与 yaw 无关的位置净空:yaw 正是这一步要决定的量,拿 yaw 相关的
   // footprint 净空当输入构成循环依赖,而 annotateClearance 恰好是 yaw 相关的。
   annotatePositionClearance(trajectory, snapshot);
-  yaw_planner_.apply(trajectory, start_yaw, goal_yaw);
+  std::vector<TunnelSegment> tunnel_segments;
+  if (tunnel_yaw_params_.enabled && snapshot.clearance_esdf) {
+    tunnel_segments = detectTunnelSegments(
+      trajectory, *snapshot.clearance_esdf, tunnel_yaw_params_);
+  }
+  yaw_planner_.apply(
+    trajectory, start_yaw, goal_yaw,
+    tunnel_segments.empty() ? nullptr : &tunnel_segments);
   // yaw 定下后才知道平移与转向叠加的轮速；超出底盘能力的局部放慢时间，位置和 yaw 不变。
   applyWheelSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 窄通道边平移边转向时再放慢，压低 MPC 横向/yaw 跟踪误差；同样只改时间。
