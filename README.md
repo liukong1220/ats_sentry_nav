@@ -54,6 +54,7 @@
 - [功能模块](#功能模块)
 - [系统依赖](#系统依赖)
 - [Quick Start](#quick-start)
+- [Gazebo 2027 直接启动](#gazebo-2027-直接启动)
 - [实机部署](#实机部署)
 - [接口契约](#接口契约)
 - [统一配置](#统一配置)
@@ -223,6 +224,25 @@ ros2 launch ats_sentry_bringup real_robot_navigation.launch.py --show-args
 - LiDAR、IMU、底盘、云台外参与 TF 已实测标定；
 - 串口设备、波特率和下位机协议一致；
 - 物理急停、独立安全员和低速测试区域已准备。
+
+## Gazebo 2027 直接启动
+
+Gazebo 仿真入口由 `rmu_gazebo_simulator` 仓库拥有；在工作区根目录构建并 source 后，可直接启动
+RMUC 2027 world。日常算法测试使用 RViz + headless Gazebo：
+
+```bash
+cd /home/ats/ATS_2026_snetry_test
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch rmu_gazebo_simulator ats_gazebo_nav.launch.py \
+  world:=rmuc_2027 \
+  use_gazebo_gt_odometry:=true \
+  use_rviz:=true
+```
+
+需要 Gazebo GUI 时显式传入 `headless:=false use_viewer:=true`。服务器或只验证重定位时，需按
+[Gazebo 仓 README](../sim/gazebo_simulator/README.md) 设置 NVIDIA EGL/surfaceless 环境，并使用独立
+`ROS_DOMAIN_ID`；重定位验证命令会关闭 `launch_planning`，不代表完整导航闭环通过。
 
 ## 实机部署
 
