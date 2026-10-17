@@ -431,7 +431,7 @@ S1/P4 准备阶段的历史证据（早于速度仲裁迁移和 58 x 58 cm 足�
 
 2027 回归证据：`minco_planner` 隧道 yaw、yaw spline、terminal relocation CTest 为 `3/3`；
 MuJoCo `tunnel_B` 进入/通过，隧道内最大 yaw 误差约 `4.9e-12`、终点误差 `0.0`。Gazebo 2027
-入口和 RViz 通过静态/启动检查，但当前 GPU/EGL 环境没有 `/registered_scan`，完整 Gazebo 导航闭环仍未通过。
+入口、RViz、world transport、仿真 Mid360 TF 和 `/registered_scan` 通过 headless 重定位验证；完整 Gazebo 红框导航仍未通过。
 
 ## P4 状态与限制
 
