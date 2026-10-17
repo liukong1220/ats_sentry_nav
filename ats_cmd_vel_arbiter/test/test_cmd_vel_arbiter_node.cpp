@@ -21,7 +21,8 @@ using Twist = geometry_msgs::msg::Twist;
 
 enum class Rejection {
   FUTURE, STALE, REPLAY, OLD_INCARNATION, INVALID_MODE,
-  OLD_GENERATION, FUTURE_GENERATION, ZERO_GENERATION, OLD_EPOCH, FUTURE_EPOCH
+  OLD_GENERATION, FUTURE_GENERATION, ZERO_GENERATION, OLD_EPOCH, FUTURE_EPOCH,
+  NEGATIVE_STAMP, BAD_NANOSEC
 };
 
 class CmdVelArbiterNodeRejection : public ::testing::TestWithParam<Rejection>
@@ -203,6 +204,16 @@ TEST_P(CmdVelArbiterNodeRejection, PublishesImmediateZeroAndRequiresFreshVelocit
     case Rejection::FUTURE_EPOCH:
       rejected.localization_epoch = 8;
       break;
+    case Rejection::NEGATIVE_STAMP:
+      // A producer that backdates a lease before the sim clock has started emits
+      // sec=-1. rclcpp::Time throws on that, which used to abort this node.
+      rejected.header.stamp.sec = -1;
+      rejected.header.stamp.nanosec = 980000000;
+      break;
+    case Rejection::BAD_NANOSEC:
+      rejected.header.stamp.sec = 9;
+      rejected.header.stamp.nanosec = 1000000000U;
+      break;
   }
   const auto before_rejection = selected_count_;
   execution_pub_->publish(rejected);
@@ -231,7 +242,8 @@ INSTANTIATE_TEST_SUITE_P(
     Rejection::FUTURE, Rejection::STALE, Rejection::REPLAY,
     Rejection::OLD_INCARNATION, Rejection::INVALID_MODE,
     Rejection::OLD_GENERATION, Rejection::FUTURE_GENERATION, Rejection::ZERO_GENERATION,
-    Rejection::OLD_EPOCH, Rejection::FUTURE_EPOCH));
+    Rejection::OLD_EPOCH, Rejection::FUTURE_EPOCH,
+    Rejection::NEGATIVE_STAMP, Rejection::BAD_NANOSEC));
 
 TEST_F(CmdVelArbiterNodeRejection, UnknownGenerationNeedsStatusThenHigherSequence)
 {
