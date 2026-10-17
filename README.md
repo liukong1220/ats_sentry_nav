@@ -90,8 +90,10 @@ adapter 融合 ROGMap、terrain/slope 和静态图后，成为
 `clearance_aware` yaw 在开阔区朝向目标，在窄通道内（进入/退出阈值滞回）对齐路径切线；
 可选正方形 4 阶切线对称、窄段间隙桥接和 yaw 角加速度限制。门禁不通过时依次尝试足迹 yaw
 不动点补解、无 ESDF 基线兜底、局部碰撞修复、终端 yaw 重定位和（默认关闭的）脱困前缀，每个结果都重新经过
-同一门禁。车辆足迹为 `0.58 x 0.58 m`。参数与各阶段说明见
+同一门禁。2027 车体足迹为 `0.571 x 0.581 m`；隧道模式固定让 `0.571 m` 面正对隧道，参数与各阶段说明见
 [minco_planner/README.md](./minco_planner/README.md)。
+
+2027 隧道 yaw 由 ESDF 估计隧道轴线，入口前必须让车体 `0.571 m` 面正对隧道；隧道内仍由同一矩形 footprint gate 检查，不能用各向同性圆形净空替代。
 
 一次规划内，JPS、二维 RC-ESDF、MINCO clearance、footprint gate 与 repair 共用同一个
 MINCO 本地不可变 snapshot。ROGMap source generation、adapter publication sequence 和
@@ -426,6 +428,10 @@ S1/P4 准备阶段的历史证据（早于速度仲裁迁移和 58 x 58 cm 足�
 
 包级 lint 仍有既有 copyright、cpplint、clang-format 和离线 schema 债务。定向功能测试通过
 不能写成全包 lint 通过。
+
+2027 回归证据：`minco_planner` 隧道 yaw、yaw spline、terminal relocation CTest 为 `3/3`；
+MuJoCo `tunnel_B` 进入/通过，隧道内最大 yaw 误差约 `4.9e-12`、终点误差 `0.0`。Gazebo 2027
+入口和 RViz 通过静态/启动检查，但当前 GPU/EGL 环境没有 `/registered_scan`，完整 Gazebo 导航闭环仍未通过。
 
 ## P4 状态与限制
 
