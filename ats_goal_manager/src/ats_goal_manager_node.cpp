@@ -2006,8 +2006,16 @@ private:
     // consumer can therefore observe a just-published sample against an older
     // clock tick. Backdate only the producer lease; consumers still reject any
     // genuinely future or expired sample with their hard timestamp gates.
-    const rclcpp::Time lease_stamp = publish_stamp -
+    // Sim-time nodes read 0 until the first /clock sample arrives. Time minus
+    // Duration does not throw in Humble, it yields a negative nanosecond count,
+    // and that serialises as sec=-1. Every consumer builds an rclcpp::Time from
+    // this stamp, which throws on a negative sec and kills the arbiter and MPC
+    // at startup. Never backdate below the epoch.
+    const rclcpp::Duration backdate =
       rclcpp::Duration::from_seconds(execution_command_stamp_backdate_sec_);
+    const rclcpp::Time lease_stamp = publish_stamp.nanoseconds() > backdate.nanoseconds() ?
+      publish_stamp - backdate :
+      rclcpp::Time(0, 0, publish_stamp.get_clock_type());
     command.header.stamp = lease_stamp;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
