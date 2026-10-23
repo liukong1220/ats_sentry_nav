@@ -38,7 +38,8 @@ double tunnelAlignedYaw(double axis_yaw, double yaw_offset, double reference_yaw
   const double target = axis_yaw + yaw_offset;
   double best = target;
   double best_error = std::abs(normalize(reference_yaw - target));
-  // 矩形足迹在隧道内只允许 2 阶对称，避免 0.581 m 面被当成等价朝向。
+  // 矩形足迹在隧道内只允许 2 阶对称：车头（+x，0.571 m 短边）沿隧道轴前进，
+  // 倒车朝向 target + pi 等价，+-pi/2 的朝向会让 0.581 m 长边正对隧道口，不可取。
   for (int k = 1; k < 2; ++k) {
     const double candidate = target + k * kPi;
     const double error = std::abs(normalize(reference_yaw - candidate));
