@@ -41,7 +41,7 @@ minco_planner::ReferenceTrajectory makeTrajectory()
 }
 }  // namespace
 
-TEST(TunnelYawAlignment, DetectsTwoWallCorridorAndUsesNarrowFootprintOrientation)
+TEST(TunnelYawAlignment, DetectsTwoWallCorridorAndDrivesAlongTheAxis)
 {
   const CorridorEsdf esdf;
   auto trajectory = makeTrajectory();
@@ -52,7 +52,11 @@ TEST(TunnelYawAlignment, DetectsTwoWallCorridorAndUsesNarrowFootprintOrientation
   EXPECT_NEAR(segments.front().width_estimate, 0.75, 0.08);
   const double aligned = minco_planner::tunnelAlignedYaw(
     segments.front().axis_yaw.front(), params.yaw_offset, 0.0);
-  EXPECT_NEAR(std::abs(std::atan2(std::sin(aligned), std::cos(aligned))), M_PI_2, 1e-6);
+  // The corridor runs along +x. Vehicle +x is the heading (front face 0.571 m),
+  // so the aligned yaw is the corridor axis itself, not a quarter turn from it.
+  EXPECT_NEAR(params.yaw_offset, 0.0, 1e-12);
+  EXPECT_NEAR(std::abs(std::cos(aligned)), 1.0, 1e-6);
+  EXPECT_NEAR(std::sin(aligned), 0.0, 1e-6);
 }
 
 TEST(TunnelYawAlignment, DisabledIsNoOp)

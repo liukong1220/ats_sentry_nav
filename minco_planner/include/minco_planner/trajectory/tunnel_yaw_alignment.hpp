@@ -20,7 +20,9 @@ struct TunnelYawParams
   double max_width = 0.90;
   double axis_window = 0.30;
   double min_coherence = 0.80;
-  double yaw_offset = 1.5707963267948966;
+  // Vehicle +x is the heading and the short 0.571 m face is the front, so
+  // driving along the tunnel axis needs no extra rotation (2026-10-23).
+  double yaw_offset = 0.0;
   double pre_align_distance = 0.53;
   double post_release_distance = 0.31;
 };
