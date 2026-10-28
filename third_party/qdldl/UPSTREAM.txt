@@ -1,0 +1,8 @@
+upstream: https://github.com/osqp/qdldl
+tag: v0.1.8
+commit: 138fdac58b9cd1c4137ff1b99152c8108a6cff5b
+license: Apache-2.0 (see LICENSE)
+
+Vendored so OSQP's FetchContent does not git-fetch this pin. The cached
+clone's `git show-ref v0.1.8` also matches refs/remotes/origin/im/v0.1.8,
+which makes CMake's update step contact GitHub on every reconfigure.

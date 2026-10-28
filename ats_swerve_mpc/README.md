@@ -42,8 +42,9 @@ ros2 launch ats_mujoco_sim rmuc_2025_mujoco.launch.py
 
 ## LTV-QP 迁移状态
 
-OSQP v1.0.0 源码位于 `../third_party/osqp`，以静态库链接；其 QDLDL 依赖通过 FetchContent
-获取（v0.1.8），已缓存在 `build/ats_swerve_mpc/_deps`。
+OSQP v1.0.0 源码位于 `../third_party/osqp`，以静态库链接。QDLDL v0.1.8
+（commit `138fdac58b9cd1c4137ff1b99152c8108a6cff5b`）内置于 `../third_party/qdldl`，
+由 `FETCHCONTENT_SOURCE_DIR_QDLDL` 指向该目录，配置时不再从 GitHub 拉取。
 
 `solver_mode` 取值：
 
@@ -73,7 +74,8 @@ cd build/ats_swerve_mpc
 ctest --output-on-failure
 ```
 
-重新配置本包时不要使用 `-UFETCHCONTENT_SOURCE_DIR_QDLDL`。
+`FETCHCONTENT_SOURCE_DIR_QDLDL` 在本包 `CMakeLists.txt` 中被强制指向内置 QDLDL。
+不要把它改回空值或 `build/` 下的 git 缓存，否则配置会再次访问 GitHub。
 
 MuJoCo 闭环回归脚本位于工作区根目录：
 
