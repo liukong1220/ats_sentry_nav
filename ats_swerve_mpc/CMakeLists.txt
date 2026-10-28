@@ -19,6 +19,16 @@ set(OSQP_CODEGEN OFF CACHE BOOL "" FORCE)
 set(OSQP_ENABLE_PRINTING OFF CACHE BOOL "" FORCE)
 set(OSQP_ENABLE_PROFILING ON CACHE BOOL "" FORCE)
 set(OSQP_ENABLE_INTERRUPT ON CACHE BOOL "" FORCE)
+# OSQP 的 FetchContent 固定 QDLDL v0.1.8。已有 git 缓存里
+# `git show-ref v0.1.8` 会先命中 refs/remotes/origin/im/v0.1.8，CMake
+# 因此每次 update 都访问 GitHub；当前网络上 gnutls_handshake 会失败。
+# 指向同一提交的内置树后，配置阶段不再下载或更新。
+set(_ATS_QDLDL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/qdldl")
+if(NOT EXISTS "${_ATS_QDLDL_SOURCE_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR "Vendored QDLDL is missing: ${_ATS_QDLDL_SOURCE_DIR}")
+endif()
+set(FETCHCONTENT_SOURCE_DIR_QDLDL "${_ATS_QDLDL_SOURCE_DIR}"
+    CACHE PATH "Vendored QDLDL v0.1.8 (138fdac). Do not clear this." FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp
                  ${CMAKE_CURRENT_BINARY_DIR}/osqp EXCLUDE_FROM_ALL)
 if(TARGET osqpstatic AND NOT TARGET osqp::osqpstatic)
@@ -74,6 +84,8 @@ install(FILES README.md DESTINATION share/${PROJECT_NAME})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp/LICENSE
               ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/osqp/NOTICE
         DESTINATION share/${PROJECT_NAME}/third_party/osqp)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/qdldl/LICENSE
+        DESTINATION share/${PROJECT_NAME}/third_party/qdldl)
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/osqp/include/public/
         DESTINATION include/osqp FILES_MATCHING PATTERN "*.h")
 
