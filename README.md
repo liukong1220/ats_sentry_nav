@@ -205,9 +205,9 @@ MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
   --parallel-workers 6
 ```
 
-单包构建：`colcon build --base-paths src --packages-select <pkg>`。`ats_swerve_mpc` 内置 OSQP，
-其 QDLDL 依赖已由 FetchContent 缓存在 `build/ats_swerve_mpc/_deps`；重新配置时不要使用
-`-UFETCHCONTENT_SOURCE_DIR_QDLDL`。
+单包构建：`colcon build --base-paths src --packages-select <pkg>`。`ats_swerve_mpc` 内置 OSQP。
+QDLDL v0.1.8 内置于 `third_party/qdldl`，`FETCHCONTENT_SOURCE_DIR_QDLDL` 被强制指向该目录；
+不要把它改回空值或 `build/` 下的 git 缓存，否则配置会再次访问 GitHub。
 
 ### 启动前检查
 
