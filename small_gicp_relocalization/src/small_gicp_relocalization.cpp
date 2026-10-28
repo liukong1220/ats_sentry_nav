@@ -205,6 +205,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("status_stale_skip_registration_s", 1.0);
   this->declare_parameter("cold_start_prior_max_xy_m", 1.0);
   this->declare_parameter("cold_start_prior_max_yaw_rad", 0.60);
+  this->declare_parameter("cold_start_seed_attempts", 3);
   this->declare_parameter("height_filter.enable", false);
   this->declare_parameter("height_filter.min_z", -0.5);
   this->declare_parameter("height_filter.max_z", 2.5);
@@ -319,6 +320,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("status_stale_skip_registration_s", status_stale_skip_registration_s_);
   this->get_parameter("cold_start_prior_max_xy_m", cold_start_prior_max_xy_m_);
   this->get_parameter("cold_start_prior_max_yaw_rad", cold_start_prior_max_yaw_rad_);
+  this->get_parameter("cold_start_seed_attempts", cold_start_seed_attempts_);
+  cold_start_seed_attempts_ = std::max(0, cold_start_seed_attempts_);
   status_stale_skip_registration_s_ = std::max(0.0, status_stale_skip_registration_s_);
   cold_start_prior_max_xy_m_ = std::max(0.0, cold_start_prior_max_xy_m_);
   cold_start_prior_max_yaw_rad_ = std::max(0.0, cold_start_prior_max_yaw_rad_);
@@ -944,13 +947,99 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     return outcome;
   }
 
+  // 冷启动种子优先（报告 5.1.4 B1）：init_pose 是已知的，先单独对它做粗配准加精配准，使用同样的
+  // 硬门，不占格点预算、不受格点截止约束。通过就直接作为结果，之后仍走冷启动先验门和两次一致确认；
+  // 不通过就记录原因，格点搜索照旧（预算从这里之后才开始计）。
+  bool seed_stage_ran = false;
+  if (request.seed_first) {
+    seed_stage_ran = true;
+    outcome.seed_stage_ran = true;
+    const auto seed_started = std::chrono::steady_clock::now();
+    GicpRegistration seed_register;
+    RegistrationAttempt seed_attempt = alignOnceOn(
+      request.seed, max_dist_sq_, coarse_max_iterations_, request.source, request.source_tree,
+      seed_register);
+    seed_attempt.stage = "cold_seed";
+    bool seed_ok = passesQualityGates(
+      seed_attempt, request.allow_unconverged,
+      fine_alignment_enabled_ ? GateStage::kScreen : GateStage::kAccept);
+    if (seed_ok && fine_alignment_enabled_ && !cancel_flag.load()) {
+      seed_attempt = alignOnceOn(
+        seed_attempt.transform, fine_max_dist_sq_, fine_max_iterations_, request.source,
+        request.source_tree, seed_register);
+      seed_attempt.stage = "cold_seed";
+      seed_ok = passesQualityGates(seed_attempt, request.allow_unconverged, GateStage::kAccept);
+    }
+    const CandidateEvidence seed_evidence =
+      attemptEvidence(seed_attempt, request.seed, request.reference, request.current_odom_to_base);
+    seed_attempt.motion_residual = seed_evidence.motion_residual;
+    seed_attempt.prior_deviation = seed_evidence.prior_deviation;
+    seed_attempt.score =
+      seed_ok ? scoreCandidate(seed_evidence, score_weights_).total
+              : std::numeric_limits<double>::infinity();
+    const double seed_elapsed_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - seed_started).count();
+    char seed_line[640];
+    std::snprintf(
+      seed_line, sizeof(seed_line),
+      "【重定位冷启动种子】判决=%s(%s) 用时=%.3fs 初值=(%.3f,%.3f,%.3f) converged=%s 内点=%zu "
+      "重叠率=%.3f 误差=%.6f 先验偏差=%.3f 结果=(%.3f,%.3f,%.3f)",
+      seed_ok ? "通过" : "拒绝", seed_ok ? "-" : seed_attempt.reject_reason.c_str(), seed_elapsed_s,
+      request.seed.translation().x(), request.seed.translation().y(), yawOf(request.seed),
+      seed_attempt.converged ? "true" : "false", seed_attempt.num_inliers,
+      seed_attempt.overlap_ratio, seed_attempt.registration_error, seed_attempt.prior_deviation,
+      seed_attempt.transform.translation().x(), seed_attempt.transform.translation().y(),
+      yawOf(seed_attempt.transform));
+    if (seed_ok) {
+      RCLCPP_INFO(this->get_logger(), "%s", seed_line);
+    } else {
+      RCLCPP_WARN(this->get_logger(), "%s", seed_line);
+    }
+    if (cancel_flag.load()) {
+      outcome.best.ok = false;
+      outcome.best.reject_reason = "multi_guess cancelled";
+      outcome.elapsed_s = seed_elapsed_s;
+      return outcome;
+    }
+    if (seed_ok && std::isfinite(seed_attempt.score)) {
+      // Same bookkeeping as the confirmation recheck: one hypothesis, no lattice progress.
+      outcome.lattice.generated = 1;
+      outcome.lattice.min_x = outcome.lattice.max_x = request.seed.translation().x();
+      outcome.lattice.min_y = outcome.lattice.max_y = request.seed.translation().y();
+      outcome.lattice.max_radius = 0.0;
+      outcome.lattice.rings = 0;
+      outcome.evaluated = 1;
+      outcome.refined = fine_alignment_enabled_ ? 1 : 0;
+      outcome.gated = 1;
+      outcome.skipped = 0;
+      outcome.wrapped = false;
+      outcome.next_cursor = request.cursor;
+      outcome.best = seed_attempt;
+      outcome.selection.has_best = true;
+      outcome.selection.best_index = 0;
+      outcome.selection.best_score = seed_attempt.score;
+      outcome.selection.alternative_score = std::numeric_limits<double>::infinity();
+      outcome.selection.score_margin = std::numeric_limits<double>::infinity();
+      outcome.selection.ambiguous = false;
+      outcome.elapsed_s = seed_elapsed_s;
+      return outcome;
+    }
+  }
+
   const auto candidates =
     buildLayeredCandidateLattice(request.seed, latticeConfig(), &outcome.lattice);
   const std::size_t total = candidates.size();
   if (total == 0) {
     return outcome;
   }
-  const std::size_t cursor = request.cursor % total;
+  std::size_t cursor = request.cursor % total;
+  // The seed stage already evaluated lattice candidate 0 (same input, deterministic), so the
+  // lattice does not spend budget on it again.
+  if (
+    seed_stage_ran && cursor == 0 && total > 1 &&
+    candidates[0].matrix().isApprox(request.seed.matrix(), 1e-9)) {
+    cursor = 1;
+  }
   outcome.cursor = cursor;
   const std::size_t budget_count =
     static_cast<std::size_t>(std::max(1, multi_guess_max_candidates_per_scan_));
@@ -1079,6 +1168,17 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     static_cast<std::size_t>(std::max(1, multi_guess_max_fine_per_scan_));
   const std::size_t refine_count =
     fine_alignment_enabled_ ? std::min(screened.size(), refine_budget) : screened.size();
+  // 诊断：筛选阶段已用掉多少预算。fine 只剩 budget - screening_elapsed，
+  // 与 multi_guess.fine_time_reserve_s 比较即可看出 fine 是否有机会在截止前完成。
+  RCLCPP_INFO(
+    this->get_logger(),
+    "【重定位筛选完成】通过筛选=%zu/%zu 送入精配准=%zu 筛选用时=%.3fs 预算=%.2fs 剩余=%.3fs "
+    "fine预留=%.2fs",
+    screened.size(), consumed, refine_count,
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+    multi_guess_time_budget_s_,
+    std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count(),
+    multi_guess_fine_time_reserve_s_);
   for (std::size_t i = 0; i < refine_count; ++i) {
     if (cancel_flag.load()) {
       outcome.best.ok = false;
@@ -1098,6 +1198,7 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     }
     const ScreenedCandidate & candidate = screened[i];
     RegistrationAttempt attempt = candidate.attempt;
+    const auto fine_started = std::chrono::steady_clock::now();
     if (fine_alignment_enabled_) {
       attempt = alignOnceOn(
         candidate.attempt.transform, fine_max_dist_sq_, fine_max_iterations_, request.source,
@@ -1105,7 +1206,39 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
       attempt.stage = "multi_guess_fine";
       ++outcome.refined;
     }
-    if (multiGuessDeadlineExpired(std::chrono::steady_clock::now(), deadline)) {
+    const auto fine_finished = std::chrono::steady_clock::now();
+    if (multiGuessDeadlineExpired(fine_finished, deadline)) {
+      // 诊断（不改判决）：精配准在截止时间之后才完成，结果被整体丢弃。此前这里没有任何输出，
+      // retained 为空时节点只报 budget_exhausted，看不出是候选质量差还是只是慢。
+      // 这里把"如果没有被丢弃，质量门会怎么判"打出来，并写进候选 CSV。
+      RegistrationAttempt probe = attempt;
+      const bool would_accept =
+        passesQualityGates(probe, request.allow_unconverged, GateStage::kAccept);
+      const CandidateEvidence probe_evidence =
+        attemptEvidence(probe, request.seed, request.reference, request.current_odom_to_base);
+      probe.motion_residual = probe_evidence.motion_residual;
+      probe.prior_deviation = probe_evidence.prior_deviation;
+      probe.score = would_accept ? scoreCandidate(probe_evidence, score_weights_).total
+                                 : std::numeric_limits<double>::infinity();
+      const auto seconds_between = [](auto from, auto to) {
+        return std::chrono::duration<double>(to - from).count();
+      };
+      RCLCPP_WARN(
+        this->get_logger(),
+        "【重定位精配准丢弃】候选=%zu 精配准用时=%.3fs 本次多猜测累计=%.3fs 预算=%.2fs "
+        "超出=%.3fs 若不丢弃质量门判决=%s(%s) converged=%s 内点=%zu 重叠率=%.3f 误差=%.6f "
+        "先验偏差=%.3f 结果=(%.3f,%.3f,%.3f)",
+        candidate.index, seconds_between(fine_started, fine_finished),
+        seconds_between(start, fine_finished), multi_guess_time_budget_s_,
+        seconds_between(deadline, fine_finished), would_accept ? "通过" : "拒绝",
+        would_accept ? "-" : probe.reject_reason.c_str(), probe.converged ? "true" : "false",
+        probe.num_inliers, probe.overlap_ratio, probe.registration_error, probe.prior_deviation,
+        probe.transform.translation().x(), probe.transform.translation().y(),
+        yawOf(probe.transform));
+      logRow(
+        candidate.index, candidates[candidate.index], probe,
+        would_accept ? std::string("discarded_late(would_accept)")
+                     : "discarded_late(" + probe.reject_reason + ")");
       outcome.budget_exhausted = true;
       break;
     }
@@ -1120,6 +1253,25 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     logRow(
       candidate.index, candidates[candidate.index], attempt,
       accepted ? std::string("accepted") : attempt.reject_reason);
+    // 每个进入精配准的候选都打印判决（每次多猜测最多 max_fine_per_scan 行），
+    // 不依赖 multi_guess.log_candidates：精配准阶段的拒绝原因必须留在节点日志里。
+    // 拒绝用 WARN（runner 默认 log_level=warn 也能看到），通过用 INFO。
+    char verdict_line[640];
+    std::snprintf(
+      verdict_line, sizeof(verdict_line),
+      "【重定位精配准】候选=%zu 判决=%s(%s) 精配准用时=%.3fs 本次多猜测累计=%.3fs "
+      "converged=%s 内点=%zu 重叠率=%.3f 误差=%.6f 先验偏差=%.3f 结果=(%.3f,%.3f,%.3f)",
+      candidate.index, accepted ? "通过" : "拒绝", accepted ? "-" : attempt.reject_reason.c_str(),
+      std::chrono::duration<double>(fine_finished - fine_started).count(),
+      std::chrono::duration<double>(fine_finished - start).count(),
+      attempt.converged ? "true" : "false", attempt.num_inliers, attempt.overlap_ratio,
+      attempt.registration_error, attempt.prior_deviation, attempt.transform.translation().x(),
+      attempt.transform.translation().y(), yawOf(attempt.transform));
+    if (accepted) {
+      RCLCPP_INFO(this->get_logger(), "%s", verdict_line);
+    } else {
+      RCLCPP_WARN(this->get_logger(), "%s", verdict_line);
+    }
     if (!accepted || !std::isfinite(attempt.score)) {
       continue;
     }
@@ -1282,6 +1434,16 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
     request.cursor = 0;
     request.confirmation_recheck = true;
   }
+  // Cold start: the known init_pose is tried by itself before the lattice (report 5.1.4 B1).
+  // Bounded by cold_start_seed_attempts so a wrong init_pose cannot loop here forever.
+  if (
+    !request.confirmation_recheck && !has_accepted_alignment_ &&
+    cold_start_seed_tried_ < cold_start_seed_attempts_) {
+    // The attempt is counted when its result is adopted (drainAsyncMultiGuessResult), not here:
+    // a result fenced off by a generation bump (state UNINITIALIZED -> BOOTSTRAP during the run)
+    // or dropped while a confirmation is pending must not use up one of the few tries (5.1.4 B3).
+    request.seed_first = true;
+  }
   request.sweep = multi_guess_sweep_;
   request.allow_unconverged = simRelaxAllowed();
   request.source_points = source_ ? source_->size() : 0;
@@ -1374,13 +1536,19 @@ void SmallGicpRelocalizationNode::drainAsyncMultiGuessResult()
       outcome.lattice.generated, outcome.gated);
     return;
   }
+  if (outcome.seed_stage_ran) {
+    ++cold_start_seed_tried_;
+  }
   handleRegistrationAttempt(outcome.best, scan_time, source_points);
   })) {
     ++stale_async_result_count_;
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), log_throttle_ms_,
-      "【重定位丢弃】丢弃过期 multi_guess 结果（累计=%s）",
-      std::to_string(stale_async_result_count_).c_str());
+    RCLCPP_WARN(
+      this->get_logger(),
+      "【重定位丢弃】丢弃过期 multi_guess 结果（累计=%s 结果代际=%s 当前代际=%s 候选通过=%zu "
+      "最佳=%s）",
+      std::to_string(stale_async_result_count_).c_str(), std::to_string(outcome.generation).c_str(),
+      std::to_string(relocalization_generation_.current()).c_str(), outcome.gated,
+      outcome.best.ok ? "有" : "无");
   }
 }
 

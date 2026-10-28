@@ -102,6 +102,8 @@ private:
     Eigen::Isometry3d seed{Eigen::Isometry3d::Identity()};
     /// 本次扫描是为复核待确认假设而运行，cursor 不代表探索进度。
     bool confirmation_recheck{false};
+    /// 冷启动种子优先：格点搜索之前先对 seed（init_pose）做一次粗加精，不受格点预算约束。
+    bool seed_first{false};
     std::size_t cursor{0};
     std::uint64_t sweep{0};
     bool allow_unconverged{false};
@@ -126,6 +128,8 @@ private:
     std::size_t next_cursor{0};
     bool wrapped{false};
     bool budget_exhausted{false};
+    /// 冷启动种子试探在本次运行里执行过（不论通过与否）。采用结果时才消耗试探次数。
+    bool seed_stage_ran{false};
     double elapsed_s{0.0};
     CandidateSelection selection;
   };
@@ -267,6 +271,12 @@ private:
   // the planning grid free-space check at the nominal goal).
   double cold_start_prior_max_xy_m_{1.0};
   double cold_start_prior_max_yaw_rad_{0.60};
+  // Before the first accepted alignment, try the known init_pose (coarse + fine, full hard
+  // gates, outside the lattice time budget) before searching the lattice.  The lattice shares a
+  // 1.5 s wall budget among all candidates, and under load the init_pose candidate's fine result
+  // landed just after the deadline and was discarded (report 5.1.4 A).  0 restores lattice-only.
+  int cold_start_seed_attempts_{3};
+  int cold_start_seed_tried_{0};
 
   // 组合评分与歧义拒绝。权重/阈值由候选分布决定，min_score_margin<=0 表示门未启用。
   CandidateScoreWeights score_weights_;

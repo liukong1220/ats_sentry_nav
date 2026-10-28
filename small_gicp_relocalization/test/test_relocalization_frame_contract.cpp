@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -261,12 +262,14 @@ protected:
     node_->handleRegistrationAttempt(result, rclcpp::Time(stamp_ns, RCL_ROS_TIME), 1000);
   }
 
-  void drainCapturedResult(std::int64_t stamp_ns, bool ok, std::uint64_t generation)
+  void drainCapturedResult(
+    std::int64_t stamp_ns, bool ok, std::uint64_t generation, bool seed_stage_ran = false)
   {
     node_->last_scan_time_ = rclcpp::Time(stamp_ns + 500000000LL, RCL_ROS_TIME);
     node_->has_received_scan_ = true;
     node_->async_result_ = SmallGicpRelocalizationNode::MultiGuessOutcome{};
     node_->async_result_.generation = generation;
+    node_->async_result_.seed_stage_ran = seed_stage_ran;
     node_->async_result_.best.ok = ok;
     node_->async_result_.best.registration_error = 0.01;
     node_->async_result_.best.num_inliers = 900;
@@ -278,6 +281,8 @@ protected:
   }
 
   std::uint64_t generation() const { return node_->relocalization_generation_.current(); }
+  int seedAttemptsUsed() const { return node_->cold_start_seed_tried_; }
+  void bumpGeneration() { node_->relocalization_generation_.invalidate(); }
   int pendingCount() const { return node_->pending_confirmation_count_; }
   bool accepted() const { return node_->has_accepted_alignment_; }
   double previousResultX() const { return node_->previous_result_t_.translation().x(); }
@@ -312,6 +317,77 @@ protected:
     ASSERT_TRUE(node_->pending_confirmation_);
     EXPECT_DOUBLE_EQ(node_->pending_confirmation_->scan_time_s, first);
     EXPECT_DOUBLE_EQ(node_->pending_confirmation_->last_counted_scan_time_s, counted);
+  }
+
+  /// A small room (floor, two walls, one pillar) dense enough for a real GICP alignment.
+  static pcl::PointCloud<pcl::PointXYZ> makeRoom()
+  {
+    pcl::PointCloud<pcl::PointXYZ> room;
+    const auto add = [&room](double x, double y, double z) {
+      room.push_back(pcl::PointXYZ(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+    };
+    for (int i = 0; i <= 60; ++i) {
+      for (int j = 0; j <= 60; ++j) {
+        const double a = -3.0 + 0.1 * i;
+        const double b = -3.0 + 0.1 * j;
+        add(a, b, 0.0);                       // floor
+        if (j <= 20) {
+          add(3.0, a, 0.1 * j);               // wall x = 3
+          add(a, 3.0, 0.1 * j);               // wall y = 3
+        }
+      }
+    }
+    for (int i = 0; i <= 6; ++i) {            // pillar [0.8, 1.4]^2 x [0, 1.2]
+      for (int k = 0; k <= 12; ++k) {
+        const double s = 0.8 + 0.1 * i;
+        const double z = 0.1 * k;
+        add(s, 0.8, z);
+        add(s, 1.4, z);
+        add(0.8, s, z);
+        add(1.4, s, z);
+      }
+    }
+    return room;
+  }
+
+  /// Node whose prior is the room, with a one-frame window and a lattice budget that is already
+  /// spent when the lattice starts (the seed stage must not depend on it).
+  void createRoomNode(const pcl::PointCloud<pcl::PointXYZ> & room)
+  {
+    const auto path = (directory_ / "room.pcd").string();
+    ASSERT_EQ(pcl::io::savePCDFileASCII(path, room), 0);
+    auto settings = options(path);
+    settings.append_parameter_override("accumulate_frames", 1);
+    settings.append_parameter_override("min_source_points", 100);
+    settings.append_parameter_override("min_inliers", 50);
+    settings.append_parameter_override("num_threads", 2);
+    settings.append_parameter_override("multi_guess.time_budget_s", 0.05);
+    node_ = std::make_shared<SmallGicpRelocalizationNode>(settings);
+  }
+
+  /// Runs the multi-guess worker once on a scan equal to the room (so map == odom is exact).
+  auto runWorker(
+    const pcl::PointCloud<pcl::PointXYZ> & room, const Eigen::Isometry3d & seed, bool seed_first)
+  {
+    receiveStatus(1000000000LL, ats_navigation_interfaces::msg::LocalizationStatus::STATE_TRACKING);
+    auto scan = std::make_shared<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(room, *scan);
+    scan->header.frame_id = "odom";
+    scan->header.stamp = rclcpp::Time(1000000000LL, RCL_ROS_TIME);
+    node_->registeredPcdCallback(scan);
+    node_->preprocessAccumulatedSource();
+    SmallGicpRelocalizationNode::MultiGuessRequest request;
+    request.generation = node_->relocalization_generation_.current();
+    request.source = node_->source_;
+    request.source_tree = node_->source_tree_;
+    request.screen_source = node_->screen_source_;
+    request.screen_source_tree = node_->screen_source_tree_;
+    request.seed = seed;
+    request.seed_first = seed_first;
+    request.allow_unconverged = true;
+    request.source_points = node_->source_ ? node_->source_->size() : 0;
+    const std::atomic<bool> cancel{false};
+    return node_->runMultiGuessAlignmentOn(request, cancel);
   }
 
   rclcpp::Subscription<Observation>::SharedPtr observation_sub_;
@@ -759,6 +835,70 @@ TEST_F(SmallGicpRelocalizationFrameTest, ConfirmationTimeoutMustBeFiniteAndPosit
     settings.append_parameter_override("confirmation_timeout_s", timeout);
     EXPECT_THROW(std::make_shared<SmallGicpRelocalizationNode>(settings), std::invalid_argument);
   }
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, ColdStartSeedIsTriedFirstAndDoesNotNeedTheLatticeBudget)
+{
+  // Report 5.1.4 A: the init_pose candidate used to share the lattice's wall budget, and its
+  // finished fine alignment was discarded when it landed after the deadline.  The seed stage
+  // runs before the lattice, so a budget that is already spent (0.05 s) cannot discard it.
+  const auto room = makeRoom();
+  createRoomNode(room);
+  const auto outcome = runWorker(room, Eigen::Isometry3d::Identity(), true);
+  EXPECT_TRUE(outcome.best.ok) << outcome.best.reject_reason;
+  EXPECT_EQ(outcome.best.stage, "cold_seed");
+  EXPECT_LT(outcome.best.transform.translation().norm(), 0.02);
+  EXPECT_EQ(outcome.gated, 1U);
+  EXPECT_EQ(outcome.evaluated, 1U);
+  EXPECT_EQ(outcome.lattice.generated, 1U);
+  EXPECT_FALSE(outcome.budget_exhausted);
+  EXPECT_EQ(outcome.next_cursor, 0U);  // the seed stage does not advance the lattice sweep
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, FailedColdStartSeedFallsBackToTheLatticeWithoutRepeatingIt)
+{
+  // A seed with no overlap fails the same hard gates as before; the lattice then runs as it did
+  // and starts at candidate 1 because candidate 0 is that same seed.
+  const auto room = makeRoom();
+  createRoomNode(room);
+  Eigen::Isometry3d far_away = Eigen::Isometry3d::Identity();
+  far_away.translation() << 40.0, 0.0, 0.0;
+  const auto outcome = runWorker(room, far_away, true);
+  EXPECT_FALSE(outcome.best.ok);
+  EXPECT_NE(outcome.best.stage, "cold_seed");
+  EXPECT_GT(outcome.lattice.generated, 1U);
+  EXPECT_EQ(outcome.cursor, 1U);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, WithoutSeedFirstTheLatticeStillStartsAtCandidateZero)
+{
+  // cold_start_seed_attempts = 0 (or a later scan) must leave the lattice exactly as before.
+  const auto room = makeRoom();
+  createRoomNode(room);
+  Eigen::Isometry3d far_away = Eigen::Isometry3d::Identity();
+  far_away.translation() << 40.0, 0.0, 0.0;
+  const auto outcome = runWorker(room, far_away, false);
+  EXPECT_FALSE(outcome.best.ok);
+  EXPECT_EQ(outcome.cursor, 0U);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, StaleSeedAttemptDoesNotConsumeTheColdStartBudget)
+{
+  // Report 5.1.4 B3: in the lio 2025 red box the first seed attempt finished after a generation
+  // bump (UNINITIALIZED -> BOOTSTRAP) and was fenced off, yet it had already used one of the three
+  // tries.  An attempt is counted only when its result is adopted.
+  createConfirmationNode(2);
+  ASSERT_EQ(seedAttemptsUsed(), 0);
+  const std::uint64_t stale = generation();
+  bumpGeneration();
+  drainCapturedResult(1000000000LL, true, stale, true);
+  EXPECT_EQ(staleResults(), 1U);
+  EXPECT_EQ(seedAttemptsUsed(), 0);          // fenced off: no try used
+
+  drainCapturedResult(1200000000LL, true, generation(), true);
+  EXPECT_EQ(seedAttemptsUsed(), 1);          // adopted: one try used
+  drainCapturedResult(1400000000LL, true, generation(), false);
+  EXPECT_EQ(seedAttemptsUsed(), 1);          // a lattice / recheck result never counts
 }
 
 }  // namespace small_gicp_relocalization
