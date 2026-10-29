@@ -3,6 +3,8 @@
 #ifndef MINCO_PLANNER__TRAJECTORY__MINCO_JOINT_OPTIMIZER_HPP_
 #define MINCO_PLANNER__TRAJECTORY__MINCO_JOINT_OPTIMIZER_HPP_
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
@@ -39,6 +41,11 @@ struct MincoJointOptimizerParams
   double time_bound_weight = 1e4;
   // 三次铰链在小违例处很软：1e4 时 L 形内角残差约 0.07 m，1e6 时约 0.01 m。
   double obstacle_weight = 1e6;
+  // > 0 时障碍罚改用 C1 平滑 L1（调研报告 A.22.1）：违例 v 在 [0, mu] 内为
+  // (mu - v/2)(v/mu)^3，超过 mu 后线性 v - mu/2，梯度有界，不随穿障深度平方增长。
+  // 此时 obstacle_weight 不再使用，该罚项权重 = obstacle_smooth_l1_weight [代价/m]。0 = 三次铰链。
+  double obstacle_smooth_l1_weight = 0.0;
+  double obstacle_smooth_l1_mu = 0.01;
   double velocity_weight = 1e3;
   double acceleration_weight = 1e3;
   double lateral_weight = 1e3;
@@ -124,6 +131,26 @@ struct MincoJointResult
   std::vector<Eigen::Vector2d> waypoints;
   Eigen::VectorXd durations;
 };
+
+// 进程级联合优化终止原因计数（只增不减，原子，开销可忽略）。一次 planGoal 会调用多次
+// optimize（中心候选、足迹候选、yaw 精修、回退、修复），只看最终提交那一次会低估
+// line_search_failed 的发生率；沙盒与日志用它得到逐次调用的真实分布。
+struct MincoJointSolveCounters
+{
+  std::atomic<std::uint64_t> calls{0};
+  std::atomic<std::uint64_t> converged{0};
+  std::atomic<std::uint64_t> stop_by_delta{0};
+  std::atomic<std::uint64_t> max_iterations{0};
+  std::atomic<std::uint64_t> time_budget{0};
+  std::atomic<std::uint64_t> line_search_failed{0};
+  std::atomic<std::uint64_t> invalid{0};
+  std::atomic<std::uint64_t> iterations{0};
+  std::atomic<std::uint64_t> evaluations{0};
+  std::atomic<std::uint64_t> constraints_unsatisfied{0};
+  std::atomic<std::uint64_t> wall_time_us{0};
+};
+
+MincoJointSolveCounters & jointSolveCounters();
 
 class MincoJointOptimizer
 {

@@ -328,6 +328,11 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("joint_g_epsilon", optimizer_params.joint_g_epsilon);
   declare_parameter<int>("joint_max_iterations", optimizer_params.joint_max_iterations);
   declare_parameter<double>("joint_time_budget_ms", optimizer_params.joint_time_budget_ms);
+  declare_parameter<std::string>("joint_distance_field", optimizer_params.joint_distance_field);
+  declare_parameter<double>(
+    "joint_obstacle_smooth_l1_weight", optimizer_params.joint_obstacle_smooth_l1_weight);
+  declare_parameter<double>(
+    "joint_obstacle_smooth_l1_mu", optimizer_params.joint_obstacle_smooth_l1_mu);
   declare_parameter<double>("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   declare_parameter<double>(
     "esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
@@ -572,6 +577,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("joint_g_epsilon", optimizer_params.joint_g_epsilon);
   get_parameter("joint_max_iterations", optimizer_params.joint_max_iterations);
   get_parameter("joint_time_budget_ms", optimizer_params.joint_time_budget_ms);
+  get_parameter("joint_distance_field", optimizer_params.joint_distance_field);
+  get_parameter(
+    "joint_obstacle_smooth_l1_weight", optimizer_params.joint_obstacle_smooth_l1_weight);
+  get_parameter("joint_obstacle_smooth_l1_mu", optimizer_params.joint_obstacle_smooth_l1_mu);
   get_parameter("esdf_obstacle_max_step", optimizer_params.esdf_obstacle_max_step);
   get_parameter("esdf_obstacle_max_deviation", optimizer_params.esdf_obstacle_max_deviation);
   get_parameter("esdf_obstacle_trust_region", optimizer_params.esdf_obstacle_trust_region);

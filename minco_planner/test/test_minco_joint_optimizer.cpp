@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
+#include "minco_planner/trajectory/consistent_distance_field.hpp"
 #include "minco_planner/trajectory/minco_joint_optimizer.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
 #include "minco_planner/trajectory/minco_time_allocator.hpp"
@@ -253,6 +254,19 @@ TEST(MincoJointOptimizer, EveryCostTermMatchesCentralDifference)
     footprint.params.footprint_clearance = 0.10;
     footprint.params.footprint_edge_samples = 2;
     cases.push_back(footprint);
+    // 平滑 L1 障碍罚：mu 取大一些，使测试里的违例同时覆盖二次段(v<mu)与线性段(v>mu)。
+    Case center_l1{"center_obstacle_smooth_l1", isolatedTerm(), true, false};
+    center_l1.params.obstacle_smooth_l1_weight = 4000.0;
+    center_l1.params.obstacle_smooth_l1_mu = 0.05;
+    center_l1.params.center_clearance = 0.60;
+    cases.push_back(center_l1);
+    Case footprint_l1{"footprint_obstacle_smooth_l1", isolatedTerm(), true, true};
+    footprint_l1.params.obstacle_smooth_l1_weight = 4000.0;
+    footprint_l1.params.obstacle_smooth_l1_mu = 0.05;
+    footprint_l1.params.center_clearance = 0.0;
+    footprint_l1.params.footprint_clearance = 0.10;
+    footprint_l1.params.footprint_edge_samples = 2;
+    cases.push_back(footprint_l1);
     Case guide{"guide_tube", isolatedTerm(), false, false};
     guide.params.guide_weight = 1e5;
     guide.params.max_guide_deviation = 0.10;
@@ -591,6 +605,188 @@ TEST(MincoJointOptimizer, TwentySixMeterPathFinishesWithinBudget)
   // 预算只在每次迭代结束后检查，允许超出最后一次线搜索的耗时。
   EXPECT_LT(result.wall_time_ms, 2.0 * params.solver.time_budget_ms)
     << "iterations " << result.iterations << " evaluations " << result.evaluations;
+}
+
+// 平滑 L1 在 mu 处 C1：值与斜率连续，v<=0 为 0，v>mu 线性斜率为 1。
+TEST(MincoJointOptimizer, SmoothedL1ObstaclePenaltyIsC1AndBoundedSlope)
+{
+  // 单点、单段近似：用障碍罚的总代价对违例量做差分，只检查形状。
+  MincoJointOptimizerParams params = isolatedTerm();
+  params.obstacle_smooth_l1_weight = 1000.0;
+  params.obstacle_smooth_l1_mu = 0.05;
+  params.center_clearance = 0.5;
+  const MincoJointOptimizer optimizer(params);
+  const std::vector<Point> waypoints = {Point(0.0, 0.0), Point(1.0, 0.0)};
+  Eigen::VectorXd durations(1);
+  durations << 1.0;
+  const Eigen::VectorXd x = packVariables(waypoints, durations);
+  const auto cost_for_wall = [&](double wall_y) {
+      // y = wall_y 处的半平面障碍：d = wall_y - y，沿 x 轴的直线上 d 恒定。
+      const JointDistanceQuery wall =
+        [wall_y](const Point & p, double & d, Point & g) {
+          d = wall_y - p.y();
+          g = Point(0.0, -1.0);
+          return true;
+        };
+      MincoJointProblem problem = makeProblem(
+        waypoints, durations, Eigen::Matrix<double, 2, 3>::Zero(), wall, JointYawQuery());
+      Eigen::VectorXd gradient;
+      return optimizer.evaluate(problem, x, gradient);
+    };
+  // 违例 v = center_clearance - d = 0.5 - wall_y；线性段斜率 = weight * 轨迹长度(1 m)。
+  const double slope_linear = (cost_for_wall(0.30) - cost_for_wall(0.31)) / 0.01;
+  EXPECT_NEAR(slope_linear, 1000.0, 1.0);
+  const double slope_far = (cost_for_wall(0.10) - cost_for_wall(0.11)) / 0.01;
+  EXPECT_NEAR(slope_far, 1000.0, 1.0);  // 深度穿障时斜率不增长（三次铰链会随 v^2 增长）
+  EXPECT_DOUBLE_EQ(cost_for_wall(0.60), 0.0);  // v<=0
+  // mu 附近斜率连续：v = mu 两侧各取 1e-4。
+  const double below = (cost_for_wall(0.5 - 0.0499) - cost_for_wall(0.5 - 0.0500)) / 1e-4;
+  const double above = (cost_for_wall(0.5 - 0.0500) - cost_for_wall(0.5 - 0.0501)) / 1e-4;
+  EXPECT_NEAR(below, above, 5.0);
+}
+
+// 一致场：值与梯度来自同一个函数；旧的 provider.query() 在同一张栅格上不满足这一点。
+TEST(ConsistentDistanceField, GradientIsExactDerivativeOfItsOwnValue)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = "odom";
+  grid.info.width = 60;
+  grid.info.height = 40;
+  grid.info.resolution = 0.1;
+  grid.info.origin.position.x = -1.0;
+  grid.info.origin.position.y = -1.0;
+  grid.data.assign(60 * 40, 0);
+  // 一块斜着的小障碍团 + 一道墙，让梯度方向在场内变化。
+  for (int y = 10; y < 18; ++y) {
+    for (int x = 20 + (y - 10) / 2; x < 26 + (y - 10) / 2; ++x) {
+      grid.data[static_cast<std::size_t>(y) * 60 + static_cast<std::size_t>(x)] = 100;
+    }
+  }
+  for (int y = 0; y < 40; ++y) {
+    grid.data[static_cast<std::size_t>(y) * 60 + 55] = 100;
+  }
+  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
+  esdf.updateGrid(grid, 50, false);
+  ASSERT_TRUE(esdf.available());
+
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<double> rx(0.2, 4.6);
+  std::uniform_real_distribution<double> ry(-0.8, 2.8);
+  const double h = 1e-5;
+  for (const minco_planner::JointDistanceFieldMode mode :
+    {minco_planner::JointDistanceFieldMode::kBilinear,
+      minco_planner::JointDistanceFieldMode::kBicubic})
+  {
+    minco_planner::ConsistentDistanceField field;
+    ASSERT_TRUE(field.build(esdf, grid, mode));
+    int checked = 0;
+    int legacy_bad = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+      const Point p(rx(rng), ry(rng));
+      // 避开格线（双线性在格线上梯度不连续，中心差分跨格线无意义）。
+      const double gx = (p.x() + 1.0) / 0.1 - 0.5;
+      const double gy = (p.y() + 1.0) / 0.1 - 0.5;
+      if (std::abs(gx - std::round(gx)) < 1e-3 || std::abs(gy - std::round(gy)) < 1e-3) {
+        continue;
+      }
+      double d = 0.0;
+      Point g = Point::Zero();
+      if (!field.query(p, d, g)) {
+        continue;
+      }
+      double dxp = 0.0, dxm = 0.0, dyp = 0.0, dym = 0.0;
+      Point scratch;
+      ASSERT_TRUE(field.query(p + Point(h, 0.0), dxp, scratch));
+      ASSERT_TRUE(field.query(p - Point(h, 0.0), dxm, scratch));
+      ASSERT_TRUE(field.query(p + Point(0.0, h), dyp, scratch));
+      ASSERT_TRUE(field.query(p - Point(0.0, h), dym, scratch));
+      const Point numeric((dxp - dxm) / (2.0 * h), (dyp - dym) / (2.0 * h));
+      EXPECT_LT((numeric - g).norm(), 1e-5 * std::max(1.0, g.norm()))
+        << "mode " << static_cast<int>(mode) << " at (" << p.x() << "," << p.y() << ")";
+      // 值与 provider 的原始场在格心处一致（插值只改变格间的值）。
+      ats_rc_esdf::EsdfQueryResult legacy;
+      if (esdf.query(p.x(), p.y(), legacy)) {
+        const Point legacy_numeric(
+          (esdf.getDistance(p.x() + h, p.y()) - esdf.getDistance(p.x() - h, p.y())) / (2.0 * h),
+          (esdf.getDistance(p.x(), p.y() + h) - esdf.getDistance(p.x(), p.y() - h)) / (2.0 * h));
+        if ((legacy_numeric - legacy.gradient).norm() > 1e-3) {
+          ++legacy_bad;
+        }
+      }
+      ++checked;
+    }
+    EXPECT_GT(checked, 200);
+    // 旧接口：梯度来自平滑场，与自身距离的数值导数不一致，说明这个测试确实能区分两者。
+    EXPECT_GT(legacy_bad, checked / 4) << "legacy gradient unexpectedly consistent";
+  }
+}
+
+TEST(ConsistentDistanceField, BicubicInterpolatesCellCentresAndRejectsMismatchedGrid)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = "odom";
+  grid.info.width = 30;
+  grid.info.height = 30;
+  grid.info.resolution = 0.1;
+  grid.data.assign(30 * 30, 0);
+  for (int y = 12; y < 18; ++y) {
+    for (int x = 12; x < 18; ++x) {
+      grid.data[static_cast<std::size_t>(y) * 30 + static_cast<std::size_t>(x)] = 100;
+    }
+  }
+  ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
+  esdf.updateGrid(grid, 50, false);
+  ASSERT_TRUE(esdf.available());
+  minco_planner::ConsistentDistanceField field;
+  ASSERT_TRUE(field.build(esdf, grid, minco_planner::JointDistanceFieldMode::kBicubic));
+  for (const auto & cell : {std::make_pair(3, 4), std::make_pair(7, 20),
+      std::make_pair(25, 9)})
+  {
+    const Point centre((cell.first + 0.5) * 0.1, (cell.second + 0.5) * 0.1);
+    double d = 0.0;
+    Point g;
+    ASSERT_TRUE(field.query(centre, d, g));
+    EXPECT_NEAR(d, esdf.getDistance(centre.x(), centre.y()), 1e-6);
+  }
+  // 半格以内的边缘与栅格外都不可查询，与 provider 的语义一致。
+  double d = 0.0;
+  Point g;
+  EXPECT_FALSE(field.query(Point(0.02, 1.5), d, g));
+  EXPECT_FALSE(field.query(Point(-1.0, 1.5), d, g));
+  // 栅格几何与 provider 不符（这里改了原点）时拒绝，调用方回退旧查询。
+  nav_msgs::msg::OccupancyGrid shifted = grid;
+  shifted.info.origin.position.x = 0.5;
+  minco_planner::ConsistentDistanceField mismatched;
+  EXPECT_FALSE(mismatched.build(esdf, shifted, minco_planner::JointDistanceFieldMode::kBicubic));
+  EXPECT_FALSE(mismatched.valid());
+  minco_planner::ConsistentDistanceField legacy_mode;
+  EXPECT_FALSE(legacy_mode.build(esdf, grid, minco_planner::JointDistanceFieldMode::kLegacy));
+}
+
+TEST(MincoJointOptimizer, SolveCountersRecordTerminationReason)
+{
+  const auto & counters = minco_planner::jointSolveCounters();
+  const std::uint64_t calls_before = counters.calls.load();
+  const std::uint64_t terminal_before = counters.converged.load() + counters.stop_by_delta.load() +
+    counters.max_iterations.load() + counters.time_budget.load() +
+    counters.line_search_failed.load() + counters.invalid.load();
+  const MincoJointOptimizer optimizer;
+  const std::vector<Point> guide = {Point(0.0, 0.0), Point(3.0, 0.0)};
+  const std::vector<Point> waypoints = MincoJointOptimizer::resampleByArcLength(guide, 1.0);
+  const MincoJointResult ok = optimizer.optimize(
+    Eigen::Matrix<double, 2, 3>::Zero(), waypoints, allocate(waypoints), JointDistanceQuery(),
+    JointYawQuery());
+  ASSERT_TRUE(ok.solved);
+  // 非法输入也要记一次（invalid_input 归入 invalid 桶），每次调用恰好落入一个桶。
+  const MincoJointResult bad = optimizer.optimize(
+    Eigen::Matrix<double, 2, 3>::Zero(), {Point(0.0, 0.0)}, Eigen::VectorXd(),
+    JointDistanceQuery(), JointYawQuery());
+  EXPECT_FALSE(bad.solved);
+  EXPECT_EQ(counters.calls.load(), calls_before + 2U);
+  const std::uint64_t terminal_after = counters.converged.load() + counters.stop_by_delta.load() +
+    counters.max_iterations.load() + counters.time_budget.load() +
+    counters.line_search_failed.load() + counters.invalid.load();
+  EXPECT_EQ(terminal_after, terminal_before + 2U);
 }
 
 }  // namespace
