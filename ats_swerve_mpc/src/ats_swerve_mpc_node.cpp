@@ -799,6 +799,7 @@ void AtsSwerveMpcNode::onPlannerStatus(
     return;
   }
   bool stop = false;
+  bool superseded_only = false;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     if (message->localization_epoch < planner_epoch_ ||
@@ -835,6 +836,13 @@ void AtsSwerveMpcNode::onPlannerStatus(
       if (planner_generation_usable_ && mapReadyFreshLocked()) {
         ready_lease_generation_ = planner_generation_;
       }
+      // 同一 epoch 内更新的 generation 就绪：旧命令照常作废并停车，但这不是危险停车，
+      // 不推进 last_stop_stamp_。旧 reference 不可能复活：EXECUTE 必须带新 generation
+      // （mapExecutionValidLocked），而新 generation 的命令只能在本状态之后由 Goal
+      // Manager 提交。domain 112：替换 EXECUTE 的 reference 戳 44.4225 s 早于这里的
+      // 停车戳，被 installPath 判为"早于最近一次急停"，无停车重规划因此每次都停住。
+      // legacy Path 模式没有 generation 绑定，仍按原规则推进停车戳。
+      superseded_only = execution_command_enabled_ && changed_identity && !changed_epoch;
     } else {
       planner_generation_usable_ = false;
       stop = true;
@@ -844,7 +852,7 @@ void AtsSwerveMpcNode::onPlannerStatus(
     }
   }
   if (stop) {
-    engageFailStop();
+    engageFailStop(!superseded_only);
   }
 }
 
@@ -1673,14 +1681,16 @@ void AtsSwerveMpcNode::reportSolverDiagnostics(const Se2MpcResult &result) {
  * @details 首次进入时清空 reference、controller warm state 和 frame/deadline；每次调用都通过
  *          同一 command publisher 重发零速度，防止下游保持最后一条非零 Twist。
  */
-void AtsSwerveMpcNode::engageFailStop() {
+void AtsSwerveMpcNode::engageFailStop(bool record_stop_stamp) {
   const bool was_engaged = fail_stop_engaged_.exchange(true);
   if (!was_engaged) {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     trajectory_tracker_.clear();
     trajectory_frame_.clear();
     trajectory_deadline_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
-    last_stop_stamp_ = now();
+    if (record_stop_stamp) {
+      last_stop_stamp_ = now();
+    }
     controller_->reset();
   }
   last_control_.setZero();
