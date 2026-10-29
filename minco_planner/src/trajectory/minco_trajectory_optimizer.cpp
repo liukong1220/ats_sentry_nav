@@ -11,6 +11,7 @@
 #include <Eigen/Core>
 
 #include "minco_planner/safety/footprint_samples.hpp"
+#include "minco_planner/trajectory/consistent_distance_field.hpp"
 #include "minco_planner/trajectory/minco_joint_optimizer.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
@@ -559,6 +560,8 @@ MincoJointOptimizerParams makeJointParams(const MincoTrajectoryOptimizerParams &
   joint.energy_weight = params.joint_energy_weight;
   joint.time_weight = params.joint_time_weight;
   joint.obstacle_weight = params.joint_obstacle_weight;
+  joint.obstacle_smooth_l1_weight = params.joint_obstacle_smooth_l1_weight;
+  joint.obstacle_smooth_l1_mu = params.joint_obstacle_smooth_l1_mu;
   joint.velocity_weight = params.joint_velocity_weight;
   joint.acceleration_weight = params.joint_acceleration_weight;
   joint.lateral_weight = params.joint_lateral_weight;
@@ -714,7 +717,17 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const bool joint_footprint = joint_obstacle && esdfFootprintOptimizationEnabled() &&
     footprint_orientation && !footprint_orientation->points.empty();
   JointDistanceQuery distance_query;
-  if (joint_obstacle) {
+  // 值与梯度同源的距离场（见 consistent_distance_field.hpp）；几何不符时回退 provider 查询。
+  ConsistentDistanceField consistent_field;
+  JointDistanceFieldMode field_mode = JointDistanceFieldMode::kLegacy;
+  const bool consistent_ready = joint_obstacle && planning_grid != nullptr &&
+    parseJointDistanceFieldMode(params_.joint_distance_field, field_mode) &&
+    consistent_field.build(*esdf, *planning_grid, field_mode);
+  if (consistent_ready) {
+    distance_query = [&consistent_field](const Point & position, double & distance, Point & gradient) {
+        return consistent_field.query(position, distance, gradient);
+      };
+  } else if (joint_obstacle) {
     distance_query = [esdf](const Point & position, double & distance, Point & gradient) {
         ats_rc_esdf::EsdfQueryResult query;
         if (!esdf->query(position.x(), position.y(), query) || !std::isfinite(query.distance) ||

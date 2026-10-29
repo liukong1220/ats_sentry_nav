@@ -56,6 +56,7 @@
 #include "minco_planner/safety/goal_pose_admission.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/safety/local_collision_repair.hpp"
+#include "minco_planner/trajectory/minco_joint_optimizer.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
 #include "minco_planner/trajectory/terminal_yaw_relocation.hpp"
 #include "minco_planner/trajectory/trajectory_quality_evaluator.hpp"
@@ -665,8 +666,39 @@ int main(int argc, char ** argv)
     out << ",\"timing_ms\":{\"node_construct\":" << jsonNumber(build_ms) <<
       ",\"grid_and_esdf\":" << jsonNumber(grid_ms) << ",\"plan_goal\":" << jsonNumber(plan_ms) <<
       ",\"total\":" << jsonNumber(msSince(t_start)) << "}";
+    out << ",\"joint_stats\":{";
+    {
+      const auto & c = minco_planner::jointSolveCounters();
+      const auto get = [](const std::atomic<std::uint64_t> & v) {
+          return static_cast<unsigned long long>(v.load());
+        };
+      out << "\"calls\":" << get(c.calls) << ",\"converged\":" << get(c.converged) <<
+        ",\"stop_by_delta\":" << get(c.stop_by_delta) <<
+        ",\"max_iterations\":" << get(c.max_iterations) <<
+        ",\"time_budget\":" << get(c.time_budget) <<
+        ",\"line_search_failed\":" << get(c.line_search_failed) <<
+        ",\"invalid\":" << get(c.invalid) << ",\"iterations\":" << get(c.iterations) <<
+        ",\"evaluations\":" << get(c.evaluations) <<
+        ",\"constraints_unsatisfied\":" << get(c.constraints_unsatisfied) <<
+        ",\"wall_ms\":" << jsonNumber(static_cast<double>(c.wall_time_us.load()) / 1000.0);
+    }
+    out << "}";
     out << "}";
     std::cout << out.str() << std::endl;
+    // planner.py only forwards the last stderr lines, so repeat the counters there where the
+    // batch harness can read them without changing the sandbox.
+    {
+      const auto & c = minco_planner::jointSolveCounters();
+      std::cerr << "JOINT_STATS calls=" << c.calls.load() << " converged=" << c.converged.load() <<
+        " stop_by_delta=" << c.stop_by_delta.load() <<
+        " max_iterations=" << c.max_iterations.load() <<
+        " time_budget=" << c.time_budget.load() <<
+        " line_search_failed=" << c.line_search_failed.load() <<
+        " invalid=" << c.invalid.load() << " iterations=" << c.iterations.load() <<
+        " evaluations=" << c.evaluations.load() <<
+        " constraints_unsatisfied=" << c.constraints_unsatisfied.load() <<
+        " wall_ms=" << static_cast<double>(c.wall_time_us.load()) / 1000.0 << std::endl;
+    }
   }
   rclcpp::shutdown();
   return exit_code;

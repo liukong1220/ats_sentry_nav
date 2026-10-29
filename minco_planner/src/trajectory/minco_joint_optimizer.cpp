@@ -24,6 +24,22 @@ double cube(double value)
   return value * value * value;
 }
 
+// C1 平滑 L1：v<=0 为 0；0<v<=mu 为 (mu - v/2)(v/mu)^3；v>mu 为 v - mu/2。slope = dℓ/dv。
+double smoothedL1(double violation, double mu, double & slope)
+{
+  if (violation <= 0.0) {
+    slope = 0.0;
+    return 0.0;
+  }
+  if (violation >= mu) {
+    slope = 1.0;
+    return violation - 0.5 * mu;
+  }
+  const double ratio = violation / mu;
+  slope = ratio * ratio * (3.0 - 2.0 * ratio);
+  return (mu - 0.5 * violation) * ratio * ratio * ratio;
+}
+
 // 从 x = [vec(q); τ] 取出内点矩阵（2 x (N-1)）与时长向量。
 void unpack(
   const Eigen::VectorXd & x, int piece_count, Eigen::MatrixXd & inner, Eigen::VectorXd & tau)
@@ -72,6 +88,46 @@ double arcOnGuide(
     }
   }
   return best_arc;
+}
+
+}  // namespace
+
+MincoJointSolveCounters & jointSolveCounters()
+{
+  static MincoJointSolveCounters counters;
+  return counters;
+}
+
+namespace
+{
+
+void recordJointSolve(const MincoJointResult & result)
+{
+  MincoJointSolveCounters & counters = jointSolveCounters();
+  counters.calls.fetch_add(1, std::memory_order_relaxed);
+  counters.iterations.fetch_add(
+    static_cast<std::uint64_t>(std::max(0, result.iterations)), std::memory_order_relaxed);
+  counters.evaluations.fetch_add(
+    static_cast<std::uint64_t>(std::max(0, result.evaluations)), std::memory_order_relaxed);
+  counters.wall_time_us.fetch_add(
+    static_cast<std::uint64_t>(std::max(0.0, result.wall_time_ms) * 1000.0),
+    std::memory_order_relaxed);
+  std::atomic<std::uint64_t> * bucket = &counters.invalid;
+  if (result.termination == "converged") {
+    bucket = &counters.converged;
+  } else if (result.termination == "stop_by_delta") {
+    bucket = &counters.stop_by_delta;
+  } else if (result.termination == "max_iterations") {
+    bucket = &counters.max_iterations;
+  } else if (result.termination == "time_budget") {
+    bucket = &counters.time_budget;
+  } else if (result.termination == "line_search_failed") {
+    bucket = &counters.line_search_failed;
+  }
+  bucket->fetch_add(1, std::memory_order_relaxed);
+  if (result.solved && !result.constraints_satisfied) {
+    counters.constraints_unsatisfied.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 }  // namespace
@@ -193,6 +249,8 @@ double MincoJointOptimizer::evaluate(
   const bool obstacle_enabled = static_cast<bool>(problem.distance);
   const bool center_enabled = obstacle_enabled && params_.center_clearance > 0.0;
   const bool footprint_enabled = obstacle_enabled && static_cast<bool>(problem.yaw);
+  const bool smooth_l1 = params_.obstacle_smooth_l1_weight > 0.0 &&
+    params_.obstacle_smooth_l1_mu > 0.0;
   const double max_speed_squared = params_.max_velocity * params_.max_velocity;
   const double max_acceleration_squared = params_.max_acceleration * params_.max_acceleration;
   const int samples = params_.samples_per_piece;
@@ -233,15 +291,27 @@ double MincoJointOptimizer::evaluate(
       Point grad_velocity = Point::Zero();
       Point grad_acceleration = Point::Zero();
 
+      // 障碍罚：三次铰链（默认）或 C1 平滑 L1（obstacle_smooth_l1_weight > 0）。
+      const auto addObstacle = [&](double violation, const Point & distance_gradient) {
+          if (smooth_l1) {
+            double slope = 0.0;
+            obstacle_penalty += params_.obstacle_smooth_l1_weight *
+              smoothedL1(violation, params_.obstacle_smooth_l1_mu, slope);
+            grad_position -= params_.obstacle_smooth_l1_weight * slope * distance_gradient;
+          } else {
+            obstacle_penalty += params_.obstacle_weight * cube(violation);
+            grad_position -=
+              3.0 * params_.obstacle_weight * violation * violation * distance_gradient;
+          }
+        };
+
       if (center_enabled) {
         double distance = 0.0;
         Point distance_gradient = Point::Zero();
         if (problem.distance(position, distance, distance_gradient) && std::isfinite(distance)) {
           const double violation = params_.center_clearance - distance;
           if (violation > 0.0) {
-            obstacle_penalty += params_.obstacle_weight * cube(violation);
-            grad_position -=
-              3.0 * params_.obstacle_weight * violation * violation * distance_gradient;
+            addObstacle(violation, distance_gradient);
             local.max_center_violation = std::max(local.max_center_violation, violation);
           }
         }
@@ -264,9 +334,7 @@ double MincoJointOptimizer::evaluate(
           }
           const double violation = params_.footprint_clearance - distance;
           if (violation > 0.0) {
-            obstacle_penalty += params_.obstacle_weight * cube(violation);
-            grad_position -=
-              3.0 * params_.obstacle_weight * violation * violation * distance_gradient;
+            addObstacle(violation, distance_gradient);
             local.max_footprint_violation = std::max(local.max_footprint_violation, violation);
           }
         }
@@ -382,6 +450,7 @@ MincoJointResult MincoJointOptimizer::optimize(
   const auto finish = [&result, &started]() {
       result.wall_time_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+      recordJointSolve(result);
       return result;
     };
 

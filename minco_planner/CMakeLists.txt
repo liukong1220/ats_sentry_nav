@@ -104,6 +104,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_atomic_planning_contract test/test_atomic_planning_contract.cpp)
   target_link_libraries(test_atomic_planning_contract ${PROJECT_NAME})
 
+  # Drives the real MincoPlannerNode in-process (same approach as minco_sandbox_cli).
+  ament_add_gtest(test_minco_planner_node_ongrid test/test_minco_planner_node_ongrid.cpp)
+  target_link_libraries(test_minco_planner_node_ongrid ${PROJECT_NAME})
+
   ament_add_gtest(test_reference_path_timing test/test_reference_path_timing.cpp)
   target_link_libraries(test_reference_path_timing ${PROJECT_NAME})
 

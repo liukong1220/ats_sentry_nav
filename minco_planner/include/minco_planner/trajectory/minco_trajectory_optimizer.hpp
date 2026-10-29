@@ -94,6 +94,14 @@ struct MincoTrajectoryOptimizerParams
   double joint_g_epsilon = 1e-5;
   int joint_max_iterations = 200;
   double joint_time_budget_ms = 15.0;
+  // 联合优化用的距离场："legacy" = provider.query()（距离取原始场、梯度取平滑场，两者不是
+  // 同一个函数）；"bilinear"/"bicubic" = 拷出原始场自己插值，值与梯度同源
+  // （见 consistent_distance_field.hpp）。需要 planning_grid 与 ESDF 几何一致，否则回退 legacy。
+  std::string joint_distance_field = "legacy";
+  // > 0 时联合优化的障碍罚用 C1 平滑 L1（A.22.1），权重 [代价/m]；0 = 三次铰链
+  // joint_obstacle_weight。mu 为二次段与线性段的分界违例量 [m]。
+  double joint_obstacle_smooth_l1_weight = 0.0;
+  double joint_obstacle_smooth_l1_mu = 0.01;
   double esdf_obstacle_max_step = 0.10;
   double esdf_obstacle_max_deviation = 0.50;
   double esdf_obstacle_trust_region = 0.10;
