@@ -71,8 +71,13 @@ private:
       const ats_navigation_interfaces::msg::GimbalYawStatus::SharedPtr message);
   /** @brief 控制周期唯一入口：完整检查健康、求解 iLQR、唯一发布并可选 shadow。 */
   void onControlTimer();
-  /** @brief 进入急停状态、清空 tracker/warm state 并通过既有唯一发布者发送零速度。 */
-  void engageFailStop();
+  /**
+   * @brief 进入急停状态、清空 tracker/warm state 并通过既有唯一发布者发送零速度。
+   * @param record_stop_stamp 为 false 时不更新 last_stop_stamp_（只用于同一定位 epoch 内
+   *        地图 generation 被更新的 REFERENCE_READY 取代：旧 reference 已由 generation 相等
+   *        门拒绝，不需要时间戳门；否则紧随其后的替换 EXECUTE 会被误判为"早于急停"）。
+   */
+  void engageFailStop(bool record_stop_stamp = true);
   /** @brief 解析并安装 legacy Path，建立 frame、deadline 和控制器 reset 契约。 */
   bool installPath(const nav_msgs::msg::Path & message);
   /** @brief 在 trajectory mutex 内校验 gimbal 回执的新鲜性和请求/反馈序列一致性。 */

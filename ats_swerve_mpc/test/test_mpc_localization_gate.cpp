@@ -284,7 +284,8 @@ protected:
     std::uint64_t sequence, std::uint64_t epoch, std::uint64_t map_generation,
     std::uint64_t gimbal_request_sequence = 0,
     std::uint64_t manager_incarnation = 0,
-    double command_stamp_offset_s = 0.0)
+    double command_stamp_offset_s = 0.0,
+    double reference_stamp_offset_s = 0.05)
   {
     ExecutionCommand command;
     command.header.stamp = driver_->now() +
@@ -310,7 +311,7 @@ protected:
     command.gimbal_feedback_sequence =
       gimbal_sequence_ > 0 ? gimbal_sequence_ - 1 : 0;
     const rclcpp::Time start =
-      driver_->now() + rclcpp::Duration::from_seconds(0.05);
+      driver_->now() + rclcpp::Duration::from_seconds(reference_stamp_offset_s);
     command.reference.header.stamp = start;
     command.reference.header.frame_id = "odom";
     for (int index = 0; index <= 20; ++index) {
@@ -721,6 +722,57 @@ TEST_F(MpcLocalizationGateTest, NewGenerationRevokesAndLateOldStatusCannotRestor
   publishPlannerStatus(1, 8);
   expectRemainsStopped();  // A READY is map evidence, never execution permission.
   ASSERT_TRUE(moveOnGeneration(8));
+}
+
+// 无停车替换（domain 112）：Goal Manager 在 MINCO 的新 generation REFERENCE_READY 之后
+// 提交 EXECUTE，但 reference 戳是提交时刻，可能早于 MPC 处理该 READY 时的停车时刻。
+// generation 取代不是危险停车，不能让替换被"早于最近一次急停"拒绝；旧 generation
+// 的命令仍被拒绝。
+TEST_F(MpcLocalizationGateTest, ReplacementStampedBeforeNewGenerationReadyIsInstalled) {
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
+  // 替换 reference 的时间基取在新 generation 就绪之前，心跳重发时保持不变
+  // （Goal Manager 的心跳重发同一 reference）。
+  const rclcpp::Time reference_start = driver_->now();
+  publishPlannerStatus(1, 8);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishExecutionWithSequence(++execution_sequence_, 1, 7);
+  expectRemainsStopped();
+  ASSERT_TRUE(spinUntil([this, reference_start]() {
+    if (command_norm_.load() > 0.02) {
+      return true;
+    }
+    publishOdometry();
+    publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+    publishExecutionWithSequence(
+      ++execution_sequence_, 1, 8, 0, 0, 0.0, (reference_start - driver_->now()).seconds());
+    return false;
+  }, 1s));
+}
+
+// 危险停车（FAILED）之后，戳早于停车的 reference 仍不能安装。
+TEST_F(MpcLocalizationGateTest, ReferenceStampedBeforeFailureStopIsStillRejected) {
+  publishPlannerStatus(1, 7);
+  ASSERT_TRUE(moveOnGeneration(7));
+  const rclcpp::Time reference_start = driver_->now();
+  publishPlannerStatus(1, 8, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_RUNTIME_UNSAFE);
+  ASSERT_TRUE(spinUntil([this]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 200ms));
+  publishPlannerStatus(1, 9);
+  EXPECT_FALSE(spinUntil([this, reference_start]() {
+    publishOdometry();
+    publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+    publishExecutionWithSequence(
+      ++execution_sequence_, 1, 9, 0, 0, 0.0, (reference_start - driver_->now()).seconds());
+    return command_norm_.load() > 1e-6;
+  }, 500ms));
+  ASSERT_TRUE(moveOnGeneration(9));
 }
 
 TEST_F(MpcLocalizationGateTest, SameGenerationPublicationAndAcceptedStatusDoNotChurn) {
