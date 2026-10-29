@@ -117,10 +117,6 @@ public:
     if (!std::isfinite(observation_lost_timeout_s_) || observation_lost_timeout_s_ <= 0.0) {
       throw std::invalid_argument("observation_lost_timeout_s must be positive and finite");
     }
-    observation_stamp_max_age_s_ =
-      std::max(0.0, declare_parameter<double>("observation_stamp_max_age_s", 1.0));
-    observation_stamp_max_future_s_ =
-      std::max(0.0, declare_parameter<double>("observation_stamp_max_future_s", 0.25));
     history_duration_s_ = std::max(0.5, declare_parameter<double>("history_duration_s", 5.0));
     const auto max_history = declare_parameter<std::int64_t>("max_odom_history_samples", 2000);
     if (max_history < 2) {
@@ -294,14 +290,6 @@ private:
           stamp, message->sequence, last_input_observation_stamp_,
           last_input_observation_sequence_)) {
       recordRejectionLocked("dropped delayed or duplicate relocalization observation", true);
-      publishStatusLocked();
-      return;
-    }
-
-    const std::string stamp_error = validateObservationStamp(
-      stamp, now(), observation_stamp_max_age_s_, observation_stamp_max_future_s_);
-    if (!stamp_error.empty()) {
-      recordRejectionLocked(stamp_error, true);
       publishStatusLocked();
       return;
     }
@@ -634,8 +622,6 @@ private:
   double odom_timeout_s_{0.5};
   double observation_degraded_timeout_s_{3.0};
   double observation_lost_timeout_s_{10.0};
-  double observation_stamp_max_age_s_{1.0};
-  double observation_stamp_max_future_s_{0.25};
   double history_duration_s_{5.0};
   std::size_t max_odom_history_samples_{2000};
   std::uint64_t odom_history_count_drops_{0};
