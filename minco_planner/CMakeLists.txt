@@ -46,6 +46,17 @@ install(FILES README.md THIRD_PARTY_NOTICES.md
   DESTINATION share/${PROJECT_NAME}
 )
 
+# 参考/minco_sandbox 调试平台的适配器: 在本进程里驱动真实 MincoPlannerNode 并导出参考轨迹。
+# 它是调试工具, 默认不编译, 常规构建和整仓构建不受影响。需要时:
+#   colcon build --base-paths src --packages-select minco_planner \
+#     --cmake-args -DMINCO_BUILD_SANDBOX_CLI=ON
+option(MINCO_BUILD_SANDBOX_CLI "Build minco_sandbox_cli for the MINCO debug sandbox" OFF)
+if(MINCO_BUILD_SANDBOX_CLI)
+  add_executable(minco_sandbox_cli tools/minco_sandbox_cli.cpp)
+  target_link_libraries(minco_sandbox_cli ${PROJECT_NAME})
+  install(TARGETS minco_sandbox_cli DESTINATION lib/${PROJECT_NAME})
+endif()
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
