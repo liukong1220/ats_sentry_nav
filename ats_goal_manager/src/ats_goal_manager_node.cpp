@@ -1,5 +1,6 @@
 // Copyright 2026
 
+#include "ats_goal_manager/goal_deadline.hpp"
 #include "ats_goal_manager/goal_lifecycle.hpp"
 #include "ats_goal_manager/plan_progress_watchdog.hpp"
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
@@ -131,6 +132,10 @@ std::chrono::steady_clock::duration secondsToDuration(double seconds) {
       std::chrono::duration<double>(std::max(0.0, seconds)));
 }
 
+std::int64_t secondsToNanoseconds(double seconds) {
+  return static_cast<std::int64_t>(std::llround(std::max(0.0, seconds) * 1e9));
+}
+
 std::uint64_t managerIncarnation() {
   const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch())
@@ -223,8 +228,8 @@ private:
   struct ActiveGoal {
     std::uint64_t id{0};
     geometry_msgs::msg::PoseStamped target;
-    std::chrono::steady_clock::time_point started;
-    std::chrono::steady_clock::duration timeout{};
+    // 按节点时钟计（use_sim_time 下是 /clock），见 goal_deadline.hpp。
+    GoalDeadline deadline;
     std::shared_ptr<GoalHandleNavigateToPose> action_handle;
     bool cancel_requested{false};
     std::uint64_t localization_epoch{0};
@@ -368,6 +373,7 @@ private:
       if (active_goal_ && active_goal_->action_handle == handle) {
         active_goal_->cancel_requested = true;
         fail_stop_ = true;
+        noteStopReason("action_cancel");
       }
     }
     // cancel 回调立即续发急停；最终 result 由 tick 统一收敛，避免与 planner
@@ -429,8 +435,8 @@ private:
       lifecycle_.start(id, mapReadyLocked() && localizationHealthyLocked());
       active_goal_ = ActiveGoal{id,
                                 target,
-                                std::chrono::steady_clock::now(),
-                                secondsToDuration(timeout_sec),
+                                GoalDeadline(now().nanoseconds(),
+                                             secondsToNanoseconds(timeout_sec)),
                                 handle,
                                 false,
                                 0,
@@ -452,6 +458,7 @@ private:
         active_goal_->waiting_since = std::chrono::steady_clock::now();
       }
       fail_stop_ = true;
+      noteStopReason("start_goal");
       dispatch_now = lifecycle_.state() == GoalLifecycleState::kPlanning;
     }
     // 先停止旧任务；即使旧 MINCO 回调晚到，也会因 goal_id 不匹配而被丢弃。
@@ -466,7 +473,7 @@ private:
     }
     if (dispatch_now) {
       if (!publishPlannerGoal(id, localization_epoch, target)) {
-        suspendActiveGoal(id);
+        suspendActiveGoal("start_goal_dispatch_failed", id);
       }
     }
   }
@@ -515,8 +522,9 @@ private:
     return true;
   }
 
+  // site 只用于日志：急停跳变时打印是哪个调用点挂起了目标（5.1.5 E2）。
   void suspendActiveGoal(
-      std::uint64_t id,
+      const char *site, std::uint64_t id,
       std::optional<std::chrono::steady_clock::time_point> waiting_since = std::nullopt,
       std::uint64_t wait_for_publication_after = 0) {
     {
@@ -526,6 +534,18 @@ private:
       }
       const bool already_waiting =
           lifecycle_.state() == GoalLifecycleState::kWaitingForMap;
+      noteStopReason(std::string("suspend:") + site);
+      if (!already_waiting) {
+        RCLCPP_WARN(
+          get_logger(),
+          "P2 suspend goal=%llu site=%s state=%s replacement_pending=%d "
+          "committed_request=%llu expected_request=%llu map_sequence=%llu",
+          static_cast<unsigned long long>(id), site, stateName(lifecycle_.state()).c_str(),
+          active_goal_->replacement_pending ? 1 : 0,
+          static_cast<unsigned long long>(active_goal_->committed_plan_request_sequence),
+          static_cast<unsigned long long>(active_goal_->expected_plan_request_sequence),
+          static_cast<unsigned long long>(map_status_publication_sequence_));
+      }
       const auto previous_waiting_since = active_goal_->waiting_since;
       candidate_reference_.reset();
       planner_ready_status_.reset();
@@ -639,7 +659,8 @@ private:
           // 尚无完整的更新 snapshot 时等待下一次 map status；已经收到严格更新
           // 的同序号 snapshot 时可立即派发新请求，旧 command 仍先经 suspend 清除。
           suspendActiveGoal(
-            message->goal_id, std::nullopt, wait_for_publication_after);
+            "planner_transient_failure", message->goal_id, std::nullopt,
+            wait_for_publication_after);
         } else {
           finishActive(NavigateToPose::Result::RESULT_PLANNING_FAILED,
                        plannerFailureMessage(message->failure_reason),
@@ -692,6 +713,7 @@ private:
           active_execution_command_.reset();
           pending_yaw_authority_request_.reset();
           fail_stop_ = true;
+          noteStopReason("planner_status_protected_mode_switch");
           // referenceReady() is deliberately valid only from kPlanning.  Keep
           // the goal active but require this newly planned reference to cross
           // the protected request/ack gate before re-entering tracking.
@@ -798,7 +820,7 @@ private:
     if (suspend_goal_id) {
       // map status 与 grid/TF 更新跨 topic，不具备原子顺序。先急停并进入有界等待；
       // 恢复后重规划，持续超时才由 tick 返回 MAP_UNREADY。
-      suspendActiveGoal(*suspend_goal_id);
+      suspendActiveGoal("map_status_not_ready", *suspend_goal_id);
       return;
     }
     // The adapter publishes the immutable snapshot and its heartbeat on two
@@ -832,7 +854,7 @@ private:
     if (suspend_goal_id) {
       // Snapshot and map status are separate DDS topics.  An unavailable
       // snapshot must stop execution even if its status callback arrives next.
-      suspendActiveGoal(*suspend_goal_id);
+      suspendActiveGoal("planning_snapshot_unavailable", *suspend_goal_id);
       return;
     }
     // A candidate can legitimately arrive just before the same adapter
@@ -879,6 +901,7 @@ private:
         planner_ready_status_.reset();
         active_execution_command_.reset();
         fail_stop_ = true;
+        noteStopReason("localization_status_unhealthy_or_epoch_changed");
         active_goal_->localization_epoch = message->epoch;
         active_goal_->recovering = true;
         if (lifecycle_.state() != GoalLifecycleState::kWaitingForMap ||
@@ -915,6 +938,7 @@ private:
             active_execution_command_->gimbal_request_sequence)) {
         active_execution_command_.reset();
         fail_stop_ = true;
+        noteStopReason("gimbal_status_unsatisfied");
         stop_active = true;
         if (active_goal_) {
           active_goal_->recovering = true;
@@ -928,7 +952,7 @@ private:
     if (recover_goal_id) {
       // A lost yaw lease invalidates the tracker.  Re-enter planning so the
       // eventual release can only use a newly timed candidate and fresh ACK.
-      suspendActiveGoal(*recover_goal_id);
+      suspendActiveGoal("gimbal_status_recover", *recover_goal_id);
     }
     tryCommitReference();
   }
@@ -952,7 +976,7 @@ private:
         }
       }
       if (suspend_goal_id) {
-        suspendActiveGoal(*suspend_goal_id);
+        suspendActiveGoal("odom_tf_unhealthy", *suspend_goal_id);
       }
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "%s", reason.c_str());
       return;
@@ -1067,7 +1091,7 @@ private:
           static_cast<unsigned long long>(candidate_publication_sequence),
           static_cast<unsigned long long>(current_publication_sequence));
         if (!publishPlannerGoal(*stale_candidate_goal, replacement_epoch, *replacement_target)) {
-          suspendActiveGoal(*stale_candidate_goal);
+          suspendActiveGoal("replacement_stale_redispatch_failed", *stale_candidate_goal);
         }
         return;
       }
@@ -1078,7 +1102,7 @@ private:
         static_cast<unsigned long long>(*stale_candidate_goal),
         static_cast<unsigned long long>(candidate_publication_sequence),
         static_cast<unsigned long long>(current_publication_sequence));
-      suspendActiveGoal(*stale_candidate_goal);
+      suspendActiveGoal("stale_candidate_rejected", *stale_candidate_goal);
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1109,6 +1133,7 @@ private:
     if (yaw_authority != PlannerStatus::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
         yaw_authority != PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW) {
       fail_stop_ = true;
+      noteStopReason("commit_unsupported_yaw_authority");
       return;
     }
     // With a serial gimbal enabled, every reference is bound to a fresh
@@ -1127,10 +1152,21 @@ private:
     // explicitly selected profile the chassis adapter owns the yaw transform,
     // so a zero request sequence is the deliberate "no gimbal lease"
     // representation.  Real-vehicle profiles keep the request/ack gate.
-    if (require_gimbal_status_ &&
-        (!pending_yaw_authority_request_ ||
-         !gimbalStatusSatisfiesLocked(yaw_authority, requires_gimbal_lock, 0))) {
+    // 替换时 pending_yaw_authority_request_ 已在上一次提交末尾清空（见本函数结尾），
+    // 而 replacing 又跳过了 requestYawAuthorityLocked，所以替换不能再要求"有待确认的请求"
+    // （5.1.6：domain 111 的无停车替换每次都在这里急停）。改为按正在执行的命令已确认的
+    // request/feedback 序号复核云台租约，与 onTick 对 active command 的持续复核是同一道门。
+    const bool gimbal_authorized = replacing ?
+      gimbalStatusSatisfiesLocked(
+        yaw_authority, requires_gimbal_lock,
+        active_execution_command_->gimbal_feedback_sequence,
+        active_execution_command_->gimbal_request_sequence) :
+      (pending_yaw_authority_request_ &&
+       gimbalStatusSatisfiesLocked(yaw_authority, requires_gimbal_lock, 0));
+    if (require_gimbal_status_ && !gimbal_authorized) {
       fail_stop_ = true;
+      noteStopReason(replacing ? "commit_replacement_gimbal_lease_lost" :
+        "commit_gimbal_ack_missing");
       return;
     }
     if (replacing) {
@@ -1157,8 +1193,9 @@ private:
     command.failure_reason = PlannerStatus::FAILURE_NONE;
     command.yaw_authority = yaw_authority;
     command.requires_gimbal_lock = requires_gimbal_lock;
-    command.gimbal_request_sequence = pending_yaw_authority_request_ ?
-      pending_yaw_authority_request_->request_sequence : 0;
+    command.gimbal_request_sequence = replacing ?
+      active_execution_command_->gimbal_request_sequence :
+      (pending_yaw_authority_request_ ? pending_yaw_authority_request_->request_sequence : 0);
     command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
     fillCandidateDigest(command.candidate_content_digest,
@@ -1256,17 +1293,19 @@ private:
           candidate_reference_.reset();
           planner_ready_status_.reset();
             fail_stop_ = true;
+            noteStopReason("tick_gimbal_status_unsatisfied");
           if (active_goal_) {
             active_goal_->recovering = true;
             gimbal_recovery_goal_id = active_goal_->id;
           }
         }
-        const auto elapsed =
-            std::chrono::steady_clock::now() - active_goal_->started;
+        const std::int64_t clock_now_ns = now().nanoseconds();
+        const double elapsed =
+            1e-9 * static_cast<double>(active_goal_->deadline.elapsed(clock_now_ns));
         cancel = active_goal_->cancel_requested ||
                  (active_goal_->action_handle &&
                   active_goal_->action_handle->is_canceling());
-        timeout = elapsed >= active_goal_->timeout;
+        timeout = active_goal_->deadline.expired(clock_now_ns);
         const bool map_ready = mapReadyLocked();
         const bool localization_ready = localizationHealthyLocked();
         const bool recovery_snapshot_ready =
@@ -1276,6 +1315,7 @@ private:
           candidate_reference_.reset();
           planner_ready_status_.reset();
           fail_stop_ = true;
+          noteStopReason("tick_localization_not_ready");
           lifecycle_.start(active_goal_->id, false);
           active_goal_->waiting_since = std::chrono::steady_clock::now();
           map_ready_signal_ = false;
@@ -1478,6 +1518,7 @@ private:
               pending_yaw_authority_request_.reset();
               terminal_converged_since_.reset();
               fail_stop_ = true;
+              noteStopReason("progress_watchdog_replan");
               active_goal_->recovering = true;
               lifecycle_.start(active_goal_->id, true);
               active_goal_->waiting_since.reset();
@@ -1564,7 +1605,7 @@ private:
 
     if (dispatch && snapshot) {
       if (!publishPlannerGoal(snapshot->id, dispatch_epoch, snapshot->target)) {
-        suspendActiveGoal(snapshot->id, snapshot->waiting_since);
+        suspendActiveGoal("tick_dispatch_failed", snapshot->id, snapshot->waiting_since);
       }
     }
     if (progress_replan) {
@@ -1581,15 +1622,15 @@ private:
       if (!publishPlannerGoal(
           progress_replan->id, progress_replan->localization_epoch,
           progress_replan->target, progress_replan_snapshot_sequence)) {
-        suspendActiveGoal(progress_replan->id);
+        suspendActiveGoal("progress_replan_dispatch_failed", progress_replan->id);
       }
     }
     if (gimbal_recovery_goal_id && !progress_replan) {
-      suspendActiveGoal(*gimbal_recovery_goal_id);
+      suspendActiveGoal("tick_gimbal_recovery", *gimbal_recovery_goal_id);
     }
     if (progress_suspend_goal_id && !progress_replan && !gimbal_recovery_goal_id) {
       suspendActiveGoal(
-        *progress_suspend_goal_id, std::nullopt,
+        "progress_watchdog_suspend", *progress_suspend_goal_id, std::nullopt,
         progress_suspend_after_publication);
     }
     if (localization_suspended) {
@@ -1630,6 +1671,10 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stop = fail_stop_ || lifecycle_.emergencyStopRequired();
+      if (stop) {
+        noteStopReason(std::string("tick fail_stop=") + (fail_stop_ ? "1" : "0") +
+          " state=" + stateName(lifecycle_.state()));
+      }
       if (!stop && active_execution_command_) {
         execution_heartbeat = active_execution_command_;
       } else if (active_goal_) {
@@ -1690,6 +1735,7 @@ private:
       pending_yaw_authority_request_.reset();
       terminal_converged_since_.reset();
       fail_stop_ = true;
+      noteStopReason("finish_active");
     }
     publishEmergencyStop(true);
     publishExecutionStop(
@@ -1907,8 +1953,7 @@ private:
     }
   }
 
-  void publishFeedbackLocked(const std::chrono::steady_clock::duration &elapsed,
-                             double distance) {
+  void publishFeedbackLocked(double elapsed_sec, double distance) {
     if (!active_goal_ || !active_goal_->action_handle) {
       return;
     }
@@ -1916,7 +1961,7 @@ private:
     feedback->goal_id = active_goal_->id;
     feedback->state = actionState(lifecycle_.state());
     feedback->distance_remaining = distance;
-    feedback->elapsed_sec = std::chrono::duration<double>(elapsed).count();
+    feedback->elapsed_sec = elapsed_sec;
     feedback->status = stateName(lifecycle_.state());
     if (has_current_pose_) {
       feedback->current_pose = current_pose_;
@@ -1985,16 +2030,35 @@ private:
     message.data = stop;
     emergency_stop_pub_->publish(message);
     bool transition = false;
+    std::string reason;
     {
       std::lock_guard<std::mutex> lock(emergency_stop_log_mutex_);
       transition = !last_emergency_stop_published_ ||
         *last_emergency_stop_published_ != stop;
       last_emergency_stop_published_ = stop;
+      if (transition) {
+        reason = stop ? (stop_reason_.empty() ? std::string("unattributed") : stop_reason_) :
+          std::string("released");
+      }
+      if (!stop || transition) {
+        stop_reason_.clear();
+      }
     }
     if (transition) {
       RCLCPP_WARN(
-        get_logger(), "P2 emergency-stop transition value=%d stamp_ns=%lld",
-        stop ? 1 : 0, static_cast<long long>(now().nanoseconds()));
+        get_logger(), "P2 emergency-stop transition value=%d stamp_ns=%lld reason=%s",
+        stop ? 1 : 0, static_cast<long long>(now().nanoseconds()), reason.c_str());
+    }
+  }
+
+  // 记录"下一次急停跳变"的原因（只用于日志）。同一跳变前有多个来源时保留第一个，
+  // 后到的追加在后面，便于看出先后。可在持有 mutex_ 时调用（锁顺序 mutex_ -> log mutex）。
+  void noteStopReason(const std::string &reason) {
+    std::lock_guard<std::mutex> lock(emergency_stop_log_mutex_);
+    if (stop_reason_.empty()) {
+      stop_reason_ = reason;
+    } else if (stop_reason_.size() < 256U) {
+      stop_reason_ += "+" + reason;
     }
   }
 
@@ -2106,6 +2170,7 @@ private:
   bool fail_stop_{true};
   bool replan_without_stop_enabled_{false};
   std::optional<bool> last_emergency_stop_published_;
+  std::string stop_reason_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_planning_snapshot_signal_;

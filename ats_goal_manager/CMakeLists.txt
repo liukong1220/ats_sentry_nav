@@ -40,6 +40,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_goal_lifecycle test/test_goal_lifecycle.cpp)
   target_include_directories(test_goal_lifecycle PRIVATE include)
 
+  ament_add_gtest(test_goal_deadline test/test_goal_deadline.cpp)
+  target_include_directories(test_goal_deadline PRIVATE include)
+
   ament_add_gtest(test_plan_progress_watchdog test/test_plan_progress_watchdog.cpp)
   target_include_directories(test_plan_progress_watchdog PRIVATE include)
 
@@ -48,6 +51,9 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_planning_snapshot_safety ats_navigation_interfaces geometry_msgs)
 
   ament_add_pytest_test(test_goal_manager_epoch test/test_goal_manager_epoch.py
+    TIMEOUT 40
+  )
+  ament_add_pytest_test(test_goal_manager_replacement test/test_goal_manager_replacement.py
     TIMEOUT 40
   )
 endif()
