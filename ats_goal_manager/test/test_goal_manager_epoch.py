@@ -69,6 +69,7 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             "emergency_stop_heartbeat_period_sec": 0.05,
             "gimbal_status_timeout_sec": 5.0,
         }
+        parameters.update(getattr(cls, "extra_parameters", {}))
         command = [
             executable,
             "--ros-args",
@@ -845,9 +846,18 @@ class TestGoalManagerLocalizationEpoch(unittest.TestCase):
             immediate_recovery_goal.plan_request_sequence,
             recovered_goal.plan_request_sequence,
         )
+        # The tracking heartbeat keeps emitting EXECUTE until the failure is
+        # processed, so only commands after the first STOP are checked: once the
+        # old command is stopped it must not be re-authorised (HEAD flaked 2/8
+        # when this looked at every command after command_count).
+        after = self.execution_commands[command_count:]
+        first_stop = next(
+            index for index, command in enumerate(after)
+            if command.mode == ExecutionCommand.MODE_STOP
+        )
         self.assertFalse(
             any(
                 command.mode == ExecutionCommand.MODE_EXECUTE
-                for command in self.execution_commands[command_count:]
+                for command in after[first_stop:]
             )
         )
