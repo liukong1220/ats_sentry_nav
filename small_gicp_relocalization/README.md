@@ -85,11 +85,13 @@ may set `max_scan_age_s:=0` when message timestamps intentionally do not share t
 replay node's clock; this disables only the age gate, not frame, monotonicity,
 finite-point or range checks.
 
-The fusion node applies a separate receive-time gate to accepted observations:
-`observation_stamp_max_age_s` and `observation_stamp_max_future_s` prevent a
-delayed message from changing `map->odom` merely because the matching odometry
-sample is still present in the history buffer. The existing odometry-history,
-quality, plausibility, confirmation and epoch checks remain authoritative.
+The fusion node has no separate stamp-age gate. An accepted observation is expressed
+against `odom->base` interpolated at the observation stamp, so a delayed observation
+still yields a correct `map->odom`; its age is bounded by the odometry history window
+(`history_duration_s`, default 5 s) and its stamp may not be newer than the latest odometry
+sample (`history_boundary_tolerance_s`). Outside that window the observation is rejected as
+"outside fresh odometry history". Quality, plausibility, confirmation and epoch checks and the
+`observation_timeout_s` lease remain.
 
 For asynchronous multi-guess recovery, the coarse screen uses a sparse cloud and
 therefore has its own `multi_guess.screen_min_inliers` floor (zero selects an
