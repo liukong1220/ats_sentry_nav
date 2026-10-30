@@ -18,7 +18,6 @@
 
     <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
-    <depend>laser_geometry</depend>
     <depend>message_filters</depend>
     <depend>rclcpp</depend>
     <depend>rclcpp_components</depend>
@@ -26,9 +25,6 @@
     <depend>tf2</depend>
     <depend>tf2_ros</depend>
     <depend>tf2_sensor_msgs</depend>
-
-    <exec_depend>launch</exec_depend>
-    <exec_depend>launch_ros</exec_depend>
 
     <test_depend>ament_lint_auto</test_depend>
     <!-- <exec_depend>ament_cmake_copyright</exec_depend> -->
