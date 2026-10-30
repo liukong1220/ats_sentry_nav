@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
 
@@ -352,6 +353,101 @@ TEST(Se2MpcController, SucceedsAtStationaryWarmStart) {
     ASSERT_TRUE(result.success);
   }
   EXPECT_TRUE(result.success);
+}
+
+// 附录 A.9 旋转相位补偿：没有延迟或角速度时必须原样返回，位置永远不变，yaw 归一化。
+TEST(Se2MpcController, RotationPhaseCompensationOnlyShiftsYaw) {
+  const ats_swerve_mpc::State measured(1.0, -2.0, 0.3);
+  EXPECT_EQ(ats_swerve_mpc::rotationPhaseCompensatedState(measured, 3.0, 0.0),
+            measured);
+  EXPECT_EQ(ats_swerve_mpc::rotationPhaseCompensatedState(measured, 0.0, 0.2),
+            measured);
+  EXPECT_EQ(ats_swerve_mpc::rotationPhaseCompensatedState(
+                measured, std::numeric_limits<double>::quiet_NaN(), 0.2),
+            measured);
+
+  const auto shifted =
+      ats_swerve_mpc::rotationPhaseCompensatedState(measured, 3.0, 0.2);
+  EXPECT_DOUBLE_EQ(shifted(0), measured(0));
+  EXPECT_DOUBLE_EQ(shifted(1), measured(1));
+  EXPECT_NEAR(shifted(2), 0.3 + 3.0 * 0.2 / 2.0, 1e-12);
+
+  // 越过 +pi 时折回 [-pi, pi]，与 Se2Model::normalizeAngle 一致。
+  const ats_swerve_mpc::State near_pi(0.0, 0.0, M_PI - 0.05);
+  const auto wrapped =
+      ats_swerve_mpc::rotationPhaseCompensatedState(near_pi, 3.0, 0.1);
+  EXPECT_NEAR(wrapped(2), -M_PI + 0.10, 1e-12);
+}
+
+// 3 rad/s 自转下直线平移：指令在延迟 t_d 后才生效，生效时车体已多转 omega * t_d / 2。
+// 按测量 yaw 旋转的车体系指令序列在世界系横向漂移，漂移率约 |v| * sin(omega * t_d / 2)；按
+// psi + omega * t_d / 2 旋转（节点用的同一个 rotationPhaseCompensatedState）后漂移应基本消失。
+// 度量：把 MPC 求出的整条控制序列从“指令生效时刻的真实状态”用同一个 Se2Model 重放，取世界系
+// 横向（y）偏离直线 reference 的最大值。本用例只隔离旋转相位这一项：reference 取在指令生效
+// 时刻（reference yaw = 生效 yaw，位置与测量重合）。
+TEST(Se2MpcController, RotationPhaseCompensationReducesLateralDeviationWhileSpinning) {
+  constexpr double kSpinRate = 3.0;   // rad/s，车体自转
+  constexpr double kSpeed = 1.5;      // m/s，世界系沿 +x 直线平移
+  constexpr double kDelay = 0.1;      // s，控制延迟 t_d
+  constexpr double kYaw = 0.4;        // rad，当前测量 yaw
+  // 指令生效时的真实 yaw，取 A.9 的相位：psi + omega * t_d / 2。
+  constexpr double kExecutionYaw = kYaw + kSpinRate * kDelay / 2.0;
+  ats_swerve_mpc::Se2MpcConfig config;
+  config.horizon = 20;
+  config.dt = 0.1;
+  config.max_vx = 2.0;
+  config.max_vy = 2.0;
+  config.max_wz = 4.0;
+  // 增量限幅不是本用例的考察对象，放宽到不会截断第一拍。
+  config.max_ax = 10.0;
+  config.max_ay = 10.0;
+  config.max_awz = 10.0;
+
+  // 世界系参考：位置沿 +x 匀速，yaw 自生效 yaw 起以 kSpinRate 自转；车体系前馈按参考 yaw 旋转。
+  std::vector<ats_swerve_mpc::Se2Reference> references;
+  for (int step = 0; step <= config.horizon; ++step) {
+    const double time = step * config.dt;
+    ats_swerve_mpc::Se2Reference reference;
+    const double yaw = kExecutionYaw + kSpinRate * time;
+    reference.state << kSpeed * time, 0.0, yaw;
+    reference.control << std::cos(yaw) * kSpeed, -std::sin(yaw) * kSpeed,
+        kSpinRate;
+    references.push_back(reference);
+  }
+  const ats_swerve_mpc::State measured(0.0, 0.0, kYaw);
+  // 上一拍已发布的指令：稳态自转 + 直线平移，wz 同时就是补偿用的 omega。
+  const ats_swerve_mpc::Control last_control(
+      std::cos(kExecutionYaw) * kSpeed, -std::sin(kExecutionYaw) * kSpeed,
+      kSpinRate);
+
+  ats_swerve_mpc::Se2MpcController uncompensated(config);
+  ats_swerve_mpc::Se2MpcController compensated(config);
+  const auto off = uncompensated.solve(measured, references, last_control);
+  const auto on = compensated.solve(
+      ats_swerve_mpc::rotationPhaseCompensatedState(
+          measured, last_control(2), kDelay),
+      references, last_control);
+  ASSERT_TRUE(off.success);
+  ASSERT_TRUE(on.success);
+
+  // 指令生效时刻的真实状态：位置与测量重合，yaw 为 psi + omega * t_d / 2。
+  const ats_swerve_mpc::State executed(0.0, 0.0, kExecutionYaw);
+  const ats_swerve_mpc::Se2Model model(config.dt);
+  const auto maxLateralDeviation =
+      [&model, &executed](const std::vector<ats_swerve_mpc::Control> &controls) {
+        double deviation = 0.0;
+        for (const auto &state : model.rollout(executed, controls)) {
+          deviation = std::max(deviation, std::abs(state(1)));
+        }
+        return deviation;
+      };
+  const double lateral_off = maxLateralDeviation(off.controls);
+  const double lateral_on = maxLateralDeviation(on.controls);
+
+  // 不补偿时整条序列按错相位旋转，约 2 s 内横向漂出数十厘米；补偿后只剩求解器的小残差。
+  EXPECT_GT(lateral_off, 0.15);
+  EXPECT_LT(lateral_on, 0.05);
+  EXPECT_LT(lateral_on, 0.25 * lateral_off);
 }
 
 } // namespace

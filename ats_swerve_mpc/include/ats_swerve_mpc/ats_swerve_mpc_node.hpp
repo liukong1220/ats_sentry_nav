@@ -78,8 +78,14 @@ private:
    *        门拒绝，不需要时间戳门；否则紧随其后的替换 EXECUTE 会被误判为"早于急停"）。
    */
   void engageFailStop(bool record_stop_stamp = true);
-  /** @brief 解析并安装 legacy Path，建立 frame、deadline 和控制器 reset 契约。 */
-  bool installPath(const nav_msgs::msg::Path & message);
+  /**
+   * @brief 解析并安装 reference，建立 frame、deadline 和控制器 reset 契约。
+   * @param keep_control_state 仅同一 goal、同一定位 epoch、同一 planner generation 内的
+   *        换轨为 true：保留 last_control_ 与 iLQR warm start（下一拍 solve 照常左移一格），
+   *        避免 max_a*dt 增量限幅把换轨第一拍压到约 0.1 m/s。默认 false：清零，与首次安装、
+   *        急停后恢复、legacy Path 的既有行为一致。
+   */
+  bool installPath(const nav_msgs::msg::Path & message, bool keep_control_state = false);
   /** @brief 在 trajectory mutex 内校验 gimbal 回执的新鲜性和请求/反馈序列一致性。 */
   bool gimbalExecutionValidLocked(
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
