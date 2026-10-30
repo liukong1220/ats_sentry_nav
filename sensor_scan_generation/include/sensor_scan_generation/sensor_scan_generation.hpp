@@ -63,6 +63,8 @@ private:
   std::unique_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
 
   tf2::Transform tf_lidar_to_robot_base_;
+  // 静态外参 lidar->robot_base_frame 首次查询成功后置 true，之后不再查 TF。
+  bool has_lidar_to_robot_base_ = false;
   tf2::Transform tf_odom_to_robot_base_;
   tf2::Transform tf_odom_to_chassis_;
   tf2::Transform previous_odom_to_robot_base_;
