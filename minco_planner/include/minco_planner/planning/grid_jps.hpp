@@ -59,7 +59,6 @@ private:
     const nav_msgs::msg::OccupancyGrid & grid,
     const GridIndex & index) const;
   bool isTraversable(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const;
-  bool isCellFree(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const;
   GridOccupancyPolicy occupancyPolicy() const;
   std::size_t linearIndex(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const;
   bool hasForcedNeighbor(
