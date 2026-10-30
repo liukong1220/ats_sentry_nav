@@ -161,7 +161,8 @@ int main(int argc, char ** argv)
   rclcpp::init(argc, argv);
   auto nh = std::make_shared<rclcpp::Node>("laserMapping");
 
-  rclcpp::executors::MultiThreadedExecutor executor;
+  // 回调只在主循环线程里执行（spin_some / spin_once），多线程执行器没有并行可用，只带来开销
+  rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(nh);
 
   readParameters(nh);
@@ -201,7 +202,9 @@ int main(int argc, char ** argv)
 
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
-  rclcpp::Rate rate(500);
+  // 组不出包时阻塞等下一条消息，不再 500 Hz 轮询。超时只为了检查 flg_exit：
+  // SigHandle 替换了 rclcpp 的 SIGINT 处理，Ctrl-C 不会唤醒执行器
+  const auto idle_wait = std::chrono::milliseconds(100);
   while (rclcpp::ok()) {
     if (flg_exit) break;
     executor.spin_some();
@@ -506,8 +509,9 @@ angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y,
       }
       /******* Publish points *******/
       if (scan_pub_en || pcd_save_en) publish_frame_world(pub_laser_cloud_full_res);
+    } else {
+      executor.spin_once(idle_wait);
     }
-    rate.sleep();
   }
   //--------------------------save map-----------------------------------
   // 1. make sure you have enough memories
