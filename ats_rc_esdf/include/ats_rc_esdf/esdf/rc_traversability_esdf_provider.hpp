@@ -36,10 +36,6 @@ public:
   // "this is a local rolling field" assumption explicit through configurable bounds.
   void configureRollingWindow(bool enabled, double size_x, double size_y);
 
-  // slope_grid is published as 0~100 for visualization / transport efficiency.
-  // This parameter tells the provider what physical slope angle the encoded "100" means.
-  void setSlopeGridMaxDegrees(double max_degrees);
-
   void updateGrid(
     const nav_msgs::msg::OccupancyGrid & traversability_grid,
     int obstacle_value_threshold,

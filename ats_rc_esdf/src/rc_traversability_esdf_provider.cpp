@@ -154,12 +154,6 @@ void RcTraversabilityEsdfProvider::configureRollingWindow(bool enabled, double s
   updateRollingWindowBoundsUnlocked();
 }
 
-void RcTraversabilityEsdfProvider::setSlopeGridMaxDegrees(double max_degrees)
-{
-  std::lock_guard<std::mutex> lock(mutex_);
-  slope_grid_max_degrees_ = std::max(1e-3, max_degrees);
-}
-
 void RcTraversabilityEsdfProvider::updateGrid(
   const nav_msgs::msg::OccupancyGrid & traversability_grid,
   int obstacle_value_threshold,

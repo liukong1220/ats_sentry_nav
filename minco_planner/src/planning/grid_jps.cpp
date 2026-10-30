@@ -281,11 +281,6 @@ bool GridJps::isTraversable(const nav_msgs::msg::OccupancyGrid & grid, int x, in
   return hasGridClearance(grid, x, y, params_.safe_distance, occupancyPolicy());
 }
 
-bool GridJps::isCellFree(const nav_msgs::msg::OccupancyGrid & grid, int x, int y) const
-{
-  return isGridCellFree(grid, x, y, occupancyPolicy());
-}
-
 std::size_t GridJps::linearIndex(
   const nav_msgs::msg::OccupancyGrid & grid,
   int x,
