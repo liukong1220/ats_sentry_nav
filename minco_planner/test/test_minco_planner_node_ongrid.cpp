@@ -405,4 +405,77 @@ TEST_F(OnGridBranchTest, InvalidatesFarConflictWhenAdvisoryIsDisabled)
   ASSERT_NO_FATAL_FAILURE(expectInvalidated(2));
 }
 
+// 无停车重规划的起点（调研报告 A.3）：advisory 之后同目标的新请求，起点取旧参考上
+// "车的推进位置 + plan_lead"处，而不是请求冻结的实测位姿；车离旧参考过远时退回实测。
+constexpr double kReplanElapsedSec = 2.0;
+
+class ReplanStartTest : public OnGridBranchTest
+{
+protected:
+  // 把旧参考的提交时刻回拨 kReplanElapsedSec（"车已执行 2 s"不依赖墙钟），实测位姿放在
+  // 旧参考 t=kReplanElapsedSec 处再横向偏 lateral，然后发同目标的第二次请求。
+  void replanFromCar(double lateral)
+  {
+    ASSERT_NO_FATAL_FAILURE(startAndCommit(/*retain=*/true, /*advisory=*/true));
+    feed(arenaWithBlockOnReference(kFarBlockTime));
+    ASSERT_TRUE(node_->replan_advised_reference_stamp_.has_value()) << "no advisory was raised";
+    const builtin_interfaces::msg::Time backdated =
+      node_->now() - rclcpp::Duration::from_seconds(kReplanElapsedSec);
+    node_->active_safety_reference_->trajectory.header.stamp = backdated;
+    node_->replan_advised_reference_stamp_ = backdated;
+
+    car_ = minco_planner::interpolateReferencePoint(committed_.trajectory, kReplanElapsedSec);
+    const auto start = makePose(car_.x, car_.y + lateral);
+    minco_planner::InitialKinematicState seed;
+    seed.valid = true;
+    seed.velocity = Eigen::Vector2d(car_.vx, car_.vy);
+    node_->planGoal(
+      makePose(kGoalX, 0.0), kGoalId, /*localization_epoch=*/1, /*plan_request_sequence=*/2,
+      /*map_publication_sequence=*/2, /*report_status=*/true, &start, &seed);
+    done_ = node_->now();
+
+    ASSERT_TRUE(node_->active_safety_reference_.has_value());
+    ASSERT_EQ(node_->active_safety_reference_->plan_request_sequence, 2U)
+      << "the second request did not commit a new reference";
+    replanned_ = *node_->active_safety_reference_;
+  }
+
+  // 新参考时间原点比提交完成时刻晚多少秒（>0 表示 t=0 还在未来）。
+  double originAheadSec() const
+  {
+    return (rclcpp::Time(replanned_.trajectory.header.stamp) - done_).seconds();
+  }
+
+  minco_planner::ReferencePoint car_;
+  MincoPlannerNode::ActiveSafetyReference replanned_;
+  rclcpp::Time done_{0, 0, RCL_ROS_TIME};
+};
+TEST_F(ReplanStartTest, StartsOnCommittedReferenceAheadOfMeasuredPose)
+{
+  ASSERT_NO_FATAL_FAILURE(replanFromCar(/*lateral=*/0.0));
+  const double lead = node_->replan_start_params_.plan_lead_sec;
+  const auto expected =
+    minco_planner::interpolateReferencePoint(committed_.trajectory, kReplanElapsedSec + lead);
+  const auto & first = replanned_.trajectory.points.front();
+  ASSERT_GT(expected.x - car_.x, 0.05) << "bad scene: the reference barely moves in plan_lead";
+
+  // 新参考的起点是旧参考 t_now + plan_lead 处，而不是请求冻结的实测位姿。
+  EXPECT_NEAR(first.x, expected.x, 0.02) << "measured x=" << car_.x;
+  EXPECT_NEAR(first.y, expected.y, 0.02);
+  EXPECT_GT(first.x - car_.x, 0.8 * (expected.x - car_.x));
+  // 新参考的 t=0 比提交时刻晚 plan_lead（沿用提交处已有的时间重基）。
+  EXPECT_GT(originAheadSec(), 0.0);
+  EXPECT_LE(originAheadSec(), lead + 1e-9);
+}
+
+TEST_F(ReplanStartTest, KeepsMeasuredStartWhenCarIsFarFromCommittedReference)
+{
+  // 横向偏 1.0 m，超过 deviation_max（0.5 m）：起点仍取实测，时间原点就是提交时刻。
+  ASSERT_NO_FATAL_FAILURE(replanFromCar(/*lateral=*/1.0));
+  const auto & first = replanned_.trajectory.points.front();
+  EXPECT_NEAR(first.x, car_.x, 0.1);
+  EXPECT_NEAR(first.y, car_.y + 1.0, 0.1);
+  EXPECT_LE(originAheadSec(), 1e-9);
+}
+
 }  // namespace

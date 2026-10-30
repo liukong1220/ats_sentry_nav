@@ -214,6 +214,8 @@ void MincoPlannerNode::declareAndLoadParams()
     "reference_window_from_robot_progress", reference_window_from_robot_progress_);
   declare_parameter<double>("reference_window_backward_sec", reference_window_backward_sec_);
   declare_parameter<bool>("replan_advisory_enabled", replan_advisory_enabled_);
+  declare_parameter<double>("plan_lead", replan_start_params_.plan_lead_sec);
+  declare_parameter<double>("deviation_max", replan_start_params_.deviation_max_m);
   declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   declare_parameter<bool>("force_body_yaw_follow", force_body_yaw_follow_);
   declare_parameter<std::string>("global_frame", global_frame_);
@@ -465,6 +467,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("retain_reference_horizon_sec", retain_reference_horizon_sec_);
   get_parameter("reference_window_from_robot_progress", reference_window_from_robot_progress_);
   get_parameter("replan_advisory_enabled", replan_advisory_enabled_);
+  get_parameter("plan_lead", replan_start_params_.plan_lead_sec);
+  replan_start_params_.plan_lead_sec = std::isfinite(replan_start_params_.plan_lead_sec) ?
+    std::max(0.0, replan_start_params_.plan_lead_sec) : 0.0;
+  get_parameter("deviation_max", replan_start_params_.deviation_max_m);
   get_parameter("reference_window_backward_sec", reference_window_backward_sec_);
   reference_window_backward_sec_ = std::max(0.0, reference_window_backward_sec_);
   get_parameter("body_yaw_follow_clearance", body_yaw_follow_clearance_);
@@ -1374,7 +1380,11 @@ void MincoPlannerNode::planGoal(
     bool report_status,
     const geometry_msgs::msg::PoseStamped * frozen_start,
     const InitialKinematicState * initial_state) {
+  const auto plan_wall_begin = std::chrono::steady_clock::now();
+  const rclcpp::Time plan_begin_time = now();
   bool keep_active_reference = false;
+  // 无停车重规划时拷一份正在执行的已提交参考，用来取新参考的起点（附录 A.3）。
+  std::optional<ActiveSafetyReference> committed_for_start;
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
     // 由【建议重规划】触发的同目标新请求：旧参考仍在执行，保留它的运行期复检守护与
@@ -1384,7 +1394,9 @@ void MincoPlannerNode::planGoal(
       active_safety_reference_->localization_epoch == localization_epoch &&
       active_safety_reference_->plan_request_sequence < plan_request_sequence &&
       active_safety_reference_->trajectory.header.stamp == *replan_advised_reference_stamp_;
-    if (!keep_active_reference) {
+    if (keep_active_reference) {
+      committed_for_start = active_safety_reference_;
+    } else {
       active_safety_reference_.reset();
     }
   }
@@ -1470,6 +1482,45 @@ void MincoPlannerNode::planGoal(
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_START_TF,
       map_snapshot->generation);
     return;
+  }
+
+  // 无停车重规划的起点（调研报告附录 A.3）。请求里冻结的实测位姿在规划耗时内已落到车后面
+  // （domain 111 目标 69965bd0 第二条参考的起点落后车 0.26 m，车速 0.96 m/s），所以新参考
+  // 改从旧参考上"车的推进位置 + plan_lead"处取 p/v/a/yaw。车离旧参考 >= deviation_max、
+  // 定位 epoch 不同、旧参考已不在执行（含急停撤销）时仍用实测，行为与此前一致。
+  ReplanStart replan_start;
+  bool replan_frame_matches = true;
+  double replan_elapsed_sec = 0.0;
+  const double measured_start_x = start.pose.position.x;
+  const double measured_start_y = start.pose.position.y;
+  if (committed_for_start) {
+    MeasuredStart measured;
+    measured.x = measured_start_x;
+    measured.y = measured_start_y;
+    measured.yaw = tf2::getYaw(start.pose.orientation);
+    if (seed_ptr) {
+      measured.vx = seed_ptr->velocity.x();
+      measured.vy = seed_ptr->velocity.y();
+    }
+    // 旧参考按当前 map->odom 修正后再和实测比较，两者才在同一栅格坐标系里。
+    const ReferenceTrajectory aligned = alignedToCurrentTf(*committed_for_start);
+    replan_frame_matches = aligned.header.frame_id == planning_grid.header.frame_id;
+    replan_elapsed_sec = std::max(0.0, (now() - rclcpp::Time(aligned.header.stamp)).seconds());
+    replan_start = selectReplanStart(
+      replan_frame_matches ? &aligned : nullptr, committed_for_start->localization_epoch,
+      localization_epoch, replan_elapsed_sec, measured, replan_start_params_);
+    if (replan_start.source == ReplanStartSource::kCommitted) {
+      start.pose.position.x = replan_start.x;
+      start.pose.position.y = replan_start.y;
+      start.pose.orientation.x = 0.0;
+      start.pose.orientation.y = 0.0;
+      start.pose.orientation.z = std::sin(replan_start.yaw * 0.5);
+      start.pose.orientation.w = std::cos(replan_start.yaw * 0.5);
+      frozen_seed.valid = true;
+      frozen_seed.velocity = Eigen::Vector2d(replan_start.vx, replan_start.vy);
+      frozen_seed.acceleration = Eigen::Vector2d(replan_start.ax, replan_start.ay);
+      seed_ptr = &frozen_seed;
+    }
   }
 
   geometry_msgs::msg::PoseStamped goal = input_goal;
@@ -2027,13 +2078,41 @@ void MincoPlannerNode::planGoal(
                                  plan_request_sequence, map_publication_sequence, yaw_authority,
                                  report_status, telemetry,
                                  control_from_grid.header.frame_id.empty() ?
-                                 nullptr : &control_from_grid)) {
+                                 nullptr : &control_from_grid,
+                                 replan_start.start_delay_sec)) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_, "【参考提交丢弃】generation=%llu 因规划地图变化或过期而丢弃，等待重规划。",
       static_cast<unsigned long long>(map_snapshot->generation));
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_SNAPSHOT_CHANGED,
       map_snapshot->generation);
     return;
+  }
+  if (committed_for_start) {
+    // 只有无停车重规划才有这一行（不节流，每次建议重规划一行）。source=committed 表示新起点
+    // 取自旧参考，measured 表示退回实测，reason 说明原因。start_gap 是新起点到请求时实测
+    // 位姿的距离，约等于 车速*plan_lead；拿它和提交时刻车的实际位置比，就是新参考采用瞬间
+    // 的起点间隙。plan_ms 为进入 planGoal 到提交的节点时钟耗时，plan_wall_ms 为同段墙钟耗时。
+    const double plan_ms = (now() - plan_begin_time).seconds() * 1000.0;
+    const double plan_wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - plan_wall_begin).count();
+    const double start_gap = std::hypot(
+      start.pose.position.x - measured_start_x, start.pose.position.y - measured_start_y);
+    RCLCPP_INFO(
+      get_logger(),
+      "【重规划起点】目标=%llu 请求=%llu source=%s reason=%s frame_ok=%d elapsed=%.3f "
+      "progress=%.3f lag=%.3f t_ref=%.3f origin_delay=%.3f deviation=%.3f plan_lead=%.3f "
+      "deviation_max=%.3f measured=(%.3f, %.3f) start=(%.3f, %.3f, yaw=%.3f) start_gap=%.3f "
+      "v=(%.3f, %.3f) a=(%.3f, %.3f) plan_ms=%.1f plan_wall_ms=%.1f",
+      static_cast<unsigned long long>(goal_id),
+      static_cast<unsigned long long>(plan_request_sequence),
+      replan_start.source == ReplanStartSource::kCommitted ? "committed" : "measured",
+      replanStartReasonName(replan_start.reason), replan_frame_matches ? 1 : 0,
+      replan_elapsed_sec, replan_start.progress, replan_elapsed_sec - replan_start.progress,
+      replan_start.t_ref, replan_start.start_delay_sec, replan_start.deviation,
+      replan_start_params_.plan_lead_sec, replan_start_params_.deviation_max_m,
+      measured_start_x, measured_start_y, start.pose.position.x, start.pose.position.y,
+      tf2::getYaw(start.pose.orientation), start_gap, replan_start.vx, replan_start.vy,
+      replan_start.ax, replan_start.ay, plan_ms, plan_wall_ms);
   }
   if (marker_pub_) {
     // Marker publication follows the immutable-snapshot commit, so the red
@@ -2380,7 +2459,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     std::uint8_t yaw_authority,
     bool report_status,
     const PlannerCommitTelemetry & telemetry,
-    const geometry_msgs::msg::TransformStamped * control_from_grid) {
+    const geometry_msgs::msg::TransformStamped * control_from_grid,
+    double reference_origin_delay_sec) {
   std::lock_guard<std::mutex> lock(map_mutex_);
   const bool heartbeat_fresh = map_ready_topic_.empty() || steadyHeartbeatLeaseValid(
     last_map_ready_signal_, std::chrono::steady_clock::now(), map_ready_timeout_sec_);
@@ -2411,7 +2491,11 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     return false;
   }
   nav_msgs::msg::Path committed_reference = reference_path;
-  rebasePathTimestamps(committed_reference, now());
+  // 新参考的 t=0 是旧参考上的取点时刻 t0（附录 A.3），比提交时刻晚 reference_origin_delay_sec；
+  // 沿用这里已有的时间重基，不另加一套机制。GoalManager 提交时仍会按自己的 now() 重基。
+  rebasePathTimestamps(
+    committed_reference,
+    now() + rclcpp::Duration::from_seconds(std::max(0.0, reference_origin_delay_sec)));
   safety_state_.plan_safe = true;
   ActiveSafetyReference active_reference;
   active_reference.trajectory = safety_reference;
