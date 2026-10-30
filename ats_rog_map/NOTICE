@@ -12,7 +12,4 @@ in the local reference package.xml.
 The ATS wrapper in src/ats_rog_map_node.cpp is project-specific glue code.
 
 Embedded third-party headers retain their own notices and licenses:
-- include/fmt is copyright Victor Zverovich and licensed under MIT;
-- include/super_utils/backward.hpp is copyright Google Inc. and licensed under MIT;
-- include/super_utils/tinycolormap.hpp is copyright Yuki Koyama under MIT and
-  includes an Apache-2.0-attributed Turbo lookup table from Google LLC.
+- include/fmt is copyright Victor Zverovich and licensed under MIT.
