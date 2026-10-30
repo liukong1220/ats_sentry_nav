@@ -36,15 +36,14 @@ public:
   ~ImuProcess();
 
   void Reset();
-  void Process(const MeasureGroup & meas, PointCloudXYZI::Ptr pcl_un_);
+  // 去畸变点云直接指向 meas.lidar（不再深拷贝）；调用方在下一次 sync_packages 之前只读使用
+  void Process(const MeasureGroup & meas, PointCloudXYZI::Ptr & pcl_un_);
   void set_gyr_cov(const V3D & scaler);
   void set_acc_cov(const V3D & scaler);
   void Set_init(Eigen::Vector3d & tmp_gravity, Eigen::Matrix3d & rot);
 
   MD(12, 12) state_cov = MD(12, 12)::Identity();
-  int lidar_type;
   V3D gravity_;
-  bool imu_en;
   V3D mean_acc;
   bool imu_need_init_ = true;
   bool after_imu_init_ = false;

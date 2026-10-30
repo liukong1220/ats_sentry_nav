@@ -54,7 +54,6 @@ find_package(Eigen3 REQUIRED)
 find_package(glog REQUIRED)
 find_package(OpenMP QUIET)
 find_package(PythonLibs REQUIRED) # Consider using Pybind11 for ROS2
-find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
 if(OPENMP_FOUND)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")

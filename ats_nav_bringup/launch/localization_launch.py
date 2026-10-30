@@ -67,7 +67,6 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
-            "prior_pcd.prior_pcd_map_path": prior_pcd_file,
         }],
         arguments=["--ros-args", "--log-level", log_level],
     )
