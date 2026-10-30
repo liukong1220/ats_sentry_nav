@@ -22,22 +22,15 @@ typedef MTK::vect<1, double> vect1;
 typedef MTK::vect<2, double> vect2;
 
 MTK_BUILD_MANIFOLD(
-  state_input, ((vect3, pos))((SO3, rot))((SO3, offset_R_L_I))((vect3, offset_T_L_I))((vect3, vel))(
-                 (vect3, bg))((vect3, ba))((vect3, gravity)));
-
-MTK_BUILD_MANIFOLD(
   state_output,
   ((vect3, pos))((SO3, rot))((SO3, offset_R_L_I))((vect3, offset_T_L_I))((vect3, vel))(
     (vect3, omg))((vect3, acc))((vect3, gravity))((vect3, bg))((vect3, ba)));
 
 MTK_BUILD_MANIFOLD(input_ikfom, ((vect3, acc))((vect3, gyro)));
 
-MTK_BUILD_MANIFOLD(process_noise_input, ((vect3, ng))((vect3, na))((vect3, nbg))((vect3, nba)));
-
 MTK_BUILD_MANIFOLD(
   process_noise_output, ((vect3, vel))((vect3, ng))((vect3, na))((vect3, nbg))((vect3, nba)));
 
-extern esekfom::esekf<state_input, 24, input_ikfom> kf_input;
 extern esekfom::esekf<state_output, 30, input_ikfom> kf_output;
 
 #define PBWIDTH 30
@@ -60,7 +53,6 @@ extern esekfom::esekf<state_output, 30, input_ikfom> kf_output;
 #define ARRAY_FROM_EIGEN(mat) mat.data(), mat.data() + mat.rows() * mat.cols()
 #define STD_VEC_FROM_EIGEN(mat) \
   vector<decltype(mat)::Scalar>(mat.data(), mat.data() + mat.rows() * mat.cols())
-#define DEBUG_FILE_DIR(name) (string(string(ROOT_DIR) + "Log/" + name))
 
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointXYZRGB PointTypeRGB;
