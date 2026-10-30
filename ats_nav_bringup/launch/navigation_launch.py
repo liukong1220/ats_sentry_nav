@@ -21,6 +21,7 @@ def generate_launch_description():
     require_serial_link = LaunchConfiguration("require_serial_link")
     require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
+    launch_terrain_analysis = LaunchConfiguration("launch_terrain_analysis")
 
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
@@ -61,14 +62,23 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("require_gimbal_status", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument(
+            "launch_terrain_analysis",
+            default_value="False",
+            description="Start terrain_analysis; only the near field of /terrain_map_ext uses it.",
+        ),
     ]
 
     common = {
         "use_sim_time": use_sim_time,
     }
+    # /terrain_map 只进 terrain_analysis_ext 的 4 m 近域点云 /terrain_map_ext（slam_launch.py 的
+    # pointcloud_to_laserscan 与 RViz 在用，slam_launch.py 目前没有入口引用），/traversability_grid
+    # 由 terrain_analysis_ext 自己的体素统计算出、不读它，所以导航默认不启动。
     terrain = Node(
         package="terrain_analysis", executable="terrainAnalysis", name="terrain_analysis",
-        namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
+        namespace=namespace, condition=IfCondition(launch_terrain_analysis), output="screen",
+        respawn=use_respawn, respawn_delay=2.0,
         parameters=[params_file, common], arguments=["--ros-args", "--log-level", log_level],
     )
     terrain_ext = Node(
