@@ -1,515 +1,270 @@
-<div align="center">
+# ats_sentry_nav
 
-# 🧭 ATS SENTRY NAVIGATION
+ATS 四驱四转舵轮哨兵的 ROS 2 Humble 导航仓库，覆盖定位、地图、规划和全向控制。
+本仓位于工作区 `src/ats_sentry_nav`；实机入口与唯一正式参数文件在根仓 `src/ats_sentry_bringup`，
+MuJoCo 仿真在 `src/sim/ats_mujoco_sim`。
 
-**面向 ATS 四驱四转舵轮哨兵的 ROS 2 自研定位、地图、规划与全向控制仓库**
+导航目标统一进入 ATS action `/ats_navigate_to_pose`。运行链路不启动 Nav2 的 server、costmap 和 BT navigator。
+ROGMap 只做环境表示，不做定位；位姿来自 `/localization`。
 
-<p>
-  <img src="https://img.shields.io/badge/C%2B%2B-17%2B-00599C.svg?style=for-the-badge&logo=cplusplus">
-  <img src="https://img.shields.io/badge/CMake-3.8%2B-064F8C.svg?style=for-the-badge&logo=cmake">
-  <img src="https://img.shields.io/badge/ROS%202-Humble-22314E.svg?style=for-the-badge&logo=ros">
-  <img src="https://img.shields.io/badge/Linux-Ubuntu%2022.04-E95420.svg?style=for-the-badge&logo=ubuntu">
-</p>
+## 包职责
 
-<p>
-  <img src="https://img.shields.io/badge/Mapping-ROGMap%20%2F%20RC--ESDF-2E7D32.svg?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Planning-JPS%20%2B%20MINCO%20S3-B00020.svg?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Control-Omnidirectional%20SE2%20MPC-5C2D91.svg?style=for-the-badge">
-</p>
+| 包 | 职责 |
+| :--- | :--- |
+| `livox_ros_driver2` | Livox 雷达驱动，SDK 随包放在 `Livox-SDK2/`。 |
+| `point_lio` | 雷达惯性里程计，输出 `cloud_registered` 与 `aft_mapped_to_init`。 |
+| `loam_interface` | 把 Point-LIO 输出整理成 `/registered_scan` 与 `/lidar_odometry`。 |
+| `sensor_scan_generation` | 由 `/lidar_odometry` 和 `/registered_scan` 生成 `/odometry`、`/sensor_scan` 与相关 TF。 |
+| `small_gicp_relocalization` | `small_gicp_relocalization_node` 用先验 PCD 做 GICP 重定位；`localization_fusion_node` 融合出 `/localization`、`/localization/status` 和 `map -> odom`。small_gicp 头文件放在包内 `include/small_gicp`，不需要另装。 |
+| `terrain_analysis` / `terrain_analysis_ext` | 地形分析。`terrain_analysis_ext` 输出 `/traversability_grid` 等栅格，供 adapter 融合；`terrain_analysis` 默认不启动。 |
+| `ats_rog_map` | ROG-Map 封装：概率占据、膨胀、三维 ESDF，通过 `/rog_map/get_ground_projection` 服务提供数值地面投影。 |
+| `ats_rog_map_interfaces` | 上述 projection 服务的 schema（`GetRogMapProjection.srv`）。 |
+| `ats_rog_map_adapter` | 融合 ROGMap 地面投影、terrain 栅格和静态图，发布 `/rc_esdf/planning_grid` 与 `/rog_map_adapter/*` 状态。 |
+| `ats_rc_esdf` | 二维 signed distance、gradient、unknown 与静态图融合的算法库，被 `ats_rog_map_adapter` 和 `minco_planner` 依赖，没有自己的节点。 |
+| `ats_goal_manager` | `/ats_navigate_to_pose` action server、目标状态机、候选参考的提交复核、急停与 `ExecutionCommand` 执行授权。 |
+| `minco_planner` | JPS/A* 图搜索、MINCO 轨迹优化、独立 yaw、矩形足迹门禁与局部修复，详见 [minco_planner/README.md](./minco_planner/README.md)。 |
+| `ats_swerve_mpc` | 全向 SE2 MPC（约束 iLQR），输出 `/cmd_vel/autonomy_raw`；OSQP LTV-QP 只有诊断用的 `qp_shadow` 模式，详见 [ats_swerve_mpc/README.md](./ats_swerve_mpc/README.md)。 |
+| `fake_vel_transform` | 云台 yaw 与底盘速度 frame 的兼容层。 |
+| `sentry_chassis_vel_transform` | 底盘速度 frame 适配，独立仓库，由 `dependencies.repos` 导入，本仓目录默认为空。 |
+| `ats_cmd_vel_arbiter` | 手动 `/cmd_vel` 与自主 `/cmd_vel/autonomy` 仲裁，唯一输出 `/cmd_vel/selected`。 |
+| `ats_teleop_twist_joy` | 手柄遥控。 |
+| `pointcloud_to_laserscan` | 点云转 LaserScan，只被建图入口 `slam_launch.py` 使用。 |
+| `ats_navigation_interfaces` | 导航 action 与 msg（`NavigateToPose`、`PlannerGoal`、`PlannerStatus`、`ExecutionCommand`、`LocalizationStatus`、`PlanningMapStatus`、`PlanningMapSnapshot` 等）。 |
+| `ats_nav_bringup` | 定位、导航、建图和 RViz 的 launch，`static_map_publisher.py`（发布 `/map`）和 Mid360 用户配置。 |
+| `ats_sentry_nav` | 聚合包，只有依赖声明。 |
+| `third_party/osqp`、`third_party/qdldl` | OSQP 与 QDLDL 源码，由 `ats_swerve_mpc/CMakeLists.txt` 用 `add_subdirectory` 编译。`third_party/COLCON_IGNORE` 让 colcon 不把它们当独立包。 |
 
-<p>
-  <img src="https://img.shields.io/github/stars/liukong1220/ats_sentry_nav?style=for-the-badge">
-  <img src="https://img.shields.io/github/license/liukong1220/ats_sentry_nav?style=for-the-badge">
-  <img src="https://img.shields.io/github/last-commit/liukong1220/ats_sentry_nav?style=for-the-badge">
-</p>
+## 数据流
 
-</div>
-
----
-
-> 当前正式运行链为 Nav2-free：不启动 Nav2 server、costmap、BT navigator，
-> 不消费 `/plan`，也不保留运行时回退入口。导航目标统一进入 ATS
-> `NavigateToPose` action。
-
-## 项目简介
-
-本仓库提供从 LiDAR-Inertial 定位输入到四舵轮车体系速度指令的主要导航能力：
-
-- Point-LIO 里程计与配准点云；
-- ROGMap 概率占据、膨胀、三维 ESDF 与数值地面投影；
-- terrain、静态图和 ROGMap 的 2.5D 保守融合；
-- RC-ESDF signed distance、unknown、gradient 与地图边界语义；
-- JPS/A* 图搜索、整条轨迹 MINCO 联合优化、clearance-aware 独立 yaw、局部时间缩放与
-  矩形足迹安全链；
-- 自研 Goal Manager action 生命周期和执行授权；
-- 保留横移自由度的全向 SE2 MPC（约束 iLQR）；
-- `cmd_vel_arbiter` 手动/自主速度仲裁，唯一输出 `/cmd_vel/selected`。
-
-本仓库不把 ROGMap 当作定位器。`point_lio` 继续提供 `/localization` 与
-`/registered_scan`，ROGMap 只负责环境表示和规划地图数据。
-
-## 目录
-
-- [技术亮点](#技术亮点)
-- [功能模块](#功能模块)
-- [系统依赖](#系统依赖)
-- [Quick Start](#quick-start)
-- [Gazebo 2027 直接启动](#gazebo-2027-直接启动)
-- [实机部署](#实机部署)
-- [接口契约](#接口契约)
-- [统一配置](#统一配置)
-- [数据流与所有权](#数据流与所有权)
-- [RViz 可视化](#rviz-可视化)
-- [测试与验证](#测试与验证)
-- [P4 状态与限制](#p4-状态与限制)
-- [目录结构](#目录结构)
-- [致谢与许可证](#致谢与许可证)
-
-## 技术亮点
-
-### ROGMap 数值投影与唯一地图所有权
-
-`ats_rog_map` 维护概率占据、inflated occupancy 和 3D ESDF，并通过
-`GetRogMapProjection` service 返回二维 occupancy、signed distance、gradient 和 source
-generation。`ats_rog_map_adapter` 直接消费该数值服务，不从 `/rog_map/esdf`
-`PointCloud2` 可视化数据反解析距离。
-
-adapter 融合 ROGMap、terrain/slope 和静态图后，成为
-`/rc_esdf/planning_grid` 的唯一发布者。细静态图降采样按输出单元覆盖范围保守聚合，
-保留 resolution、origin、origin yaw、unknown 和 occupied 语义。
-
-### JPS、MINCO 联合优化与矩形 footprint 安全链
-
-`minco_planner` 的处理链：
+下面的 topic 名来自根仓 `src/ats_sentry_bringup/params/node_params.yaml` 与各节点源码。
 
 ```text
-目标位姿准入 -> JPS/A* 图搜索（净空梯子）-> 路径预处理 -> 整条轨迹 MINCO 联合优化
-（全部内点 q 与段时长 T 一次 L-BFGS，带时间预算）-> planYaw（clearance_aware yaw、
-轮速与窄通道转向局部放慢）-> 矩形足迹门禁（逐点 + 扫掠）
+Livox 雷达 + IMU            /livox/lidar, /livox/imu
+  -> point_lio              cloud_registered, aft_mapped_to_init
+  -> loam_interface         /registered_scan, /lidar_odometry
+  -> sensor_scan_generation /odometry, /sensor_scan, TF
+
+定位   small_gicp_relocalization (/registered_scan + 先验 PCD) -> relocalization_observation
+       localization_fusion (/odometry + observation) -> /localization, /localization/status, TF map -> odom
+
+地图   ats_rog_map (/localization + /registered_scan) -> 服务 /rog_map/get_ground_projection
+       terrain_analysis_ext (/lidar_odometry + /registered_scan) -> /traversability_grid 等
+       ats_rog_map_adapter (ROGMap 投影 + terrain 栅格 + /map 静态图，用 ats_rc_esdf)
+         -> /rc_esdf/planning_grid, /rc_esdf/signed_distance_grid, /rog_map_adapter/{ready,status,planning_snapshot,generation}
+
+规划   /ats_navigate_to_pose -> ats_goal_manager -> /ats_goal_manager/planner_goal
+       -> minco_planner (读 /rc_esdf/planning_grid) -> /minco/planning_status, /minco/reference_path_candidate
+       -> ats_goal_manager 复核并提交 -> /minco/reference_path, /planner/execution_command, /planner/emergency_stop
+
+控制   ats_swerve_mpc (/localization + /minco/reference_path + /planner/execution_command) -> /cmd_vel/autonomy_raw
+       -> fake_vel_transform -> sentry_chassis_vel_transform -> /cmd_vel/autonomy   （两层按 launch 参数启用）
+       -> ats_cmd_vel_arbiter (另有手动 /cmd_vel) -> /cmd_vel/selected
+       -> standard_robot_pp_ros2 串口驱动 (cmd_vel_topic: /cmd_vel/selected) -> 底盘
 ```
 
-`clearance_aware` yaw 在开阔区朝向目标，在窄通道内（进入/退出阈值滞回）对齐路径切线；
-可选正方形 4 阶切线对称、窄段间隙桥接和 yaw 角加速度限制。门禁不通过时依次尝试足迹 yaw
-不动点补解、无 ESDF 基线兜底、局部碰撞修复、终端 yaw 重定位和（默认关闭的）脱困前缀，每个结果都重新经过
-同一门禁。2027 车体足迹为 `0.571 x 0.581 m`；隧道模式固定让 `0.571 m` 面正对隧道，参数与各阶段说明见
-[minco_planner/README.md](./minco_planner/README.md)。
+补充：
 
-2027 隧道 yaw 由 ESDF 估计隧道轴线，入口前必须让车体 `0.571 m` 面正对隧道；隧道内仍由同一矩形 footprint gate 检查，不能用各向同性圆形净空替代。
+- 目标在 `map` 系，规划与 ROGMap 在 `odom` 系（`ats_goal_manager` 的 `goal_frame`、`planning_frame`，`ats_rog_map` 的 `map_frame`）。
+- 速度变换两层各由一个 launch 开关控制，MPC 输出 topic 随之变化，见“启动入口”一节的速度链表。
+- 唯一权威：`/rc_esdf/planning_grid` 只由 adapter 发布，`/cmd_vel/selected` 只由 arbiter 发布。
+- 失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度；`/rog_map_adapter/ready` 是持续续租的 heartbeat，不是永久状态。
+- `ats_rog_map` 与 `ats_rog_map_adapter` 由根仓 `bringup.launch.py` 启动，不在本仓 `navigation_launch.py` 里。
 
-一次规划内，JPS、二维 RC-ESDF、MINCO clearance、footprint gate 与 repair 共用同一个
-MINCO 本地不可变 snapshot。ROGMap source generation、adapter publication sequence 和
-MINCO local snapshot generation 是三个不同编号域，当前不会把它们误写成端到端同号。
+## 构建
 
-### 全向 SE2 MPC 与唯一速度链
-
-控制状态是世界系 `[x, y, yaw]`，MPC 输出是车体系 `[vx, vy, wz]`。正式控制器为约束 iLQR，
-同时约束车体速度/加速度与逐轮轮速、舵角速率；OSQP LTV-QP 只有诊断用的 `qp_shadow` 模式。
-实现保留四舵轮横移能力，不引入差速、ICR 或 `vy=0` 约束。
-
-速度链每一段只有一个 owner。实机默认：
-
-```text
-ats_swerve_mpc -> /cmd_vel/autonomy_raw -> fake_vel_transform -> /cmd_vel/autonomy_gimbal
-  -> chassis_vel_transform -> /cmd_vel/autonomy -> cmd_vel_arbiter -> /cmd_vel/selected -> chassis input
+```bash
+cd /home/ats/ATS_2026_snetry_test
+source /opt/ros/humble/setup.bash
+rosdep install --from-paths src --ignore-src -r -y     # 首次
+MAKEFLAGS=-j4 colcon build --base-paths src --parallel-workers 1 \
+  --packages-up-to ats_sentry_bringup \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
 
-MuJoCo 不启动两个 transform，arbiter 直接订阅 `/cmd_vel/autonomy_raw`。
+- 必须带 `--base-paths src`：工作区里的 `参考/` 有同名参考包，不能进入构建图。
+- 显式带 `-DCMAKE_BUILD_TYPE=Release`，不要依赖各包的默认值。
+- 整仓构建用根仓的 `./build.sh`（按机器内存与核数自动算并发，已带 Release）。单包用 `--packages-select <pkg>`。
+- 与别人正在使用的 `build/`、`install/` 并行验证时，加 `--build-base`、`--install-base` 指向独立目录，不要在共享目录里构建。
+- `sentry_chassis_vel_transform` 在独立仓库：`vcs import --skip-existing src < src/ats_sentry_nav/dependencies.repos`。
+- 依赖：Ubuntu 22.04、ROS 2 Humble、Eigen3、PCL、yaml-cpp、glog、OpenMP、libunwind；Livox SDK 与 small_gicp 已在源码树内。
 
-失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度。
-急停会清空 MPC tracker，旧 reference 不会因 ready 恢复而自动复活。
+## 启动入口与常用参数
 
-### 自研 action 与执行授权
+下面的参数名与默认值取自 launch 源码；以 `ros2 launch <pkg> <file> --show-args` 的输出为准。
 
-`ats_goal_manager` 提供 `/ats_navigate_to_pose`，支持 feedback、result、cancel、preempt 和
-timeout。Goal Manager 将目标、定位 epoch、地图状态和规划结果关联，并通过
-`ExecutionCommand` 向 MPC 发放带 incarnation/sequence 的执行授权。
+### 实机：根仓 `ats_sentry_bringup`
 
-P3 运行链已经使用该授权；P4 的 candidate digest 关联字段已定义，但尚未在全链启用，
-详见 [P4 状态与限制](#p4-状态与限制)。
+```bash
+ros2 launch ats_sentry_bringup real_robot_navigation.launch.py \
+  world:=rmuc_2026 prior_pcd_file:=/绝对路径/rmuc_2026.pcd use_rviz:=true
+```
 
-## 功能模块
+`real_robot_navigation.launch.py` 的参数：
 
-| 包 | 主要职责 | 正式运行角色 |
+| 参数 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `point_lio` | LiDAR-Inertial odometry、配准点云 | `/localization`、`/registered_scan` 的上游来源 |
-| `small_gicp_relocalization` | 先验点云重定位与 localization fusion | 维护 `map -> odom` 和定位健康状态 |
-| `ats_rog_map` | 概率占据、膨胀、3D ESDF、数值地面投影 | 动态地图源 |
-| `ats_rog_map_interfaces` | ROGMap 数值 projection service schema | 地图跨进程契约 |
-| `terrain_analysis` / `terrain_analysis_ext` | 近远场地形与可通行语义 | adapter 的 terrain/slope 来源 |
-| `ats_rog_map_adapter` | ROGMap、terrain、slope、静态图保守融合 | planning grid 唯一 owner |
-| `ats_rc_esdf` | 中立二维 signed distance、unknown、gradient、静态图融合算法 | planner 数值地图后端 |
-| `minco_planner` | JPS/A*、MINCO 联合优化、yaw、局部时间缩放、footprint 门禁与修复 | 规划候选 producer |
-| `ats_goal_manager` | ATS action、目标状态机、提交复核、急停、执行授权 | 导航 action server |
-| `ats_swerve_mpc` | 全向 SE2 MPC（iLQR）、授权/急停/定位 watchdog | `/cmd_vel/autonomy_raw` 唯一 producer |
-| `fake_vel_transform` / `sentry_chassis_vel_transform` | 云台 yaw 与底盘速度 frame 兼容层（后者由 `dependencies.repos` 外置） | 实机默认启用，MuJoCo 不启动 |
-| `ats_cmd_vel_arbiter` | 手动优先、自动执行租约、急停、链路心跳与超时仲裁 | `/cmd_vel/selected` 唯一 producer |
-| `ats_navigation_interfaces` | action、状态、授权及 P4 原子 schema | 跨模块接口权威 |
-| `ats_nav_bringup` | 定位与导航子系统 launch、地图及 RViz 资源 | 被根 bringup 编排 |
+| `world` | `rmuc_2026` | 场地名，决定默认的先验 PCD 文件名。 |
+| `prior_pcd_file` | `<ats_sentry_bringup>/pcd/<world>.pcd` | 先验 PCD，必须是同一场地、已在 map 系下。文件缺失时 `prior_pcd_preflight.launch.py` 拒绝启动，不会换用别的场地。 |
+| `namespace` | 空 | 节点命名空间。 |
+| `params_file` | `<ats_sentry_bringup>/params/node_params.yaml` | 唯一正式参数文件。 |
+| `require_gimbal_status` | `True` | 是否要求云台状态（云台状态桥、Goal Manager、MPC 使用）。 |
+| `launch_behavior` | `True` | `False` 时不启动行为节点，只调导航 action。 |
+| `use_rviz` | `False` | 是否启动 RViz。 |
+| `launch_fake_vel_transform` | `True` | 云台速度 frame 兼容层。 |
+| `launch_chassis_vel_transform` | `True` | 底盘速度 frame 兼容层。 |
+| `log_level` | `info` | 节点日志级别。 |
 
-## 系统依赖
+它把 `use_sim_time:=False`、`require_serial_link:=True`、`launch_small_gicp_relocalization:=True`、
+`launch_localization_fusion:=True` 固定后转给 `bringup.launch.py`。`bringup.launch.py` 自己的
+`launch_fake_vel_transform`、`launch_chassis_vel_transform` 默认值是 `False`，两个入口的默认不同，改动前先看 `--show-args`。
 
-### 基础环境
+`bringup.launch.py` 的其他常用参数：`world`（默认 `rmuc_2025`）、`map`（默认 `<ats_sentry_bringup>/map/<world>.yaml`）、
+`prior_pcd_file`、`use_sim_time`、`use_robot_state_pub`、`launch_joy_teleop`、`launch_rosbag_recorder`、
+`launch_small_gicp_relocalization`、`launch_localization_fusion`、`launch_cmd_vel_arbiter`、`require_serial_link`、
+`mpc_cmd_vel_topic`、`fake_vel_output_topic`、`chassis_vel_input_topic`、`chassis_vel_output_topic`、
+`launch_lidar_static_tf` 及其外参 `lidar_static_tf_x/y/z/roll/pitch/yaw`、`rviz_config_file`、`use_respawn`、`log_level`。
+它启动的内容：串口驱动（`use_robot_state_pub:=False` 时）、雷达静态 TF（`use_sim_time:=False` 且 `launch_lidar_static_tf` 为真时）、云台状态桥（`require_gimbal_status` 为真时）、`ats_rog_map`、
+`ats_rog_map_adapter`、本仓的 `rm_navigation_reality_launch.py`、行为节点、RViz、rosbag 录制。
 
-- Ubuntu 22.04；
-- ROS 2 Humble；
-- C++17 编译器与 CMake；
-- Python 3、`colcon`、`rosdep`、`vcstool`；
-- Eigen3、PCL、OpenCV、yaml-cpp、glog、libunwind；
-- Livox SDK/driver、small_gicp 及工作区内 ATS interface/bringup 包。
+根仓另有 `decision_vision_test.launch.py`、`record_rosbag_launch.py`、`rviz_launch.py`。
 
-独立克隆本仓时，用仓内 manifest 补齐外置的底盘速度 frame adapter：
-
-```bash
-cd /home/ats/ATS_2026_snetry_test
-vcs import --skip-existing src < src/ats_sentry_nav/dependencies.repos
-```
-
-Point-LIO、Livox driver、small_gicp、ROGMap、RC-ESDF、MINCO、Goal Manager 和 MPC
-已经由本仓直接版本控制，不再通过旧 `.gitmodules` 拉取 PB/Nav2 子模块。
-
-建议优先由 `rosdep` 根据活动源码安装系统依赖：
+发送单个目标（会驱动车辆，只在受限低速区域、物理急停可用且操作员授权后执行）：
 
 ```bash
-cd /home/ats/ATS_2026_snetry_test
-source /opt/ros/humble/setup.bash
-sudo rosdep init  # 仅首次使用 rosdep 时执行
-rosdep update
-rosdep install --from-paths src --ignore-src -r -y
-```
-
-若 `rosdep init` 已执行，不要重复初始化。Livox SDK、small_gicp 等无法由当前 rosdep
-环境解析的依赖，按对应上游仓库说明安装。
-
-## Quick Start
-
-### 正式工作区构建
-
-所有 ROS 2 构建必须限制活动源码路径，避免 `参考/` 或同名参考包进入构建图：
-
-```bash
-cd /home/ats/ATS_2026_snetry_test
-source /opt/ros/humble/setup.bash
-MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
-  --parallel-workers 6
-source install/setup.bash
-```
-
-只构建导航核心时可使用：
-
-```bash
-MAKEFLAGS=-j6 colcon build --base-paths src --symlink-install \
-  --packages-select \
-    ats_navigation_interfaces ats_rog_map_interfaces ats_rc_esdf \
-    ats_rog_map ats_rog_map_adapter minco_planner ats_goal_manager \
-    ats_swerve_mpc ats_cmd_vel_arbiter ats_nav_bringup ats_sentry_nav \
-  --parallel-workers 6
-```
-
-单包构建：`colcon build --base-paths src --packages-select <pkg>`。`ats_swerve_mpc` 内置 OSQP。
-QDLDL v0.1.8 内置于 `third_party/qdldl`，`FETCHCONTENT_SOURCE_DIR_QDLDL` 被强制指向该目录；
-不要把它改回空值或 `build/` 下的 git 缓存，否则配置会再次访问 GitHub。
-
-### 启动前检查
-
-```bash
-source /opt/ros/humble/setup.bash
-source /home/ats/ATS_2026_snetry_test/install/setup.bash
-ros2 launch ats_sentry_bringup real_robot_navigation.launch.py --show-args
-```
-
-确认以下实机资源有效后再允许底盘运动：
-
-- `world` 对应的 static map 和 prior PCD 存在；
-- Livox 设备、IP/SDK 和 topic 与 `node_params.yaml` 一致；
-- LiDAR、IMU、底盘、云台外参与 TF 已实测标定；
-- 串口设备、波特率和下位机协议一致；
-- 物理急停、独立安全员和低速测试区域已准备。
-
-## Gazebo 2027 直接启动
-
-Gazebo 仿真入口由 `rmu_gazebo_simulator` 仓库拥有；在工作区根目录构建并 source 后，可直接启动
-RMUC 2027 world。日常算法测试使用 RViz + headless Gazebo：
-
-```bash
-cd /home/ats/ATS_2026_snetry_test
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch rmu_gazebo_simulator ats_gazebo_nav.launch.py \
-  world:=rmuc_2027 \
-  use_gazebo_gt_odometry:=true \
-  use_rviz:=true
-```
-
-需要 Gazebo GUI 时显式传入 `headless:=false use_viewer:=true`。服务器或只验证重定位时，需按
-[Gazebo 仓 README](../sim/gazebo_simulator/README.md) 设置 NVIDIA EGL/surfaceless 环境，并使用独立
-`ROS_DOMAIN_ID`；重定位验证命令会关闭 `launch_planning`，不代表完整导航闭环通过。
-
-## 实机部署
-
-完整实机入口由根仓 `ats_sentry_bringup` 拥有：
-
-```bash
-ros2 launch ats_sentry_bringup real_robot_navigation.launch.py \
-  world:=rmuc_2026 \
-  use_rviz:=true
-```
-
-正式入口默认保持：
-
-```text
-launch_fake_vel_transform:=True
-launch_chassis_vel_transform:=True
-require_gimbal_status:=True
-```
-
-这两个 transform 兼容层属于实机 topic/frame 契约。固定雷达或底盘速度 frame 迁移时，
-只能通过 launch 参数显式关闭，并同时核对下游速度坐标系、TF 和 topic；不能仅关闭
-`chassis_vel_transform` 后继续假设底盘收到相同 frame 的速度。
-
-不启动行为仓、只调导航 action 时：
-
-```bash
-ros2 launch ats_sentry_bringup real_robot_navigation.launch.py \
-  world:=rmuc_2026 \
-  launch_behavior:=false \
-  use_rviz:=true
-```
-
-发送单个调试目标：
-
-```bash
-ros2 action send_goal --feedback \
-  /ats_navigate_to_pose \
+ros2 action send_goal --feedback /ats_navigate_to_pose \
   ats_navigation_interfaces/action/NavigateToPose \
   "{goal_pose: {header: {frame_id: map}, pose: {position: {x: 1.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}, timeout: {sec: 60, nanosec: 0}}"
 ```
 
-该命令会驱动车辆。实车只能在受限低速区域、物理急停可用且操作员明确授权后执行。
+`timeout` 小于等于 0 时使用 Goal Manager 的服务端默认值。
 
-## 接口契约
+### 仿真：MuJoCo
 
-### 主要 Topic
-
-| Topic | 类型 | 主要 producer -> consumer | QoS/语义 |
-| :--- | :--- | :--- | :--- |
-| `/localization` | `nav_msgs/msg/Odometry` | localization fusion -> ROGMap/Goal Manager/MPC | `SensorDataQoS`，运行期已核对 BEST_EFFORT |
-| `/registered_scan` | `sensor_msgs/msg/PointCloud2` | Point-LIO/仿真 sensor -> ROGMap | latest sensor data，运行期已核对 BEST_EFFORT |
-| `/map` | `nav_msgs/msg/OccupancyGrid` | static map publisher -> adapter/RViz | RELIABLE + TRANSIENT_LOCAL |
-| `/rc_esdf/planning_grid` | `nav_msgs/msg/OccupancyGrid` | adapter -> MINCO/behavior/RViz | RELIABLE + TRANSIENT_LOCAL；唯一 owner |
-| `/rog_map_adapter/ready` | `std_msgs/msg/Bool` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL；持续 heartbeat/lease，不是永久 ready |
-| `/rog_map_adapter/status` | `ats_navigation_interfaces/msg/PlanningMapStatus` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL |
-| `/rog_map_adapter/planning_snapshot` | `ats_navigation_interfaces/msg/PlanningMapSnapshot` | adapter -> Goal Manager | RELIABLE + TRANSIENT_LOCAL；实机 profile `require_planning_snapshot: true` |
-| `/ats_goal_manager/planner_goal` | `ats_navigation_interfaces/msg/PlannerGoal` | Goal Manager -> MINCO | 目标和 epoch 身份 |
-| `/minco/planning_status` | `ats_navigation_interfaces/msg/PlannerStatus` | MINCO -> Goal Manager | 规划结果与 snapshot generation |
-| `/minco/reference_path_candidate` | `nav_msgs/msg/Path` | MINCO -> Goal Manager | 未提交候选 reference |
-| `/minco/reference_path` | `nav_msgs/msg/Path` | Goal Manager -> MPC/RViz | 已提交、统一重定时的 reference |
-| `/planner/emergency_stop` | `std_msgs/msg/Bool` | Goal Manager -> MPC/底盘安全链 | RELIABLE + TRANSIENT_LOCAL，带 heartbeat |
-| `/planner/execution_command` | `ats_navigation_interfaces/msg/ExecutionCommand` | Goal Manager -> MPC/arbiter | RELIABLE + TRANSIENT_LOCAL；自动源唯一执行授权 |
-| `/cmd_vel/autonomy_raw` | `geometry_msgs/msg/Twist` | MPC -> `fake_vel_transform`（实机）或 arbiter（MuJoCo） | 车体系 `[vx, vy, wz]` |
-| `/cmd_vel/autonomy` | `geometry_msgs/msg/Twist` | `chassis_vel_transform` -> arbiter | 实机 arbiter 的自主输入 |
-| `/cmd_vel/selected` | `geometry_msgs/msg/Twist` | arbiter -> 唯一最终 velocity bridge | 手动优先、自动源需新鲜 lease |
-
-### 数值地图服务
-
-| Service | 类型 | 契约 |
-| :--- | :--- | :--- |
-| `/rog_map/get_ground_projection` | `ats_rog_map_interfaces/srv/GetRogMapProjection` | 返回二维 occupancy、米制 signed distance、XY gradient、ready/stale 和 source generation |
-
-距离正负号约定：known free 非负、occupied 非正、unknown 为 `NaN`；二维 occupancy 使用
-`0` free、`100` occupied、`-1` unknown。地图外部与 unknown 默认按不可通行处理。
-
-### 导航 Action
-
-| Action | 类型 | 能力 |
-| :--- | :--- | :--- |
-| `/ats_navigate_to_pose` | `ats_navigation_interfaces/action/NavigateToPose` | feedback、result、cancel、preempt、timeout、TF/map/planning 失败码 |
-
-目标必须能转换到 planning frame。timeout 小于等于 0 时使用 Goal Manager 的服务端默认值。
-
-### ROGMap/RViz 诊断
-
-`/rog_map/occ`、`/rog_map/inf_occ`、`/rog_map/unk`、`/rog_map/esdf` 和
-`/rog_map/bounds` 用于可视化与诊断。它们不替代数值 projection service，也不是 planner
-的输入格式。ROGMap 诊断发布与 RViz subscriber 的运行期 QoS 已核对为 BEST_EFFORT。
-
-## 统一配置
-
-正式参数唯一权威是根仓：
-
-```text
-src/ats_sentry_bringup/params/node_params.yaml
-```
-
-正式 launch 将同一个 `params_file` 传给串口、行为、定位、地图、规划与控制节点。
-包内 `*_reality.yaml`、`ats_goal_manager/config/*.yaml` 和 behavior example 不是正式入口的
-第二配置源，只能在明确的 standalone/test 场景中显式传入。
-
-修改参数时优先按以下段落定位：
-
-| 节点段 | 主要内容 |
-| :--- | :--- |
-| `point_lio` / `loam_interface` | 传感器 topic、外参、里程计与 frame |
-| `small_gicp_relocalization` | 重定位、fusion、状态与 timeout |
-| `ats_rog_map` | 地图尺寸、分辨率、概率、膨胀、输入 QoS、projection |
-| `ats_rog_map_adapter` | 高度带、terrain/static 融合、unknown、deadline、lease |
-| `minco_planner` | JPS、MINCO 联合优化、yaw、局部时间缩放、clearance、footprint、repair |
-| `ats_goal_manager` | action、goal tolerance、heartbeat、提交复核、执行授权 |
-| `ats_swerve_mpc` | SE2 模型、horizon、权重、约束、watchdog、输出 topic |
-
-接口 schema 仍以 `.msg`、`.srv`、`.action` 为唯一权威；行为树 XML、航点 CSV、地图图像和
-PCD 是结构化资产，不应被内嵌进 ROS 参数 YAML。
-
-## 数据流与所有权
-
-```mermaid
-flowchart LR
-    Lidar["LiDAR + IMU"] --> LIO["Point-LIO"]
-    LIO --> Odom["/localization"]
-    LIO --> Cloud["/registered_scan"]
-    Odom --> ROG["ROGMap"]
-    Cloud --> ROG
-    ROG --> Projection["numeric ground projection"]
-    Static["static map"] --> Adapter["ROGMap adapter"]
-    Terrain["terrain / slope"] --> Adapter
-    Projection --> Adapter
-    Adapter --> Grid["/rc_esdf/planning_grid"]
-    Grid --> Planner["JPS + MINCO joint opt + yaw + footprint gate"]
-    Goal["/ats_navigate_to_pose"] --> Manager["Goal Manager"]
-    Manager --> Planner
-    Planner --> Manager
-    Manager --> Exec["ExecutionCommand + committed reference"]
-    Exec --> MPC["omnidirectional SE2 MPC"]
-    Odom --> MPC
-    MPC --> Raw["/cmd_vel/autonomy_raw"]
-    Raw --> VT["fake_vel / chassis_vel transform（实机）"]
-    VT --> Arbiter["cmd_vel arbiter"]
-    Raw -. MuJoCo .-> Arbiter
-    Arbiter --> Cmd["/cmd_vel/selected"]
-    Cmd --> Bridge["unique velocity bridge"]
-    Bridge --> Chassis["swerve chassis"]
-```
-
-运行图必须满足：planning grid、`/cmd_vel/autonomy_raw`、`/cmd_vel/selected`、底盘最终输入、关键 TF
-和急停各有唯一权威。
-
-## RViz 可视化
-
-实机配置位于根仓：
-
-```text
-src/ats_sentry_bringup/rviz/sentry_default_view.rviz
-```
-
-当前视图直接展示活动自研链：
-
-- ROGMap occupied、inflated、unknown、bounds 与 ESDF 诊断；
-- `/rc_esdf/planning_grid`；
-- MINCO raw path、candidate/committed reference；
-- MPC reference horizon 与 predicted path；
-- 定位、机器人模型和 TF。
-
-不要用 RViz 中点云的颜色或像素值代替数值地图接口验收。RViz 可见只证明诊断链可观察，
-规划闭环仍需 action、轨迹、速度、底盘和终点证据。
-
-## 测试与验证
-
-### 单元与包级测试
-
-先按单包构建，再在对应构建目录用 `ctest` 运行 GTest：
+仿真入口在根仓 `scripts/test_mujoco_minco_mpc_chain.sh`：启动 MuJoCo 与导航栈，发目标并评估，常用环境变量有
+`ROS_DOMAIN_ID`（默认 `88`）、`TEST_PROFILE`（`default`、`single`、`rectangle`、`south_corridor`、`red_box`、`red_box_2027`、`tunnel_2027`，默认 `single`）、
+`SCENE`（默认 `rmuc_2025`）、`USE_RVIZ`（默认 `false`）、`USE_MUJOCO_VIEWER`。
 
 ```bash
 cd /home/ats/ATS_2026_snetry_test
-colcon build --base-paths src --packages-select minco_planner
-cd build/minco_planner
-ctest -R '^test_' --output-on-failure
+ROS_DOMAIN_ID=88 TEST_PROFILE=single USE_RVIZ=false scripts/test_mujoco_minco_mpc_chain.sh
 ```
 
-`minco_planner` 的 copyright、cpplint、clang_format 等 ament lint 测试是已知历史失败，完整
-`ctest` 不是全绿；功能结论只能基于 `test_*` GTest。`ats_swerve_mpc`、`ats_cmd_vel_arbiter` 等
-包同样在 `build/<pkg>` 下运行 `ctest`。
+手动启动与场景细节见 [src/sim/ats_mujoco_sim/README.md](../sim/ats_mujoco_sim/README.md)，
+RViz 与窗口的使用规则见根仓 `AGENTS.md` 7.1。Gazebo 入口见 [src/sim/gazebo_simulator/README.md](../sim/gazebo_simulator/README.md)。
 
-S1/P4 准备阶段的历史证据（早于速度仲裁迁移和 58 x 58 cm 足迹切换）：
+### 本仓 `ats_nav_bringup/launch`
 
-- **已构建**：8 个目标包按正式 `colcon --base-paths src --symlink-install` 方式通过；
-- **已通过定向测试**：MINCO atomic/snapshot/footprint GTest、Goal Manager epoch、
-  behavior action 和 serial authorization；
-- **已运行 MuJoCo rectangle，domain 184 + RViz**：五段最大终点误差
-  `0.038681 m`，generation `313 -> 1328`；
-- **已运行 MuJoCo rectangle，domain 186 headless**：五段最大终点误差
-  `0.041613 m`，generation `309 -> 1264`；
-- 两次均观测到 south/north 非零 `vy`、唯一 `/cmd_vel_mpc` 与底盘输入 owner、
-  MINCO 离散 collision sample `0`、最终命令/RPM `0`、
-  `contact_violation_count=0`；
-- 上述 `/cmd_vel_mpc` 话题均属于速度仲裁迁移前的历史记录，不能证明当前 selected 链；9 项 P2/P3 独立故障用例曾验证
-  `emergency_stop=true -> /cmd_vel_mpc=0 -> /motion_control=0`。
+| 文件 | 内容 |
+| :--- | :--- |
+| `rm_navigation_reality_launch.py` | 实机导航编排，被根 `bringup.launch.py` 包含。必填 `assets_dir`（根仓 `ats_sentry_bringup` 目录），`map`、`prior_pcd_file`、`params_file`、`rviz_config_file` 默认取自 `assets_dir` 下的 `map/<world>.yaml`、`pcd/<world>.pcd`、`params/node_params.yaml`、`rviz/sentry_default_view.rviz`；`world` 默认 `rmul`。另有 `launch_joy_teleop`、`launch_small_gicp_relocalization`、`launch_localization_fusion`、`launch_fake_vel_transform`、`launch_chassis_vel_transform`、`launch_cmd_vel_arbiter`、`require_serial_link`、`require_gimbal_status`、`use_respawn`、`use_robot_state_pub`、`use_rviz`、`log_level` 等。 |
+| `bringup_launch.py` | 依次包含 `localization_launch.py` 与 `navigation_launch.py`。 |
+| `localization_launch.py` | `static_map_publisher.py`（`/map`）、`point_lio`、`small_gicp_relocalization`、`localization_fusion`；关闭 GICP 时改发恒等的静态 `map -> odom`。 |
+| `navigation_launch.py` | `loam_interface`、`sensor_scan_generation`、`terrain_analysis_ext`、`fake_vel_transform`、`chassis_vel_transform`、`cmd_vel_arbiter`、`minco_planner`、`ats_goal_manager`、`ats_swerve_mpc`；`launch_terrain_analysis`（默认 `False`）控制 `terrain_analysis`。 |
+| `slam_launch.py` | 建图：`point_lio`（`pcd_save.pcd_save_en: True`）、`pointcloud_to_laserscan`、`slam_toolbox`、静态 `map -> odom`。 |
+| `prior_pcd_preflight.launch.py` | 先验 PCD 预检；参数 `world`、`prior_pcd_file`、`launch_small_gicp_relocalization`。 |
+| `joy_teleop_launch.py`、`rviz_launch.py`、`robot_state_publisher_launch.py` | 手柄、RViz、机器人模型。 |
 
-`contact_violation_count=0` 只表示现有 MuJoCo evaluator 未报告接触，不等价于实车物理
-零碰撞，也不替代连续 swept footprint 证明。
+速度链随两个开关变化。根 `bringup.launch.py`、`rm_navigation_reality_launch.py` 和 `navigation_launch.py`
+按下表推导 `mpc_cmd_vel_topic`、`fake_vel_output_topic`、`chassis_vel_input_topic`，`chassis_vel_output_topic` 固定为 `/cmd_vel/autonomy`：
 
-包级 lint 仍有既有 copyright、cpplint、clang-format 和离线 schema 债务。定向功能测试通过
-不能写成全包 lint 通过。
-
-2027 回归证据：`minco_planner` 隧道 yaw、yaw spline、terminal relocation CTest 为 `3/3`；
-MuJoCo `tunnel_B` 进入/通过，隧道内最大 yaw 误差约 `4.9e-12`、终点误差 `0.0`。Gazebo 2027
-入口、RViz、world transport、仿真 Mid360 TF 和 `/registered_scan` 通过 headless 重定位验证；完整 Gazebo 红框导航仍未通过。
-
-## P4 状态与限制
-
-| 项目 | 当前状态 | 边界 |
+| `launch_fake_vel_transform` | `launch_chassis_vel_transform` | 速度链 |
 | :--- | :--- | :--- |
-| `PlanningMapSnapshot.msg` | adapter 已发布 `/rog_map_adapter/planning_snapshot`，Goal Manager 用于提交复核 | MINCO 仍消费 `/rc_esdf/planning_grid`，尚未替代旧 grid/status 组合 |
-| `PlannerCandidate.msg` | 已定义、候选关联契约 GTest 已通过 | MINCO 尚未在正式运行链输出原子 candidate |
-| `ExecutionCommand` candidate correlation 字段 | 已加入 schema | 正式运行时字段仍为零，consumer 继续执行 P3 授权规则 |
-| adapter -> MINCO -> Goal Manager -> MPC -> serial | 未完成 P4 迁移 | 不得宣称 digest/serial 原子链已上线 |
-| 连续 swept footprint | 未完成 | 门禁为逐点 + 相邻点自适应细分的扫掠采样，不是连续体证明 |
-| 实车动力学、制动与 HIL | 未执行 | MuJoCo 参数和结果不能作为 ATS 实测性能 |
+| 真 | 真 | MPC -> `/cmd_vel/autonomy_raw` -> fake -> `/cmd_vel/autonomy_gimbal` -> chassis -> `/cmd_vel/autonomy` |
+| 真 | 假 | MPC -> `/cmd_vel/autonomy_raw` -> fake -> `/cmd_vel/autonomy` |
+| 假 | 真 | MPC -> `/cmd_vel/autonomy_gimbal` -> chassis -> `/cmd_vel/autonomy` |
+| 假 | 假 | MPC -> `/cmd_vel/autonomy` |
 
-下一阶段应先完成原子 schema 的端到端运行迁移、重启/乱序/digest mismatch 故障回放，再进入
-抬轮 HIL 和受限低速实车。任何 unexpected motion、telemetry 丢失、过热/过流或物理急停
-不可用都应立即停止测试。
+arbiter 订阅的自主输入 `autonomy_cmd_vel_topic` 默认是 `/cmd_vel/autonomy`。
+
+### 各包独立 launch
+
+`ros2 launch ats_rog_map ats_rog_map.launch.py`、`ats_rog_map_adapter ats_rog_map_adapter.launch.py`、
+`ats_swerve_mpc ats_swerve_mpc.launch.py` 可单独启动对应节点。包内的 `config/*.yaml`
+（如 `ats_goal_manager/config`、`ats_swerve_mpc/config/*_reality.yaml`）不是正式入口的第二配置源，只在独立调试或测试时显式传入。
+
+### Point-LIO 手动入口
+
+```bash
+ros2 launch point_lio point_lio.launch.py                       # 默认 rviz:=True，配置为 config/mid360.yaml
+ros2 launch point_lio point_lio.launch.py rviz:=False \
+  point_lio_cfg_dir:=/绝对路径/config/avia.yaml
+```
+
+参数：`namespace`、`rviz`、`point_lio_cfg_dir`。`config/` 下有 `avia`、`horizon`、`mid360`、`ouster64`、`velody16` 五份参数，
+RViz 配置是 `rviz_cfg/point_lio_replay.rviz`。这个 launch 不被任何实机或仿真入口包含；
+正式运行的 Point-LIO 参数来自 `node_params.yaml` 的 `point_lio:` 段。Point-LIO 本身的说明见 [point_lio/README.md](./point_lio/README.md)。
+
+## 参数
+
+正式参数的唯一权威是根仓 `src/ats_sentry_bringup/params/node_params.yaml`。按节点段定位：
+
+| 节点段 | 主要内容 |
+| :--- | :--- |
+| `livox_ros_driver2`、`point_lio`、`loam_interface`、`sensor_scan_generation` | 雷达与 IMU topic、frame、里程计输出。 |
+| `small_gicp_relocalization`、`localization_fusion` | 重定位、融合、状态与 timeout。 |
+| `terrain_analysis`、`terrain_analysis_ext` | 地形与可通行栅格。 |
+| `ats_rog_map`、`ats_rog_map_adapter` | 地图尺寸、分辨率、概率、膨胀、projection 服务、栅格 topic、ready/lease。 |
+| `minco_planner` | JPS、MINCO、yaw、足迹、修复、输入输出 topic。 |
+| `ats_goal_manager` | action、goal/planning frame、heartbeat、提交复核、执行授权。 |
+| `ats_swerve_mpc` | SE2 模型、horizon、权重、约束、watchdog、输出 topic。 |
+| `cmd_vel_arbiter` | 手动/自主/选中 topic、超时、串口链路检查。 |
+| `fake_vel_transform`、`chassis_vel_transform`、`ats_teleop_twist_joy_node` | 速度 frame 兼容层与手柄映射。 |
+
+接口 schema 以 `.msg`、`.srv`、`.action` 为准；行为树 XML、航点 CSV、地图图像和 PCD 是结构化资产，不放进参数 YAML。
+
+## 测试与验证
+
+```bash
+cd /home/ats/ATS_2026_snetry_test
+MAKEFLAGS=-j4 colcon build --base-paths src --packages-select <pkg> --parallel-workers 1 \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon test --base-paths src --packages-select <pkg>
+colcon test-result --test-result-base build/<pkg> --verbose
+python3 scripts/validate_navigation_config.py          # 正式参数、launch 与 RViz 契约
+ros2 launch <pkg> <file> --show-args
+```
+
+- 部分包的 ament lint 用例（copyright、cpplint、uncrustify、black、pep257 等）在当前 HEAD 上本来就是红的，
+  功能结论只看对应的 GTest/pytest 用例，不要写成“全包测试通过”。
+- 单元测试通过、topic 存在或 RViz 可见都不代替闭环验收；闭环用 MuJoCo 入口，结果要有终点测量和话题证据。
+
+## 已知边界
+
+- `PlannerCandidate.msg` 与 `ExecutionCommand` 的候选关联字段已在 schema 中定义；目前只有
+  `minco_planner/include/minco_planner/nodes/atomic_planning_contract.hpp` 及其测试使用候选结构，正式运行链还没有发布它。
+- 足迹门禁是离散采样（逐点与扫掠），连续 swept footprint 属于后续阶段，不是连续体证明。
+- 实车动力学、制动与 HIL 尚未验证；MuJoCo 的参数和结果不能当作 ATS 实测。
+- 分阶段状态与验收记录见根仓 `AGENTS.md` 与 `docs/`。
 
 ## 目录结构
 
 ```text
 ats_sentry_nav/
-├── ats_navigation_interfaces/   # action、状态、授权和 P4 原子接口
-├── ats_rog_map_interfaces/      # ROGMap 数值 projection service
-├── ats_rog_map/                 # 概率地图、膨胀、3D ESDF、projection
-├── ats_rog_map_adapter/         # 地面投影与 2.5D 保守融合
-├── ats_rc_esdf/                 # 中立 RC-ESDF 与静态图融合算法
-├── minco_planner/               # JPS/A*、MINCO 联合优化、yaw、footprint 门禁与修复
-├── ats_goal_manager/            # ATS action 与执行提交状态机
-├── ats_swerve_mpc/              # 全向 SE2 MPC（iLQR + OSQP shadow）
-├── ats_cmd_vel_arbiter/         # 手动/自主速度仲裁，/cmd_vel/selected 唯一 owner
-├── ats_nav_bringup/             # 导航/定位 launch、地图、RViz
-├── point_lio/                   # LiDAR-Inertial odometry
-├── small_gicp_relocalization/   # 重定位与 localization fusion
-├── terrain_analysis*/           # 地形与 traversability
-├── fake_vel_transform/          # 云台 yaw 速度 frame 兼容层
-├── sentry_chassis_vel_transform/ # 底盘速度 frame 适配（dependencies.repos 外置）
-├── loam_interface/              # 里程计点云 frame 接口
-├── sensor_scan_generation/      # 点云/TF 链适配
-├── ats_teleop_twist_joy/        # 手柄遥控
-├── third_party/osqp/            # ats_swerve_mpc 使用的 OSQP 源码
-├── dependencies.repos           # standalone 外置源码依赖
-└── ats_sentry_nav/              # 导航聚合包
+├── ats_navigation_interfaces/    ats_rog_map_interfaces/
+├── ats_rog_map/    ats_rog_map_adapter/    ats_rc_esdf/
+├── minco_planner/    ats_goal_manager/    ats_swerve_mpc/    ats_cmd_vel_arbiter/
+├── ats_nav_bringup/    ats_sentry_nav/    ats_teleop_twist_joy/
+├── point_lio/    loam_interface/    sensor_scan_generation/    small_gicp_relocalization/
+├── terrain_analysis/    terrain_analysis_ext/    pointcloud_to_laserscan/    livox_ros_driver2/
+├── fake_vel_transform/    sentry_chassis_vel_transform/   （后者来自 dependencies.repos）
+├── third_party/    osqp/  qdldl/  COLCON_IGNORE
+├── dependencies.repos    Dockerfile
+└── README.md    README_en.md
 ```
 
 ## 致谢与许可证
 
-感谢以下开源项目和社区对本项目的基础支持：
-
-| 技术/项目 | 在本仓中的用途 | 上游 |
+| 项目 | 用途 | 上游 |
 | :--- | :--- | :--- |
-| ROS 2 | 节点、Topic、Service、Action、TF、launch 与工具链 | [ros2/ros2](https://github.com/ros2/ros2) |
-| Point-LIO | LiDAR-Inertial odometry 与配准点云基础 | [hku-mars/Point-LIO](https://github.com/hku-mars/Point-LIO) |
+| Point-LIO | 雷达惯性里程计 | [hku-mars/Point-LIO](https://github.com/hku-mars/Point-LIO) |
 | ROG-Map | 概率占据、滑窗地图与 ESDF 核心 | [hku-mars/ROG-Map](https://github.com/hku-mars/ROG-Map) |
-| GCOPTER / MINCO | 非均匀时间 MINCO S3 轨迹表示与优化基础 | [ZJU-FAST-Lab/GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) |
-| small_gicp | 点云配准与重定位基础 | [koide3/small_gicp](https://github.com/koide3/small_gicp) |
-| Livox ROS Driver 2 | Livox 设备接入与带点时间戳的消息 | [Livox-SDK/livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) |
-| Eigen / PCL / OpenCV / yaml-cpp | 数值计算、点云、图像与配置解析 | 各上游项目 |
+| GCOPTER / MINCO | MINCO S3 轨迹表示与优化基础 | [ZJU-FAST-Lab/GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) |
+| small_gicp | 点云配准与重定位 | [koide3/small_gicp](https://github.com/koide3/small_gicp) |
+| Livox ROS Driver 2 | Livox 设备接入 | [Livox-SDK/livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) |
+| OSQP / QDLDL | `ats_swerve_mpc` 的 QP 诊断求解器 | [osqp/osqp](https://github.com/osqp/osqp)、[osqp/qdldl](https://github.com/osqp/qdldl) |
+| pointcloud_to_laserscan | 点云转 LaserScan | [ros-perception/pointcloud_to_laserscan](https://github.com/ros-perception/pointcloud_to_laserscan) |
 
-本仓聚合了不同来源与许可证的包。ATS 自研主要包通常为 Apache-2.0；
-`ats_rog_map` 为 `LGPL-3.0-or-later`，其 ROG-Map 核心和嵌入头文件的归属见
-`ats_rog_map/NOTICE`；MINCO 归属见 `minco_planner/THIRD_PARTY_NOTICES.md`。
-最终许可证和再分发要求以每个包的 `package.xml`、`LICENSE`、`NOTICE` 及上游声明为准。
+本仓聚合了不同来源与许可证的包：ATS 自研的大多数包为 Apache-2.0；`ats_rog_map` 为 `LGPL-3.0-or-later`
+（归属见 `ats_rog_map/NOTICE`）；`point_lio`、`terrain_analysis`、`terrain_analysis_ext`、`pointcloud_to_laserscan` 为 BSD；
+`livox_ros_driver2` 为 MIT；MINCO 归属见 `minco_planner/THIRD_PARTY_NOTICES.md`。最终以各包的 `package.xml`、`LICENSE`、`NOTICE` 和上游声明为准。
