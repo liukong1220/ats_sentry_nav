@@ -1,0 +1,2 @@
+osqp 与 qdldl 不是 colcon 包：ats_swerve_mpc 的 CMakeLists.txt 用 add_subdirectory 直接编译 third_party/osqp，
+并把 FETCHCONTENT_SOURCE_DIR_QDLDL 指向 third_party/qdldl。放在这里（而不是各自目录内）是为了保持两份上游快照逐字节不变。
