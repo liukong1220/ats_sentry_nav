@@ -117,6 +117,8 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   previous_result_t_(Eigen::Isometry3d::Identity())
 {
   this->declare_parameter("num_threads", 4);
+  // 恢复期（LOST 多猜测、恢复中的粗配准）与启动时全局地图预处理用的线程数；<=0 时与 num_threads 相同
+  this->declare_parameter("recovery_num_threads", 0);
   this->declare_parameter("num_neighbors", 20);
   this->declare_parameter("min_source_points", 500);
   this->declare_parameter("min_inliers", 200);
@@ -211,6 +213,9 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("height_filter.max_z", 2.5);
 
   this->get_parameter("num_threads", num_threads_);
+  this->get_parameter("recovery_num_threads", recovery_num_threads_);
+  num_threads_ = std::max(1, num_threads_);
+  recovery_num_threads_ = recovery_num_threads_ > 0 ? recovery_num_threads_ : num_threads_;
   this->get_parameter("num_neighbors", num_neighbors_);
   this->get_parameter("min_source_points", min_source_points_);
   this->get_parameter("min_inliers", min_inliers_);
@@ -426,10 +431,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *global_map_, global_leaf_size_);
 
-  small_gicp::estimate_covariances_omp(*target_, num_neighbors_, num_threads_);
+  small_gicp::estimate_covariances_omp(*target_, num_neighbors_, recovery_num_threads_);
 
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
-    target_, small_gicp::KdTreeBuilderOMP(num_threads_));
+    target_, small_gicp::KdTreeBuilderOMP(recovery_num_threads_));
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
     "registered_scan", rclcpp::SensorDataQoS().keep_last(1),
@@ -665,7 +670,7 @@ bool SmallGicpRelocalizationNode::preferMultiGuess() const
          (localization_state_ == LS::STATE_RELOCALIZING && recovery_from_lost_);
 }
 
-void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
+void SmallGicpRelocalizationNode::preprocessAccumulatedSource(int num_threads)
 {
   auto filtered = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   scan_window_.assemble(filtered->points);
@@ -693,9 +698,9 @@ void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
   source_ = small_gicp::voxelgrid_sampling_omp<
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *filtered, registered_leaf_size_);
-  small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads_);
+  small_gicp::estimate_covariances_omp(*source_, num_neighbors_, num_threads);
   source_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
-    source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+    source_, small_gicp::KdTreeBuilderOMP(num_threads));
 
   // 稀疏筛选云只服务于 multi_guess 的 coarse 级：候选成本与源点数近似线性，
   // 稀疏化直接决定单次扫描能覆盖多少候选。fine 与验收仍用 source_。
@@ -703,10 +708,10 @@ void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
     screen_source_ = small_gicp::voxelgrid_sampling_omp<
       pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
       *filtered, multi_guess_screen_leaf_size_);
-    small_gicp::estimate_covariances_omp(*screen_source_, num_neighbors_, num_threads_);
+    small_gicp::estimate_covariances_omp(*screen_source_, num_neighbors_, num_threads);
     screen_source_tree_ =
       std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
-        screen_source_, small_gicp::KdTreeBuilderOMP(num_threads_));
+        screen_source_, small_gicp::KdTreeBuilderOMP(num_threads));
   } else {
     screen_source_.reset();
     screen_source_tree_.reset();
@@ -714,20 +719,22 @@ void SmallGicpRelocalizationNode::preprocessAccumulatedSource()
 }
 
 SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::alignOnce(
-  const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations) const
+  const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
+  int num_threads) const
 {
   if (!register_) {
     RegistrationAttempt attempt;
     attempt.reject_reason = "registration inputs unavailable";
     return attempt;
   }
-  return alignOnceOn(initial_guess, max_dist_sq, max_iterations, source_, source_tree_, *register_);
+  return alignOnceOn(
+    initial_guess, max_dist_sq, max_iterations, source_, source_tree_, *register_, num_threads);
 }
 
 SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::alignOnceOn(
   const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
   const PointCovarianceCloud::Ptr & source, const std::shared_ptr<PointKdTree> & source_tree,
-  GicpRegistration & registration) const
+  GicpRegistration & registration, int num_threads) const
 {
   RegistrationAttempt attempt;
   if (!source || !source_tree || !target_ || !target_tree_) {
@@ -735,7 +742,7 @@ SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::al
     return attempt;
   }
 
-  registration.reduction.num_threads = num_threads_;
+  registration.reduction.num_threads = num_threads;
   registration.rejector.max_dist_sq = max_dist_sq;
   registration.optimizer.max_iterations = max_iterations;
 
@@ -901,7 +908,8 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     const int iters =
       fine_alignment_enabled_ ? fine_max_iterations_ : coarse_max_iterations_;
     RegistrationAttempt attempt = alignOnceOn(
-      request.seed, corr, iters, request.source, request.source_tree, local_register);
+      request.seed, corr, iters, request.source, request.source_tree, local_register,
+      request.num_threads);
     attempt.stage = "confirmation_recheck";
     if (fine_alignment_enabled_) {
       ++outcome.refined;
@@ -958,7 +966,7 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     GicpRegistration seed_register;
     RegistrationAttempt seed_attempt = alignOnceOn(
       request.seed, max_dist_sq_, coarse_max_iterations_, request.source, request.source_tree,
-      seed_register);
+      seed_register, request.num_threads);
     seed_attempt.stage = "cold_seed";
     bool seed_ok = passesQualityGates(
       seed_attempt, request.allow_unconverged,
@@ -966,7 +974,7 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     if (seed_ok && fine_alignment_enabled_ && !cancel_flag.load()) {
       seed_attempt = alignOnceOn(
         seed_attempt.transform, fine_max_dist_sq_, fine_max_iterations_, request.source,
-        request.source_tree, seed_register);
+        request.source_tree, seed_register, request.num_threads);
       seed_attempt.stage = "cold_seed";
       seed_ok = passesQualityGates(seed_attempt, request.allow_unconverged, GateStage::kAccept);
     }
@@ -1139,7 +1147,8 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     ++outcome.evaluated;
 
     RegistrationAttempt attempt = alignOnceOn(
-      guess, max_dist_sq_, coarse_max_iterations_, screen_source, screen_tree, local_register);
+      guess, max_dist_sq_, coarse_max_iterations_, screen_source, screen_tree, local_register,
+      request.num_threads);
     attempt.stage = "multi_guess_screen";
     // 截断的 coarse 只做筛选，不认定收敛；fine 级才是验收权威。
     const bool screened_ok =
@@ -1202,7 +1211,7 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     if (fine_alignment_enabled_) {
       attempt = alignOnceOn(
         candidate.attempt.transform, fine_max_dist_sq_, fine_max_iterations_, request.source,
-        request.source_tree, local_register);
+        request.source_tree, local_register, request.num_threads);
       attempt.stage = "multi_guess_fine";
       ++outcome.refined;
     }
@@ -1338,12 +1347,13 @@ SmallGicpRelocalizationNode::RegistrationAttempt
 SmallGicpRelocalizationNode::runCoarseFineAlignment(
   const Eigen::Isometry3d & initial_guess, bool allow_unconverged)
 {
+  const int num_threads = registration_num_threads_;
   const bool coarse_required = !fine_alignment_enabled_ || !coarse_first_window_only_ ||
                                need_coarse_alignment_ || !has_accepted_alignment_;
 
   RegistrationAttempt attempt;
   if (coarse_required || !fine_alignment_enabled_) {
-    attempt = alignOnce(initial_guess, max_dist_sq_, coarse_max_iterations_);
+    attempt = alignOnce(initial_guess, max_dist_sq_, coarse_max_iterations_, num_threads);
     attempt.stage = fine_alignment_enabled_ ? "coarse" : "single";
     // coarse 后面还有 fine 时按筛选级放行 converged，否则 coarse 自己承担验收。
     const GateStage coarse_stage =
@@ -1352,7 +1362,8 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(
       return attempt;
     }
     if (fine_alignment_enabled_) {
-      auto fine = alignOnce(attempt.transform, fine_max_dist_sq_, fine_max_iterations_);
+      auto fine =
+        alignOnce(attempt.transform, fine_max_dist_sq_, fine_max_iterations_, num_threads);
       fine.stage = "coarse+fine";
       passesQualityGates(fine, allow_unconverged, GateStage::kAccept);
       return fine;
@@ -1360,7 +1371,7 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(
     return attempt;
   }
 
-  attempt = alignOnce(initial_guess, fine_max_dist_sq_, fine_max_iterations_);
+  attempt = alignOnce(initial_guess, fine_max_dist_sq_, fine_max_iterations_, num_threads);
   attempt.stage = "fine_only";
   passesQualityGates(attempt, allow_unconverged, GateStage::kAccept);
   return attempt;
@@ -1383,8 +1394,14 @@ void SmallGicpRelocalizationNode::performRegistration()
     return;
   }
 
+  // 跟踪期单线程；LOST 多猜测与恢复中的粗配准才用 recovery_num_threads（报告 9.3 第 5 项）。
+  // 这里的判定是之后 preferMultiGuess() 的超集：multi_guess 模式下它只多看 need_coarse_alignment_，
+  // 而下面恰好在恢复期把它置真。
+  const bool recovery = isRecoveringLocalization() || preferMultiGuess();
+  registration_num_threads_ = recovery ? recovery_num_threads_ : num_threads_;
+
   // Preprocess the accumulated window once; coarse and fine reuse the same source.
-  preprocessAccumulatedSource();
+  preprocessAccumulatedSource(registration_num_threads_);
   if (!source_ || !source_tree_ || source_->empty()) {
     return;
   }
@@ -1447,6 +1464,7 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
   request.sweep = multi_guess_sweep_;
   request.allow_unconverged = simRelaxAllowed();
   request.source_points = source_ ? source_->size() : 0;
+  request.num_threads = registration_num_threads_;
   request.current_odom_to_base = getOdomToRobotBase(last_scan_time_);
   if (
     last_hypothesis_ && last_hypothesis_time_ &&

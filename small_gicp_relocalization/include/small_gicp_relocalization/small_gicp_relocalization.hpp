@@ -111,6 +111,7 @@ private:
     std::optional<ConfirmationSample> reference;
     std::optional<Eigen::Isometry3d> current_odom_to_base;
     std::size_t source_points{0};
+    int num_threads{1};
   };
 
   struct MultiGuessOutcome
@@ -152,7 +153,7 @@ private:
   bool inInitialPoseForceWindow() const;
   bool simRelaxAllowed() const;
   void clearAccumulation();
-  void preprocessAccumulatedSource();
+  void preprocessAccumulatedSource(int num_threads);
   void recordDroppedScan(const std::string & reason);
   double accumulatedCloudAgeSeconds() const;
   std::optional<Eigen::Isometry3d> getCurrentRobotBaseToOdom() const;
@@ -168,11 +169,12 @@ private:
   double yawDeltaFromLastTrigger(const Eigen::Isometry3d & current_robot_base_to_odom) const;
 
   RegistrationAttempt alignOnce(
-    const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations) const;
+    const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
+    int num_threads) const;
   RegistrationAttempt alignOnceOn(
     const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
     const PointCovarianceCloud::Ptr & source, const std::shared_ptr<PointKdTree> & source_tree,
-    GicpRegistration & registration) const;
+    GicpRegistration & registration, int num_threads) const;
   RegistrationAttempt runCoarseFineAlignment(
     const Eigen::Isometry3d & initial_guess, bool allow_unconverged);
   MultiGuessOutcome runMultiGuessAlignmentOn(
@@ -200,6 +202,9 @@ private:
     observation_pub_;
 
   int num_threads_;
+  int recovery_num_threads_{0};
+  /// 本次注册选定的线程数（performRegistration 写，同一回调线程里的粗/精配准读）。
+  int registration_num_threads_{1};
   int num_neighbors_;
   int min_source_points_;
   int min_inliers_;

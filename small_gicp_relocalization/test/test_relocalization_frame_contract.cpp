@@ -375,7 +375,7 @@ protected:
     scan->header.frame_id = "odom";
     scan->header.stamp = rclcpp::Time(1000000000LL, RCL_ROS_TIME);
     node_->registeredPcdCallback(scan);
-    node_->preprocessAccumulatedSource();
+    node_->preprocessAccumulatedSource(node_->num_threads_);
     SmallGicpRelocalizationNode::MultiGuessRequest request;
     request.generation = node_->relocalization_generation_.current();
     request.source = node_->source_;
