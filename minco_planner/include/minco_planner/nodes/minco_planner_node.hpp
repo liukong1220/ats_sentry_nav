@@ -26,6 +26,7 @@
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/safety/local_collision_repair.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
+#include "minco_planner/trajectory/replan_start.hpp"
 #include "minco_planner/trajectory/terminal_yaw_relocation.hpp"
 #include "minco_planner/trajectory/trajectory_quality_evaluator.hpp"
 #include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
@@ -117,7 +118,8 @@ private:
       std::uint8_t yaw_authority,
       bool report_status,
       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry(),
-      const geometry_msgs::msg::TransformStamped * control_from_grid = nullptr);
+      const geometry_msgs::msg::TransformStamped * control_from_grid = nullptr,
+      double reference_origin_delay_sec = 0.0);
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
@@ -197,6 +199,9 @@ private:
   bool replan_advisory_enabled_{false};
   // 已发过建议的参考（以参考戳标识），每条参考只建议一次；对应的重规划请求保留旧参考守护。
   std::optional<builtin_interfaces::msg::Time> replan_advised_reference_stamp_;
+  // 无停车重规划的新参考起点取自正在执行的已提交轨迹（调研报告附录 A.3），而不是请求时
+  // 的实测位姿：规划耗时内车已前行，实测起点落在车后面。plan_lead / deviation_max 见参数。
+  ReplanStartParams replan_start_params_{};
   double reference_window_backward_sec_{0.0};
   double body_yaw_follow_clearance_ = 0.55;
   bool force_body_yaw_follow_ = false;
