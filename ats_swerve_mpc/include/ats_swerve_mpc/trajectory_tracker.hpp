@@ -60,6 +60,8 @@ public:
   double finalTime() const { return trajectory_.back().time; }
   /** @brief 返回横向偏差降速允许的下限，供 deadline 保守放大。 */
   double minimumProgressScale() const { return config_.min_progress_scale; }
+  /** @brief 返回预测域起点补偿的命令延迟 t_d（秒，已夹到非负），供旋转相位补偿共用。 */
+  double commandLatencyCompensation() const { return config_.command_latency_compensation; }
   /** @brief 仅按二维位置投影，供无可靠 yaw 的调用方使用。 */
   TrajectoryProjection project(const Eigen::Vector2d & position);
   /** @brief 按完整 SE(2) 状态投影，结合 yaw 抑制路径交叉处跳段。 */

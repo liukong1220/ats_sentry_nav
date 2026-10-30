@@ -9,6 +9,18 @@
 
 namespace ats_swerve_mpc {
 
+/** @brief 只把 yaw 前推 yaw_rate * delay / 2；无补偿量时原样返回以保持逐位一致。 */
+State rotationPhaseCompensatedState(const State &measured, double yaw_rate,
+                                    double delay) {
+  const double phase = 0.5 * yaw_rate * delay;
+  if (phase == 0.0 || !std::isfinite(phase)) {
+    return measured;
+  }
+  State compensated = measured;
+  compensated(2) = Se2Model::normalizeAngle(measured(2) + phase);
+  return compensated;
+}
+
 /** @brief 用配置初始化 iLQR 状态；SE(2) 模型步长必须与 config.dt 同步。 */
 Se2MpcController::Se2MpcController(const Se2MpcConfig &config)
     : config_(config), model_(config.dt) {}

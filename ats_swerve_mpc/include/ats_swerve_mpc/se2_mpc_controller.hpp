@@ -78,6 +78,20 @@ struct Se2Reference {
 };
 
 /**
+ * @brief 旋转相位补偿（报告附录 A.9）：把求解用状态的 yaw 换成 psi + omega * t_d / 2。
+ * @param measured 测量得到的世界系状态 [x, y, yaw]。
+ * @param yaw_rate MPC 采用的车体 yaw 角速度 omega [rad/s]（节点取上一拍已发布指令的 wz）。
+ * @param delay 控制延迟 t_d [s]（节点取 command_latency_compensation）。
+ * @return 仅 yaw 被前推 omega * t_d / 2 并归一化的状态；位置不变。delay 或 yaw_rate 为 0、
+ *         或乘积不是有限数时原样返回，行为与未补偿时逐位一致。
+ * @details iLQR 的车体系指令经 `Se2Model::dynamics` 按状态 yaw 旋到世界系，等价于“世界系误差
+ *          按 yaw 旋到车体系”。指令实际生效在延迟之后，车体已多转 omega * t_d，不补偿时
+ *          横向会偏出 |v| * sin(omega * t_d / 2)。yaw 误差项同时看到这份前推，属预期。
+ */
+State rotationPhaseCompensatedState(const State &measured, double yaw_rate,
+                                    double delay);
+
+/**
  * @brief MPC 求解结果与实车诊断标志。
  *
  * success 语义：控制/状态序列长度合法、代价有限，并且本周期至少完成一次成功的
