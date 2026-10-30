@@ -3,6 +3,8 @@
 #include "loam_interface/loam_interface.hpp"
 
 #include <algorithm>
+#include <memory>
+#include <utility>
 
 #include "pcl_ros/transforms.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -60,10 +62,12 @@ void LoamInterfaceNode::pointCloudCallback(const sensor_msgs::msg::PointCloud2::
 
   // NOTE: Input point cloud message is based on the `lidar_odom`
   // Here we transform it to the REAL `odom` frame
-  auto out = std::make_shared<sensor_msgs::msg::PointCloud2>();
+  // 以 unique_ptr 发布：开 intra-process 时 publish(const T &) 会整帧深拷贝一次。
+  auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
   pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, *msg, *out);
-  pcd_pub_->publish(*out);
-  odom_pub_->publish(buildOdometryMessage(matched_odom, cloud_stamp));
+  pcd_pub_->publish(std::move(out));
+  odom_pub_->publish(
+    std::make_unique<nav_msgs::msg::Odometry>(buildOdometryMessage(matched_odom, cloud_stamp)));
 }
 
 void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)

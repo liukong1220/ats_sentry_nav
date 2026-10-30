@@ -2,6 +2,9 @@
 
 #include "sensor_scan_generation/sensor_scan_generation.hpp"
 
+#include <memory>
+#include <utility>
+
 #include "pcl_ros/transforms.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
@@ -59,15 +62,25 @@ void SensorScanGenerationNode::odometryHandler(
 {
   tf2::Transform tf_odom_to_lidar;
   tf2::Transform tf_lidar_to_chassis;
-  tf2::Transform tf_lidar_to_robot_base;
 
   tf2::fromMsg(odometry_msg->pose.pose, tf_odom_to_lidar);
-  if (!lookupTransform(
-        lidar_frame_, robot_base_frame_, odometry_msg->header.stamp, tf_lidar_to_robot_base)) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 1000,
-      "Skipping odometry publish because required lidar->robot_base TF is unavailable.");
-    return;
+
+  // lidar->robot_base_frame 是静态外参（实车 bringup、MuJoCo、Gazebo 都只在 /tf_static 提供），
+  // 首次查询成功后缓存，之后每帧不再查 TF；成功之前每帧照旧重试，失败时不发布。
+  // lidar->base_frame 中间隔着 gimbal_yaw_odom_joint，会随云台 yaw 变化，
+  // 不能缓存，仍逐帧按时间戳查询。
+  if (!has_lidar_to_robot_base_) {
+    if (!lookupTransform(
+          lidar_frame_, robot_base_frame_, odometry_msg->header.stamp, tf_lidar_to_robot_base_)) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Skipping odometry publish because required lidar->robot_base TF is unavailable.");
+      return;
+    }
+    has_lidar_to_robot_base_ = true;
+    RCLCPP_INFO(
+      this->get_logger(), "Cached static extrinsic %s->%s, no further per-frame lookup.",
+      lidar_frame_.c_str(), robot_base_frame_.c_str());
   }
 
   // An empty base_frame declares "this profile has no chassis-footprint
@@ -84,7 +97,6 @@ void SensorScanGenerationNode::odometryHandler(
     return;
   }
 
-  tf_lidar_to_robot_base_ = tf_lidar_to_robot_base;
   tf_odom_to_robot_base_ = tf_odom_to_lidar * tf_lidar_to_robot_base_;
   if (publish_chassis_frame) {
     tf_odom_to_chassis_ = tf_odom_to_lidar * tf_lidar_to_chassis;
@@ -113,9 +125,10 @@ void SensorScanGenerationNode::laserCloudAndOdometryHandler(
   }
   tf2::fromMsg(odometry_msg->pose.pose, tf_odom_to_lidar);
 
-  sensor_msgs::msg::PointCloud2 out;
-  pcl_ros::transformPointCloud(lidar_frame_, tf_odom_to_lidar.inverse(), *pcd_msg, out);
-  pub_laser_cloud_->publish(out);
+  // 以 unique_ptr 发布：开 intra-process 时 publish(const T &) 会整帧深拷贝一次。
+  auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
+  pcl_ros::transformPointCloud(lidar_frame_, tf_odom_to_lidar.inverse(), *pcd_msg, *out);
+  pub_laser_cloud_->publish(std::move(out));
 }
 
 bool SensorScanGenerationNode::lookupTransform(
@@ -194,7 +207,7 @@ void SensorScanGenerationNode::publishOdometry(
   previous_odom_stamp_ = stamp;
   has_previous_odometry_ = true;
 
-  pub_chassis_odometry_->publish(out);
+  pub_chassis_odometry_->publish(std::make_unique<nav_msgs::msg::Odometry>(std::move(out)));
 }
 
 }  // namespace sensor_scan_generation

@@ -86,6 +86,13 @@ def generate_launch_description():
         namespace=namespace, condition=UnlessCondition(launch_fake_vel_transform), output="screen",
         arguments=["--frame-id", "gimbal_yaw_odom", "--child-frame-id", "gimbal_yaw_fake"],
     )
+    # 实车保持两个独立进程。试过放进同一个容器开 intra-process：Humble 的 component_container_isolated
+    # 收到 SIGINT/SIGTERM 不退出（launch 关闭要等约 10 s 被 SIGKILL），容器 respawn 后
+    # LoadComposableNodes 不会重新执行、两个组件都不在，定位链断掉；component_container_mt
+    # 开 intra-process 实测 /sensor_scan 每 59 帧少 4~21 帧；单线程 component_container 下
+    # sensor_scan_generation 逐帧最长 0.5 s 的动态 TF 查询会拖住 loam_interface。
+    # 仿真（ats_mujoco_sim lio_launch.py、gazebo ats_gazebo_nav.launch.py）base_frame 为空、没有逐帧阻塞查询，
+    # 用单线程容器加 intra-process。
     loam = Node(
         package="loam_interface", executable="loam_interface_node", name="loam_interface",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
