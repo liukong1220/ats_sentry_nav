@@ -2,10 +2,6 @@
 
 const bool time_list(PointType & x, PointType & y) { return (x.curvature < y.curvature); };
 
-void ImuProcess::set_gyr_cov(const V3D & scaler) { cov_gyr_scale = scaler; }
-
-void ImuProcess::set_acc_cov(const V3D & scaler) { cov_vel_scale = scaler; }
-
 ImuProcess::ImuProcess()
 : b_first_frame_(true), imu_need_init_(true), logger(rclcpp::get_logger("ImuProcess"))
 {
