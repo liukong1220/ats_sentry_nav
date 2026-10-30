@@ -13,6 +13,11 @@ uint8 STATE_CONFIRMED=6
 uint8 state
 
 uint64 epoch
+# odom 系里程计前端（Point-LIO）的实例号与重置计数（调研报告附录 A.18）：instance_id 在前端进程
+# 启动时生成，epoch 在前端重启、重新初始化或冷重置时加 1。前端现在还不上报，融合节点固定发 0，
+# 消费者暂不读取；0 表示"前端未上报"，不是一个可比较的 epoch。
+uint64 odom_instance_id
+uint64 odom_epoch
 uint64 observation_sequence
 builtin_interfaces/Time last_observation_stamp
 # 以下 silence 使用 steady clock 计算，不受 /clock 暂停或回拨影响。

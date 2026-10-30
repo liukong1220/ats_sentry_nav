@@ -583,6 +583,9 @@ private:
     status.header.frame_id = map_frame_;
     status.state = status_;
     status.epoch = epoch_;
+    // 前端还不上报 odom 实例号与重置计数（附录 A.18），先固定为 0
+    status.odom_instance_id = 0;
+    status.odom_epoch = 0;
     status.observation_sequence = last_observation_sequence_.value_or(0);
     status.odometry_silence_sec = last_odom_receive_time_
                                     ? std::max(0.0, steadySecondsSince(*last_odom_receive_time_))
