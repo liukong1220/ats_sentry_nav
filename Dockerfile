@@ -34,11 +34,6 @@ WORKDIR /root/ros_ws
 # install dependencies and some tools
 RUN rosdep install -r --from-paths src --ignore-src --rosdistro $ROS_DISTRO -y
 
-# Download simulation pcd files
-RUN gdown https://drive.google.com/uc\?id\=1kAxdOU-mi1TcLssyKmDR0pz0ojF96jQ4 -O /tmp/simulation_pcd.zip && \
-    unzip /tmp/simulation_pcd.zip -d /root/ros_ws/src/ats_sentry_nav/ats_nav_bringup/pcd/simulation/ && \
-    rm /tmp/simulation_pcd.zip
-
 # build
 RUN . /opt/ros/$ROS_DISTRO/setup.sh && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=release
 
