@@ -606,13 +606,27 @@ private:
     geometry_msgs::msg::TransformStamped static_from_robot;
     if (!lookupAtProjectionStamp(
         static_map->header.frame_id, projection_grid.header.frame_id,
-        projection_grid.header.stamp, static_from_projection) ||
+        projection_grid.header.stamp, static_from_projection)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "ROGMap adapter waits for %s <- %s TF at the projection stamp",
+        static_map->header.frame_id.c_str(), projection_grid.header.frame_id.c_str());
+      publishUnavailable("ROGMap projection transform is unavailable");
+      return;
+    }
+    // The robot pose only centres the ego unknown-clearing circle. With the radius at its
+    // default 0.0 it is unused, and requiring it made the grid unavailable whenever
+    // odom -> robot TF lagged the projection stamp by more than 0.1 s: in MuJoCo lio runs that
+    // was 106 of 161 moving stops (report 5.1.10 item 2), each a ready=false heartbeat that the
+    // planner turns into FAILURE_MAP_UNREADY and the MPC into a fail-stop.
+    if (robot_unknown_clear_radius_ > 0.0 &&
       !lookupAtProjectionStamp(
         static_map->header.frame_id, robot_frame_, projection_grid.header.stamp,
         static_from_robot)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "ROGMap adapter waits for static-map TF at the projection stamp");
+        "ROGMap adapter waits for %s <- %s TF at the projection stamp",
+        static_map->header.frame_id.c_str(), robot_frame_.c_str());
       publishUnavailable("ROGMap projection transform is unavailable");
       return;
     }
