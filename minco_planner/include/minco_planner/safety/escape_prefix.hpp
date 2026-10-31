@@ -61,6 +61,18 @@ struct EscapePrefixParams
   // 深压进障碍或沿薄障碍穿行的前缀在内缩足迹下仍然冲突而被拒。
   // 0 保持旧行为（不做深度检查），仅用于兼容已有 profile。
   double max_contact_depth_m = 0.0;
+  // 单调脱困的深度上界。> 0 时，绝对深度上界（max_contact_depth_m）判负的前缀还可以走这条路：
+  // 起点的接触深度不超过本值，前缀内每个位姿的接触深度（按 monotone_depth_step_m 分档）逐点
+  // 不增，且 prefix_end 处的完整足迹无冲突。这样"深度 0.2 m 的接触"只允许沿深度一路变浅的
+  // 前缀驶离，先变深再变浅（穿过薄障碍）、反复进出、深于本上界的前缀仍然判负。
+  //
+  // 为什么需要它：停车是在接触深度越过 max_contact_depth_m 的那一刻触发的，而急停的制动距离
+  // （1.26 m/s 约 0.15 m）一定让车停在更深处（实测 0.10–0.30 m），绝对上界因此永远不会放行
+  // 一次停车之后的脱困。足迹检查本身（margin、阈值、unknown 语义、扫掠采样）一项都不变。
+  // 0 = 关闭，行为与旧版逐位一致。
+  double monotone_max_contact_depth_m = 0.0;
+  // 深度分档宽度。分档让栅格量化带来的 1–2 cm 抖动不会被当成"重新靠近障碍"。
+  double monotone_depth_step_m = 0.025;
 };
 
 struct EscapePrefixDecision
@@ -194,6 +206,118 @@ inline bool escapePrefixContactShallow(
     trajectory.points.begin(),
     trajectory.points.begin() + static_cast<std::ptrdiff_t>(decision.prefix_end + 1U));
   return FootprintSafetyChecker(shrunk).check(prefix, grid).safe;
+}
+
+// 单个位姿的接触深度分档：最小的 m，使每边内缩 m * step 的足迹在该位姿无冲突。
+// 内缩后的尺寸 <= 0 或 m 超过 max_buckets 时返回 max_buckets + 1（"深于上界/无法证明"）。
+// 无冲突对内缩量单调（足迹越小冲突越少），所以用二分。
+inline int contactDepthBucket(
+  const FootprintSafetyParams & footprint, const ReferencePoint & point,
+  const nav_msgs::msg::OccupancyGrid & grid, double step, int max_buckets)
+{
+  ReferenceTrajectory pose;
+  pose.header = grid.header;
+  pose.points.assign(2U, point);
+  pose.points[1].t = point.t + 1e-3;
+  const auto safe_at = [&](int bucket) {
+      FootprintSafetyParams shrunk = footprint;
+      shrunk.length -= 2.0 * step * bucket;
+      shrunk.width -= 2.0 * step * bucket;
+      if (shrunk.length <= 0.0 || shrunk.width <= 0.0) {
+        return false;
+      }
+      return FootprintSafetyChecker(shrunk).check(pose, grid).safe;
+    };
+  if (safe_at(0)) {
+    return 0;
+  }
+  // 内缩到足迹退化成点之前为止；再深就是车心压进障碍，按"深于上界"处理。
+  const int limit = static_cast<int>(std::floor(
+      (0.5 * std::min(footprint.length, footprint.width) - 0.01) / step + 1e-9));
+  const int probe = std::min(max_buckets, limit);
+  if (probe < 1 || !safe_at(probe)) {
+    return max_buckets + 1;     // 哨兵：深于上界
+  }
+  int low = 0;                  // 已知有冲突
+  int high = probe;             // 已知无冲突
+  while (high - low > 1) {
+    const int mid = (low + high) / 2;
+    if (safe_at(mid)) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  return high;
+}
+
+// 单调脱困判定，见 EscapePrefixParams::monotone_max_contact_depth_m。在 evaluateEscapePrefix
+// 放行之后调用；对 [0, prefix_end] 逐点测深度分档，要求起点不超过上界、逐点不增、末点为 0，
+// 并且每个相邻线段在其起点分档的内缩足迹下扫掠无冲突（深度逐点不增，起点分档就是该段最大值）。
+inline bool escapePrefixContactDecreasing(
+  const ReferenceTrajectory & trajectory,
+  const EscapePrefixDecision & decision,
+  const FootprintSafetyParams & footprint,
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const EscapePrefixParams & params)
+{
+  if (!decision.allowed || !(params.monotone_max_contact_depth_m > 0.0) ||
+    decision.prefix_end == 0U || decision.prefix_end >= trajectory.points.size())
+  {
+    return false;
+  }
+  const double step = std::max(1e-3, params.monotone_depth_step_m);
+  // 深度超过半宽（内缩后的足迹退化成点）时车心已经压进障碍，不属于脱困，所以上界不超过
+  // 最短边的一半减 1 cm。
+  const double depth_cap = std::min(
+    params.monotone_max_contact_depth_m,
+    0.5 * std::min(footprint.length, footprint.width) - 0.01);
+  const int max_buckets = static_cast<int>(std::floor(depth_cap / step + 1e-9));
+  if (max_buckets < 1) {
+    return false;
+  }
+  std::vector<int> buckets;
+  buckets.reserve(decision.prefix_end + 1U);
+  for (std::size_t i = 0U; i <= decision.prefix_end; ++i) {
+    const int bucket =
+      contactDepthBucket(footprint, trajectory.points[i], grid, step, max_buckets);
+    if (bucket > max_buckets || (i > 0U && bucket > buckets.back())) {
+      return false;
+    }
+    buckets.push_back(bucket);
+  }
+  if (buckets.back() != 0) {
+    return false;
+  }
+  for (std::size_t i = 0U; i < decision.prefix_end; ++i) {
+    FootprintSafetyParams shrunk = footprint;
+    shrunk.length -= 2.0 * step * buckets[i];
+    shrunk.width -= 2.0 * step * buckets[i];
+    if (shrunk.length <= 0.0 || shrunk.width <= 0.0) {
+      return false;
+    }
+    ReferenceTrajectory segment;
+    segment.header = trajectory.header;
+    segment.points.assign(
+      trajectory.points.begin() + static_cast<std::ptrdiff_t>(i),
+      trajectory.points.begin() + static_cast<std::ptrdiff_t>(i + 2U));
+    if (!FootprintSafetyChecker(shrunk).check(segment, grid).safe) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 提交门、保留检查、运行期复检共用的放行口径：浅接触（绝对上界）或深度单调下降。
+inline bool escapePrefixContactAdmitted(
+  const ReferenceTrajectory & trajectory,
+  const EscapePrefixDecision & decision,
+  const FootprintSafetyParams & footprint,
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const EscapePrefixParams & params)
+{
+  return escapePrefixContactShallow(trajectory, decision, footprint, grid, params) ||
+         escapePrefixContactDecreasing(trajectory, decision, footprint, grid, params);
 }
 
 // 平移逃逸候选。贴着障碍时 yaw 规划在起点就开始转向，矩形足迹的角点随转向扫进

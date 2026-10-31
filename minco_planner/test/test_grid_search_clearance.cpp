@@ -184,6 +184,126 @@ TEST(GridSearchClearance, StartCellPaintedOccupiedIsStillAdmitted)
   EXPECT_TRUE(admitted.success) << admitted.reason;
 }
 
+// --- Defect A2: the start cell is admitted but none of its neighbours is, so A* stops at expanded=1 ---
+//
+// Recorded 2025 red-box stops (20 events, runs d141..d222) all look like this: the robot was pushed
+// to 0.1-0.2 m from a wall, the search floor is 0.376 m, every neighbour of the start cell is below
+// it, and the search ends after expanding the start cell only. Escape prefix and local repair run
+// after the search, so they never got a path to act on.
+
+constexpr double kSearchFloor = 0.376;  // inscribed 0.3055 + half-cell diagonal 0.0707
+
+minco_planner::GridAstarParams escapeParams(int max_steps)
+{
+  minco_planner::GridAstarParams params;
+  params.obstacle_value_threshold = kThreshold;
+  params.unknown_is_obstacle = false;
+  params.safe_distance = kSearchFloor;
+  params.min_safe_distance = kInscribedRadius;
+  params.start_escape_max_steps = max_steps;
+  return params;
+}
+
+/// One wall row at y = 10 (cell centre 1.05 m); the field above it is open.
+nav_msgs::msg::OccupancyGrid makeSouthWallGrid()
+{
+  auto grid = makeOpenGrid(60, 30);
+  blockRow(grid, 10, 0, 59);
+  return grid;
+}
+
+TEST(GridSearchStartEscape, DisabledKeepsTheExpandedOneDeadEnd)
+{
+  const auto grid = makeSouthWallGrid();
+  const auto start = poseAt(3.05, 1.25);  // 0.20 m from the wall; its neighbours reach only 0.30 m
+  const auto goal = poseAt(3.05, 2.05);
+
+  const auto result = minco_planner::GridAstar(escapeParams(0)).plan(grid, start, goal);
+  ASSERT_FALSE(result.success);
+  EXPECT_EQ(result.reason, "no path");
+  EXPECT_EQ(result.expanded_nodes, 1);
+}
+
+TEST(GridSearchStartEscape, ClimbsOutAlongNonDecreasingClearance)
+{
+  const auto grid = makeSouthWallGrid();
+  const auto start = poseAt(3.05, 1.25);
+  const auto goal = poseAt(3.05, 2.05);
+
+  const auto result = minco_planner::GridAstar(escapeParams(2)).plan(grid, start, goal);
+  ASSERT_TRUE(result.success) << result.reason;
+  ASSERT_GE(result.path.poses.size(), 3U);
+
+  // Clearance never drops along the sub-floor stretch, and the path ends up at the search floor
+  // or better after it leaves the start.
+  double previous = -1.0;
+  bool reached_floor = false;
+  for (const auto & pose : result.path.poses) {
+    const int x = static_cast<int>(std::floor(pose.pose.position.x / 0.1));
+    const int y = static_cast<int>(std::floor(pose.pose.position.y / 0.1));
+    const double clearance = minco_planner::measureGridClearance(grid, x, y, 2.0, policy());
+    if (!reached_floor) {
+      EXPECT_GE(clearance + 1e-9, previous) << "pose (" << x << "," << y << ") re-approaches the wall";
+      previous = clearance;
+    }
+    reached_floor = reached_floor || clearance > kSearchFloor;
+  }
+  EXPECT_TRUE(reached_floor);
+}
+
+TEST(GridSearchStartEscape, StepBudgetIsAHardBound)
+{
+  const auto grid = makeSouthWallGrid();
+  const auto start = poseAt(3.05, 1.15);  // 0.10 m from the wall: two sub-floor cells to cross
+  const auto goal = poseAt(3.05, 2.05);
+
+  EXPECT_FALSE(minco_planner::GridAstar(escapeParams(1)).plan(grid, start, goal).success);
+  EXPECT_TRUE(minco_planner::GridAstar(escapeParams(2)).plan(grid, start, goal).success);
+}
+
+TEST(GridSearchStartEscape, DoesNotDescendOrTunnelThroughAClosedPocket)
+{
+  // Start in a strip between two walls whose clearance peaks at the start itself. Nothing is
+  // "uphill" from there, so the escape must not wander through the plateau or across a wall.
+  auto grid = makeOpenGrid(60, 30);
+  blockRow(grid, 10, 0, 59);
+  blockRow(grid, 14, 0, 59);
+  for (int y = 10; y <= 14; ++y) {
+    block(grid, 0, y);
+    block(grid, 59, y);
+  }
+  const auto start = poseAt(3.05, 1.25);  // y index 12, the middle of the strip
+  const auto goal = poseAt(3.05, 2.05);   // above the upper wall
+
+  EXPECT_FALSE(minco_planner::GridAstar(escapeParams(8)).plan(grid, start, goal).success);
+}
+
+TEST(GridSearchStartEscape, NormalStartIsUntouchedByTheOption)
+{
+  const auto grid = makeSouthWallGrid();
+  const auto start = poseAt(3.05, 1.65);  // 0.60 m: already above the floor
+  const auto goal = poseAt(5.05, 2.05);
+
+  const auto plain = minco_planner::GridAstar(escapeParams(0)).plan(grid, start, goal);
+  const auto escape = minco_planner::GridAstar(escapeParams(4)).plan(grid, start, goal);
+  ASSERT_TRUE(plain.success);
+  ASSERT_TRUE(escape.success);
+  ASSERT_EQ(plain.path.poses.size(), escape.path.poses.size());
+  EXPECT_EQ(plain.expanded_nodes, escape.expanded_nodes);
+  EXPECT_DOUBLE_EQ(plain.length, escape.length);
+}
+
+TEST(GridSearchStartEscape, StartCellPaintedOccupiedCanAlsoClimbOut)
+{
+  auto grid = makeSouthWallGrid();
+  block(grid, 30, 12);  // the robot's own cell painted as a hard obstacle (transient fusion)
+  const auto start = poseAt(3.05, 1.25);
+  const auto goal = poseAt(3.05, 2.05);
+
+  EXPECT_FALSE(minco_planner::GridAstar(escapeParams(0)).plan(grid, start, goal).success);
+  EXPECT_TRUE(minco_planner::GridAstar(escapeParams(3)).plan(grid, start, goal).success);
+}
+
 // --- Defect C: a goal that no yaw-free disc fits, but the real body does ---
 
 TEST(GridSearchClearance, GoalBelowCircumscribedRadiusIsReachedAtItsOwnClearance)

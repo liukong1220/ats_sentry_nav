@@ -125,6 +125,11 @@ GridAstarResult GridAstar::planWithClearance(
   std::vector<double> g_score(cell_count, std::numeric_limits<double>::infinity());
   std::vector<int> parent(cell_count, -1);
   std::vector<uint8_t> closed(cell_count, 0);
+  // 起点脱出：只有起点自己不满足净空时才启用。escape_steps 记录到达该格之前连续经过的
+  // 低于净空的格数（走到达标格就清零），超过 start_escape_max_steps 不再外扩。
+  const bool start_escape = params_.start_escape_max_steps > 0 &&
+    !isTraversable(grid, blocked_squared, start_idx);
+  std::vector<uint16_t> escape_steps(start_escape ? cell_count : 0U, 0);
   std::priority_queue<QueueNode, std::vector<QueueNode>, QueueNodeCompare> open;
 
   const std::size_t start_linear = linearIndex(grid, start_idx);
@@ -158,24 +163,46 @@ GridAstarResult GridAstar::planWithClearance(
       break;
     }
 
+    // 当前格自己低于净空（只可能是起点或从起点爬出来的格）。
+    const bool current_below_clearance =
+      start_escape && !isTraversable(grid, blocked_squared, current_idx);
     for (int i = 0; i < neighbor_count; ++i) {
       const int dx = params_.allow_diagonal ? kDx8[i] : kDx4[i];
       const int dy = params_.allow_diagonal ? kDy8[i] : kDy4[i];
       GridIndex next {current.x + dx, current.y + dy};
       if (next.x < 0 || next.y < 0 ||
         next.x >= static_cast<int>(grid.info.width) ||
-        next.y >= static_cast<int>(grid.info.height) ||
-        !isTraversable(grid, blocked_squared, next))
+        next.y >= static_cast<int>(grid.info.height))
       {
         continue;
+      }
+      bool escape_edge = false;
+      if (!isTraversable(grid, blocked_squared, next)) {
+        // 唯一的例外：低于净空的当前格 -> 净空不减的空闲邻格，且累计步数未超上限。
+        if (!current_below_clearance ||
+          static_cast<int>(escape_steps[linearIndex(grid, current_idx)]) >=
+          params_.start_escape_max_steps ||
+          !isGridCellFree(grid, next.x, next.y, policy) ||
+          blocked_squared[linearIndex(grid, next)] + 1e-9 <
+          blocked_squared[linearIndex(grid, current_idx)])
+        {
+          continue;
+        }
+        escape_edge = true;
       }
       if (params_.allow_diagonal && dx != 0 && dy != 0) {
         // Avoid diagonal corner cutting through two blocked cells. The later
         // footprint checker still verifies body clearance, but the graph search
         // should not create topologically invalid shortcuts.
-        if (!isTraversable(grid, blocked_squared, GridIndex {current.x + dx, current.y}) ||
-          !isTraversable(grid, blocked_squared, GridIndex {current.x, current.y + dy}))
-        {
+        // 脱出段上两个正交邻格只要求空闲（不能夹着阻塞格斜穿），不要求达标。
+        const GridIndex side_a {current.x + dx, current.y};
+        const GridIndex side_b {current.x, current.y + dy};
+        const bool corner_ok = current_below_clearance ?
+          (isGridCellFree(grid, side_a.x, side_a.y, policy) &&
+          isGridCellFree(grid, side_b.x, side_b.y, policy)) :
+          (isTraversable(grid, blocked_squared, side_a) &&
+          isTraversable(grid, blocked_squared, side_b));
+        if (!corner_ok) {
           continue;
         }
       }
@@ -195,6 +222,10 @@ GridAstarResult GridAstar::planWithClearance(
 
       parent[next_linear] = static_cast<int>(current_linear);
       g_score[next_linear] = tentative_g;
+      if (start_escape) {
+        escape_steps[next_linear] = escape_edge ?
+          static_cast<uint16_t>(escape_steps[current_linear] + 1U) : static_cast<uint16_t>(0U);
+      }
       open.push(QueueNode {
           next.x,
           next.y,

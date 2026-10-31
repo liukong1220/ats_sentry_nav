@@ -366,3 +366,160 @@ TEST(EscapePrefix, ContactDepthBoundSeparatesGrazingFromPenetration)
   EXPECT_FALSE(minco_planner::escapePrefixContactShallow(
     trajectory, rejected, footprint, grid, params));
 }
+
+// --- 单调脱困：停车一定停在比触发上界更深的地方，绝对深度上界因此永远放行不了停车后的脱困 ---
+
+namespace
+{
+
+nav_msgs::msg::OccupancyGrid makeContactGrid()
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = "map";
+  grid.info.resolution = 0.1;
+  grid.info.width = 60;
+  grid.info.height = 40;
+  grid.info.origin.position.x = -2.0;
+  grid.info.origin.position.y = -2.0;
+  grid.info.origin.orientation.w = 1.0;
+  grid.data.assign(60 * 40, 0);
+  // 单格障碍 x∈[-0.3,-0.2) y∈[0.2,0.3)，与 ContactDepthBoundSeparatesGrazingFromPenetration 同。
+  grid.data[22 * 60 + 17] = 100;
+  return grid;
+}
+
+minco_planner::FootprintSafetyParams contactFootprint()
+{
+  minco_planner::FootprintSafetyParams footprint;
+  footprint.length = 0.60;
+  footprint.width = 0.50;
+  footprint.safety_margin = 0.02;
+  footprint.obstacle_value_threshold = 100;
+  return footprint;
+}
+
+minco_planner::ReferenceTrajectory trajectoryThrough(
+  const std::vector<std::pair<double, double>> & xy)
+{
+  minco_planner::ReferenceTrajectory trajectory;
+  trajectory.header.frame_id = "map";
+  double length = 0.0;
+  for (std::size_t i = 0; i < xy.size(); ++i) {
+    minco_planner::ReferencePoint point;
+    point.t = 0.1 * static_cast<double>(i);
+    if (i > 0) {
+      length += std::hypot(xy[i].first - xy[i - 1].first, xy[i].second - xy[i - 1].second);
+    }
+    point.s = length;
+    point.x = xy[i].first;
+    point.y = xy[i].second;
+    trajectory.points.push_back(point);
+  }
+  return trajectory;
+}
+
+}  // namespace
+
+TEST(EscapePrefixMonotone, DepthBucketGrowsWithPenetrationAndIsZeroWhenClear)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  minco_planner::ReferencePoint at_origin;  // overlaps the cell by 0.07 m in y
+  minco_planner::ReferencePoint far_away;
+  far_away.x = 1.0;
+  EXPECT_EQ(minco_planner::contactDepthBucket(footprint, far_away, grid, 0.025, 12), 0);
+  const int bucket = minco_planner::contactDepthBucket(footprint, at_origin, grid, 0.025, 12);
+  EXPECT_GE(bucket, 3);  // > 0.05 m
+  EXPECT_LE(bucket, 4);  // <= 0.10 m
+  // 上界太小时给哨兵值，而不是截断成"达标"。
+  EXPECT_EQ(minco_planner::contactDepthBucket(footprint, at_origin, grid, 0.025, 2), 3);
+}
+
+TEST(EscapePrefixMonotone, AdmitsADeepContactThatTheAbsoluteCapRefuses)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  const auto trajectory = trajectoryThrough(
+    {{0.0, 0.0}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.20, 0.0}, {0.30, 0.0}, {0.40, 0.0}});
+  const auto safety = minco_planner::FootprintSafetyChecker(footprint).check(trajectory, grid);
+  ASSERT_FALSE(safety.safe);
+
+  auto params = enabledParams();
+  params.max_contact_depth_m = 0.05;
+  const auto decision =
+    minco_planner::evaluateEscapePrefix(trajectory.points, safety.collisions, params);
+  ASSERT_TRUE(decision.allowed);
+
+  // 旧口径（关闭单调判据）：深度 > 0.05 m 判负。
+  EXPECT_FALSE(minco_planner::escapePrefixContactAdmitted(
+    trajectory, decision, footprint, grid, params));
+
+  params.monotone_max_contact_depth_m = 0.30;
+  EXPECT_FALSE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+  EXPECT_TRUE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, decision, footprint, grid, params));
+  EXPECT_TRUE(minco_planner::escapePrefixContactAdmitted(
+    trajectory, decision, footprint, grid, params));
+}
+
+TEST(EscapePrefixMonotone, StillRefusesContactDeeperThanItsOwnCap)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  const auto trajectory = trajectoryThrough(
+    {{0.0, 0.0}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.20, 0.0}, {0.30, 0.0}, {0.40, 0.0}});
+  const auto safety = minco_planner::FootprintSafetyChecker(footprint).check(trajectory, grid);
+  auto params = enabledParams();
+  params.max_contact_depth_m = 0.05;
+  const auto decision =
+    minco_planner::evaluateEscapePrefix(trajectory.points, safety.collisions, params);
+  ASSERT_TRUE(decision.allowed);
+
+  params.monotone_max_contact_depth_m = 0.05;  // 起点深度约 0.07-0.10 m
+  EXPECT_FALSE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, decision, footprint, grid, params));
+}
+
+TEST(EscapePrefixMonotone, RefusesAPrefixThatFirstGoesDeeper)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  // 先朝障碍方向挪 0.06 m（接触更深），再折回并驶离。穿过薄障碍的轨迹形态与此同构：
+  // 深度先升后降，必须判负。
+  const auto trajectory = trajectoryThrough(
+    {{0.0, 0.0}, {0.0, 0.06}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.25, 0.0}, {0.40, 0.0}});
+  const auto safety = minco_planner::FootprintSafetyChecker(footprint).check(trajectory, grid);
+  auto params = enabledParams();
+  params.max_contact_depth_m = 0.05;
+  const auto decision =
+    minco_planner::evaluateEscapePrefix(trajectory.points, safety.collisions, params);
+  ASSERT_TRUE(decision.allowed);
+
+  params.monotone_max_contact_depth_m = 0.30;
+  EXPECT_FALSE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, decision, footprint, grid, params));
+  EXPECT_FALSE(minco_planner::escapePrefixContactAdmitted(
+    trajectory, decision, footprint, grid, params));
+}
+
+TEST(EscapePrefixMonotone, DisabledByDefaultAndNeverClaimsAnEscapeWithoutADecision)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  const auto trajectory = trajectoryThrough(
+    {{0.0, 0.0}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.20, 0.0}, {0.30, 0.0}, {0.40, 0.0}});
+  const auto safety = minco_planner::FootprintSafetyChecker(footprint).check(trajectory, grid);
+  auto params = enabledParams();
+  const auto decision =
+    minco_planner::evaluateEscapePrefix(trajectory.points, safety.collisions, params);
+  ASSERT_TRUE(decision.allowed);
+
+  EXPECT_DOUBLE_EQ(params.monotone_max_contact_depth_m, 0.0);
+  EXPECT_FALSE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, decision, footprint, grid, params));
+
+  params.monotone_max_contact_depth_m = 0.30;
+  EXPECT_FALSE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, minco_planner::EscapePrefixDecision{}, footprint, grid, params));
+}
