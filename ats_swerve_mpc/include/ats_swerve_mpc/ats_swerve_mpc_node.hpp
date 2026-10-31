@@ -86,6 +86,10 @@ private:
    *        急停后恢复、legacy Path 的既有行为一致。
    */
   bool installPath(const nav_msgs::msg::Path & message, bool keep_control_state = false);
+  /** @brief 在 trajectory mutex 内判断换代宽限是否仍在进行（有 active 命令且未急停）。 */
+  bool supersedeGraceActiveLocked(std::chrono::steady_clock::time_point now) const;
+  /** @brief 在 trajectory mutex 内校验 active 命令：本 generation 有效，或处于换代宽限。 */
+  bool activeExecutionValidLocked(std::chrono::steady_clock::time_point now) const;
   /** @brief 在 trajectory mutex 内校验 gimbal 回执的新鲜性和请求/反馈序列一致性。 */
   bool gimbalExecutionValidLocked(
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
@@ -154,6 +158,8 @@ private:
   // 内、且 reference 终点速度为零时生效（报告 5.1.10 第 1 项）。
   double terminal_approach_time_constant_ = 0.0;
   double terminal_approach_radius_ = 0.5;
+  // 同一 epoch 内新 generation 就绪后，旧命令最多继续执行的时长 [s]；0 = 立即作废（报告 5.1.9 D）。
+  double supersede_grace_sec_ = 0.0;
   bool publish_debug_paths_ = true;
   bool require_localization_status_ = false;
   bool require_gimbal_status_ = false;
@@ -212,6 +218,9 @@ private:
   std::uint64_t ready_lease_generation_{0};
   std::int64_t planner_status_stamp_ns_{0};
   bool planner_generation_usable_{false};
+  // 换代宽限截止时刻与被取代的 generation；只在宽限进行中有值。
+  std::optional<std::chrono::steady_clock::time_point> supersede_deadline_;
+  std::uint64_t supersede_old_generation_{0};
   bool map_ready_{false};
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<ats_navigation_interfaces::msg::ExecutionCommand>

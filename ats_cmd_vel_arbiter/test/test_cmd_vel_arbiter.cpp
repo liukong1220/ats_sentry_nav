@@ -712,3 +712,94 @@ TEST(CmdVelArbiterMapAuthority, ReadyLeaseExpiryAndLateHeartbeatRetireGeneration
     EXPECT_EQ(arbiter.tick(now + milliseconds(51)).source, CmdVelSource::AUTO);
   }
 }
+
+// 换代宽限（报告 5.1.9 D）：同一 epoch 的新 generation 就绪后，旧授权最多再保留
+// supersede_grace，期间旧 generation 的心跳不撤销、不续租；新 generation 的 EXECUTE 接管。
+namespace
+{
+
+CmdVelArbiterConfig graceConfig()
+{
+  CmdVelArbiterConfig value = config();
+  value.supersede_grace = milliseconds(400);
+  return value;
+}
+
+void authorizeGeneration11(CmdVelArbiter & arbiter, std::chrono::steady_clock::time_point t0)
+{
+  armLink(arbiter, t0);
+  ASSERT_TRUE(execute(arbiter, 1, milliseconds(0), t0));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0);
+  ASSERT_EQ(arbiter.tick(t0).reason, CmdVelArbiterReason::AUTO_AUTHORIZED);
+}
+
+}  // namespace
+
+TEST(CmdVelArbiterSupersedeGrace, SuccessorExecuteWithinGraceKeepsAuto)
+{
+  CmdVelArbiter arbiter(graceConfig());
+  const auto t0 = std::chrono::steady_clock::now();
+  authorizeGeneration11(arbiter, t0);
+  arbiter.onPlannerStatus(7, 12, 2, true, false, false, t0 + milliseconds(50));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0 + milliseconds(60));
+  EXPECT_EQ(arbiter.tick(t0 + milliseconds(60)).reason, CmdVelArbiterReason::AUTO_AUTHORIZED);
+  // 旧 generation 的心跳被容忍。
+  EXPECT_TRUE(execute(arbiter, 2, milliseconds(0), t0 + milliseconds(100)));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0 + milliseconds(110));
+  const auto during = arbiter.tick(t0 + milliseconds(110));
+  EXPECT_EQ(during.reason, CmdVelArbiterReason::AUTO_AUTHORIZED);
+  EXPECT_DOUBLE_EQ(during.vx, 1.0);
+  // 新 generation 的 EXECUTE 接管，宽限截止之后仍按自己的租约有效。
+  EXPECT_TRUE(arbiter.onExecutionCommand(
+    1, kManagerIncarnation, 3, 7, 12, milliseconds(0), t0 + milliseconds(150)));
+  // 链路心跳 300 ms 超时与本用例无关，续上；新租约从 150 ms 起算，600 ms 时仍在 500 ms 内。
+  arbiter.onLinkHealth(true, t0 + milliseconds(590));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0 + milliseconds(600));
+  EXPECT_EQ(arbiter.tick(t0 + milliseconds(600)).reason, CmdVelArbiterReason::AUTO_AUTHORIZED);
+}
+
+TEST(CmdVelArbiterSupersedeGrace, GraceExpiryWithoutSuccessorRevokes)
+{
+  CmdVelArbiter arbiter(graceConfig());
+  const auto t0 = std::chrono::steady_clock::now();
+  authorizeGeneration11(arbiter, t0);
+  arbiter.onPlannerStatus(7, 12, 2, true, false, false, t0 + milliseconds(50));
+  EXPECT_TRUE(execute(arbiter, 2, milliseconds(0), t0 + milliseconds(300)));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0 + milliseconds(460));
+  const auto expired = arbiter.tick(t0 + milliseconds(460));
+  EXPECT_TRUE(expired.isZero());
+  EXPECT_FALSE(arbiter.autoAuthorized());
+  // 宽限过后旧 generation 的 EXECUTE 照旧被拒绝。
+  EXPECT_FALSE(execute(arbiter, 3, milliseconds(0), t0 + milliseconds(470)));
+}
+
+TEST(CmdVelArbiterSupersedeGrace, FailedMapUnreadyAndEpochChangeRevokeImmediately)
+{
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int variant = 0; variant < 3; ++variant) {
+    CmdVelArbiter arbiter(graceConfig());
+    authorizeGeneration11(arbiter, t0);
+    const auto t1 = t0 + milliseconds(50);
+    if (variant == 0) {
+      arbiter.onPlannerStatus(7, 12, 2, false, true, false, t1);
+    } else if (variant == 1) {
+      arbiter.onPlannerStatus(7, 12, 2, false, true, true, t1);
+    } else {
+      arbiter.onPlannerStatus(8, 12, 2, true, false, false, t1);
+    }
+    arbiter.onAuto(1.0, 0.2, 0.1, t1);
+    EXPECT_TRUE(arbiter.tick(t1).isZero()) << "variant " << variant;
+    EXPECT_FALSE(arbiter.autoAuthorized()) << "variant " << variant;
+  }
+}
+
+TEST(CmdVelArbiterSupersedeGrace, ZeroGraceRevokesOnNewGeneration)
+{
+  CmdVelArbiter arbiter(config());
+  const auto t0 = std::chrono::steady_clock::now();
+  authorizeGeneration11(arbiter, t0);
+  arbiter.onPlannerStatus(7, 12, 2, true, false, false, t0 + milliseconds(50));
+  arbiter.onAuto(1.0, 0.2, 0.1, t0 + milliseconds(60));
+  EXPECT_TRUE(arbiter.tick(t0 + milliseconds(60)).isZero());
+  EXPECT_FALSE(execute(arbiter, 2, milliseconds(0), t0 + milliseconds(100)));
+}
