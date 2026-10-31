@@ -16,6 +16,11 @@
 namespace ats_swerve_mpc {
 
 namespace {
+// reference 最后一段低于该平面速度即视为在终点停车（MINCO 尾状态 v = a = 0）。
+constexpr double kTerminalStopSpeed = 0.05;
+}  // namespace
+
+namespace {
 /** @brief 读取三元素参数并在维度错误时保留物理安全默认值。 */
 Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
                                 const Eigen::Vector3d &defaults) {
@@ -175,6 +180,11 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       "goal_position_tolerance", goal_position_tolerance_);
   goal_yaw_tolerance_ =
       declare_parameter<double>("goal_yaw_tolerance", goal_yaw_tolerance_);
+  terminal_approach_time_constant_ = std::max(
+      0.0, declare_parameter<double>("terminal_approach_time_constant",
+                                     terminal_approach_time_constant_));
+  terminal_approach_radius_ = std::max(
+      0.0, declare_parameter<double>("terminal_approach_radius", terminal_approach_radius_));
   publish_debug_paths_ =
       declare_parameter<bool>("publish_debug_paths", publish_debug_paths_);
   // 里程计健康监测阈值：超时判定定位链路中断，跳变判定重定位/漂移突变。
@@ -1076,6 +1086,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   std::vector<Se2Reference> references;
   bool trajectory_expired = false;
   double rotation_delay = 0.0;
+  double reference_terminal_speed = 0.0;
   // 参考提取（含 trajectory_mutex_ 等待、投影和 horizon 构造）单独计时，
   // 使其不再隐含在 state_trajectory_snapshot 内无法归因。
   const auto reference_extraction_start = std::chrono::steady_clock::now();
@@ -1094,6 +1105,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     }
     goal = trajectory_tracker_.goal();
     rotation_delay = trajectory_tracker_.commandLatencyCompensation();
+    reference_terminal_speed = trajectory_tracker_.terminalSpeed();
     projection = trajectory_tracker_.project(current);
     references = trajectory_tracker_.buildHorizon(
         projection, controller_->config().horizon, controller_->config().dt);
@@ -1234,6 +1246,15 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   // 7. 应用第一个控制量并发布
   last_control_ = result.controls.front();
+  // 终点区限速（报告 5.1.10 第 1 项）：MPC 的模型里没有底盘约 0.4 s 的响应滞后，离终点
+  // 0.15-0.3 m 时仍给 0.9-1.0 m/s，冲过终点再拉回。终点区内按 |v| <= d / tau 限速，相当于
+  // 一阶趋近，tau 大于 e 倍滞后时不过冲。只对终点速度为零的 reference 生效。
+  if (terminal_approach_time_constant_ > 0.0 &&
+      goal_position_error <= terminal_approach_radius_ &&
+      reference_terminal_speed <= kTerminalStopSpeed) {
+    last_control_ = limitTerminalApproachSpeed(
+        last_control_, goal_position_error, terminal_approach_time_constant_);
+  }
   const auto command_publish_start = std::chrono::steady_clock::now();
   publishCommand(last_control_);
   recordTiming(telemetry, ControlCycleTimingStage::kIlqrCommandPublish,
@@ -1593,6 +1614,18 @@ void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                          "【控制兜底】%s，已输出确定性零速度。", reason_zh);
   }
+}
+
+Control AtsSwerveMpcNode::limitTerminalApproachSpeed(
+    const Control & command, double goal_distance, double time_constant) {
+  const double limit = std::max(0.0, goal_distance) / time_constant;
+  const double speed = command.head<2>().norm();
+  if (speed <= limit || speed <= 0.0) {
+    return command;
+  }
+  Control limited = command;
+  limited.head<2>() *= limit / speed;
+  return limited;
 }
 
 /**

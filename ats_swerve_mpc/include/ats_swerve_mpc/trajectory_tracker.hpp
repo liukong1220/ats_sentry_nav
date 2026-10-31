@@ -58,6 +58,17 @@ public:
   double duration() const { return trajectory_.back().time - trajectory_.front().time; }
   /** @brief 返回最后一个轨迹点的相对时间。 */
   double finalTime() const { return trajectory_.back().time; }
+  /** @brief 返回最后一段的平面速度（m/s），即 reference 的终点速度；少于两点时为 0。 */
+  double terminalSpeed() const
+  {
+    if (trajectory_.size() < 2) {
+      return 0.0;
+    }
+    const auto & last = trajectory_.back();
+    const auto & previous = trajectory_[trajectory_.size() - 2];
+    const double dt = last.time - previous.time;
+    return dt > 1e-6 ? (last.state.head<2>() - previous.state.head<2>()).norm() / dt : 0.0;
+  }
   /** @brief 返回横向偏差降速允许的下限，供 deadline 保守放大。 */
   double minimumProgressScale() const { return config_.min_progress_scale; }
   /** @brief 返回预测域起点补偿的命令延迟 t_d（秒，已夹到非负），供旋转相位补偿共用。 */
