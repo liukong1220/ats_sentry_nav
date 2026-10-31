@@ -49,6 +49,8 @@ public:
     const int link_timeout_ms = declare_parameter<int>("link_timeout_ms", 300);
     execution_command_timeout_s_ = declare_parameter<double>("execution_command_timeout", 0.5);
     const double rate_hz = declare_parameter<double>("control_rate_hz", 20.0);
+    const double supersede_grace_sec = std::max(
+      0.0, declare_parameter<double>("supersede_grace_sec", 0.0));
 
     CmdVelArbiterConfig config;
     config.manual_timeout = std::chrono::milliseconds(manual_timeout_ms);
@@ -58,6 +60,8 @@ public:
     config.link_timeout = std::chrono::milliseconds(require_serial_link_ ? link_timeout_ms : 0);
     config.map_ready_timeout = std::chrono::milliseconds(
       static_cast<int>(map_ready_timeout * 1000.0));
+    config.supersede_grace = std::chrono::milliseconds(
+      static_cast<int>(supersede_grace_sec * 1000.0));
     arbiter_.setConfig(config);
     if (!require_serial_link_) {
       arbiter_.onSerialLinkUp(std::chrono::steady_clock::now());
@@ -164,7 +168,8 @@ private:
       rclcpp::Time(msg->header.stamp).nanoseconds(),
       msg->state == Status::STATE_REFERENCE_READY && msg->failure_reason == Status::FAILURE_NONE,
       msg->state == Status::STATE_FAILED || msg->failure_reason != Status::FAILURE_NONE,
-      msg->failure_reason == Status::FAILURE_MAP_UNREADY);
+      msg->failure_reason == Status::FAILURE_MAP_UNREADY,
+      std::chrono::steady_clock::now());
     publishSelection(std::chrono::steady_clock::now());
   }
 

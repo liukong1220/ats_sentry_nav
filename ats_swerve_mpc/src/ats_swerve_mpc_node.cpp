@@ -177,6 +177,8 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       0.1, declare_parameter<double>("execution_command_timeout",
                                      execution_command_timeout_));
   execution_command_enabled_ = !execution_command_topic_.empty();
+  supersede_grace_sec_ = std::max(
+      0.0, declare_parameter<double>("supersede_grace_sec", supersede_grace_sec_));
   goal_position_tolerance_ = declare_parameter<double>(
       "goal_position_tolerance", goal_position_tolerance_);
   goal_yaw_tolerance_ =
@@ -719,6 +721,21 @@ void AtsSwerveMpcNode::onExecutionCommand(
     }
     last_execution_command_signal_ = std::chrono::steady_clock::now() -
       std::chrono::nanoseconds(command_age.nanoseconds());
+    const bool grace_active = supersedeGraceActiveLocked(std::chrono::steady_clock::now());
+    if (!stop && grace_active &&
+        message->mode == ats_navigation_interfaces::msg::ExecutionCommand::MODE_EXECUTE &&
+        active_execution_command_->goal_id == message->goal_id &&
+        active_execution_command_->localization_epoch == message->localization_epoch &&
+        message->map_generation == supersede_old_generation_) {
+      // 换代宽限内 Goal Manager 仍按旧 generation 心跳：不安装、不停车，旧 reference
+      // 继续执行到宽限截止或新 generation 的 EXECUTE 到达（报告 5.1.9 D）。
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "【换代宽限】旧 generation %llu 的心跳不安装，等待 generation %llu 的执行授权。",
+          static_cast<unsigned long long>(message->map_generation),
+          static_cast<unsigned long long>(planner_generation_));
+      return;
+    }
     if (stop) {
       active_execution_command_.reset();
     } else if (message->mode !=
@@ -741,6 +758,12 @@ void AtsSwerveMpcNode::onExecutionCommand(
         active_execution_command_->goal_id == message->goal_id &&
         active_execution_command_->localization_epoch == message->localization_epoch &&
         active_execution_command_->map_generation == message->map_generation;
+      // 换代宽限内到达的新 generation：同一 goal 与 epoch，车还在旧 reference 上按巡航
+      // 速度跑，和同 generation 换轨一样沿用 last_control_ 与 warm start。
+      const bool successor_generation = grace_active &&
+        active_execution_command_->goal_id == message->goal_id &&
+        active_execution_command_->localization_epoch == message->localization_epoch &&
+        message->map_generation > active_execution_command_->map_generation;
       const bool same_reference = same_goal_epoch_generation &&
         active_execution_command_->map_publication_sequence ==
           message->map_publication_sequence &&
@@ -755,9 +778,11 @@ void AtsSwerveMpcNode::onExecutionCommand(
         // max_a*dt 增量限幅把换轨第一拍压到约 0.1 m/s，等同一次急刹。其余情形照旧清零：
         // 首次安装（无 active command）、STOP/急停/FAILED/MAP_UNREADY 之后（这些路径都已清掉
         // active command 或置 fail_stop_engaged_）、generation/epoch/goal 变化。
-        keep_control_state = same_goal_epoch_generation && !fail_stop_engaged_.load();
+        keep_control_state = (same_goal_epoch_generation || successor_generation) &&
+          !fail_stop_engaged_.load();
       }
       active_execution_command_ = *message;
+      supersede_deadline_.reset();
     }
   }
   if (stop) {
@@ -868,12 +893,27 @@ void AtsSwerveMpcNode::onPlannerStatus(
       // 停车戳，被 installPath 判为"早于最近一次急停"，无停车重规划因此每次都停住。
       // legacy Path 模式没有 generation 绑定，仍按原规则推进停车戳。
       superseded_only = execution_command_enabled_ && changed_identity && !changed_epoch;
+      // 换代宽限（报告 5.1.9 D）：旧命令不立即作废，最多再执行 supersede_grace_sec，
+      // 等新 generation 的 EXECUTE。新 generation 已标为可用，旧 generation 的 EXECUTE
+      // 仍不能安装；宽限截止时控制周期按 superseded 停车。宽限已开始时不延长。
+      if (superseded_only && supersede_grace_sec_ > 0.0 && active_execution_command_ &&
+          !fail_stop_engaged_.load() &&
+          active_execution_command_->localization_epoch == message->localization_epoch) {
+        if (!supersede_deadline_) {
+          supersede_deadline_ = std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(supersede_grace_sec_));
+          supersede_old_generation_ = active_execution_command_->map_generation;
+        }
+        stop = false;
+      }
     } else {
       planner_generation_usable_ = false;
       stop = true;
     }
     if (stop) {
       active_execution_command_.reset();
+      supersede_deadline_.reset();
     }
   }
   if (stop) {
@@ -888,6 +928,28 @@ bool AtsSwerveMpcNode::mapReadyFreshLocked() const {
   const auto age = std::chrono::steady_clock::now() - *last_map_ready_signal_;
   return age >= std::chrono::steady_clock::duration::zero() &&
     std::chrono::duration<double>(age).count() <= map_ready_timeout_sec_;
+}
+
+bool AtsSwerveMpcNode::supersedeGraceActiveLocked(
+    std::chrono::steady_clock::time_point now) const {
+  return supersede_deadline_ && now <= *supersede_deadline_ &&
+    active_execution_command_ && !fail_stop_engaged_.load();
+}
+
+bool AtsSwerveMpcNode::activeExecutionValidLocked(
+    std::chrono::steady_clock::time_point now) const {
+  if (!active_execution_command_) {
+    return false;
+  }
+  const auto & command = *active_execution_command_;
+  if (mapExecutionValidLocked(command)) {
+    return true;
+  }
+  // 宽限内旧命令仍可执行：地图心跳新鲜、新 generation 已就绪，旧 generation 没被退役。
+  return supersedeGraceActiveLocked(now) && mapReadyFreshLocked() &&
+    planner_generation_usable_ && command.localization_epoch == planner_epoch_ &&
+    command.map_generation == supersede_old_generation_ &&
+    command.map_generation > retired_planner_generation_;
 }
 
 bool AtsSwerveMpcNode::mapExecutionValidLocked(
@@ -918,6 +980,7 @@ void AtsSwerveMpcNode::onMapReady(const std_msgs::msg::Bool::SharedPtr message) 
         retired_planner_generation_, retire_floor);
       planner_generation_usable_ = false;
       active_execution_command_.reset();
+      supersede_deadline_.reset();
     }
     map_ready_ = message->data;
     last_map_ready_signal_ = std::chrono::steady_clock::now();
@@ -1044,8 +1107,18 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   if (execution_command_enabled_) {
     const auto lease_check_time = std::chrono::steady_clock::now();
+    bool supersede_grace_expired = false;
     {
       std::lock_guard<std::mutex> lock(trajectory_mutex_);
+      if (supersede_deadline_ && lease_check_time > *supersede_deadline_) {
+        // 宽限截止仍没有新 generation 的 EXECUTE：与无宽限时 superseded 的停车相同。
+        supersede_deadline_.reset();
+        if (active_execution_command_ &&
+            active_execution_command_->map_generation == supersede_old_generation_) {
+          active_execution_command_.reset();
+          supersede_grace_expired = true;
+        }
+      }
       if (map_ready_ && last_map_ready_signal_ && !mapReadyFreshLocked()) {
         const std::uint64_t retire_floor = ready_lease_generation_ != 0
           ? ready_lease_generation_
@@ -1061,10 +1134,14 @@ void AtsSwerveMpcNode::onControlTimer() {
         std::chrono::duration<double>(
           lease_check_time - *last_execution_command_signal_).count() <=
           execution_command_timeout_ && active_execution_command_ &&
-        mapExecutionValidLocked(*active_execution_command_) &&
+        activeExecutionValidLocked(lease_check_time) &&
         gimbalExecutionValidLocked(*active_execution_command_);
       gimbal_valid = active_execution_command_ &&
                      gimbalExecutionValidLocked(*active_execution_command_);
+    }
+    if (supersede_grace_expired) {
+      engageFailStop(false);
+      return;
     }
     if (!execution_lease_valid || fail_stop_engaged_.load()) {
       engageFailStop();

@@ -1274,6 +1274,134 @@ TEST_F(MpcTerminalApproachTest, PlanarSpeedStaysBelowDistanceOverTimeConstant) {
   }
 }
 
+// 换代宽限（报告 5.1.9 D）：supersede_grace_sec > 0 时，同一 epoch 内新 generation 的
+// REFERENCE_READY 不立即作废旧命令；宽限内到达的新 generation EXECUTE 沿用 last_control_。
+class MpcSupersedeGraceTest : public MpcReferenceSwitchTest
+{
+protected:
+  static constexpr double kGraceSec = 0.5;
+
+  std::vector<rclcpp::Parameter> extraParameters() const override
+  {
+    auto parameters = MpcReferenceSwitchTest::extraParameters();
+    parameters.emplace_back("supersede_grace_sec", kGraceSec);
+    return parameters;
+  }
+
+  // 巡航到位后发布 READY(g8)，返回发布 READY 时的指令下标。
+  std::size_t cruiseThenSupersede(rclcpp::Time & old_start)
+  {
+    publishPlannerStatus(1, 7);
+    EXPECT_TRUE(startMoving(1, 7, 1, old_start));
+    EXPECT_TRUE(reachCruise(1, 7, 1, old_start));
+    const std::size_t ready_index = commands_.size();
+    publishPlannerStatus(1, 8);
+    return ready_index;
+  }
+
+  // 用旧 generation 的固定戳心跳，持续 duration（Goal Manager 提交新 generation 之前的形态）。
+  void oldGenerationHeartbeats(
+    const rclcpp::Time & old_start, std::chrono::steady_clock::duration duration)
+  {
+    spinUntil([&]() {
+      heartbeat(1, 7, 1, old_start);
+      return false;
+    }, duration);
+  }
+};
+
+TEST_F(MpcSupersedeGraceTest, NewGenerationWithinGraceKeepsLastControl) {
+  rclcpp::Time old_start;
+  const std::size_t ready_index = cruiseThenSupersede(old_start);
+  oldGenerationHeartbeats(old_start, 200ms);
+  const rclcpp::Time new_start = driver_->now() + rclcpp::Duration::from_seconds(0.05);
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 8, 1, new_start);
+    return commands_.size() >= ready_index + 20;
+  }, 3s));
+  expectNoDropBeyondStepLimit(ready_index);
+  EXPECT_GE(lowestVx(ready_index), kCruiseFloor);
+}
+
+TEST_F(MpcSupersedeGraceTest, NewGenerationBeyondGraceStopsThenRestarts) {
+  rclcpp::Time old_start;
+  const std::size_t ready_index = cruiseThenSupersede(old_start);
+  // 宽限内旧命令继续：READY 后 0.25 s 还在巡航。
+  oldGenerationHeartbeats(old_start, 250ms);
+  ASSERT_GT(commands_.size(), ready_index);
+  EXPECT_GE(lowestVx(ready_index), kCruiseFloor);
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 7, 1, old_start);
+    return command_norm_.load() < 1e-6;
+  }, 1s));
+  const std::size_t stopped_index = commands_.size();
+  rclcpp::Time next_start;
+  ASSERT_TRUE(startMoving(1, 8, 1, next_start));
+  const auto first_motion = std::find_if(
+    commands_.begin() + static_cast<std::ptrdiff_t>(stopped_index), commands_.end(),
+    [](const geometry_msgs::msg::Twist & command) {
+      return std::hypot(command.linear.x, command.linear.y) > kTolerance;
+    });
+  ASSERT_NE(first_motion, commands_.end());
+  EXPECT_LE(first_motion->linear.x, kLinearStepLimit + kTolerance);
+}
+
+TEST_F(MpcSupersedeGraceTest, FailedStatusDuringGraceStopsImmediately) {
+  rclcpp::Time old_start;
+  cruiseThenSupersede(old_start);
+  oldGenerationHeartbeats(old_start, 100ms);
+  ASSERT_GT(command_norm_.load(), 0.02);
+  publishPlannerStatus(1, 9, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_RUNTIME_UNSAFE);
+  // 远早于 0.5 s 的宽限截止。
+  ASSERT_TRUE(spinUntil([&]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 150ms));
+}
+
+TEST_F(MpcSupersedeGraceTest, OldGenerationExecuteDuringGraceIsRejected) {
+  rclcpp::Time old_start;
+  cruiseThenSupersede(old_start);
+  // 旧 generation 带一条新 reference：宽限内不安装，宽限到期后停车且不能恢复。
+  const rclcpp::Time replacement_start =
+    driver_->now() + rclcpp::Duration::from_seconds(0.05);
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 7, 1, replacement_start);
+    return command_norm_.load() < 1e-6;
+  }, 1s));
+  EXPECT_FALSE(spinUntil([&]() {
+    heartbeat(1, 7, 1, replacement_start);
+    return command_norm_.load() > 1e-6;
+  }, 300ms));
+}
+
+TEST_F(MpcSupersedeGraceTest, GoalChangeDuringGraceRestartsFromZero) {
+  rclcpp::Time old_start;
+  const std::size_t ready_index = cruiseThenSupersede(old_start);
+  oldGenerationHeartbeats(old_start, 100ms);
+  const std::size_t switch_index = commands_.size();
+  ASSERT_GT(switch_index, ready_index);
+  const rclcpp::Time new_start = driver_->now() + rclcpp::Duration::from_seconds(0.05);
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 8, 2, new_start);
+    return commands_.size() >= switch_index + 6;
+  }, 3s));
+  EXPECT_LE(lowestVx(switch_index), kLinearStepLimit + kTolerance);
+}
+
+TEST_F(MpcSupersedeGraceTest, EpochChangeDuringGraceStopsImmediately) {
+  rclcpp::Time old_start;
+  cruiseThenSupersede(old_start);
+  oldGenerationHeartbeats(old_start, 100ms);
+  ASSERT_GT(command_norm_.load(), 0.02);
+  publishPlannerStatus(2, 9);
+  ASSERT_TRUE(spinUntil([&]() {
+    publishOdometry();
+    return command_norm_.load() < 1e-6;
+  }, 150ms));
+}
+
 // 旋转相位补偿的节点接线（报告 9.4 第 6 项 / A.9）：车体静止在原点、reference 要求 yaw 1 rad，
 // MPC 持续输出正 wz。debug 预测路径的首个 yaw 就是交给 iLQR 的初始 yaw，应等于
 // 0 + wz_prev * t_d / 2，其中 wz_prev 是上一拍已发布指令的 wz。t_d 取一个放大的值以便观测。

@@ -49,6 +49,9 @@ struct CmdVelArbiterConfig
   /// `/serial/link_up` heartbeat 超时。无样本或超龄都必须按链路失效归零。
   std::chrono::milliseconds link_timeout{300};
   std::chrono::milliseconds map_ready_timeout{5000};
+  /// 同一 epoch 内更新的 generation REFERENCE_READY 后，旧授权最多再保留这么久，等新
+  /// generation 的 EXECUTE（报告 5.1.9 D）。0 = 立即撤销（旧行为）。
+  std::chrono::milliseconds supersede_grace{0};
 };
 
 struct CmdVelSample
@@ -103,7 +106,8 @@ public:
   // PlannerStatus carries MINCO-local identity, never the map producer generation.
   void onPlannerStatus(
     uint64_t epoch, uint64_t generation, int64_t stamp_ns,
-    bool reference_ready, bool failed, bool map_unready)
+    bool reference_ready, bool failed, bool map_unready,
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
   {
     if ((!reference_ready && !failed && !map_unready) ||
       epoch == 0 || generation == 0 || stamp_ns <= 0 ||
@@ -117,7 +121,20 @@ public:
       return;
     }
     if (changed) {
-      rejectExecutionCommand();
+      // 换代宽限：只覆盖"同一 epoch、新 generation 已就绪、旧授权仍有效"这一种情形；
+      // FAILED、MAP_UNREADY、epoch 变化照旧立即撤销。宽限已开始时不重置截止时刻，
+      // 连续换代也不会让旧授权活得比一个宽限窗口更久。
+      const bool grace = config_.supersede_grace.count() > 0 && reference_ready &&
+        !failed && !map_unready && epoch == planner_epoch_ && auto_authorized_ &&
+        has_execution_lease_;
+      if (grace) {
+        if (!supersede_deadline_) {
+          supersede_deadline_ = now + config_.supersede_grace;
+          superseded_generation_ = planner_generation_;
+        }
+      } else {
+        rejectExecutionCommand();
+      }
       planner_epoch_ = epoch;
       planner_generation_ = generation;
       planner_generation_usable_ = false;
@@ -205,6 +222,15 @@ public:
     has_command_sequence_ = true;
     last_command_sequence_ = sequence;
     expireMapReady(now);
+    expireSupersedeGrace(now);
+    if (execute && supersede_deadline_ && auto_authorized_ &&
+      localization_epoch == planner_epoch_ && map_generation == superseded_generation_ &&
+      mapReady(now))
+    {
+      // Goal Manager 在提交新 generation 之前的心跳仍带旧 generation：不续租、不撤销，
+      // 授权在宽限截止或新 generation 的 EXECUTE 到达时结算。
+      return true;
+    }
     if (execute && (!mapReady(now) || !planner_generation_usable_ ||
       localization_epoch == 0 || map_generation == 0 ||
       localization_epoch != planner_epoch_ || map_generation != planner_generation_))
@@ -221,6 +247,7 @@ public:
       has_execution_lease_ = true;
       execution_lease_stamp_ = now - age;
       dual_map_execute_latched_ = false;
+      supersede_deadline_.reset();
     } else {
       // DualMap passed but estop/link blocked authorization. GM publishes
       // estop=false then MODE_EXECUTE in one critical section; DDS can deliver
@@ -313,6 +340,7 @@ public:
     }
     expireExecutionLease(now);
     expireMapReady(now);
+    expireSupersedeGrace(now);
     if (!mapReady(now)) {
       rejectExecutionCommand();
     }
@@ -378,7 +406,16 @@ private:
   {
     clearExecutionLease();
     invalidateAuto();
+    supersede_deadline_.reset();
     return false;
+  }
+
+  /// 宽限到期且还没有新 generation 的 EXECUTE：与无宽限时一样撤销旧授权。
+  void expireSupersedeGrace(std::chrono::steady_clock::time_point now)
+  {
+    if (supersede_deadline_ && now > *supersede_deadline_) {
+      rejectExecutionCommand();
+    }
   }
 
   static CmdVelArbiterOutput zero(CmdVelArbiterReason reason)
@@ -428,6 +465,7 @@ private:
   {
     auto_authorized_ = false;
     has_execution_lease_ = false;
+    supersede_deadline_.reset();
   }
 
   void maybeAuthorizeLatchedExecute(std::chrono::steady_clock::time_point now)
@@ -497,6 +535,8 @@ private:
   int64_t planner_status_stamp_ns_ = -1;
   bool planner_generation_usable_ = false;
   bool planner_generation_retired_ = false;
+  std::optional<std::chrono::steady_clock::time_point> supersede_deadline_;
+  uint64_t superseded_generation_ = 0;
   bool has_map_ready_ = false;
   bool map_ready_ = false;
   std::chrono::steady_clock::time_point map_ready_stamp_{};
