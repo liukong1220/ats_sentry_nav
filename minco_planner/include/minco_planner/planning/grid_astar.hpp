@@ -52,6 +52,16 @@ struct GridAstarParams
   double clearance_cost_weight = 0.0;
   /// 离墙代价生效的距离上界（米）；超过该距离视为开阔，不再加代价。
   double clearance_cost_distance = 0.0;
+  /// 起点格净空低于 `safe_distance` 时，允许从起点沿"净空不减"的空闲格向外爬的最大格数。
+  ///
+  /// `assume_start_traversable` 只豁免起点格本身，它的 8 个邻格仍要满足 `safe_distance`。
+  /// 车被推到墙边（净空 0.1–0.2 m，低于搜索下限 0.376 m）时所有邻格都不达标，A* 展开
+  /// 1 个节点就结束（`expanded=1`），逃逸前缀与局部修复都在 A* 之后运行，一次都不会被调用。
+  /// 这里只放开"离开"这一个方向：下一格必须是空闲格，且到最近阻塞格的距离不小于当前格，
+  /// 因此路径不会为了绕路而重新靠近障碍；累计超过本上限仍没爬到 `safe_distance` 就放弃。
+  /// 足迹门禁与图搜索的净空判据（`safe_distance`、阈值、unknown 语义）都不变。
+  /// 0 = 关闭，与旧行为逐位一致。
+  int start_escape_max_steps = 0;
 };
 
 struct GridAstarResult

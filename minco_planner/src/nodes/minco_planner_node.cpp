@@ -237,6 +237,10 @@ void MincoPlannerNode::declareAndLoadParams()
     static_cast<int>(escape_prefix_params_.max_prefix_points));
   declare_parameter<double>(
     "escape_from_contact_max_contact_depth", escape_prefix_params_.max_contact_depth_m);
+  declare_parameter<double>(
+    "escape_from_contact_monotone_max_depth", escape_prefix_params_.monotone_max_contact_depth_m);
+  declare_parameter<double>(
+    "escape_from_contact_monotone_depth_step", escape_prefix_params_.monotone_depth_step_m);
   declare_parameter<bool>(
     "goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
   declare_parameter<double>(
@@ -268,6 +272,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("search_clearance_cost_weight", astar_params.clearance_cost_weight);
   declare_parameter<double>(
     "search_clearance_cost_distance", astar_params.clearance_cost_distance);
+  declare_parameter<int>("start_escape_max_steps", astar_params.start_escape_max_steps);
   GridJpsParams jps_params;
   declare_parameter<int>("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
   declare_parameter<double>("jps_safe_distance", jps_params.safe_distance);
@@ -499,6 +504,14 @@ void MincoPlannerNode::declareAndLoadParams()
   }
   get_parameter(
     "escape_from_contact_max_contact_depth", escape_prefix_params_.max_contact_depth_m);
+  get_parameter(
+    "escape_from_contact_monotone_max_depth", escape_prefix_params_.monotone_max_contact_depth_m);
+  get_parameter(
+    "escape_from_contact_monotone_depth_step", escape_prefix_params_.monotone_depth_step_m);
+  escape_prefix_params_.monotone_max_contact_depth_m =
+    std::max(0.0, escape_prefix_params_.monotone_max_contact_depth_m);
+  escape_prefix_params_.monotone_depth_step_m =
+    std::max(1e-3, escape_prefix_params_.monotone_depth_step_m);
   get_parameter("goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
   get_parameter(
     "goal_admission_position_tolerance", goal_pose_admission_params_.position_tolerance_m);
@@ -530,6 +543,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("allow_diagonal", astar_params.allow_diagonal);
   get_parameter("search_clearance_cost_weight", astar_params.clearance_cost_weight);
   get_parameter("search_clearance_cost_distance", astar_params.clearance_cost_distance);
+  get_parameter("start_escape_max_steps", astar_params.start_escape_max_steps);
+  astar_params.start_escape_max_steps = std::max(0, astar_params.start_escape_max_steps);
   if (astar_params.clearance_cost_weight > 0.0 && search_algorithm_ == "jps") {
     // JPS 的跳点剪枝只对均匀代价成立，无法表达离墙代价；开启离墙代价时改用 A*。
     RCLCPP_WARN(
@@ -1127,7 +1142,7 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
   }
   const EscapePrefixDecision escape =
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
-  const bool shallow = escapePrefixContactShallow(
+  const bool shallow = escapePrefixContactAdmitted(
     remaining, escape, footprint_params_, grid, escape_prefix_params_);
   if (!shallow && reason) {
     std::ostringstream text;
@@ -1211,7 +1226,7 @@ bool MincoPlannerNode::runtimeWindowSafeOn(
   }
   const EscapePrefixDecision escape =
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
-  return escapePrefixContactShallow(
+  return escapePrefixContactAdmitted(
     remaining, escape, footprint_params_, grid, escape_prefix_params_);
 }
 
@@ -1276,7 +1291,7 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   // 才放行；车一旦沿轨迹驶离，head_offset 增大，这个放行自然停止生效。
   const EscapePrefixDecision runtime_escape =
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
-  if (escapePrefixContactShallow(
+  if (escapePrefixContactAdmitted(
       remaining, runtime_escape, footprint_params_, snapshot->grid, escape_prefix_params_))
   {
     RCLCPP_WARN_THROTTLE(
@@ -1890,7 +1905,7 @@ void MincoPlannerNode::planGoal(
     EscapePrefixDecision{} :
     evaluateEscapePrefix(reference.points, safety.collisions, escape_prefix_params_);
   if (escape_decision.allowed &&
-    !escapePrefixContactShallow(
+    !escapePrefixContactAdmitted(
       reference, escape_decision, footprint_params_, planning_grid, escape_prefix_params_))
   {
     // 前缀压进占据格超过深度上界：不是擦边接触，照旧 fail-closed。
@@ -1924,7 +1939,7 @@ void MincoPlannerNode::planGoal(
         EscapePrefixDecision{} :
         evaluateEscapePrefix(candidate.points, candidate_safety.collisions, escape_prefix_params_);
       if (candidate_escape.allowed &&
-        !escapePrefixContactShallow(
+        !escapePrefixContactAdmitted(
           candidate, candidate_escape, footprint_params_, planning_grid, escape_prefix_params_))
       {
         candidate_escape.prefix_end = 0U;
