@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 #include "minco_planner/safety/footprint_samples.hpp"
@@ -520,6 +522,171 @@ TEST(MincoTrajectoryOptimizer, GuideSmoothingRoundsDenseLCornerAndKeepsEndpoints
   EXPECT_LT(smoothed_curvature, 0.5 * polyline_curvature);
   // 偏离受 max_deviation 约束，不会把拐角抄近路抄穿。
   EXPECT_LT(maxPolylineDeviation(smoothed_trajectory), params.guide_smoothing_max_deviation + 0.10);
+}
+
+
+// --- 首端种子回退（2025 红框 d221）---
+// 碰墙瞬间里程计给出约 2 m/s（真值 0.97 m/s），起点贴墙、首段被压到最小时长。固定的非零首端速度
+// 让“拉长时长”不再降低速度峰值（渐近值与种子成正比），旧循环一路乘到 1e3-3e4 s 仍超限。
+// 离线复现与原型见报告 5.1.11：部署参数、无 ESDF 即可触发。
+
+minco_planner::MincoTrajectoryOptimizerParams deployedSeedParams()
+{
+  minco_planner::MincoTrajectoryOptimizerParams p;
+  p.reference_speed = 1.2;
+  p.max_velocity = 2.0;
+  p.max_acceleration = 2.5;
+  p.max_jerk = 12.0;
+  p.max_lateral_acceleration = 1.5;
+  p.max_time_scaling_iterations = 5;
+  p.time_scaling_factor = 1.25;
+  p.guide_control_point_spacing = 0.3;
+  p.joint_waypoint_spacing = 1.0;
+  p.joint_samples_per_piece = 16;
+  p.joint_max_piece_time = 3.0;
+  p.joint_max_iterations = 200;
+  p.joint_time_budget_ms = 50.0;
+  p.joint_time_weight = 20.0;
+  p.esdf_obstacle_optimization_enabled = false;
+  return p;
+}
+
+nav_msgs::msg::Path pathThrough(const std::vector<std::pair<double, double>> & points)
+{
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "map";
+  for (const auto & xy : points) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = xy.first;
+    pose.pose.position.y = xy.second;
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  return path;
+}
+
+// 起点后 0.1 m 处就有约 50 度转角的绕行路径，与记录的失败同形。
+const std::vector<std::pair<double, double>> kSeedDetour = {
+  {0.0, 0.0}, {-0.04, -0.10}, {-1.29, -0.52}, {-2.37, -0.77}, {-2.24, -1.32}, {-1.30, -2.28},
+  {-0.18, -2.23}, {0.83, -2.26}, {1.83, -2.28}, {2.80, -2.08}, {3.66, -1.62}, {4.5, -0.8},
+  {6.0, 0.0}};
+
+struct SeedOutcome
+{
+  bool valid = false;
+  minco_planner::MincoOptimizationTrace trace;
+  double longest_segment = 0.0;
+};
+
+SeedOutcome optimizeWithSeed(
+  const std::vector<std::pair<double, double>> & points, double vx, double vy)
+{
+  const minco_planner::MincoTrajectoryOptimizer optimizer(deployedSeedParams());
+  minco_planner::InitialKinematicState seed;
+  seed.valid = true;
+  seed.velocity = Eigen::Vector2d(vx, vy);
+  SeedOutcome outcome;
+  const auto reference =
+    optimizer.optimize(pathThrough(points), nullptr, nullptr, &seed, nullptr, nullptr, &outcome.trace);
+  outcome.valid = reference.valid();
+  for (const double duration : outcome.trace.segment_durations) {
+    outcome.longest_segment = std::max(outcome.longest_segment, duration);
+  }
+  return outcome;
+}
+
+void expectInsideUnchangedGates(const SeedOutcome & outcome)
+{
+  ASSERT_TRUE(outcome.valid) << outcome.trace.failure_reason;
+  EXPECT_LE(outcome.trace.peak_velocity, 2.0 + 1e-6);
+  EXPECT_LE(outcome.trace.peak_acceleration, 2.5 + 1e-6);
+  EXPECT_LE(outcome.trace.peak_jerk, 12.0 + 1e-6);
+  // joint_max_piece_time 3 s 乘上局部缩放余量；旧循环在这些用例里达到 1e3-1e7 s。
+  EXPECT_LE(outcome.longest_segment, 20.0);
+}
+
+TEST(MincoSeedBackoff, OdometrySpikeSeedOnDetourFallsBackInsideTheSameGates)
+{
+  // 里程计在碰墙瞬间的 2 m/s 尖峰沿第一段方向：完整种子下时间缩放不收敛（峰值 15 m/s），
+  // 单次求解以 dynamic_scaling_non_contractive 终止；回退到 0.5 倍种子后在同样的限幅内可行。
+  const SeedOutcome outcome = optimizeWithSeed(kSeedDetour, -0.71, -1.87);
+  expectInsideUnchangedGates(outcome);
+  EXPECT_LT(outcome.trace.seed_scale, 1.0);
+}
+
+TEST(MincoSeedBackoff, StraightPathSpikeSeedsFallBackInsideTheSameGates)
+{
+  // 沿路径方向与横向的 2 m/s 种子在直线上同样推出发散（峰值 7-17 m/s）。
+  for (const auto & seed : {std::pair<double, double> {2.0, 0.0}, {0.0, 2.0}}) {
+    const SeedOutcome outcome = optimizeWithSeed({{0.0, 0.0}, {10.0, 0.0}}, seed.first, seed.second);
+    expectInsideUnchangedGates(outcome);
+    EXPECT_LT(outcome.trace.seed_scale, 1.0)
+      << "seed (" << seed.first << "," << seed.second << ")";
+  }
+}
+
+TEST(MincoSeedBackoff, SeedPointingAwayFromTheDetourNeedsNoFallback)
+{
+  // 反向 2 m/s 种子本身不会把峰值推到限幅外，保持完整种子（回退只在必败时触发）。
+  const SeedOutcome outcome = optimizeWithSeed(kSeedDetour, 0.71, 1.87);
+  expectInsideUnchangedGates(outcome);
+  EXPECT_DOUBLE_EQ(outcome.trace.seed_scale, 1.0);
+}
+
+TEST(MincoSeedBackoff, SeedsThatFitTheGatesAreHonouredAtFullScale)
+{
+  // 静止起步与 1 m/s 沿路径方向的正常重规划不应触发回退（seed_scale 保持 1）。
+  const SeedOutcome rest = optimizeWithSeed(kSeedDetour, 0.0, 0.0);
+  expectInsideUnchangedGates(rest);
+  EXPECT_DOUBLE_EQ(rest.trace.seed_scale, 1.0);
+
+  const SeedOutcome along = optimizeWithSeed({{0.0, 0.0}, {10.0, 0.0}}, 1.0, 0.0);
+  expectInsideUnchangedGates(along);
+  EXPECT_DOUBLE_EQ(along.trace.seed_scale, 1.0);
+}
+
+TEST(MincoSeedBackoff, UnseededAndInvalidSeedRunExactlyOnce)
+{
+  const minco_planner::MincoTrajectoryOptimizer optimizer(deployedSeedParams());
+  minco_planner::MincoOptimizationTrace no_seed_trace;
+  const auto no_seed = optimizer.optimize(
+    pathThrough(kSeedDetour), nullptr, nullptr, nullptr, nullptr, nullptr, &no_seed_trace);
+  minco_planner::InitialKinematicState invalid;  // valid = false
+  invalid.velocity = Eigen::Vector2d(2.0, 0.0);
+  minco_planner::MincoOptimizationTrace invalid_trace;
+  const auto ignored = optimizer.optimize(
+    pathThrough(kSeedDetour), nullptr, nullptr, &invalid, nullptr, nullptr, &invalid_trace);
+  ASSERT_TRUE(no_seed.valid());
+  ASSERT_TRUE(ignored.valid());
+  EXPECT_DOUBLE_EQ(no_seed_trace.seed_scale, 1.0);
+  EXPECT_DOUBLE_EQ(invalid_trace.seed_scale, 1.0);
+  ASSERT_EQ(no_seed.points.size(), ignored.points.size());
+  EXPECT_DOUBLE_EQ(no_seed.totalTime(), ignored.totalTime());
+}
+
+TEST(MincoSeedBackoff, GatesAreNotRelaxedWhenNoSeedWorks)
+{
+  // 路径本身不可能在限幅内走完（max_velocity 压到 0.05 m/s，参考速度 1.2）：回退到 0 档
+  // 之后仍然失败，返回空轨迹而不是放宽限幅。
+  auto params = deployedSeedParams();
+  params.max_velocity = 0.05;
+  params.max_acceleration = 0.05;
+  params.max_jerk = 0.05;
+  const minco_planner::MincoTrajectoryOptimizer optimizer(params);
+  minco_planner::InitialKinematicState seed;
+  seed.valid = true;
+  seed.velocity = Eigen::Vector2d(2.0, 0.0);
+  minco_planner::MincoOptimizationTrace trace;
+  const auto reference = optimizer.optimize(
+    pathThrough({{0.0, 0.0}, {10.0, 0.0}}), nullptr, nullptr, &seed, nullptr, nullptr, &trace);
+  if (reference.valid()) {
+    EXPECT_LE(trace.peak_velocity, 0.05 + 1e-6);
+    EXPECT_LE(trace.peak_acceleration, 0.05 + 1e-6);
+    EXPECT_LE(trace.peak_jerk, 0.05 + 1e-6);
+  } else {
+    EXPECT_FALSE(trace.failure_reason.empty());
+  }
 }
 
 }  // namespace

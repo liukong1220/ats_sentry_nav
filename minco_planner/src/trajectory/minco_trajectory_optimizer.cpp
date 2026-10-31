@@ -608,7 +608,7 @@ bool MincoTrajectoryOptimizer::esdfFootprintOptimizationEnabled() const
   return params_.esdf_obstacle_optimization_enabled && params_.esdf_footprint_optimization_enabled;
 }
 
-ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
+ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   const nav_msgs::msg::Path & raw_path,
   const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
   const ReferenceTrajectory * footprint_orientation,
@@ -807,6 +807,13 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   // spending every iteration locally and assuming one uniform pass is enough.
   const int local_scaling_iterations = std::max(0, maximum_scaling_iterations - 1);
   const int uniform_scaling_iterations = maximum_scaling_iterations - local_scaling_iterations + 1;
+  // 固定的非零首端速度下，拉长时长并不一定让速度峰值下降：首段被压到最小时长、第二段很长时，
+  // 峰值速度趋于与种子速度成正比的常数（2025 红框 d221：种子 2.03 m/s、T1/T0 = 27.7，
+  // 峰值 1.99 -> 8.3 -> 13.9 -> 16.0 -> 27.9 m/s，段时长一路乘到 1e3-3e4 s）。循环若继续按
+  // peak/limit 拉长只会把时长推到不可用的量级，所以连续两轮速度都超限且峰值没降时停止，
+  // 交给 optimize 的首端种子回退去处理。判据表达式一字未改，这里只决定“要不要继续拉长”。
+  bool scaling_non_contractive = false;
+  double previous_round_peak_velocity = 0.0;
   for (int iteration = 0; iteration <= local_scaling_iterations;
     ++iteration)
   {
@@ -833,6 +840,14 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     if (iteration == local_scaling_iterations) {
       break;
     }
+    if (iteration > 0 && !velocity_ok && params_.max_velocity > 0.0 &&
+      previous_round_peak_velocity > params_.max_velocity + 1e-6 &&
+      peak_velocity >= previous_round_peak_velocity)
+    {
+      scaling_non_contractive = true;
+      break;
+    }
+    previous_round_peak_velocity = peak_velocity;
     if (!time_allocator.applyLocalDynamicScaling(
         durations, segment_peak_velocities, effectiveAccelerations(segment_peak_laterals),
         segment_peak_jerks,
@@ -847,7 +862,9 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
       return trajectory;
     }
   }
-  for (int iteration = 0; !dynamic_limits_satisfied && iteration < uniform_scaling_iterations;
+  for (int iteration = 0;
+    !dynamic_limits_satisfied && !scaling_non_contractive &&
+    iteration < uniform_scaling_iterations;
     ++iteration)
   {
     double required_scale = 1.0;
@@ -892,7 +909,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     uniform_time_scaled = true;
   }
   if (!dynamic_limits_satisfied) {
-    finishTrace("dynamic_limits_unsatisfied");
+    finishTrace(scaling_non_contractive ? "dynamic_scaling_non_contractive" :
+      "dynamic_limits_unsatisfied");
     return trajectory;
   }
   if (trace) {
@@ -932,6 +950,53 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     accumulated_time += duration;
   }
   return trajectory;
+}
+
+// 首端种子回退。测得的首端速度只是前馈提示，动态限幅门禁（max_velocity/acceleration/jerk/
+// 横向加速度）、矩形足迹门禁与提交门作用在最终轨迹上，一项都没放宽。完整种子让时间缩放
+// 发散（dynamic_limits_unsatisfied 或 dynamic_scaling_non_contractive）时，把种子速度和加速度
+// 按 {0.5, 0.25, 0} 缩小后重解整条优化；0 档等价于“静止起步”的历史行为。
+// 触发条件极窄：种子非零且失败原因是动态限幅，其余输入与失败原因都只跑一次，行为不变。
+// 回退会让新参考的起始前馈小于里程计速度；这类阶跃在 makeHeadState 的限幅里本来就存在，
+// 并且只发生在原本必败的请求上。
+ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
+  const nav_msgs::msg::Path & raw_path,
+  const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
+  const ReferenceTrajectory * footprint_orientation,
+  const InitialKinematicState * initial_state,
+  const nav_msgs::msg::OccupancyGrid * planning_grid,
+  const FootprintSafetyChecker * safety_checker,
+  MincoOptimizationTrace * trace) const
+{
+  static constexpr double kSeedLadder[] = {1.0, 0.5, 0.25, 0.0};
+  const bool seeded = initial_state != nullptr && initial_state->valid &&
+    (initial_state->velocity.squaredNorm() > 1e-12 ||
+    initial_state->acceleration.squaredNorm() > 1e-12);
+  ReferenceTrajectory result;
+  MincoOptimizationTrace attempt_trace;
+  const std::size_t rungs = seeded ? 4U : 1U;
+  for (std::size_t rung = 0; rung < rungs; ++rung) {
+    InitialKinematicState scaled;
+    const InitialKinematicState * seed = initial_state;
+    if (seeded && kSeedLadder[rung] != 1.0) {
+      scaled = *initial_state;
+      scaled.velocity *= kSeedLadder[rung];
+      scaled.acceleration *= kSeedLadder[rung];
+      seed = &scaled;
+    }
+    result = optimizeOnce(
+      raw_path, esdf, footprint_orientation, seed, planning_grid, safety_checker, &attempt_trace);
+    attempt_trace.seed_scale = kSeedLadder[rung];
+    const bool dynamic_failure = attempt_trace.failure_reason == "dynamic_limits_unsatisfied" ||
+      attempt_trace.failure_reason == "dynamic_scaling_non_contractive";
+    if (result.valid() || !dynamic_failure) {
+      break;
+    }
+  }
+  if (trace != nullptr) {
+    *trace = attempt_trace;
+  }
+  return result;
 }
 
 }  // namespace minco_planner
