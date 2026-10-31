@@ -91,6 +91,8 @@ private:
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
   /** @brief 发布确定性零速度并复位控制器内部状态，供所有失败/退出路径共用。 */
   void publishZeroCommandForFailure(const char * reason_zh);
+  /** @brief 终点容差圆内把上一拍指令按 max_a*dt 每拍降到零，降到零后走零速出口。 */
+  void publishTerminalDecelerationCommand();
   /** @brief 校验里程计时效性与位姿跳变；仅返回 true 时状态才可进入本周期求解。 */
   bool odometryUsable(State & current);
   /** @brief 检查动力学参数是否落在实车合理区间，并对越界项输出中文 ERROR/WARN。 */

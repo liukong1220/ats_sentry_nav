@@ -973,9 +973,10 @@ protected:
 
   // 沿 +x、1.5 m/s 的 3 s 直线 reference。reference_start 固定时，心跳重发的戳逐位相同，
   // MPC 视为同一 reference 而不重装；换一个新戳才算一次换轨。
+  // x_offset 平移整条 reference；取 -kCruiseSpeed*3.0 时终点落在原点（车的位置）。
   void publishStraightExecution(
     std::uint64_t epoch, std::uint64_t map_generation, std::uint64_t goal_id,
-    const rclcpp::Time & reference_start)
+    const rclcpp::Time & reference_start, double x_offset = 0.0)
   {
     ExecutionCommand command;
     command.header.stamp = driver_->now();
@@ -1000,7 +1001,7 @@ protected:
       geometry_msgs::msg::PoseStamped pose;
       pose.header.frame_id = "odom";
       pose.header.stamp = reference_start + rclcpp::Duration::from_seconds(0.1 * index);
-      pose.pose.position.x = kCruiseSpeed * 0.1 * index;
+      pose.pose.position.x = x_offset + kCruiseSpeed * 0.1 * index;
       pose.pose.orientation.w = 1.0;
       command.reference.poses.push_back(pose);
     }
@@ -1010,11 +1011,11 @@ protected:
   // 里程计、云台、定位状态与执行授权的一次心跳；顺序与 moveOnGeneration 相同。
   void heartbeat(
     std::uint64_t epoch, std::uint64_t map_generation, std::uint64_t goal_id,
-    const rclcpp::Time & reference_start)
+    const rclcpp::Time & reference_start, double x_offset = 0.0)
   {
     publishOdometry();
     publishStatus(LocalizationStatus::STATE_TRACKING, epoch);
-    publishStraightExecution(epoch, map_generation, goal_id, reference_start);
+    publishStraightExecution(epoch, map_generation, goal_id, reference_start, x_offset);
   }
 
   // 与 moveOnGeneration 一样先用逐次新戳等到首个非零指令（规避 READY 与 EXECUTE 的到达
@@ -1141,6 +1142,59 @@ TEST_F(MpcReferenceSwitchTest, GoalChangeRestartsFromZero) {
   }, 3s));
 
   EXPECT_LE(lowestVx(switch_index), kLinearStepLimit + kTolerance);
+}
+
+// 终点极限环（报告 5.1.9 B）：巡航中进入终点容差圆时，指令按 max_a*dt 每拍降到零，
+// 而不是从巡航速度一拍阶跃到零；降到零后保持零。
+TEST_F(MpcReferenceSwitchTest, GoalToleranceDeceleratesByStepLimitInsteadOfStepToZero) {
+  publishPlannerStatus(1, 7);
+  rclcpp::Time first_start;
+  ASSERT_TRUE(startMoving(1, 7, 1, first_start));
+  ASSERT_TRUE(reachCruise(1, 7, 1, first_start));
+  const std::size_t switch_index = commands_.size();
+  const double cruise_vx = commands_.back().linear.x;
+  ASSERT_GE(cruise_vx, kCruiseFloor);
+
+  // 同一 goal/epoch/generation 换到终点就在车当前位置（原点）的 reference：换轨保留
+  // last_control_，下一拍车已在容差圆内。
+  constexpr double kTerminalOffset = -kCruiseSpeed * 3.0;
+  const rclcpp::Time terminal_start =
+    driver_->now() + rclcpp::Duration::from_seconds(0.05);
+  const std::size_t decay_ticks =
+    static_cast<std::size_t>(std::ceil(kCruiseSpeed / kLinearStepLimit));
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 7, 1, terminal_start, kTerminalOffset);
+    return commands_.size() >= switch_index + decay_ticks + 6;
+  }, 4s));
+
+  expectNoDropBeyondStepLimit(switch_index);
+  // 换轨后的第一拍不能是零：旧行为在这里直接阶跃到 0。
+  EXPECT_GE(commands_[switch_index].linear.x, cruise_vx - kLinearStepLimit - kTolerance);
+  // 换轨装上之前 timer 可能还按旧 reference 求解一拍，所以单调性从第一次下降算起。
+  std::size_t decay_start = switch_index;
+  while (decay_start < commands_.size() &&
+    commands_[decay_start].linear.x >= commands_[decay_start - 1].linear.x - 1e-3)
+  {
+    ++decay_start;
+  }
+  ASSERT_LT(decay_start, commands_.size());
+  std::size_t nonzero_after_switch = 0;
+  for (std::size_t index = switch_index; index < commands_.size(); ++index) {
+    if (index > decay_start) {
+      EXPECT_LE(commands_[index].linear.x, commands_[index - 1].linear.x + kTolerance)
+        << "vx rose inside the goal tolerance at command " << index;
+    }
+    if (std::abs(commands_[index].linear.x) > kTolerance) {
+      ++nonzero_after_switch;
+    }
+  }
+  // 1.5 m/s 按 0.1 m/s 每拍降完不超过 15 拍，另留换轨前后各一拍的调度余量。
+  EXPECT_LE(nonzero_after_switch, decay_ticks + 2);
+  for (std::size_t index = commands_.size() - 3; index < commands_.size(); ++index) {
+    EXPECT_EQ(commands_[index].linear.x, 0.0);
+    EXPECT_EQ(commands_[index].linear.y, 0.0);
+    EXPECT_EQ(commands_[index].angular.z, 0.0);
+  }
 }
 
 // 旋转相位补偿的节点接线（报告 9.4 第 6 项 / A.9）：车体静止在原点、reference 要求 yaw 1 rad，
