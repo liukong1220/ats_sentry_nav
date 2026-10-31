@@ -1106,15 +1106,16 @@ void AtsSwerveMpcNode::onControlTimer() {
   const double goal_position_error =
       (goal.head<2>() - current.head<2>()).norm();
   const double goal_yaw_error = std::abs(normalizeAngle(goal(2) - current(2)));
-  if ((goal_position_error <= goal_position_tolerance_ &&
-       goal_yaw_error <= goal_yaw_tolerance_) ||
-      trajectory_expired) {
-    if (trajectory_expired) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                           "【轨迹过期】参考轨迹已超过有效期，停止跟踪并输出零速度；"
-                           "请检查规划器发布频率与时间戳同步。");
-    }
+  if (trajectory_expired) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                         "【轨迹过期】参考轨迹已超过有效期，停止跟踪并输出零速度；"
+                         "请检查规划器发布频率与时间戳同步。");
     publishZeroCommandForFailure(nullptr);
+    return;
+  }
+  if (goal_position_error <= goal_position_tolerance_ &&
+      goal_yaw_error <= goal_yaw_tolerance_) {
+    publishTerminalDecelerationCommand();
     return;
   }
   // 5. 检查参考序列长度
@@ -1592,6 +1593,33 @@ void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                          "【控制兜底】%s，已输出确定性零速度。", reason_zh);
   }
+}
+
+/**
+ * @brief 终点容差圆内的减速出口：上一拍指令每轴按 max_a*dt 降向零，降到零后才清零。
+ * @details 报告 5.1.9 B：容差圆内直接发零时指令从约 0.5 m/s 阶跃到 0，底盘带着加速度
+ *          限幅与约 0.4 s 滞后滑出 0.15-0.25 m，MPC 再从零起步拉回，形成终点极限环。
+ *          这里每拍只减一个增量限幅步长，与 MPC 自身的 max_a*dt 增量约束同一口径；
+ *          车在衰减途中滑出容差圆时，MPC 从这条衰减后的指令接着求解，而不是从零。
+ *          warm start 每拍都清掉：衰减期间不求解，旧 warm controls 没有随时间左移。
+ *          轨迹过期、急停与其它失败路径不经过这里，仍直接发零。
+ */
+void AtsSwerveMpcNode::publishTerminalDecelerationCommand() {
+  const Se2MpcConfig &config = controller_->config();
+  const Control step(config.max_ax * config.dt, config.max_ay * config.dt,
+                     config.max_awz * config.dt);
+  Control next = Control::Zero();
+  for (int axis = 0; axis < 3; ++axis) {
+    const double magnitude = std::max(0.0, std::abs(last_control_(axis)) - step(axis));
+    next(axis) = std::copysign(magnitude, last_control_(axis));
+  }
+  if (next.isZero(0.0)) {
+    publishZeroCommandForFailure(nullptr);
+    return;
+  }
+  last_control_ = next;
+  publishCommand(last_control_);
+  controller_->reset();
 }
 
 /**
