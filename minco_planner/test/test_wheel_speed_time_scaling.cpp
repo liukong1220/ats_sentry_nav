@@ -212,3 +212,33 @@ TEST(WheelSpeedTimeScaling, ClearanceSpeedSlowsOnlyLowClearancePoints)
   EXPECT_FALSE(minco_planner::applyClearanceSpeedTimeScaling(
     untouched, minco_planner::WheelSpeedTimeScalingParams()));
 }
+
+// narrow_turn_clearance 单独放宽（报告 5.1.10 第 7 项）：净空 0.8 m 的边走边转段在阈值 0.55
+// 时不限速，0.9 时限到 0.8 m/s；位置与 yaw 序列不变。
+TEST(WheelSpeedTimeScaling, WiderNarrowTurnClearanceSlowsModeratelyNarrowTurns)
+{
+  auto make = []() {
+      auto trajectory = makeTurningTrajectory(40, 15, 25);
+      for (auto & point : trajectory.points) {
+        point.clearance = 0.8;
+      }
+      return trajectory;
+    };
+  minco_planner::WheelSpeedTimeScalingParams params;
+  params.narrow_turn_speed_limit = 0.8;
+  params.scale_change_rate = 2.0;
+
+  auto narrow_only = make();
+  params.narrow_turn_clearance = 0.55;
+  EXPECT_FALSE(minco_planner::applyNarrowTurnTimeScaling(narrow_only, params));
+
+  auto widened = make();
+  const auto original = widened;
+  params.narrow_turn_clearance = 0.9;
+  EXPECT_TRUE(minco_planner::applyNarrowTurnTimeScaling(widened, params));
+  for (std::size_t i = 15; i < 25; ++i) {
+    EXPECT_LE(std::hypot(widened.points[i].vx, widened.points[i].vy), 0.8 + 1e-9);
+    EXPECT_DOUBLE_EQ(widened.points[i].x, original.points[i].x);
+    EXPECT_DOUBLE_EQ(widened.points[i].yaw, original.points[i].yaw);
+  }
+}
