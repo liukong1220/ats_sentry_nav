@@ -58,16 +58,24 @@ public:
   double duration() const { return trajectory_.back().time - trajectory_.front().time; }
   /** @brief 返回最后一个轨迹点的相对时间。 */
   double finalTime() const { return trajectory_.back().time; }
-  /** @brief 返回最后一段的平面速度（m/s），即 reference 的终点速度；少于两点时为 0。 */
-  double terminalSpeed() const
+  /**
+   * @brief 返回 reference 最后 window 秒内的平均平面速度（m/s），即终点速度；少于两点时为 0。
+   * @details 只看最后一段不可靠：MINCO 停车轨迹的末两点可能只隔 1 cm 级时间，0.7 mm 的位移
+   *          也会算出 > 0.05 m/s（报告 5.1.10，MuJoCo domain 188）。轨迹短于 window 时取全长。
+   */
+  double terminalSpeed(double window = 0.1) const
   {
     if (trajectory_.size() < 2) {
       return 0.0;
     }
     const auto & last = trajectory_.back();
-    const auto & previous = trajectory_[trajectory_.size() - 2];
-    const double dt = last.time - previous.time;
-    return dt > 1e-6 ? (last.state.head<2>() - previous.state.head<2>()).norm() / dt : 0.0;
+    std::size_t index = trajectory_.size() - 2;
+    while (index > 0 && last.time - trajectory_[index].time < window) {
+      --index;
+    }
+    const auto & earlier = trajectory_[index];
+    const double dt = last.time - earlier.time;
+    return dt > 1e-6 ? (last.state.head<2>() - earlier.state.head<2>()).norm() / dt : 0.0;
   }
   /** @brief 返回横向偏差降速允许的下限，供 deadline 保守放大。 */
   double minimumProgressScale() const { return config_.min_progress_scale; }

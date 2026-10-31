@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <vector>
+
 #include "ats_swerve_mpc/trajectory_tracker.hpp"
 
 namespace
@@ -147,3 +150,34 @@ TEST(TrajectoryTracker, UsesShortestYawRateAcrossPiWrap)
 }
 
 }  // namespace
+
+// 终点速度取最后 0.1 s 的平均（报告 5.1.10）：停车 reference 末两点只隔 5 ms、位移 0.7 mm，
+// 单看最后一段是 0.14 m/s；按窗口算接近零。穿越终点的 reference 仍是巡航速度。
+TEST(TrajectoryTracker, TerminalSpeedAveragesTheLastWindow)
+{
+  ats_swerve_mpc::TrajectoryTracker stopping;
+  std::vector<ats_swerve_mpc::TimedState> poses;
+  for (int i = 0; i <= 10; ++i) {
+    ats_swerve_mpc::TimedState pose;
+    pose.time = 0.05 * i;
+    pose.state << 0.3 - 0.3 * std::pow(1.0 - pose.time / 0.5, 3), 0.0, 0.0;
+    poses.push_back(pose);
+  }
+  ats_swerve_mpc::TimedState tail = poses.back();
+  tail.time += 0.005;
+  tail.state(0) += 0.0007;
+  poses.push_back(tail);
+  stopping.setTrajectory(poses);
+  EXPECT_LT(stopping.terminalSpeed(), 0.05);
+
+  ats_swerve_mpc::TrajectoryTracker passing;
+  std::vector<ats_swerve_mpc::TimedState> cruise;
+  for (int i = 0; i <= 10; ++i) {
+    ats_swerve_mpc::TimedState pose;
+    pose.time = 0.1 * i;
+    pose.state << 1.2 * pose.time, 0.0, 0.0;
+    cruise.push_back(pose);
+  }
+  passing.setTrajectory(cruise);
+  EXPECT_NEAR(passing.terminalSpeed(), 1.2, 1e-9);
+}

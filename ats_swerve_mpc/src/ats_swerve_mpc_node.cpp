@@ -16,8 +16,9 @@
 namespace ats_swerve_mpc {
 
 namespace {
-// reference 最后一段低于该平面速度即视为在终点停车（MINCO 尾状态 v = a = 0）。
-constexpr double kTerminalStopSpeed = 0.05;
+// reference 最后 0.1 s 的平均平面速度低于该值即视为在终点停车（MINCO 尾状态 v = a = 0；
+// 2 m/s^2 减速到零时最后 0.1 s 的平均速度不超过 0.1 m/s，穿越终点的 reference 为巡航速度）。
+constexpr double kTerminalStopSpeed = 0.2;
 }  // namespace
 
 namespace {
