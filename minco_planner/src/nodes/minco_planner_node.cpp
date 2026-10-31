@@ -1654,7 +1654,7 @@ void MincoPlannerNode::planGoal(
       "【MINCO拒绝】候选被拒绝（candidate rejected generation=%llu snapshot_publication=%llu stage=%s "
       "raw_points=%zu preprocessed_points=%zu esdf_refined_points=%zu peak_v=%.3f "
       "peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f joint_termination=%s joint_iterations=%d "
-      "joint_wall_ms=%.3f segment_durations=[%s]）",
+      "joint_wall_ms=%.3f seed_scale=%.2f segment_durations=[%s]）",
       static_cast<unsigned long long>(map_snapshot->generation),
       static_cast<unsigned long long>(map_publication_sequence),
       selected_trace.failure_reason.empty() ? "unknown" : selected_trace.failure_reason.c_str(),
@@ -1663,7 +1663,8 @@ void MincoPlannerNode::planGoal(
       selected_trace.peak_acceleration, selected_trace.peak_jerk,
       selected_trace.solver_wall_time_ms,
       selected_trace.joint_termination.empty() ? "none" : selected_trace.joint_termination.c_str(),
-      selected_trace.joint_iterations, selected_trace.joint_wall_time_ms, durations.str().c_str());
+      selected_trace.joint_iterations, selected_trace.joint_wall_time_ms,
+      selected_trace.seed_scale, durations.str().c_str());
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
       map_snapshot->generation);
     return;
@@ -2164,7 +2165,7 @@ void MincoPlannerNode::planGoal(
     "expanded=%d yaw_authority=%u center_clearance=%.3f footprint_clearance=%.3f "
     "length_ratio=%.3f lateral=%.3f curvature_max=%.3f curvature_p95=%.3f turn=%.3f "
     "curvature_tv=%.3f curvature_sign_changes=%zu local_scaled=%d uniform_scaled=%d "
-    "peak_v=%.3f peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f "
+    "peak_v=%.3f peak_a=%.3f peak_j=%.3f solver_wall_ms=%.3f seed_scale=%.2f "
     "joint_pieces=%d joint_iterations=%d joint_evaluations=%d joint_termination=%s "
     "joint_cost=%.3f->%.3f joint_wall_ms=%.3f joint_satisfied=%d joint_center_violation=%.3f "
     "joint_footprint_violation=%.3f joint_guide_excess=%.3f joint_v_excess=%.3f "
@@ -2188,7 +2189,8 @@ void MincoPlannerNode::planGoal(
     quality.curvature_total_variation, quality.curvature_sign_changes,
     selected_trace.local_time_scaled ? 1 : 0, selected_trace.uniform_time_scaled ? 1 : 0,
     quality.peak_velocity, quality.peak_acceleration, quality.peak_jerk,
-    selected_trace.solver_wall_time_ms, selected_trace.joint_piece_count,
+    selected_trace.solver_wall_time_ms, selected_trace.seed_scale,
+    selected_trace.joint_piece_count,
     selected_trace.joint_iterations, selected_trace.joint_evaluations,
     selected_trace.joint_termination.empty() ? "none" : selected_trace.joint_termination.c_str(),
     selected_trace.joint_initial_cost, selected_trace.joint_final_cost,

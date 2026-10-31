@@ -157,6 +157,9 @@ struct MincoOptimizationTrace
   // Diagnostics only. A rejected candidate never reaches the control reference
   // publisher, but its stage boundary must remain observable in the same map snapshot.
   std::string failure_reason;
+  // 首端速度/加速度种子实际使用的比例（1 = 完整种子，0 = 静止起步）。只有在完整种子
+  // 把动态限幅时间缩放推成发散时才会小于 1，见 MincoTrajectoryOptimizer::optimize。
+  double seed_scale = 1.0;
   double peak_velocity = 0.0;
   double peak_acceleration = 0.0;
   double peak_jerk = 0.0;
@@ -212,6 +215,16 @@ public:
     MincoOptimizationTrace * trace = nullptr) const;
 
 private:
+  // 单次优化（原 optimize 的全部内容）；optimize 在它外面套首端种子回退。
+  ReferenceTrajectory optimizeOnce(
+    const nav_msgs::msg::Path & raw_path,
+    const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
+    const ReferenceTrajectory * footprint_orientation,
+    const InitialKinematicState * initial_state,
+    const nav_msgs::msg::OccupancyGrid * planning_grid,
+    const FootprintSafetyChecker * safety_checker,
+    MincoOptimizationTrace * trace) const;
+
   MincoTrajectoryOptimizerParams params_;
 };
 
