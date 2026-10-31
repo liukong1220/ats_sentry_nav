@@ -3,6 +3,7 @@
 #include "ats_goal_manager/goal_deadline.hpp"
 #include "ats_goal_manager/goal_lifecycle.hpp"
 #include "ats_goal_manager/plan_progress_watchdog.hpp"
+#include "ats_goal_manager/planner_failure_policy.hpp"
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
 
 #include <array>
@@ -585,33 +586,12 @@ private:
              (active_execution_command_ &&
               active_goal_->committed_plan_request_sequence ==
                 message->plan_request_sequence));
+        // 哪些失败按瞬时故障挂起重规划由 plannerFailureIsTransient 决定（含各项理由）。
+        // 起点被围、NO_PATH、起点/目标占据在动态占据地图上都可能一次刷新就解除（domain 215、
+        // 229）；FAILURE_OPTIMIZER/REPAIR 同理（报告 5.1.10，domain 221）。上界由 onTick 里
+        // 挂起态的 no_executable_plan 预算给出，不再只依赖外部目标超时。
         transient_failure =
-            matches &&
-            (message->failure_reason == PlannerStatus::FAILURE_MAP_UNREADY ||
-             message->failure_reason == PlannerStatus::FAILURE_RUNTIME_UNSAFE ||
-             message->failure_reason == PlannerStatus::FAILURE_FOOTPRINT ||
-             message->failure_reason == PlannerStatus::FAILURE_SNAPSHOT_CHANGED ||
-             // 起点被围住由实时 LiDAR 栅格决定，一次地图刷新或一次成功的
-             // 脱离动作就可能解除，所以按瞬时故障等待下一次 snapshot
-             // 发布再重规划。上界由 onTick 里挂起态的
-             // no_executable_plan 预算给出，不再只依赖外部目标超时。
-             // FAILURE_NO_PATH 在动态占据地图上同样可能是瞬时的：domain 215
-             // 已短暂 tracking 后一次 NO_PATH 重规划在 ~14s 内立即杀掉了
-             // 仍距目标 ~5m 的目标，绕过了 Gazebo 90s no_executable_plan
-             // 预算。真正不可达改由该预算收敛，而不是首击失败。
-             message->failure_reason == PlannerStatus::FAILURE_NO_PATH ||
-             message->failure_reason == PlannerStatus::FAILURE_START_ENCLOSED ||
-             // Domain 229: after west_corridor_east success the Gazebo ROG grid
-             // still marks ego occupied (ego_clear=0). The next goal then gets
-             // FAILURE_START_OR_GOAL_OCCUPIED with map ready + !recovering and
-             // used to abort in ~3 s (stitch never moved). Treat start/goal
-             // occupied like START_ENCLOSED — wait for the next snapshot /
-             // escape, bounded by no_executable_plan.
-             message->failure_reason ==
-               PlannerStatus::FAILURE_START_OR_GOAL_OCCUPIED ||
-             message->failure_reason == PlannerStatus::FAILURE_START_TF ||
-             message->failure_reason == PlannerStatus::FAILURE_GOAL_TF ||
-             message->failure_reason == PlannerStatus::FAILURE_REFERENCE_TF);
+            matches && plannerFailureIsTransient(message->failure_reason);
         if (transient_failure) {
           active_goal_->recovering = true;
           const bool snapshot_changed =
