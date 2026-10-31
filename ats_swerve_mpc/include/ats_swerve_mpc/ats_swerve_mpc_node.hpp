@@ -93,6 +93,9 @@ private:
   void publishZeroCommandForFailure(const char * reason_zh);
   /** @brief 终点容差圆内把上一拍指令按 max_a*dt 每拍降到零，降到零后走零速出口。 */
   void publishTerminalDecelerationCommand();
+  /** @brief 终点区内把平面速度按 d / tau 等比缩小（保持方向，wz 不变）。 */
+  static Control limitTerminalApproachSpeed(
+    const Control & command, double goal_distance, double time_constant);
   /** @brief 校验里程计时效性与位姿跳变；仅返回 true 时状态才可进入本周期求解。 */
   bool odometryUsable(State & current);
   /** @brief 检查动力学参数是否落在实车合理区间，并对越界项输出中文 ERROR/WARN。 */
@@ -147,6 +150,10 @@ private:
   double execution_command_timeout_ = 0.5;
   double goal_position_tolerance_ = 0.08;
   double goal_yaw_tolerance_ = 0.15;
+  // 终点区平面限速 |v| <= d / tau（d = 到终点的距离）：tau [s]，0 = 关闭；只在终点区半径 [m]
+  // 内、且 reference 终点速度为零时生效（报告 5.1.10 第 1 项）。
+  double terminal_approach_time_constant_ = 0.0;
+  double terminal_approach_radius_ = 0.5;
   bool publish_debug_paths_ = true;
   bool require_localization_status_ = false;
   bool require_gimbal_status_ = false;

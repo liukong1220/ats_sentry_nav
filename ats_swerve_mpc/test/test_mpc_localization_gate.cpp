@@ -1005,6 +1005,13 @@ protected:
       pose.pose.orientation.w = 1.0;
       command.reference.poses.push_back(pose);
     }
+    if (terminal_stop_) {
+      // 末段速度为零：与 MINCO 尾状态 v = a = 0 的 reference 一样在终点停住。
+      auto stop_pose = command.reference.poses.back();
+      stop_pose.header.stamp = rclcpp::Time(stop_pose.header.stamp) +
+        rclcpp::Duration::from_seconds(0.1);
+      command.reference.poses.push_back(stop_pose);
+    }
     execution_pub_->publish(command);
   }
 
@@ -1068,6 +1075,9 @@ protected:
         << "wz dropped at command " << index;
     }
   }
+
+  // true 时 publishStraightExecution 在终点追加一个同位置的点（末段速度为零）。
+  bool terminal_stop_{false};
 
   double lowestVx(std::size_t first_index) const
   {
@@ -1194,6 +1204,73 @@ TEST_F(MpcReferenceSwitchTest, GoalToleranceDeceleratesByStepLimitInsteadOfStepT
     EXPECT_EQ(commands_[index].linear.x, 0.0);
     EXPECT_EQ(commands_[index].linear.y, 0.0);
     EXPECT_EQ(commands_[index].angular.z, 0.0);
+  }
+}
+
+// 终点区限速（报告 5.1.10 第 1 项）：车在原点，终点在前方 0.3 m，reference 按 1.5 m/s
+// 早已跑过车的位置。无限速时 MPC 用接近巡航的速度冲向终点；tau = 1 s 时平面速度不超过
+// d / tau = 0.3 m/s。
+class MpcTerminalApproachTest : public MpcReferenceSwitchTest
+{
+protected:
+  static constexpr double kGoalDistance = 0.3;
+  static constexpr double kTimeConstant = 1.0;
+
+  std::vector<rclcpp::Parameter> extraParameters() const override
+  {
+    auto parameters = MpcReferenceSwitchTest::extraParameters();
+    parameters.emplace_back("terminal_approach_time_constant", kTimeConstant);
+    parameters.emplace_back("terminal_approach_radius", 0.5);
+    return parameters;
+  }
+};
+
+TEST_F(MpcReferenceSwitchTest, WithoutTerminalLimitApproachesNearGoalFast) {
+  terminal_stop_ = true;
+  publishPlannerStatus(1, 7);
+  const double offset = 0.3 - kCruiseSpeed * 3.0;
+  rclcpp::Time start;
+  ASSERT_TRUE(spinUntil([&]() {
+    if (command_norm_.load() > 0.02) {
+      return true;
+    }
+    start = driver_->now() + rclcpp::Duration::from_seconds(0.05);
+    heartbeat(1, 7, 1, start, offset);
+    return false;
+  }, 2s));
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 7, 1, start, offset);
+    return commands_.size() >= 15;
+  }, 3s));
+  double peak = 0.0;
+  for (const auto & command : commands_) {
+    peak = std::max(peak, std::hypot(command.linear.x, command.linear.y));
+  }
+  // 负对照：同一场景不开终点区限速时，指令明显超过 d / tau = 0.3 m/s。
+  EXPECT_GT(peak, 0.45);
+}
+
+TEST_F(MpcTerminalApproachTest, PlanarSpeedStaysBelowDistanceOverTimeConstant) {
+  terminal_stop_ = true;
+  publishPlannerStatus(1, 7);
+  const double offset = kGoalDistance - kCruiseSpeed * 3.0;
+  rclcpp::Time start;
+  ASSERT_TRUE(spinUntil([&]() {
+    if (command_norm_.load() > 0.02) {
+      return true;
+    }
+    start = driver_->now() + rclcpp::Duration::from_seconds(0.05);
+    heartbeat(1, 7, 1, start, offset);
+    return false;
+  }, 2s));
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat(1, 7, 1, start, offset);
+    return commands_.size() >= 15;
+  }, 3s));
+  for (std::size_t index = 0; index < commands_.size(); ++index) {
+    EXPECT_LE(
+      std::hypot(commands_[index].linear.x, commands_[index].linear.y),
+      kGoalDistance / kTimeConstant + kTolerance) << "command " << index;
   }
 }
 
