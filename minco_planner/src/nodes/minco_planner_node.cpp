@@ -395,6 +395,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>(
     "narrow_turn_yaw_rate_threshold",
     wheel_speed_time_scaling_params_.narrow_turn_yaw_rate_threshold);
+  // <= 0：与 yaw 规划共用 narrow_clearance_enter（旧行为）。
+  declare_parameter<double>("narrow_turn_clearance", 0.0);
   declare_parameter<double>(
     "clearance_speed_min", wheel_speed_time_scaling_params_.clearance_speed_min);
   declare_parameter<double>(
@@ -651,8 +653,14 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("clearance_speed_min", wheel_speed_time_scaling_params_.clearance_speed_min);
   get_parameter("clearance_speed_low", wheel_speed_time_scaling_params_.clearance_speed_low);
   get_parameter("clearance_speed_high", wheel_speed_time_scaling_params_.clearance_speed_high);
-  // 窄通道判据与 yaw 规划共用进入阈值，两者对"窄"的定义一致。
-  wheel_speed_time_scaling_params_.narrow_turn_clearance = yaw_params.narrow_clearance_enter;
+  // 默认与 yaw 规划共用进入阈值，两者对"窄"的定义一致。单独给 narrow_turn_clearance > 0 时，
+  // 限速覆盖更宽的"边平移边转向"区段而不改 yaw 规划的窄通道判据（报告 5.1.10 第 7 项：
+  // 2025 红框落差转弯与走廊入口在 1.0-1.4 m/s 下边走边转，横向误差 0.2-0.5 m，中心净空
+  // 大于 0.55 m 的 narrow_clearance_enter，旧限速不生效）。
+  double narrow_turn_clearance = 0.0;
+  get_parameter("narrow_turn_clearance", narrow_turn_clearance);
+  wheel_speed_time_scaling_params_.narrow_turn_clearance =
+    narrow_turn_clearance > 0.0 ? narrow_turn_clearance : yaw_params.narrow_clearance_enter;
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
   get_parameter("yaw_tunnel_enabled", yaw_params.tunnel.enabled);
   get_parameter("yaw_tunnel_yaw_offset", yaw_params.tunnel.yaw_offset);
