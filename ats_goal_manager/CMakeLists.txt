@@ -45,6 +45,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_goal_lifecycle test/test_goal_lifecycle.cpp)
   target_include_directories(test_goal_lifecycle PRIVATE include)
 
+  ament_add_gtest(test_planner_failure_policy test/test_planner_failure_policy.cpp)
+  target_include_directories(test_planner_failure_policy PRIVATE include)
+  ament_target_dependencies(test_planner_failure_policy ats_navigation_interfaces)
+
   ament_add_gtest(test_goal_deadline test/test_goal_deadline.cpp)
   target_include_directories(test_goal_deadline PRIVATE include)
 
