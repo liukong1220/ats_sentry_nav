@@ -523,3 +523,68 @@ TEST(EscapePrefixMonotone, DisabledByDefaultAndNeverClaimsAnEscapeWithoutADecisi
   EXPECT_FALSE(minco_planner::escapePrefixContactDecreasing(
     trajectory, minco_planner::EscapePrefixDecision{}, footprint, grid, params));
 }
+
+// --- 单调路径上的前缀弧长：深接触要走得更远才出得来 ---
+
+TEST(EscapePrefixMonotone, LongPrefixIsOnlyAdmittedThroughTheMonotonePath)
+{
+  const auto points = makeLine(40);             // 0.05 m 间距
+  const auto collisions = upTo(10);             // prefix_end = 12，弧长 0.60 m
+  auto params = enabledParams();                // 一般上界 0.40 m
+
+  // 关闭单调路径：弧长 0.60 > 0.40，照旧判负。
+  auto plain = minco_planner::evaluateEscapePrefix(points, collisions, params);
+  EXPECT_FALSE(plain.allowed);
+  EXPECT_FALSE(plain.monotone_only);
+
+  // 打开单调路径但没给更长上界：沿用一般上界，仍判负。
+  params.monotone_max_contact_depth_m = 0.30;
+  EXPECT_FALSE(minco_planner::evaluateEscapePrefix(points, collisions, params).allowed);
+
+  // 给出 0.80 m：放行，并标记 monotone_only。
+  params.monotone_max_prefix_length_m = 0.80;
+  const auto monotone = minco_planner::evaluateEscapePrefix(points, collisions, params);
+  EXPECT_TRUE(monotone.allowed);
+  EXPECT_TRUE(monotone.monotone_only);
+  EXPECT_EQ(monotone.prefix_end, 12U);
+
+  // 超过 0.80 m 仍判负。
+  EXPECT_FALSE(minco_planner::evaluateEscapePrefix(points, upTo(20), params).allowed);
+
+  // 浅接触的一般前缀不被标成 monotone_only。
+  const auto short_prefix = minco_planner::evaluateEscapePrefix(points, upTo(3), params);
+  EXPECT_TRUE(short_prefix.allowed);
+  EXPECT_FALSE(short_prefix.monotone_only);
+}
+
+TEST(EscapePrefixMonotone, MonotoneOnlyDecisionNeverPassesTheShallowCheck)
+{
+  const auto grid = makeContactGrid();
+  const auto footprint = contactFootprint();
+  const auto trajectory = trajectoryThrough(
+    {{0.0, 0.0}, {0.05, 0.0}, {0.10, 0.0}, {0.15, 0.0}, {0.20, 0.0}, {0.30, 0.0}, {0.40, 0.0}});
+  auto params = enabledParams();
+  params.max_contact_depth_m = 0.10;   // 这条前缀的深度本身在 0.10 m 以内
+  params.monotone_max_contact_depth_m = 0.30;
+
+  minco_planner::EscapePrefixDecision decision;
+  decision.allowed = true;
+  decision.prefix_end = 5;
+  decision.monotone_only = false;
+  EXPECT_TRUE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+
+  // 同一条前缀，一旦因弧长只靠单调路径放行，浅接触判据不得放行；单调判据放行。
+  decision.monotone_only = true;
+  EXPECT_FALSE(minco_planner::escapePrefixContactShallow(
+    trajectory, decision, footprint, grid, params));
+  EXPECT_TRUE(minco_planner::escapePrefixContactDecreasing(
+    trajectory, decision, footprint, grid, params));
+  EXPECT_TRUE(minco_planner::escapePrefixContactAdmitted(
+    trajectory, decision, footprint, grid, params));
+
+  // 单调路径关闭时，monotone_only 的决策整体判负。
+  params.monotone_max_contact_depth_m = 0.0;
+  EXPECT_FALSE(minco_planner::escapePrefixContactAdmitted(
+    trajectory, decision, footprint, grid, params));
+}

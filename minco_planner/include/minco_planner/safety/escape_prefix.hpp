@@ -71,6 +71,11 @@ struct EscapePrefixParams
   // 一次停车之后的脱困。足迹检查本身（margin、阈值、unknown 语义、扫掠采样）一项都不变。
   // 0 = 关闭，行为与旧版逐位一致。
   double monotone_max_contact_depth_m = 0.0;
+  // 单调脱困路径上的前缀弧长上界。从深度 d 的接触里出来至少要走 d 再加量化余量，深度 0.30 m
+  // 的停车（d170/d172，车压在落差线上）实测需要 0.49-0.63 m，超过一般前缀的 0.40 m。
+  // 只在单调路径上放宽到本值，一般路径（浅接触）的 max_prefix_length_m 不变；
+  // <= 0 时沿用 max_prefix_length_m。
+  double monotone_max_prefix_length_m = 0.0;
   // 深度分档宽度。分档让栅格量化带来的 1–2 cm 抖动不会被当成"重新靠近障碍"。
   double monotone_depth_step_m = 0.025;
 };
@@ -88,6 +93,9 @@ struct EscapePrefixDecision
   double prefix_length_m = 0.0;
   double prefix_yaw_sweep_rad = 0.0;
   std::size_t collision_count = 0;
+  // 前缀弧长超过一般上界、只靠单调脱困路径放行时为 true。此时浅接触判据
+  // （escapePrefixContactShallow）不能通过，只有 escapePrefixContactDecreasing 可以。
+  bool monotone_only = false;
 };
 
 // 用几何折线长度而不是 ReferencePoint::s，这样对未填充 s 的调用方同样成立。
@@ -166,11 +174,17 @@ inline EscapePrefixDecision evaluateEscapePrefix(
     return decision;
   }
 
-  decision.allowed =
+  const bool within_common =
     decision.head_offset_m <= params.max_head_offset_m &&
     decision.prefix_end <= params.max_prefix_points &&
-    decision.prefix_length_m <= params.max_prefix_length_m &&
     decision.prefix_yaw_sweep_rad <= params.max_prefix_yaw_sweep_rad;
+  const bool plain_ok = within_common && decision.prefix_length_m <= params.max_prefix_length_m;
+  const double monotone_length = params.monotone_max_prefix_length_m > 0.0 ?
+    params.monotone_max_prefix_length_m : params.max_prefix_length_m;
+  const bool monotone_ok = params.monotone_max_contact_depth_m > 0.0 && within_common &&
+    decision.prefix_length_m <= monotone_length;
+  decision.allowed = plain_ok || monotone_ok;
+  decision.monotone_only = decision.allowed && !plain_ok;
   if (!decision.allowed) {
     decision.prefix_end = 0U;
   }
@@ -186,7 +200,7 @@ inline bool escapePrefixContactShallow(
   const nav_msgs::msg::OccupancyGrid & grid,
   const EscapePrefixParams & params)
 {
-  if (!decision.allowed) {
+  if (!decision.allowed || decision.monotone_only) {
     return false;
   }
   if (!(params.max_contact_depth_m > 0.0)) {

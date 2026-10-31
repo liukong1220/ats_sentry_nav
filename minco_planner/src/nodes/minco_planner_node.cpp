@@ -241,6 +241,9 @@ void MincoPlannerNode::declareAndLoadParams()
     "escape_from_contact_monotone_max_depth", escape_prefix_params_.monotone_max_contact_depth_m);
   declare_parameter<double>(
     "escape_from_contact_monotone_depth_step", escape_prefix_params_.monotone_depth_step_m);
+  declare_parameter<double>(
+    "escape_from_contact_monotone_max_prefix_length",
+    escape_prefix_params_.monotone_max_prefix_length_m);
   declare_parameter<bool>(
     "goal_pose_admission_enabled", goal_pose_admission_params_.enabled);
   declare_parameter<double>(
@@ -508,6 +511,11 @@ void MincoPlannerNode::declareAndLoadParams()
     "escape_from_contact_monotone_max_depth", escape_prefix_params_.monotone_max_contact_depth_m);
   get_parameter(
     "escape_from_contact_monotone_depth_step", escape_prefix_params_.monotone_depth_step_m);
+  get_parameter(
+    "escape_from_contact_monotone_max_prefix_length",
+    escape_prefix_params_.monotone_max_prefix_length_m);
+  escape_prefix_params_.monotone_max_prefix_length_m =
+    std::max(0.0, escape_prefix_params_.monotone_max_prefix_length_m);
   escape_prefix_params_.monotone_max_contact_depth_m =
     std::max(0.0, escape_prefix_params_.monotone_max_contact_depth_m);
   escape_prefix_params_.monotone_depth_step_m =
@@ -1925,7 +1933,13 @@ void MincoPlannerNode::planGoal(
       })->trajectory_index == 0U)
   {
     std::ostringstream tried;
-    for (const double hold_length : {0.20, escape_prefix_params_.max_prefix_length_m}) {
+    std::vector<double> hold_lengths {0.20, escape_prefix_params_.max_prefix_length_m};
+    if (escape_prefix_params_.monotone_max_contact_depth_m > 0.0 &&
+      escape_prefix_params_.monotone_max_prefix_length_m > escape_prefix_params_.max_prefix_length_m)
+    {
+      hold_lengths.push_back(escape_prefix_params_.monotone_max_prefix_length_m);
+    }
+    for (const double hold_length : hold_lengths) {
       ReferenceTrajectory candidate;
       if (!holdStartYawForEscape(
           reference, hold_length, terminal_yaw_relocation_params_.yaw_rate_limit, &candidate))
