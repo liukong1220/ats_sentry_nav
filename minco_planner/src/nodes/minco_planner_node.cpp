@@ -101,6 +101,21 @@ std::string describeGridWindow(
   return stream.str();
 }
 
+// 两条同几何参考的 yaw 序列是否不同（逐点 1e-9 rad）；相同时不必再过两遍足迹检查。
+bool yawSequencesDiffer(
+  const minco_planner::ReferenceTrajectory & a, const minco_planner::ReferenceTrajectory & b)
+{
+  if (a.points.size() != b.points.size()) {
+    return true;
+  }
+  for (std::size_t i = 0; i < a.points.size(); ++i) {
+    if (std::abs(std::remainder(a.points[i].yaw - b.points[i].yaw, 2.0 * M_PI)) > 1e-9) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
@@ -390,6 +405,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("yaw_narrow_gap_bridge_time", yaw_params.narrow_gap_bridge_time);
   declare_parameter<double>("yaw_acceleration_limit", yaw_params.yaw_acceleration_limit);
   declare_parameter<std::string>("yaw_open_area_mode", yaw_params.open_area_yaw_mode);
+  declare_parameter<double>("yaw_narrow_start_hold_length", 0.0);
   declare_parameter<double>(
     "wheel_speed_time_scaling_limit", wheel_speed_time_scaling_params_.wheel_speed_limit);
   declare_parameter<double>(
@@ -685,6 +701,8 @@ void MincoPlannerNode::declareAndLoadParams()
   wheel_speed_time_scaling_params_.narrow_turn_clearance =
     narrow_turn_clearance > 0.0 ? narrow_turn_clearance : yaw_params.narrow_clearance_enter;
   get_parameter("terminal_yaw_sample_period", yaw_params.terminal_yaw_sample_period);
+  get_parameter("yaw_narrow_start_hold_length", narrow_start_hold_length_);
+  narrow_start_hold_length_ = std::max(0.0, narrow_start_hold_length_);
   get_parameter("yaw_tunnel_enabled", yaw_params.tunnel.enabled);
   get_parameter("yaw_tunnel_yaw_offset", yaw_params.tunnel.yaw_offset);
   get_parameter("yaw_tunnel_clearance_enter", yaw_params.tunnel.clearance_enter);
@@ -816,6 +834,9 @@ void MincoPlannerNode::declareAndLoadParams()
     yaw_params.tangent_symmetry_order = 2;
   }
   yaw_planner_.setParams(yaw_params);
+  YawSplinePlannerParams narrow_start_hold_params = yaw_params;
+  narrow_start_hold_params.narrow_start_hold_length = narrow_start_hold_length_;
+  narrow_start_hold_yaw_planner_.setParams(narrow_start_hold_params);
   // 缓存一份给目标位姿准入用，保证两者的矩形几何完全一致。
   footprint_params_ = footprint_params;
   safety_checker_.setParams(footprint_params);
@@ -2239,9 +2260,33 @@ void MincoPlannerNode::planYaw(
     tunnel_segments = detectTunnelSegments(
       trajectory, *snapshot.clearance_esdf, tunnel_yaw_params_);
   }
-  yaw_planner_.apply(
-    trajectory, start_yaw, goal_yaw,
-    tunnel_segments.empty() ? nullptr : &tunnel_segments);
+  const std::vector<TunnelSegment> * tunnels =
+    tunnel_segments.empty() ? nullptr : &tunnel_segments;
+  // 起点在窄通道里时多算一版"先保持起点 yaw 平移"的航向（报告 5.1.12 第 2 项），只有它的
+  // 矩形足迹冲突不多于原航向（整条与前 5 个点两项都不多）时才采用。最终提交仍要过同一套
+  // 足迹门禁，这里只在两种 yaw 时序之间选，不放宽任何判据。
+  std::optional<ReferenceTrajectory> held;
+  if (narrow_start_hold_length_ > 0.0) {
+    held = trajectory;
+  }
+  yaw_planner_.apply(trajectory, start_yaw, goal_yaw, tunnels);
+  if (held) {
+    narrow_start_hold_yaw_planner_.apply(*held, start_yaw, goal_yaw, tunnels);
+    if (yawSequencesDiffer(*held, trajectory)) {
+      const FootprintSafetyResult planned = safety_checker_.check(trajectory, snapshot.grid);
+      const FootprintSafetyResult holding = safety_checker_.check(*held, snapshot.grid);
+      const auto early = [](const FootprintSafetyResult & result) {
+          return std::count_if(
+            result.collisions.begin(), result.collisions.end(),
+            [](const CollisionSample & sample) {return sample.trajectory_index < 5U;});
+        };
+      if (holding.collisions.size() <= planned.collisions.size() &&
+        early(holding) <= early(planned))
+      {
+        trajectory = std::move(*held);
+      }
+    }
+  }
   // yaw 定下后才知道平移与转向叠加的轮速；超出底盘能力的局部放慢时间，位置和 yaw 不变。
   applyWheelSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 窄通道边平移边转向时再放慢，压低 MPC 横向/yaw 跟踪误差；同样只改时间。

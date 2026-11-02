@@ -32,6 +32,11 @@ struct YawSplinePlannerParams
   // （正方形取 90° 等价中最近的一个），末段过渡到目标朝向。窄通道出口后不再快速回摆到
   // 目标朝向，转向分摊到整段开阔区域，参考 yaw 角速度更小、MPC 不易超调。
   std::string open_area_yaw_mode = "goal_heading";
+  // 起点已在窄通道里时（停车后再规划），前这么长的弧长（m）保持起点 yaw 平移，之后再按切线
+  // 对齐。对齐朝向在矩形的两个等价方向里按"离上一时刻 yaw 最近"选，所以保持段也决定了之后
+  // 选哪一个方向：从起点就逐点追切线时，弯道入口的切线会把选择带到反方向，2.5 m 内转近 pi
+  // （2025 红框 d164 的楔）。0 = 关闭（默认，行为不变）；隧道对齐段不受影响。
+  double narrow_start_hold_length = 0.0;
   // 终点独立转向采用零平移采样；每个采样仍进入离散矩形足迹安全 gate。
   double terminal_yaw_sample_period = 0.10;
   TunnelYawParams tunnel{};

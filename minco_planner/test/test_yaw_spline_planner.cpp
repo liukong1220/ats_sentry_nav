@@ -546,3 +546,90 @@ TEST(YawSplinePlanner, NarrowCorridorAlignsYawWithTheCorridorTangent)
       << "narrow index " << i << " left the corridor axis";
   }
 }
+
+namespace
+{
+// 停车后再规划的参考：起点已经在窄通道里（净空 0.40 m），车头 yaw 0.4，通道沿 -x 方向。
+// 今天的规则从第一个点起就对齐切线，2.5 m 里转近 pi（2025 红框 d164 的楔）。
+minco_planner::ReferenceTrajectory makeNarrowStartTrajectory()
+{
+  minco_planner::ReferenceTrajectory trajectory;
+  for (int i = 0; i <= 30; ++i) {
+    minco_planner::ReferencePoint point;
+    point.t = 0.1 * static_cast<double>(i);
+    point.s = 0.1 * static_cast<double>(i);
+    point.x = -0.1 * static_cast<double>(i);
+    point.clearance = 0.40;
+    trajectory.points.push_back(point);
+  }
+  return trajectory;
+}
+
+minco_planner::YawSplinePlannerParams narrowStartParams(double hold_length)
+{
+  minco_planner::YawSplinePlannerParams params;
+  params.mode = "clearance_aware";
+  params.yaw_rate_limit = 1.22;
+  params.yaw_acceleration_limit = 2.0;
+  params.narrow_clearance_enter = 0.55;
+  params.narrow_clearance_exit = 0.70;
+  params.narrow_start_hold_length = hold_length;
+  return params;
+}
+}  // namespace
+
+TEST(YawSplinePlanner, NarrowStartHoldKeepsStartYawForTheHoldLength)
+{
+  auto trajectory = makeNarrowStartTrajectory();
+  minco_planner::YawSplinePlanner planner(narrowStartParams(0.3));
+  planner.apply(trajectory, 0.4, 0.4);
+  for (const auto & point : trajectory.points) {
+    if (point.s < 0.3 - 1e-9) {
+      EXPECT_NEAR(point.yaw, 0.4, 1e-9) << "s=" << point.s;
+    }
+  }
+}
+
+TEST(YawSplinePlanner, NarrowStartHoldStillAlignsAfterTheHold)
+{
+  // 保持段结束后照常对齐：yaw 0.4 离 0（反向切线）比离 pi 近，矩形 2 阶对称选 0，不再转近 pi。
+  auto trajectory = makeNarrowStartTrajectory();
+  minco_planner::YawSplinePlanner planner(narrowStartParams(0.3));
+  planner.apply(trajectory, 0.4, 0.4);
+  const double end_yaw = trajectory.points[30].yaw;
+  EXPECT_LT(std::min(std::abs(end_yaw), std::abs(std::abs(end_yaw) - M_PI)), 0.05);
+  // 只统计平移段的 31 个点；末尾追加的原地转回目标朝向不算。
+  double rotation = 0.0;
+  for (std::size_t i = 1; i <= 30U; ++i) {
+    rotation += std::abs(std::remainder(
+      trajectory.points[i].yaw - trajectory.points[i - 1].yaw, 2.0 * M_PI));
+  }
+  EXPECT_LT(rotation, 0.6);
+}
+
+TEST(YawSplinePlanner, NarrowStartHoldDisabledByDefaultAlignsFromTheFirstPoint)
+{
+  // 负对照（今天的行为）：默认 0 时第一个点之后立刻朝切线转。
+  auto trajectory = makeNarrowStartTrajectory();
+  minco_planner::YawSplinePlanner planner(narrowStartParams(0.0));
+  planner.apply(trajectory, 0.4, 0.4);
+  EXPECT_GT(std::abs(trajectory.points[3].yaw - 0.4), 0.01);
+}
+
+TEST(YawSplinePlanner, NarrowStartHoldIgnoresAnOpenStart)
+{
+  // 起点开阔时规则不生效：与关闭时逐点相同。
+  auto held = makeNarrowStartTrajectory();
+  auto plain = makeNarrowStartTrajectory();
+  for (std::size_t i = 0; i < 8U; ++i) {
+    held.points[i].clearance = 1.5;
+    plain.points[i].clearance = 1.5;
+  }
+  minco_planner::YawSplinePlanner with_hold(narrowStartParams(0.3));
+  minco_planner::YawSplinePlanner without_hold(narrowStartParams(0.0));
+  with_hold.apply(held, 0.4, 0.4);
+  without_hold.apply(plain, 0.4, 0.4);
+  for (std::size_t i = 0; i < held.points.size(); ++i) {
+    EXPECT_NEAR(held.points[i].yaw, plain.points[i].yaw, 1e-12) << "index " << i;
+  }
+}

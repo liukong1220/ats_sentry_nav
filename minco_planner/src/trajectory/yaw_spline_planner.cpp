@@ -128,6 +128,9 @@ void YawSplinePlanner::applyClearanceAware(
       return best;
     };
   const bool minimal_rotation = params_.open_area_yaw_mode == "minimal_rotation";
+  const double narrow_start_hold = std::max(0.0, params_.narrow_start_hold_length);
+  const bool start_in_narrow = narrow_start_hold > 0.0 && point_count > 1U && narrow_flags[1];
+  const double start_s = trajectory.points.front().s;
   // 当前开阔段的过渡：yaw 从 open_start_yaw 经五次 smoothstep 到 open_start_yaw + open_delta。
   double open_start_yaw = 0.0;
   double open_delta = 0.0;
@@ -194,6 +197,9 @@ void YawSplinePlanner::applyClearanceAware(
       // （正方形车沿 -pi/2 切线进南侧墙尖时，yaw 0 本身已对齐，不应再转 90 度）。
       // 转角相同时保留靠前的候选（先正向切线），与原先正/反向二选一的行为一致。
       desired_yaw = nearest_aligned_yaw(tangent_yaws[i], previous_yaw, symmetry_order);
+      if (start_in_narrow && current.s - start_s <= narrow_start_hold) {
+        desired_yaw = normalizeAngle(initial_yaw);
+      }
     }
 
     // 最后按 yaw_rate_limit 裁剪，避免参考轨迹要求舵轮瞬时转向。

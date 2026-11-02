@@ -233,6 +233,9 @@ private:
   GridJps jps_;
   MincoTrajectoryOptimizer optimizer_;
   YawSplinePlanner yaw_planner_;
+  /// 同一套航向参数，只多一项 narrow_start_hold_length；planYaw 在两版之间按足迹冲突选。
+  YawSplinePlanner narrow_start_hold_yaw_planner_;
+  double narrow_start_hold_length_ = 0.0;
   TunnelYawParams tunnel_yaw_params_{};
   WheelSpeedTimeScalingParams wheel_speed_time_scaling_params_{};
   /// 提交门使用的矩形足迹参数副本。目标位姿准入必须用同一份参数，否则"终点可行"
