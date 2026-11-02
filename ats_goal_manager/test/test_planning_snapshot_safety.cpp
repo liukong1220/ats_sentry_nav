@@ -121,4 +121,54 @@ TEST(PlanningSnapshotSafety, HonorsMapOriginYawForFootprintChecks)
   EXPECT_TRUE(result.footprint_safe);
 }
 
+TEST(PlanningSnapshotSafety, ContactDepthMatchesTheShallowBoundary)
+{
+  ats_goal_manager::PlanningSnapshotSafetyParams params;
+  params.footprint_length = 2.0;
+  params.footprint_width = 2.0;
+  params.footprint_safety_margin = 0.0;
+  auto snapshot = makeSnapshot();
+  for (int y = 0; y < 8; ++y) {
+    snapshot.occupancy[static_cast<std::size_t>(y) * 8U + 5U] = 100;
+    snapshot.signed_distance_m[static_cast<std::size_t>(y) * 8U + 5U] = -1.0F;
+  }
+  // 无接触：深度 0。
+  EXPECT_EQ(ats_goal_manager::planningSnapshotContactDepth(snapshot, poseAt(3.5, 3.5), params), 0.0);
+  // 占据格 x in [5,6)。车心 x=4.05 时足迹 [3.05,5.05]，压进 0.05 m。
+  const auto pose = poseAt(4.05, 3.5);
+  const double depth = ats_goal_manager::planningSnapshotContactDepth(snapshot, pose, params);
+  EXPECT_NEAR(depth, 0.05, 0.003);
+  // 与 shallow 判定在同一边界上一致。
+  EXPECT_TRUE(ats_goal_manager::planningSnapshotContactShallow(snapshot, pose, params, depth + 0.003));
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotContactShallow(snapshot, pose, params, depth - 0.01));
+  // 压得更深(在搜索上界 0.30 m 以内)，深度随之增大。
+  EXPECT_NEAR(
+    ats_goal_manager::planningSnapshotContactDepth(snapshot, poseAt(4.2, 3.5), params), 0.2, 0.003);
+}
+
+TEST(PlanningSnapshotSafety, ContactDepthIsInfiniteWhenTheRobotCellOrTheSearchRangeFails)
+{
+  ats_goal_manager::PlanningSnapshotSafetyParams params;
+  params.footprint_length = 2.0;
+  params.footprint_width = 2.0;
+  params.footprint_safety_margin = 0.0;
+  auto snapshot = makeSnapshot();
+  // 机器人格被占。
+  snapshot.occupancy[3U * 8U + 3U] = 100;
+  snapshot.signed_distance_m[3U * 8U + 3U] = -1.0F;
+  EXPECT_TRUE(std::isinf(
+      ats_goal_manager::planningSnapshotContactDepth(snapshot, poseAt(3.5, 3.5), params)));
+  // 车心格空闲，但接触比搜索上界深。
+  snapshot = makeSnapshot();
+  for (int y = 0; y < 8; ++y) {
+    snapshot.occupancy[static_cast<std::size_t>(y) * 8U + 5U] = 100;
+    snapshot.signed_distance_m[static_cast<std::size_t>(y) * 8U + 5U] = -1.0F;
+  }
+  EXPECT_TRUE(std::isinf(
+      ats_goal_manager::planningSnapshotContactDepth(snapshot, poseAt(4.4, 3.5), params, 0.30)));
+  // 越界。
+  EXPECT_TRUE(std::isinf(
+      ats_goal_manager::planningSnapshotContactDepth(snapshot, poseAt(-0.5, 3.5), params)));
+}
+
 }  // namespace

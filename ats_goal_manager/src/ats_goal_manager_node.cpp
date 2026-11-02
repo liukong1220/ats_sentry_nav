@@ -337,6 +337,14 @@ private:
     progress_params.max_consecutive_replans = max_consecutive_replans > 0
       ? static_cast<std::uint32_t>(max_consecutive_replans)
       : 0U;
+    // 足迹瞬态接触的有界放行(plan_progress_watchdog.hpp)。默认关闭，行为不变。
+    progress_params.contact_hold_enabled =
+      declare_parameter<bool>("contact_hold_enabled", false);
+    progress_params.contact_hold_max_depth_m = std::max(
+      0.0, declare_parameter<double>("contact_hold_max_depth", 0.12));
+    progress_params.contact_hold_max_sec = std::max(
+      0.0, declare_parameter<double>("contact_hold_max_sec", 1.5));
+    contact_hold_max_depth_m_ = progress_params.contact_hold_max_depth_m;
     progress_watchdog_.setParams(progress_params);
     planning_snapshot_timeout_sec_ = std::max(
       0.1, declare_parameter<double>("planning_snapshot_timeout_sec", map_ready_timeout_sec_));
@@ -1455,6 +1463,11 @@ private:
                 ego_contact_max_depth_m_, snapshot_pose->position.x,
                 snapshot_pose->position.y);
             }
+            if (!gate.footprint_safe && snapshot_pose) {
+              // 每次足迹不通过时记下接触深度(足迹每边内缩多少才通过)，用于日志与有界放行。
+              gate.footprint_contact_depth_m = planningSnapshotContactDepth(
+                *planning_snapshot_, *snapshot_pose, planning_snapshot_safety_params_);
+            }
             gate.has_current_reference = active_execution_command_.has_value();
             gate.distance_to_goal_m = progressDistanceLocked(distance);
             gate.identity.goal_id = active_goal_->id;
@@ -1471,6 +1484,16 @@ private:
               gate.identity.source_generation = planning_snapshot_->source_generation;
             }
             const PlanProgressDecision decision = progress_watchdog_.evaluate(gate);
+            if (progress_watchdog_.contactHoldActive()) {
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Progress watchdog contact hold: depth=%.3f m (hold <= %.3f m) pose=(%.3f, %.3f)",
+                gate.footprint_contact_depth_m, contact_hold_max_depth_m_,
+                snapshot_pose ? snapshot_pose->position.x :
+                  std::numeric_limits<double>::quiet_NaN(),
+                snapshot_pose ? snapshot_pose->position.y :
+                  std::numeric_limits<double>::quiet_NaN());
+            }
             if (progress_watchdog_.egoEscapeActive()) {
               // 自身位姿仍被占据，但有界等待已用尽。这里放行的是
               // "让执行器把车挪出去"，不是放弃 footprint 语义：
@@ -1554,14 +1577,15 @@ private:
                 get_logger(), *get_clock(), 1000,
                 "Progress watchdog unsafe gate: map_fresh=%d localization=%d tf=%d "
                 "inside=%d cell_free=%d footprint=%d reference=%d snapshot_frame=%s "
-                "current_frame=%s pose=(%.3f, %.3f)",
+                "current_frame=%s pose=(%.3f, %.3f) contact_depth=%.3f",
                 gate.map_fresh, gate.localization_fresh, gate.tf_healthy,
                 gate.robot_inside_map, gate.robot_cell_free, gate.footprint_safe,
                 gate.has_current_reference,
                 planning_snapshot_ ? planning_snapshot_->header.frame_id.c_str() : "<none>",
                 current_pose_.header.frame_id.c_str(),
                 snapshot_pose ? snapshot_pose->position.x : std::numeric_limits<double>::quiet_NaN(),
-                snapshot_pose ? snapshot_pose->position.y : std::numeric_limits<double>::quiet_NaN());
+                snapshot_pose ? snapshot_pose->position.y : std::numeric_limits<double>::quiet_NaN(),
+                gate.footprint_contact_depth_m);
               // The current command is no longer safe, but one coherent map
               // sample must not make the task terminal. Stop immediately and
               // keep the goal bounded by its normal action/map-wait deadlines.
@@ -2123,6 +2147,7 @@ private:
   bool progress_along_reference_{false};
   std::size_t progress_reference_hint_{0};
   double goal_yaw_tolerance_{0.15};
+  double contact_hold_max_depth_m_{0.12};
   double terminal_linear_velocity_tolerance_{0.05};
   double terminal_angular_velocity_tolerance_{0.10};
   double terminal_dwell_sec_{0.30};

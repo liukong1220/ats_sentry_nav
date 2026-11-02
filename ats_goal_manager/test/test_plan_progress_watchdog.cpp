@@ -656,4 +656,133 @@ TEST(PlanProgressWatchdog, SuspendedGateIgnoresForeignAndCanceledGoals)
     Decision::kNone);
 }
 
+
+ats_goal_manager::PlanProgressWatchdogParams contactHoldParams()
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.contact_hold_enabled = true;
+  params.contact_hold_max_depth_m = 0.12;
+  params.contact_hold_max_sec = 1.5;
+  params.replan_stall_timeout_sec = 100.0;   // 停滞预算不参与这几个用例
+  return params;
+}
+
+ats_goal_manager::PlanProgressGate contactGate(double distance, double depth)
+{
+  auto gate = healthyGate(distance);
+  gate.footprint_safe = false;
+  gate.footprint_contact_depth_m = depth;
+  return gate;
+}
+
+TEST(PlanProgressWatchdog, ContactHoldIsOffByDefault)
+{
+  Watchdog watchdog;   // 默认参数
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.06), t0), Decision::kUnsafe);
+  EXPECT_FALSE(watchdog.contactHoldActive());
+}
+
+TEST(PlanProgressWatchdog, ContactHoldAdmitsAShallowTransientThenExpires)
+{
+  Watchdog watchdog(contactHoldParams());
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(watchdog.evaluate(healthyGate(5.0), t0), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(100)),
+    Decision::kNone);
+  EXPECT_TRUE(watchdog.contactHoldActive());
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.11), t0 + std::chrono::milliseconds(1000)),
+    Decision::kNone);
+  EXPECT_TRUE(watchdog.contactHoldActive());
+  // 同一段接触持续超过 contact_hold_max_sec：回到原来的 kUnsafe 路径。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.09), t0 + std::chrono::milliseconds(1700)),
+    Decision::kUnsafe);
+  EXPECT_FALSE(watchdog.contactHoldActive());
+}
+
+TEST(PlanProgressWatchdog, ContactHoldAllowanceIsNotRefundedWhileTheContactPersists)
+{
+  Watchdog watchdog(contactHoldParams());
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(1600)),
+    Decision::kUnsafe);
+  // 挂起、重启后车仍在接触里(深度还更浅)：没有新额度。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.03), t0 + std::chrono::milliseconds(4000)),
+    Decision::kUnsafe);
+  // 接触完全消失才恢复额度。
+  EXPECT_EQ(watchdog.evaluate(healthyGate(5.0), t0 + std::chrono::milliseconds(5000)),
+    Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(6000)),
+    Decision::kNone);
+  EXPECT_TRUE(watchdog.contactHoldActive());
+}
+
+TEST(PlanProgressWatchdog, ContactHoldRefusesDeepContactAndUnhealthyExecution)
+{
+  Watchdog watchdog(contactHoldParams());
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  // 更深的接触照旧急停。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.13), t0), Decision::kUnsafe);
+  // 深度未算出(NaN)或机器人格被占。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, std::numeric_limits<double>::quiet_NaN()), t0),
+    Decision::kUnsafe);
+  auto occupied = contactGate(5.0, std::numeric_limits<double>::infinity());
+  occupied.robot_cell_free = false;
+  EXPECT_EQ(watchdog.evaluate(occupied, t0), Decision::kUnsafe);
+  // 没有当前参考：不是"沿规划器验证过的参考离开接触"。
+  auto no_reference = contactGate(5.0, 0.06);
+  no_reference.has_current_reference = false;
+  EXPECT_EQ(watchdog.evaluate(no_reference, t0), Decision::kUnsafe);
+  // 急停已置位：放行没有意义，也不能借它绕过急停状态。
+  auto stopped = contactGate(5.0, 0.06);
+  stopped.emergency_stop = true;
+  EXPECT_EQ(watchdog.evaluate(stopped, t0), Decision::kUnsafe);
+  // 基础设施不健康永远优先。
+  auto no_map = contactGate(5.0, 0.06);
+  no_map.map_fresh = false;
+  EXPECT_EQ(watchdog.evaluate(no_map, t0), Decision::kUnsafe);
+  EXPECT_FALSE(watchdog.contactHoldActive());
+}
+
+TEST(PlanProgressWatchdog, ContactHoldDoesNotMaskARealStall)
+{
+  auto params = contactHoldParams();
+  params.contact_hold_max_sec = 10.0;
+  params.replan_stall_timeout_sec = 1.0;
+  params.replan_min_interval_sec = 0.5;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(watchdog.evaluate(healthyGate(5.0), t0), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(500)),
+    Decision::kNone);
+  // 接触被放行，但距离一直没推进：停滞预算照常到期。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(1200)),
+    Decision::kReplan);
+}
+
+TEST(PlanProgressWatchdog, HeldContactDoesNotStartTheEgoBlockedEscapeClock)
+{
+  auto params = contactHoldParams();
+  params.ego_blocked_escape_enabled = true;
+  params.ego_blocked_escape_timeout_sec = 1.0;
+  params.contact_hold_max_sec = 0.9;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(800)),
+    Decision::kNone);
+  EXPECT_FALSE(watchdog.egoEscapeActive());
+  // 放行额度用完后，ego-blocked 等待才从头计时，而不是继承放行期。
+  EXPECT_EQ(watchdog.evaluate(contactGate(5.0, 0.08), t0 + std::chrono::milliseconds(1000)),
+    Decision::kUnsafe);
+  EXPECT_FALSE(watchdog.egoEscapeActive());
+}
+
 }  // namespace

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "geometry_msgs/msg/pose.hpp"
@@ -191,6 +192,53 @@ inline bool planningSnapshotContactShallow(
     return false;
   }
   return checkPlanningSnapshotFootprint(snapshot, pose, shrunk).footprint_safe;
+}
+
+// 当前位姿对足迹检查的"接触深度"：足迹每边内缩多少之后才能完整通过 checkPlanningSnapshotFootprint。
+// 0 = 本来就通过；+inf = 机器人格被占/越界，或内缩到 max_search_depth_m 仍不通过。
+// 与 planningSnapshotContactShallow 同一口径(depth <= d 等价于 shallow(d))，二分到 resolution_m。
+// 只用于观测(日志里每次挂起的深度)与有界放行，不改变 checkPlanningSnapshotFootprint 的判定。
+inline double planningSnapshotContactDepth(
+  const ats_navigation_interfaces::msg::PlanningMapSnapshot & snapshot,
+  const geometry_msgs::msg::Pose & pose,
+  const PlanningSnapshotSafetyParams & params, double max_search_depth_m = 0.30,
+  double resolution_m = 0.0025)
+{
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  const auto base = checkPlanningSnapshotFootprint(snapshot, pose, params);
+  if (base.footprint_safe) {
+    return 0.0;
+  }
+  if (!base.robot_cell_free) {
+    return kInf;
+  }
+  // 内缩后的足迹必须保持正的长宽。
+  const double limit = std::min(
+    max_search_depth_m, 0.5 * std::min(params.footprint_length, params.footprint_width) - 1e-3);
+  if (!(limit > 0.0) || !std::isfinite(limit)) {
+    return kInf;
+  }
+  const auto passes = [&](double depth) {
+      PlanningSnapshotSafetyParams shrunk = params;
+      shrunk.footprint_length -= 2.0 * depth;
+      shrunk.footprint_width -= 2.0 * depth;
+      return checkPlanningSnapshotFootprint(snapshot, pose, shrunk).footprint_safe;
+    };
+  if (!passes(limit)) {
+    return kInf;
+  }
+  double low = 0.0;
+  double high = limit;
+  const double step = std::max(resolution_m, 1e-4);
+  while (high - low > step) {
+    const double mid = 0.5 * (low + high);
+    if (passes(mid)) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  return high;
 }
 
 }  // namespace ats_goal_manager

@@ -46,6 +46,22 @@ struct PlanProgressWatchdogParams
   // 病态目标从外部超时压到 30 s 内的带原因失败。
   double no_executable_plan_timeout_sec{30.0};
   std::uint32_t max_consecutive_replans{2};
+  // 足迹瞬态接触的有界放行(默认关闭，行为与改动前逐位相同)。
+  //
+  // 触发条件不变：当前位姿的足迹检查不通过。变的是响应：参考轨迹已由规划器过了同一套足迹门禁
+  // (车沿它走会离开接触)，接触只是跟踪误差把车带到了格子边缘时，立即急停并挂起目标反而更糟——
+  // 制动距离让车停在更深处(5.1.11 A：触发 0.05 m，停下 0.10-0.30 m)，再等下一张快照重规划
+  // 也要 1-2 s，而且停车后新参考的起点就在接触里，常常马上再触发一次。
+  // e5 的 62 次 progress_watchdog_suspend：中位接触深度 0.069 m、p90 0.114 m；87 % 在 2 s 前
+  // 的位姿无接触、90 % 与上一张快照的接触相同，即车自己开进去的，不是地图变了。
+  //
+  // 放行必须同时满足：机器人格空闲、有当前参考且急停未置位、接触深度不超过
+  // contact_hold_max_depth_m (规划栅格一格加安全余量量级，更深的接触照旧急停)、同一段接触
+  // 持续不超过 contact_hold_max_sec。超时后回到原来的 kUnsafe 路径，并且在接触消失之前不会
+  // 重新获得放行额度。
+  bool contact_hold_enabled{false};
+  double contact_hold_max_depth_m{0.12};
+  double contact_hold_max_sec{1.5};
 };
 
 struct PlanProgressIdentity
@@ -74,6 +90,9 @@ struct PlanProgressGate
   bool footprint_safe{false};
   bool has_current_reference{false};
   double distance_to_goal_m{0.0};
+  // 当前位姿对足迹检查的接触深度：足迹每边内缩多少才能完整通过(0 = 本来就通过)。
+  // NaN = 未计算；+inf = 机器人格被占或内缩到搜索上界仍不通过。只用于有界放行与日志。
+  double footprint_contact_depth_m{std::numeric_limits<double>::quiet_NaN()};
   PlanProgressIdentity identity;
 };
 
@@ -123,6 +142,8 @@ public:
       0.0, params_.ego_blocked_escape_timeout_sec);
     params_.no_executable_plan_timeout_sec = std::max(
       0.0, params_.no_executable_plan_timeout_sec);
+    params_.contact_hold_max_depth_m = std::max(0.0, params_.contact_hold_max_depth_m);
+    params_.contact_hold_max_sec = std::max(0.0, params_.contact_hold_max_sec);
   }
 
   void resetGoal(std::uint64_t goal_id)
@@ -136,6 +157,8 @@ public:
     ego_blocked_since_.reset();
     ego_escape_active_ = false;
     no_executable_plan_since_.reset();
+    contact_hold_since_.reset();
+    contact_hold_active_ = false;
   }
 
   void observeReference(
@@ -183,6 +206,13 @@ public:
     // 车能挪出去就恢复推进，挪不出去就在 kReplan 用尽后
     // kExhausted 干净失败，两条路都是有界的。
     if (gate.robot_cell_free && gate.footprint_safe) {
+      ego_blocked_since_.reset();
+      ego_escape_active_ = false;
+      contact_hold_since_.reset();
+      contact_hold_active_ = false;
+    } else if (contactHoldAdmits(gate, now)) {
+      // 放行的瞬态接触：按"此刻足迹没问题"继续往下走(停滞/重规划预算照常计费)，
+      // 但它不计入 ego-blocked 等待，也不会提前触发 ego 逃逸。
       ego_blocked_since_.reset();
       ego_escape_active_ = false;
     } else {
@@ -315,7 +345,37 @@ public:
     return ego_escape_active_;
   }
 
+  // 最近一次 evaluate() 是否靠瞬态接触放行通过了足迹门。
+  [[nodiscard]] bool contactHoldActive() const
+  {
+    return contact_hold_active_;
+  }
+
 private:
+  // 同一段接触的放行额度只在接触完全消失(足迹通过)或换目标时恢复，
+  // 所以放行超时 -> 挂起 -> 重启后仍在接触里，不会再拿到一份新额度。
+  bool contactHoldAdmits(const PlanProgressGate & gate, Clock::time_point now)
+  {
+    contact_hold_active_ = false;
+    if (!params_.contact_hold_enabled || !gate.robot_cell_free ||
+      !gate.has_current_reference || gate.emergency_stop ||
+      !std::isfinite(gate.footprint_contact_depth_m) ||
+      gate.footprint_contact_depth_m > params_.contact_hold_max_depth_m)
+    {
+      return false;
+    }
+    if (!contact_hold_since_ || now < *contact_hold_since_) {
+      contact_hold_since_ = now;
+    }
+    if (std::chrono::duration<double>(now - *contact_hold_since_).count() >=
+      params_.contact_hold_max_sec)
+    {
+      return false;
+    }
+    contact_hold_active_ = true;
+    return true;
+  }
+
   static bool sameGoalAndReference(
     const PlanProgressIdentity & left, const PlanProgressIdentity & right)
   {
@@ -336,6 +396,8 @@ private:
   std::optional<Clock::time_point> last_replan_time_;
   std::optional<Clock::time_point> ego_blocked_since_;
   bool ego_escape_active_{false};
+  std::optional<Clock::time_point> contact_hold_since_;
+  bool contact_hold_active_{false};
 };
 
 // 沿已提交参考的剩余弧长，作为进度看门狗的"距离"。直线距离在绕行路线上会先变大
