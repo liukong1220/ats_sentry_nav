@@ -55,6 +55,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plan_progress_watchdog test/test_plan_progress_watchdog.cpp)
   target_include_directories(test_plan_progress_watchdog PRIVATE include)
 
+  ament_add_gtest(test_terminal_motion_window test/test_terminal_motion_window.cpp)
+  target_include_directories(test_terminal_motion_window PRIVATE include)
+
   ament_add_gtest(test_planning_snapshot_safety test/test_planning_snapshot_safety.cpp)
   target_include_directories(test_planning_snapshot_safety PRIVATE include)
   ament_target_dependencies(test_planning_snapshot_safety ats_navigation_interfaces geometry_msgs)

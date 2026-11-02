@@ -5,6 +5,7 @@
 #include "ats_goal_manager/plan_progress_watchdog.hpp"
 #include "ats_goal_manager/planner_failure_policy.hpp"
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
+#include "ats_goal_manager/terminal_motion_window.hpp"
 
 #include <array>
 #include <algorithm>
@@ -312,6 +313,11 @@ private:
         0.0, declare_parameter<double>("terminal_angular_velocity_tolerance", 0.10));
     terminal_dwell_sec_ = std::max(
         0.0, declare_parameter<double>("terminal_dwell_sec", 0.30));
+    // 终点"已停稳"的速度判据。> 0 时用最近这么久的位姿位移折算平均速度，代替里程计瞬时 twist：
+    // 车静止时 Point-LIO 的 twist 噪声中位数就有 0.064 m/s，按 0.05 m/s 的瞬时判据只有约三成采样通过
+    // (terminal_motion_window.hpp)。0 保持原判据。
+    terminal_motion_.setWindow(
+        declare_parameter<double>("terminal_velocity_window_sec", 0.0));
     // 可选：进度看门狗用"沿已提交参考的剩余弧长"代替到目标的直线距离。
     // 默认 false 保持原判据；RMUC 仿真 profile 打开（绕行路线直线距离先增后减）。
     progress_along_reference_ =
@@ -984,6 +990,10 @@ private:
       has_current_planning_pose_ = true;
       return;
     }
+    terminal_motion_.add(
+      rclcpp::Time(message->header.stamp).seconds(),
+      planning_normalized.pose.position.x, planning_normalized.pose.position.y,
+      tf2::getYaw(planning_normalized.pose.orientation));
     current_world_vx_ = vx_body * std::cos(yaw) - vy_body * std::sin(yaw);
     current_world_vy_ = vx_body * std::sin(yaw) + vy_body * std::cos(yaw);
     current_world_wz_ = wz;
@@ -1392,9 +1402,19 @@ private:
               std::abs(std::atan2(std::sin(yaw_delta), std::cos(yaw_delta)));
           const bool pose_converged = distance <= goal_position_tolerance_ &&
             yaw_error <= goal_yaw_tolerance_;
-          const bool velocity_converged = has_current_velocity_ &&
-            current_linear_velocity_ <= terminal_linear_velocity_tolerance_ &&
-            current_angular_velocity_ <= terminal_angular_velocity_tolerance_;
+          bool velocity_converged = false;
+          if (terminal_motion_.enabled()) {
+            double window_linear = 0.0;
+            double window_angular = 0.0;
+            velocity_converged = has_current_velocity_ &&
+              terminal_motion_.averageSpeed(window_linear, window_angular) &&
+              window_linear <= terminal_linear_velocity_tolerance_ &&
+              window_angular <= terminal_angular_velocity_tolerance_;
+          } else {
+            velocity_converged = has_current_velocity_ &&
+              current_linear_velocity_ <= terminal_linear_velocity_tolerance_ &&
+              current_angular_velocity_ <= terminal_angular_velocity_tolerance_;
+          }
           if (pose_converged && velocity_converged) {
             if (!terminal_converged_since_) {
               terminal_converged_since_ = std::chrono::steady_clock::now();
@@ -1415,6 +1435,12 @@ private:
           // replan storms stop inside the hold disk so tracking can finish
           // closing the last metres; SUCCEEDED still requires the success disk.
           const bool in_progress_hold = distance <= progress_hold_distance_m_;
+          if (pose_converged || in_progress_hold) {
+            // 目标圈内没有"推进"可言，但也不是停滞：刷新停滞计时。看门狗只在圈外被调用，
+            // 不刷新的话，车停在圈内、定位抖动让距离短暂越过圈沿时，会拿陈旧计时当场判停滞，
+            // 一次抖动耗掉一次重规划预算(e5 d124)。
+            progress_watchdog_.holdProgress(active_goal_->id);
+          }
           if (require_planning_snapshot_ && !pose_converged && !in_progress_hold) {
             PlanningSnapshotSafetyResult snapshot_safety;
             // Status and snapshot are separate DDS samples.  A newer ready
@@ -2147,6 +2173,7 @@ private:
   bool progress_along_reference_{false};
   std::size_t progress_reference_hint_{0};
   double goal_yaw_tolerance_{0.15};
+  TerminalMotionWindow terminal_motion_;
   double contact_hold_max_depth_m_{0.12};
   double terminal_linear_velocity_tolerance_{0.05};
   double terminal_angular_velocity_tolerance_{0.10};

@@ -785,4 +785,45 @@ TEST(PlanProgressWatchdog, HeldContactDoesNotStartTheEgoBlockedEscapeClock)
   EXPECT_FALSE(watchdog.egoEscapeActive());
 }
 
+TEST(PlanProgressWatchdog, HoldProgressKeepsTheStallTimerFreshInsideTheGoalDisk)
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.replan_stall_timeout_sec = 1.0;
+  params.replan_min_interval_sec = 0.5;
+  params.max_consecutive_replans = 2;
+
+  // 对照：圈内不刷新计时，离开圈沿的第一拍就把几十秒前的陈旧计时判成停滞。
+  Watchdog stale(params);
+  stale.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  EXPECT_EQ(stale.evaluate(healthyGate(0.30), t0), Decision::kNone);
+  EXPECT_EQ(stale.evaluate(healthyGate(0.29), t0 + std::chrono::seconds(30)), Decision::kReplan);
+
+  Watchdog fresh(params);
+  fresh.resetGoal(7);
+  EXPECT_EQ(fresh.evaluate(healthyGate(0.30), t0), Decision::kNone);
+  for (int second = 1; second <= 30; ++second) {
+    fresh.holdProgress(7, t0 + std::chrono::seconds(second));
+  }
+  EXPECT_EQ(fresh.evaluate(healthyGate(0.29), t0 + std::chrono::milliseconds(30200)),
+    Decision::kNone);
+  EXPECT_EQ(fresh.consecutiveReplans(), 0U);
+  // 持续在圈外不推进，停滞照样判：刷新只覆盖圈内。
+  EXPECT_EQ(fresh.evaluate(healthyGate(0.29), t0 + std::chrono::milliseconds(31300)),
+    Decision::kReplan);
+}
+
+TEST(PlanProgressWatchdog, HoldProgressIgnoresForeignGoalsAndUnobservedGoals)
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.replan_stall_timeout_sec = 1.0;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto t0 = Clock::time_point{};
+  watchdog.holdProgress(7, t0);   // 还没有观测到任何参考：不建立计时
+  EXPECT_EQ(watchdog.evaluate(healthyGate(0.30), t0 + std::chrono::seconds(30)), Decision::kNone);
+  watchdog.holdProgress(99, t0 + std::chrono::seconds(60));   // 别的目标：忽略
+  EXPECT_EQ(watchdog.evaluate(healthyGate(0.30), t0 + std::chrono::seconds(62)), Decision::kReplan);
+}
+
 }  // namespace

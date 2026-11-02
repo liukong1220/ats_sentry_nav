@@ -161,6 +161,19 @@ public:
     contact_hold_active_ = false;
   }
 
+  // 目标圈内(成功圈或 progress_hold 圈)：没有"推进"可言，但也不是停滞。圈内每拍调用，
+  // 刷新停滞计时。evaluate() 只在圈外被调用，如果不刷新，车停在圈内、定位抖动让距离短暂
+  // 越过圈沿时，会拿一个几十秒前的陈旧计时当场判停滞，一次抖动就耗掉一次重规划预算
+  // (e5 d124：位置与 yaw 全程在容差内，18 s 内连耗两次预算后以 bounded replans 判失败)。
+  // 只刷新计时，不碰重规划计数与距离基线，也不改变 evaluate() 对圈外停滞的判定。
+  void holdProgress(std::uint64_t goal_id, Clock::time_point now = Clock::now())
+  {
+    if (goal_id == 0 || goal_id != goal_id_ || !last_progress_time_) {
+      return;
+    }
+    last_progress_time_ = now;
+  }
+
   void observeReference(
     const PlanProgressIdentity & identity, double distance_to_goal_m,
     Clock::time_point now = Clock::now())
