@@ -23,6 +23,7 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 
+#include "terrain_analysis_ext/overhead_filter.hpp"
 #include "terrain_analysis_ext/planar_lattice.hpp"
 
 double scanVoxelSize = 0.1;
@@ -53,6 +54,9 @@ double traversabilityGroundWeight = 0.15;
 double traversabilityDebugHeightDiffCap = 0.30;
 double traversabilityDebugOccupancyRatioCap = 1.0;
 int traversabilityMinPointCount = 3;
+// 相对本体素地面高于该值（m）的点是头顶面（悬空板/桥），不进体素高度统计，
+// 因此不会触发硬障碍；取"车高 + 小于实测最小净空余量的余量"。0 = 关闭（实车默认）。
+double traversabilityOverheadHeight = 0.0;
 bool traversabilityUnknownAsOccupied = false;
 bool publishTraversabilityDebugGrids = true;
 double slopeGridMaxDeg = 45.0;
@@ -430,9 +434,9 @@ void publishTraversabilityGrid(
         0.6 * point_confidence + 0.4 * connectivity_confidence;
     planarVoxelGroundConfidence[i] = static_cast<float>(ground_confidence);
 
-    const double height_metric = std::max(
-        static_cast<double>(planarVoxelHeightDiff[i]),
-        static_cast<double>(planarVoxelMaxRelHeight[i]));
+    const double height_metric = static_cast<double>(
+        terrain_analysis_ext::voxelHeightMetric(
+            planarVoxelMinZ[i], planarVoxelMaxZ[i], planarVoxelMaxRelHeight[i]));
     const double height_score = clampUnit(
         (height_metric - traversabilitySafeHeightThre) / height_range);
     const double occupancy_activation = clampUnit(
@@ -555,6 +559,8 @@ int main(int argc, char **argv) {
                                 traversabilityDebugOccupancyRatioCap);
   nh->declare_parameter<int>("traversabilityMinPointCount",
                              traversabilityMinPointCount);
+  nh->declare_parameter<double>("traversabilityOverheadHeight",
+                                traversabilityOverheadHeight);
   nh->declare_parameter<bool>("traversabilityUnknownAsOccupied",
                               traversabilityUnknownAsOccupied);
   nh->declare_parameter<bool>("publishTraversabilityDebugGrids",
@@ -602,6 +608,8 @@ int main(int argc, char **argv) {
                     traversabilityDebugOccupancyRatioCap);
   nh->get_parameter("traversabilityMinPointCount",
                     traversabilityMinPointCount);
+  nh->get_parameter("traversabilityOverheadHeight",
+                    traversabilityOverheadHeight);
   nh->get_parameter("traversabilityUnknownAsOccupied",
                     traversabilityUnknownAsOccupied);
   nh->get_parameter("publishTraversabilityDebugGrids",
@@ -912,14 +920,11 @@ int main(int argc, char **argv) {
           if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
               indY < planarVoxelWidth) {
             const int ind = planarVoxelWidth * indX + indY;
-            const float relHeight = point.z - planarVoxelElev[ind];
-            if (relHeight >= 0.0f) {
-              planarVoxelMaxRelHeight[ind] =
-                  std::max(planarVoxelMaxRelHeight[ind], relHeight);
-            }
-            planarVoxelMinZ[ind] = std::min(planarVoxelMinZ[ind], point.z);
-            planarVoxelMaxZ[ind] = std::max(planarVoxelMaxZ[ind], point.z);
-            planarVoxelPointCount[ind]++;
+            // Overhead surfaces (a plate the vehicle passes under) are skipped.
+            terrain_analysis_ext::accumulateVoxelPoint(
+                point.z, planarVoxelElev[ind], traversabilityOverheadHeight,
+                planarVoxelMaxRelHeight[ind], planarVoxelMinZ[ind],
+                planarVoxelMaxZ[ind], planarVoxelPointCount[ind]);
           }
         }
       }
@@ -933,11 +938,11 @@ int main(int argc, char **argv) {
           continue;
         }
 
-        planarVoxelHeightDiff[i] =
-            std::max(0.0f, planarVoxelMaxZ[i] - planarVoxelMinZ[i]);
-        const double height_metric = std::max(
-            static_cast<double>(planarVoxelHeightDiff[i]),
-            static_cast<double>(planarVoxelMaxRelHeight[i]));
+        planarVoxelHeightDiff[i] = terrain_analysis_ext::voxelHeightDiff(
+            planarVoxelMinZ[i], planarVoxelMaxZ[i]);
+        const double height_metric = static_cast<double>(
+            terrain_analysis_ext::voxelHeightMetric(
+                planarVoxelMinZ[i], planarVoxelMaxZ[i], planarVoxelMaxRelHeight[i]));
         if (height_metric <= 0.5 * traversabilitySafeHeightThre) {
           planarVoxelOccupancyRatio[i] = 0.0f;
           continue;
