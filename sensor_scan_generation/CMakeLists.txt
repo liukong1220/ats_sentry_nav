@@ -51,7 +51,12 @@ find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(loam_interface REQUIRED)
   ament_auto_add_gtest(test_sensor_scan_generation test/test_sensor_scan_generation.cpp)
+  ament_target_dependencies(test_sensor_scan_generation loam_interface)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_identified_two_processes
+    test/test_identified_two_processes.py TIMEOUT 45)
 endif()
 
 #############

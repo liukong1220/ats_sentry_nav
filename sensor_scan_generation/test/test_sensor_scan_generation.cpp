@@ -17,7 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include "ats_navigation_interfaces/msg/identified_odometry.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "loam_interface/loam_interface.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rcutils/logging.h"
@@ -84,6 +86,15 @@ protected:
     // 与 loam_interface 的发布端一致：reliable、keep_last(5)、volatile，
     // 对面是 sensor_scan_generation 的 best_effort、keep_last(1) 订阅。
     odom_pub_ = harness_->create_publisher<nav_msgs::msg::Odometry>("lidar_odometry", 5);
+    identified_pub_ = harness_->create_publisher<
+      ats_navigation_interfaces::msg::IdentifiedOdometry>("lidar_odometry_identified", 5);
+    identified_sub_ = harness_->create_subscription<
+      ats_navigation_interfaces::msg::IdentifiedOdometry>(
+      "odometry_identified", 10,
+      [this](ats_navigation_interfaces::msg::IdentifiedOdometry::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        identified_msgs_.push_back(*msg);
+      });
     cloud_pub_ = harness_->create_publisher<sensor_msgs::msg::PointCloud2>("registered_scan", 5);
     odometry_sub_ = harness_->create_subscription<nav_msgs::msg::Odometry>(
       "odometry", 10, [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
@@ -198,6 +209,8 @@ protected:
   std::shared_ptr<rclcpp::Node> harness_;
   std::shared_ptr<rclcpp::Node> tf_node_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr identified_pub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr identified_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr scan_sub_;
@@ -209,8 +222,112 @@ protected:
 
   std::mutex mutex_;
   std::vector<nav_msgs::msg::Odometry> odometry_msgs_;
+  std::vector<ats_navigation_interfaces::msg::IdentifiedOdometry> identified_msgs_;
   std::atomic<std::size_t> scan_count_{0};
 };
+
+TEST_P(SensorScanGenerationTest, IdentifiedOdometryPreservesIdentityAndPose)
+{
+  ASSERT_TRUE(ssg_->set_parameter(rclcpp::Parameter("use_identified_odometry", true)).successful);
+  publishStaticExtrinsic(0.25);
+  ASSERT_TRUE(waitForExtrinsicInProbe(0.25));
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  bool received = false;
+  while (std::chrono::steady_clock::now() < deadline && !received) {
+    ats_navigation_interfaces::msg::IdentifiedOdometry input;
+    input.instance_id = 42;
+    input.header.stamp = harness_->now();
+    input.header.frame_id = "odom";
+    input.odometry.header = input.header;
+    input.odometry.child_frame_id = "front_mid360";
+    input.odometry.pose.pose.orientation.w = 1.0;
+    identified_pub_->publish(input);
+    std::this_thread::sleep_for(100ms);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!identified_msgs_.empty()) {
+      const auto & output = identified_msgs_.back();
+      EXPECT_EQ(output.instance_id, 42U);
+      EXPECT_EQ(output.header, output.odometry.header);
+      EXPECT_EQ(output.odometry.child_frame_id, "gimbal_yaw_odom");
+      EXPECT_NEAR(output.odometry.pose.pose.position.x, -0.25, 1e-6);
+      received = true;
+    }
+  }
+  EXPECT_TRUE(received);
+}
+
+TEST_P(SensorScanGenerationTest, IdentifiedRestartRejectsOldAndZeroInstances)
+{
+  ASSERT_TRUE(ssg_->set_parameter(rclcpp::Parameter("use_identified_odometry", true)).successful);
+  publishStaticExtrinsic(0.25);
+  ASSERT_TRUE(waitForExtrinsicInProbe(0.25));
+  auto send = [this](std::uint64_t id) {
+      ats_navigation_interfaces::msg::IdentifiedOdometry input;
+      input.instance_id = id;
+      input.header.stamp = harness_->now();
+      input.header.frame_id = "odom";
+      input.odometry.header = input.header;
+      input.odometry.child_frame_id = "front_mid360";
+      input.odometry.pose.pose.orientation.w = 1.0;
+      identified_pub_->publish(input);
+      std::this_thread::sleep_for(200ms);
+    };
+  send(101);
+  send(202);
+  std::size_t before = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ASSERT_GE(identified_msgs_.size(), 2U);
+    ASSERT_EQ(identified_msgs_.back().instance_id, 202U);
+    before = identified_msgs_.size();
+  }
+  send(101);
+  send(0);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    EXPECT_EQ(identified_msgs_.size(), before);
+  }
+}
+
+TEST_P(SensorScanGenerationTest, IdentifiedChainInSameExecutor)
+{
+  ASSERT_TRUE(ssg_->set_parameter(rclcpp::Parameter("use_identified_odometry", true)).successful);
+  rclcpp::NodeOptions options;
+  options.use_intra_process_comms(GetParam());
+  options.parameter_overrides({
+    rclcpp::Parameter("state_estimation_topic", "test_chain_state"),
+    rclcpp::Parameter("registered_scan_topic", "test_chain_cloud"),
+    rclcpp::Parameter("base_frame", "gimbal_yaw_odom"),
+    rclcpp::Parameter("lidar_frame", "front_mid360"),
+    rclcpp::Parameter("use_identified_odometry", true)});
+  auto loam = std::make_shared<loam_interface::LoamInterfaceNode>(options);
+  auto source = harness_->create_publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>(
+    "test_chain_state_identified", 10);
+  executor_->add_node(loam);
+  publishStaticExtrinsic(0.25);
+  ASSERT_TRUE(waitForExtrinsicInProbe(0.25));
+  bool received = false;
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline && !received) {
+    ats_navigation_interfaces::msg::IdentifiedOdometry input;
+    input.instance_id = 123;
+    input.header.stamp = harness_->now();
+    input.header.frame_id = "camera_init";
+    input.odometry.header = input.header;
+    input.odometry.pose.pose.orientation.w = 1.0;
+    source->publish(input);
+    std::this_thread::sleep_for(100ms);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto & message : identified_msgs_) {
+      if (message.instance_id == 123) {
+        received = true;
+        break;
+      }
+    }
+  }
+  EXPECT_TRUE(received);
+  executor_->remove_node(loam);
+}
 
 TEST_P(SensorScanGenerationTest, ExtrinsicIsCachedAfterFirstSuccess)
 {

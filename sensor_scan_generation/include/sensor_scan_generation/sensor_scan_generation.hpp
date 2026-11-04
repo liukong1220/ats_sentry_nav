@@ -5,7 +5,9 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 
+#include "ats_navigation_interfaces/msg/identified_odometry.hpp"
 #include "message_filters/subscriber.h"
 #include "message_filters/sync_policies/approximate_time.h"
 #include "message_filters/synchronizer.h"
@@ -25,7 +27,8 @@ public:
   explicit SensorScanGenerationNode(const rclcpp::NodeOptions & options);
 
 private:
-  void odometryHandler(const nav_msgs::msg::Odometry::ConstSharedPtr & odometry);
+  void odometryHandler(
+    const nav_msgs::msg::Odometry::ConstSharedPtr & odometry, std::uint64_t instance_id = 0);
   void laserCloudAndOdometryHandler(
     const nav_msgs::msg::Odometry::ConstSharedPtr & odometry,
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr & laserCloud2);
@@ -51,6 +54,12 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_laser_cloud_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_chassis_odometry_;
+  rclcpp::Publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr
+    pub_identified_odometry_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr
+    identified_odometry_sub_;
+  std::uint64_t current_instance_id_{0};
+  std::unordered_set<std::uint64_t> retired_instances_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;

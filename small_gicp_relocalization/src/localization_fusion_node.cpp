@@ -25,12 +25,14 @@
 #include <string>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_navigation_interfaces/msg/identified_odometry.hpp"
 #include "ats_navigation_interfaces/msg/relocalization_observation.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "small_gicp_relocalization/localization_fusion_core.hpp"
+#include "small_gicp_relocalization/odom_instance_tracker.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/transform_broadcaster.h"
@@ -92,6 +94,25 @@ public:
   : Node("localization_fusion", options)
   {
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/odometry");
+    const bool use_identified_odometry =
+      declare_parameter<bool>("use_identified_odometry", false);
+    const auto identified_odom_topic = declare_parameter<std::string>(
+      "identified_odom_topic", "/odometry_identified");
+    const auto identity_monitor_topic = declare_parameter<std::string>(
+      "identity_monitor_topic", "/aft_mapped_to_init_identified");
+    if (use_identified_odometry && identity_monitor_topic == identified_odom_topic) {
+      throw std::invalid_argument("identity monitor must use the unfiltered frontend topic");
+    }
+    const auto initial_samples = declare_parameter<int>("identity_initial_samples", 3);
+    const auto retired_limit = declare_parameter<int>("identity_retired_limit", 5);
+    identity_max_age_s_ = declare_parameter<double>("identity_max_age_s", 0.5);
+    if (initial_samples < 1 || retired_limit < 0 || !std::isfinite(identity_max_age_s_) ||
+      identity_max_age_s_ <= 0.0)
+    {
+      throw std::invalid_argument("invalid identity safety parameters");
+    }
+    odom_instance_tracker_ = OdomInstanceTracker(
+      static_cast<std::size_t>(initial_samples), static_cast<std::size_t>(retired_limit), 1.0);
     localization_topic_ = declare_parameter<std::string>("localization_topic", "/localization");
     observation_topic_ =
       declare_parameter<std::string>("observation_topic", "relocalization_observation");
@@ -160,9 +181,20 @@ public:
       create_publisher<nav_msgs::msg::Odometry>(localization_topic_, rclcpp::SensorDataQoS());
     status_pub_ = create_publisher<LocalizationStatus>(
       status_topic_, rclcpp::QoS(1).reliable().transient_local());
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      odom_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&LocalizationFusionNode::onOdometry, this, std::placeholders::_1));
+    if (use_identified_odometry) {
+      identity_monitor_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::IdentifiedOdometry>(
+        identity_monitor_topic, rclcpp::SensorDataQoS(),
+        std::bind(&LocalizationFusionNode::onIdentityMonitor, this, std::placeholders::_1));
+      identified_odom_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::IdentifiedOdometry>(
+        identified_odom_topic, rclcpp::SensorDataQoS(),
+        std::bind(&LocalizationFusionNode::onIdentifiedOdometry, this, std::placeholders::_1));
+    } else {
+      odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&LocalizationFusionNode::onOdometry, this, std::placeholders::_1));
+    }
     observation_sub_ = create_subscription<RelocalizationObservation>(
       observation_topic_, rclcpp::QoS(10).reliable(),
       std::bind(&LocalizationFusionNode::onObservation, this, std::placeholders::_1));
@@ -208,6 +240,77 @@ public:
   }
 
 private:
+  void onIdentityMonitor(
+    const ats_navigation_interfaces::msg::IdentifiedOdometry::SharedPtr message)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (message->instance_id == 0 || message->header != message->odometry.header ||
+      odom_instance_tracker_.instance() == 0 ||
+      message->instance_id >= odom_instance_tracker_.instance())
+    {
+      return;
+    }
+    const double steady_now = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto result = odom_instance_tracker_.observe(message->instance_id, false, steady_now);
+    if (result == OdomInstanceTracker::Result::kLatched) {
+      enterLostLocked("concurrent odometry instances; restart fusion required");
+    } else {
+      recordRejectionLocked("retired frontend instance", true);
+    }
+    publishStatusLocked();
+  }
+
+  void onIdentifiedOdometry(
+    const ats_navigation_interfaces::msg::IdentifiedOdometry::SharedPtr message)
+  {
+    if (message->header != message->odometry.header) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto & stamp = message->header.stamp;
+      const bool valid_stamp = stamp.sec >= 0 && stamp.nanosec < 1000000000U &&
+        (stamp.sec != 0 || stamp.nanosec != 0);
+      const double age = valid_stamp ? (now() - rclcpp::Time(stamp)).seconds() : -1.0;
+      const bool fresh = valid_stamp && age >= 0.0 && age <= identity_max_age_s_;
+      const double steady_now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+      const auto result = odom_instance_tracker_.observe(message->instance_id, fresh, steady_now);
+      using Result = OdomInstanceTracker::Result;
+      if (result == Result::kLatched) {
+        enterLostLocked("concurrent odometry instances; restart fusion required");
+        publishStatusLocked();
+        return;
+      }
+      if (result == Result::kRetired) {
+        recordRejectionLocked("retired odometry instance", true);
+        publishStatusLocked();
+        return;
+      }
+      if (result == Result::kInvalid || result == Result::kPending) {
+        return;
+      }
+      if (result == Result::kChanged) {
+        odom_history_.clear();
+        latest_odom_stamp_.reset();
+        last_odom_receive_time_.reset();
+        last_input_observation_stamp_.reset();
+        last_input_observation_sequence_.reset();
+        last_observation_stamp_.reset();
+        last_observation_sequence_.reset();
+        last_observation_receive_time_.reset();
+        observation_clock_start_.reset();
+        has_map_to_odom_ = false;
+        has_accepted_observation_ = false;
+        ++epoch_;
+        enterLostLocked("odometry source instance changed");
+        publishStatusLocked();
+      }
+    }
+    onOdometry(std::make_shared<nav_msgs::msg::Odometry>(message->odometry));
+  }
+
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr message)
   {
     if (!finitePose(message->pose.pose)) {
@@ -267,6 +370,11 @@ private:
   void onObservation(const RelocalizationObservation::SharedPtr message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (odom_instance_tracker_.latched()) {
+      enterLostLocked("concurrent odometry instances; restart fusion required");
+      publishStatusLocked();
+      return;
+    }
     const bool was_recovering = recovery_until_.has_value();
     updateHealthLocked();
     if (was_recovering && !recovery_until_) {
@@ -583,9 +691,8 @@ private:
     status.header.frame_id = map_frame_;
     status.state = status_;
     status.epoch = epoch_;
-    // 前端还不上报 odom 实例号与重置计数（附录 A.18），先固定为 0
-    status.odom_instance_id = 0;
-    status.odom_epoch = 0;
+    status.odom_instance_id = odom_instance_tracker_.instance();
+    status.odom_epoch = odom_instance_tracker_.epoch();
     status.observation_sequence = last_observation_sequence_.value_or(0);
     status.odometry_silence_sec = last_odom_receive_time_
                                     ? std::max(0.0, steadySecondsSince(*last_odom_receive_time_))
@@ -646,6 +753,8 @@ private:
   double max_registration_error_{-1.0};
 
   std::mutex mutex_;
+  OdomInstanceTracker odom_instance_tracker_;
+  double identity_max_age_s_{0.5};
   std::deque<OdomPoseSample> odom_history_;
   std::optional<rclcpp::Time> latest_odom_stamp_;
   std::optional<SteadyTime> last_odom_receive_time_;
@@ -676,6 +785,10 @@ private:
   std::string status_message_{"waiting for odometry"};
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr
+    identified_odom_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr
+    identity_monitor_sub_;
   rclcpp::Subscription<RelocalizationObservation>::SharedPtr observation_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr localization_pub_;
   rclcpp::Publisher<LocalizationStatus>::SharedPtr status_pub_;

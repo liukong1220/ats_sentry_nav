@@ -8,8 +8,10 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <random>
 
 #include <nav_msgs/msg/odometry.hpp>
+#include <ats_navigation_interfaces/msg/identified_odometry.hpp>
 
 #include "li_initialization.h"
 
@@ -142,7 +144,9 @@ void set_posestamp(T & out)
 }
 
 void publish_odometry(
-  const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & pubOdomAftMapped)
+  const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & pubOdomAftMapped,
+  const rclcpp::Publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr & identified_pub,
+  const std::uint64_t instance_id)
 {
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "body";
@@ -153,6 +157,13 @@ void publish_odometry(
   }
   set_posestamp(odomAftMapped.pose.pose);
 
+  ats_navigation_interfaces::msg::IdentifiedOdometry identified;
+  identified.header = odomAftMapped.header;
+  identified.instance_id = instance_id;
+  identified.odometry = odomAftMapped;
+  if (instance_id != 0) {
+    identified_pub->publish(identified);
+  }
   pubOdomAftMapped->publish(odomAftMapped);
 }
 
@@ -199,6 +210,17 @@ int main(int argc, char ** argv)
   auto pub_laser_cloud_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("Laser_map", 20);
   auto pub_odom_aft_mapped =
     nh->create_publisher<nav_msgs::msg::Odometry>("aft_mapped_to_init", 20);
+  auto pub_identified_odom =
+    nh->create_publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>(
+    "aft_mapped_to_init_identified", 20);
+  std::uint64_t instance_id = 0;
+  const auto startup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (std::chrono::steady_clock::is_steady && startup_ns > 0) {
+    instance_id = static_cast<std::uint64_t>(startup_ns);
+  } else {
+    RCLCPP_ERROR(nh->get_logger(), "steady clock unavailable; identified odometry disabled");
+  }
 
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
@@ -417,7 +439,7 @@ int main(int argc, char ** argv)
             if (publish_odometry_without_downsample) {
               /******* Publish odometry *******/
 
-              publish_odometry(pub_odom_aft_mapped);
+              publish_odometry(pub_odom_aft_mapped, pub_identified_odom, instance_id);
             }
 
             for (int j = 0; j < time_seq[k]; j++) {
@@ -500,7 +522,7 @@ angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y,
       }
       /******* Publish odometry downsample *******/
       if (!publish_odometry_without_downsample) {
-        publish_odometry(pub_odom_aft_mapped);
+        publish_odometry(pub_odom_aft_mapped, pub_identified_odom, instance_id);
       }
 
       /*** add the feature points to map ***/

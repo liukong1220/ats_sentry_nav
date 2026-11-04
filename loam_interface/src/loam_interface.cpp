@@ -16,6 +16,7 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
 : Node("loam_interface", options)
 {
   this->declare_parameter<std::string>("state_estimation_topic", "");
+  this->declare_parameter<bool>("use_identified_odometry", false);
   this->declare_parameter<std::string>("registered_scan_topic", "");
   this->declare_parameter<std::string>("odom_frame", "odom");
   this->declare_parameter<std::string>("base_frame", "");
@@ -26,6 +27,7 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
   this->declare_parameter<double>("base_frame_height", 0.0);
 
   this->get_parameter("state_estimation_topic", state_estimation_topic_);
+  this->get_parameter("use_identified_odometry", use_identified_odometry_);
   this->get_parameter("registered_scan_topic", registered_scan_topic_);
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("base_frame", base_frame_);
@@ -40,13 +42,22 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
 
   pcd_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("registered_scan", 5);
   odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("lidar_odometry", 5);
+  identified_odom_pub_ = this->create_publisher<
+    ats_navigation_interfaces::msg::IdentifiedOdometry>("lidar_odometry_identified", 5);
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
     registered_scan_topic_, rclcpp::SensorDataQoS(),
     std::bind(&LoamInterfaceNode::pointCloudCallback, this, std::placeholders::_1));
-  odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    state_estimation_topic_, rclcpp::SensorDataQoS().keep_last(1),
-    std::bind(&LoamInterfaceNode::odometryCallback, this, std::placeholders::_1));
+  if (use_identified_odometry_) {
+    identified_odom_sub_ = this->create_subscription<
+      ats_navigation_interfaces::msg::IdentifiedOdometry>(
+      state_estimation_topic_ + "_identified", rclcpp::SensorDataQoS().keep_last(1),
+      std::bind(&LoamInterfaceNode::identifiedOdometryCallback, this, std::placeholders::_1));
+  } else {
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      state_estimation_topic_, rclcpp::SensorDataQoS().keep_last(1),
+      std::bind(&LoamInterfaceNode::odometryCallback, this, std::placeholders::_1));
+  }
 }
 
 void LoamInterfaceNode::pointCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
@@ -66,8 +77,41 @@ void LoamInterfaceNode::pointCloudCallback(const sensor_msgs::msg::PointCloud2::
   auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
   pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, *msg, *out);
   pcd_pub_->publish(std::move(out));
-  odom_pub_->publish(
-    std::make_unique<nav_msgs::msg::Odometry>(buildOdometryMessage(matched_odom, cloud_stamp)));
+  if (!use_identified_odometry_) {
+    odom_pub_->publish(
+      std::make_unique<nav_msgs::msg::Odometry>(buildOdometryMessage(matched_odom, cloud_stamp)));
+  }
+}
+
+void LoamInterfaceNode::identifiedOdometryCallback(
+  const ats_navigation_interfaces::msg::IdentifiedOdometry::ConstSharedPtr msg)
+{
+  if (msg->instance_id == 0 || msg->instance_id < instance_id_ ||
+    msg->header != msg->odometry.header ||
+    retired_instances_.count(msg->instance_id) != 0U)
+  {
+    return;
+  }
+  if (instance_id_ != msg->instance_id) {
+    if (instance_id_ != 0) {
+      retired_instances_.insert(instance_id_);
+    }
+    instance_id_ = msg->instance_id;
+    std::lock_guard<std::mutex> lock(odom_buffer_mutex_);
+    odom_buffer_.clear();
+  }
+  odometryCallback(std::make_shared<nav_msgs::msg::Odometry>(msg->odometry));
+  const rclcpp::Time stamp(msg->header.stamp);
+  OdomSample sample;
+  if (!getClosestOdomSample(stamp, sample) || sample.stamp != stamp) {
+    return;
+  }
+  ats_navigation_interfaces::msg::IdentifiedOdometry identified;
+  identified.instance_id = msg->instance_id;
+  identified.odometry = buildOdometryMessage(sample, stamp);
+  identified.header = identified.odometry.header;
+  identified_odom_pub_->publish(identified);
+  odom_pub_->publish(identified.odometry);
 }
 
 void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)

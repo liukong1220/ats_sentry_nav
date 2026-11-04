@@ -19,6 +19,7 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
   this->declare_parameter<std::string>("base_frame", "");
   this->declare_parameter<std::string>("robot_base_frame", "");
   this->declare_parameter<bool>("publish_tf", true);
+  this->declare_parameter<bool>("use_identified_odometry", false);
 
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("lidar_frame", lidar_frame_);
@@ -33,6 +34,19 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
 
   pub_laser_cloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("sensor_scan", 2);
   pub_chassis_odometry_ = this->create_publisher<nav_msgs::msg::Odometry>("odometry", 2);
+  pub_identified_odometry_ = this->create_publisher<
+    ats_navigation_interfaces::msg::IdentifiedOdometry>("odometry_identified", 2);
+  identified_odometry_sub_ = this->create_subscription<
+    ats_navigation_interfaces::msg::IdentifiedOdometry>(
+    "lidar_odometry_identified", rclcpp::SensorDataQoS(),
+    [this](ats_navigation_interfaces::msg::IdentifiedOdometry::ConstSharedPtr msg) {
+      if (!get_parameter("use_identified_odometry").as_bool() || msg->instance_id == 0 ||
+        msg->header != msg->odometry.header)
+      {
+        return;
+      }
+      odometryHandler(std::make_shared<nav_msgs::msg::Odometry>(msg->odometry), msg->instance_id);
+    });
 
   rmw_qos_profile_t qos_profile = {
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
@@ -48,7 +62,11 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
   odometry_sub_.subscribe(this, "lidar_odometry", qos_profile);
   laser_cloud_sub_.subscribe(this, "registered_scan", qos_profile);
   odometry_sub_.registerCallback(
-    std::bind(&SensorScanGenerationNode::odometryHandler, this, std::placeholders::_1));
+    [this](const nav_msgs::msg::Odometry::ConstSharedPtr & msg) {
+      if (!get_parameter("use_identified_odometry").as_bool()) {
+        odometryHandler(msg);
+      }
+    });
 
   sync_ = std::make_unique<message_filters::Synchronizer<SyncPolicy>>(
     SyncPolicy(100), odometry_sub_, laser_cloud_sub_);
@@ -58,8 +76,19 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
 }
 
 void SensorScanGenerationNode::odometryHandler(
-  const nav_msgs::msg::Odometry::ConstSharedPtr & odometry_msg)
+  const nav_msgs::msg::Odometry::ConstSharedPtr & odometry_msg, std::uint64_t instance_id)
 {
+  if (instance_id != current_instance_id_) {
+    if (instance_id != 0 &&
+      (instance_id < current_instance_id_ || retired_instances_.count(instance_id) != 0U)) {
+      return;
+    }
+    if (current_instance_id_ != 0) {
+      retired_instances_.insert(current_instance_id_);
+    }
+    has_previous_odometry_ = false;
+    current_instance_id_ = instance_id;
+  }
   tf2::Transform tf_odom_to_lidar;
   tf2::Transform tf_lidar_to_chassis;
 
@@ -120,7 +149,7 @@ void SensorScanGenerationNode::laserCloudAndOdometryHandler(
 {
   tf2::Transform tf_odom_to_lidar;
 
-  if (!has_robot_base_pose_) {
+  if (!has_robot_base_pose_ && !get_parameter("use_identified_odometry").as_bool()) {
     odometryHandler(odometry_msg);
   }
   tf2::fromMsg(odometry_msg->pose.pose, tf_odom_to_lidar);
@@ -207,6 +236,13 @@ void SensorScanGenerationNode::publishOdometry(
   previous_odom_stamp_ = stamp;
   has_previous_odometry_ = true;
 
+  if (current_instance_id_ != 0) {
+    ats_navigation_interfaces::msg::IdentifiedOdometry identified;
+    identified.header = out.header;
+    identified.instance_id = current_instance_id_;
+    identified.odometry = out;
+    pub_identified_odometry_->publish(identified);
+  }
   pub_chassis_odometry_->publish(std::make_unique<nav_msgs::msg::Odometry>(std::move(out)));
 }
 

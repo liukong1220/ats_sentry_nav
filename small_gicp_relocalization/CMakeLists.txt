@@ -91,6 +91,11 @@ if(BUILD_TESTING)
     TIMEOUT 40
   )
 
+  ament_add_pytest_test(test_fusion_identified_odometry
+    test/test_fusion_identified_odometry.py
+    TIMEOUT 40
+  )
+
   ament_add_pytest_test(test_localization_fusion_cold_seed
     test/test_localization_fusion_cold_seed.py
     TIMEOUT 60

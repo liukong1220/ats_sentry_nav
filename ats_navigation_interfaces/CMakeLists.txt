@@ -16,6 +16,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavigateToPose.action"
   "msg/LocalizationStatus.msg"
+  "msg/IdentifiedOdometry.msg"
   "msg/ExecutionCommand.msg"
   "msg/GimbalYawStatus.msg"
   "msg/PlanningMapStatus.msg"

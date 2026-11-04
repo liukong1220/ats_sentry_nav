@@ -20,6 +20,7 @@
 
 #include "small_gicp_relocalization/localization_fusion_core.hpp"
 #include "small_gicp_relocalization/localization_status_input_core.hpp"
+#include "small_gicp_relocalization/odom_instance_tracker.hpp"
 
 namespace small_gicp_relocalization
 {
@@ -43,6 +44,86 @@ rclcpp::Time seconds(double value)
 }
 
 }  // namespace
+
+TEST(OdomInstanceTracker, RejectsUnknownAndCountsDistinctInstances)
+{
+  OdomInstanceTracker tracker;
+  using Result = OdomInstanceTracker::Result;
+  EXPECT_EQ(tracker.observe(0), Result::kInvalid);
+  EXPECT_EQ(tracker.epoch(), 0U);
+  EXPECT_EQ(tracker.observe(42), Result::kFirst);
+  EXPECT_EQ(tracker.epoch(), 1U);
+  EXPECT_EQ(tracker.observe(42), Result::kUnchanged);
+  EXPECT_EQ(tracker.epoch(), 1U);
+  EXPECT_EQ(tracker.observe(43), Result::kChanged);
+  EXPECT_EQ(tracker.epoch(), 2U);
+  EXPECT_EQ(tracker.instance(), 43U);
+  EXPECT_EQ(tracker.observe(42), Result::kRetired);
+  EXPECT_EQ(tracker.epoch(), 2U);
+  EXPECT_EQ(tracker.instance(), 43U);
+}
+
+TEST(OdomInstanceTracker, InterleavedRestartNeverReactivatesRetiredInstance)
+{
+  OdomInstanceTracker tracker;
+  using Result = OdomInstanceTracker::Result;
+  EXPECT_EQ(tracker.observe(101), Result::kFirst);
+  EXPECT_EQ(tracker.observe(101), Result::kUnchanged);
+  EXPECT_EQ(tracker.observe(202), Result::kChanged);
+  EXPECT_EQ(tracker.observe(101), Result::kRetired);
+  EXPECT_EQ(tracker.observe(0), Result::kInvalid);
+  EXPECT_EQ(tracker.observe(202), Result::kUnchanged);
+  EXPECT_EQ(tracker.instance(), 202U);
+  EXPECT_EQ(tracker.epoch(), 2U);
+}
+
+TEST(OdomInstanceTracker, RejectsAllPreviouslyRetiredIdentities)
+{
+  OdomInstanceTracker tracker;
+  using Result = OdomInstanceTracker::Result;
+  EXPECT_EQ(tracker.observe(101), Result::kFirst);
+  EXPECT_EQ(tracker.observe(202), Result::kChanged);
+  EXPECT_EQ(tracker.observe(303), Result::kChanged);
+  EXPECT_EQ(tracker.observe(101), Result::kRetired);
+  EXPECT_EQ(tracker.observe(202), Result::kRetired);
+  EXPECT_EQ(tracker.instance(), 303U);
+  EXPECT_EQ(tracker.epoch(), 3U);
+}
+
+TEST(OdomInstanceTracker, UnseenOlderIdAndConcurrentSources)
+{
+  using Result = OdomInstanceTracker::Result;
+  OdomInstanceTracker tracker(2, 2, 1.0);
+  EXPECT_EQ(tracker.observe(202, true, 0.0), Result::kPending);
+  EXPECT_EQ(tracker.observe(202, true, 0.1), Result::kFirst);
+  EXPECT_EQ(tracker.observe(101, true, 0.2), Result::kRetired);
+  EXPECT_EQ(tracker.observe(101, true, 0.3), Result::kRetired);
+  EXPECT_EQ(tracker.observe(101, true, 0.4), Result::kLatched);
+  EXPECT_EQ(tracker.observe(202, true, 0.5), Result::kLatched);
+}
+
+TEST(OdomInstanceTracker, ColdStartRequiresFreshConsecutiveSamples)
+{
+  using Result = OdomInstanceTracker::Result;
+  OdomInstanceTracker tracker(2, 3, 1.0);
+  EXPECT_EQ(tracker.observe(0, true, 0.0), Result::kInvalid);
+  EXPECT_EQ(tracker.observe(101, false, 0.1), Result::kInvalid);
+  EXPECT_EQ(tracker.observe(101, true, 0.2), Result::kPending);
+  EXPECT_EQ(tracker.observe(202, true, 0.3), Result::kPending);
+  EXPECT_EQ(tracker.observe(101, true, 0.4), Result::kRetired);
+  EXPECT_EQ(tracker.observe(202, true, 0.5), Result::kPending);
+  EXPECT_EQ(tracker.observe(202, true, 0.6), Result::kFirst);
+  EXPECT_EQ(tracker.instance(), 202U);
+}
+
+TEST(OdomInstanceTracker, OldSamplesCountEvenWhenTimestampStale)
+{
+  using Result = OdomInstanceTracker::Result;
+  OdomInstanceTracker tracker(1, 1, 1.0);
+  EXPECT_EQ(tracker.observe(202, true, 0.0), Result::kFirst);
+  EXPECT_EQ(tracker.observe(101, false, 0.1), Result::kRetired);
+  EXPECT_EQ(tracker.observe(101, false, 0.2), Result::kLatched);
+}
 
 TEST(LocalizationFusionCore, InterpolatesPoseAtObservationTime)
 {
