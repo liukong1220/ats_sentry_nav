@@ -3,7 +3,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -22,6 +22,7 @@ def generate_launch_description():
     )
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
     log_level = LaunchConfiguration("log_level")
+    slam = LaunchConfiguration("slam")
 
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
@@ -33,6 +34,7 @@ def generate_launch_description():
         DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument("slam", default_value="False"),
     ]
 
     prior_preflight = IncludeLaunchDescription(
@@ -42,11 +44,13 @@ def generate_launch_description():
             "prior_pcd_file": prior_pcd_file,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
         }.items(),
+        condition=UnlessCondition(slam),
     )
     static_map_publisher = Node(
         package="ats_nav_bringup",
         executable="static_map_publisher.py",
         name="static_map_publisher",
+        condition=UnlessCondition(slam),
         namespace=namespace,
         output="screen",
         parameters=[{

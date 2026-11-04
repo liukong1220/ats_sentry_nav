@@ -105,6 +105,7 @@ TEST(GroundProjectionFusion, FallsBackToStaticMapOutsideRogWindowDespiteTerrainU
   ats_rog_map_adapter::GroundProjectionFusionResult result;
   ats_rog_map_adapter::GroundProjectionFusionParams params;
   params.planning_resolution = 1.0;
+  params.use_static_map_obstacles = true;
   ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
     rog, terrain, slope, static_map, identityTransform(), params, result));
   EXPECT_EQ(result.planning_grid.data[0], 0);
@@ -131,6 +132,7 @@ TEST(GroundProjectionFusion, PreservesFinerStaticObstacleAcrossRotatedOutputFoot
   ats_rog_map_adapter::GroundProjectionFusionResult result;
   ats_rog_map_adapter::GroundProjectionFusionParams params;
   params.planning_resolution = 0.10;
+  params.use_static_map_obstacles = true;
   ASSERT_TRUE(
     ats_rog_map_adapter::GroundProjectionFusion::fuse(
       rog, terrain, slope, static_map, identityTransform(), params, result));

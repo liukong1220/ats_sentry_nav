@@ -45,6 +45,7 @@ def generate_launch_description():
     require_serial_link = LaunchConfiguration("require_serial_link")
     require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
+    slam = LaunchConfiguration("slam")
 
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
@@ -114,6 +115,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("require_gimbal_status", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument("slam", default_value="False"),
     ]
     prior_preflight = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "prior_pcd_preflight.launch.py")),
@@ -148,6 +150,7 @@ def generate_launch_description():
             "launch_cmd_vel_arbiter": launch_cmd_vel_arbiter,
             "require_serial_link": require_serial_link,
             "require_gimbal_status": require_gimbal_status, "log_level": log_level,
+            "slam": slam,
         }.items(),
     )
     joy = IncludeLaunchDescription(

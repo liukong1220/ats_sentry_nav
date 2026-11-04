@@ -51,6 +51,8 @@ install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+  ament_add_gtest(test_mapping_health test/test_mapping_health.cpp)
+  target_include_directories(test_mapping_health PRIVATE include)
   ament_add_gtest(test_ground_projection_fusion test/test_ground_projection_fusion.cpp)
   target_link_libraries(test_ground_projection_fusion ${PROJECT_NAME}_core)
 

@@ -331,9 +331,11 @@ bool GroundProjectionFusion::fuse(
       int value = 0;
       bool occupied = false;
       bool known_free = false;
-      aggregateStaticFootprint(
-        static_map, result.planning_grid, mx, my, static_threshold,
-        occupied, known_free, value);
+      if (params.use_static_map_obstacles) {
+        aggregateStaticFootprint(
+          static_map, result.planning_grid, mx, my, static_threshold,
+          occupied, known_free, value);
+      }
 
       const tf2::Vector3 projection_point =
         projection_from_static_transform * tf2::Vector3(static_x, static_y, 0.0);

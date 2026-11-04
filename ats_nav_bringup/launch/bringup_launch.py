@@ -29,6 +29,7 @@ def generate_launch_description():
     require_serial_link = LaunchConfiguration("require_serial_link")
     require_gimbal_status = LaunchConfiguration("require_gimbal_status")
     log_level = LaunchConfiguration("log_level")
+    slam = LaunchConfiguration("slam")
 
     declarations = [
         DeclareLaunchArgument("namespace", default_value=""),
@@ -53,6 +54,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("require_gimbal_status", default_value="True"),
         DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument("slam", default_value="False"),
     ]
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "localization_launch.py")),
@@ -64,6 +66,7 @@ def generate_launch_description():
             "params_file": params_file,
             "use_respawn": use_respawn,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
+            "slam": slam,
             "launch_localization_fusion": launch_localization_fusion,
             "log_level": log_level,
         }.items(),

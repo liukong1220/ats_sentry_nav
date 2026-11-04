@@ -93,6 +93,9 @@ struct GroundProjectionFusionParams
   double slope_obstacle_degrees{28.0};
   double planning_resolution{0.10};
   bool unknown_is_obstacle{true};
+  // Default true keeps the P2 contract (static walls block planning).  O1/S3 may
+  // set false only after the odom global layer feeds the planning grid.
+  bool use_static_map_obstacles{true};
 };
 
 struct GroundProjectionFusionResult

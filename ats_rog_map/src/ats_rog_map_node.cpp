@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ats_rog_map/debug_viz.hpp"
+#include "ats_rog_map/odom_layer.hpp"
 #include "ats_rog_map/point_cloud_input.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
@@ -225,6 +226,25 @@ public:
     const auto core_parameters = declareCoreParameters(*this);
     intensity_required_ = core_parameters.intensity_threshold > 0;
     map_ = std::make_unique<RogMapEngine>(get_clock(), makeRogMapConfig(core_parameters));
+    OdomLayerConfig layer_config;
+    layer_config.origin_x = declare_parameter<double>("odom_layer.origin_x", layer_config.origin_x);
+    layer_config.origin_y = declare_parameter<double>("odom_layer.origin_y", layer_config.origin_y);
+    layer_config.resolution = declare_parameter<double>("odom_layer.resolution", layer_config.resolution);
+    layer_config.width = declare_parameter<int>("odom_layer.width", layer_config.width);
+    layer_config.height = declare_parameter<int>("odom_layer.height", layer_config.height);
+    layer_config.static_promotion_seconds = declare_parameter<double>(
+      "odom_layer.static_promotion_seconds", layer_config.static_promotion_seconds);
+    layer_config.dynamic_hold_seconds = declare_parameter<double>(
+      "odom_layer.dynamic_hold_seconds", layer_config.dynamic_hold_seconds);
+    layer_config.max_frame_dt_seconds = declare_parameter<double>(
+      "odom_layer.max_frame_dt_seconds", layer_config.max_frame_dt_seconds);
+    layer_config.save_persistence_ratio = declare_parameter<double>(
+      "odom_layer.save_persistence_ratio", layer_config.save_persistence_ratio);
+    odom_layer_ = std::make_unique<OdomLayerStore>(layer_config);
+    save_odom_layer_on_shutdown_ = declare_parameter<bool>(
+      "odom_layer.save_on_shutdown", false);
+    odom_layer_output_prefix_ = declare_parameter<std::string>(
+      "odom_layer.output_prefix", "");
     if (!intensity_required_) {
       RCLCPP_INFO(
         get_logger(),
@@ -293,6 +313,18 @@ public:
       "ROGMap ready: odom='%s' cloud='%s' map='%s' base='%s' sensor='%s' core=ROS-parameters",
       odom_topic_.c_str(), cloud_topic_.c_str(), map_frame_.c_str(), base_frame_.c_str(),
       sensor_frame_.c_str());
+  }
+
+  ~AtsRogMapNode() override
+  {
+    if (save_odom_layer_on_shutdown_ && odom_layer_ != nullptr &&
+      !odom_layer_output_prefix_.empty())
+    {
+      const bool saved = odom_layer_->save(odom_layer_output_prefix_, map_frame_);
+      RCLCPP_INFO(
+        get_logger(), "odom layer shutdown save prefix='%s' success=%d",
+        odom_layer_output_prefix_.c_str(), saved ? 1 : 0);
+    }
   }
 
 private:
@@ -402,6 +434,20 @@ private:
       map_updated = map_->update(
         cloud, poseFromTransform(map_from_base), poseFromTransform(map_from_sensor));
       if (map_updated) {
+        const double stamp_seconds = stamp.seconds();
+        const double frame_dt = last_layer_stamp_seconds_ > 0.0 ?
+          std::max(0.0, stamp_seconds - last_layer_stamp_seconds_) : 0.0;
+        for (const auto & point : cloud) {
+          const int cell_x = static_cast<int>(std::floor(
+              (static_cast<double>(point.x) - odom_layer_->config().origin_x) /
+              odom_layer_->config().resolution));
+          const int cell_y = static_cast<int>(std::floor(
+              (static_cast<double>(point.y) - odom_layer_->config().origin_y) /
+              odom_layer_->config().resolution));
+          odom_layer_->observeHit(cell_x, cell_y, stamp_seconds, frame_dt);
+        }
+        odom_layer_->tick(stamp_seconds);
+        last_layer_stamp_seconds_ = stamp_seconds;
         const auto & stats = map_->getLastRaycastDebugStats();
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
@@ -1121,6 +1167,7 @@ private:
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   std::unique_ptr<RogMapEngine> map_;
+  std::unique_ptr<OdomLayerStore> odom_layer_;
   std::mutex map_mutex_;
   std::mutex input_mutex_;
   std::optional<SteadyTime> last_cloud_receive_time_;
@@ -1128,6 +1175,9 @@ private:
   std::optional<SteadyTime> last_odom_receive_time_;
   std::uint64_t projection_request_sequence_{0};
   rclcpp::Time last_map_stamp_{0, 0, RCL_ROS_TIME};
+  double last_layer_stamp_seconds_{0.0};
+  bool save_odom_layer_on_shutdown_{false};
+  std::string odom_layer_output_prefix_;
   bool has_map_data_{false};
   bool intensity_required_{false};
 

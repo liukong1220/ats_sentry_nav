@@ -40,6 +40,7 @@ set(ROG_MAP_CORE_SOURCES
   src/rog_map/prob_map.cpp
   src/rog_map/rog_map.cpp
   src/rog_map/sliding_map.cpp
+  src/odom_layer.cpp
 )
 
 add_library(${PROJECT_NAME}_core ${ROG_MAP_CORE_SOURCES})
@@ -97,6 +98,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_unknown_projection_audit test/test_unknown_projection_audit.cpp)
   target_link_libraries(test_unknown_projection_audit ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_odom_layer test/test_odom_layer.cpp)
+  target_link_libraries(test_odom_layer ${PROJECT_NAME}_core)
 
   ament_add_gtest(test_point_cloud_input test/test_point_cloud_input.cpp)
   target_link_libraries(test_point_cloud_input ${PROJECT_NAME}_core)

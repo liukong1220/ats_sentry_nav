@@ -112,6 +112,9 @@ public:
       "slope_obstacle_degrees", 28.0);
     fusion_params_.planning_resolution = planning_resolution_;
     fusion_params_.unknown_is_obstacle = declare_parameter<bool>("unknown_is_obstacle", true);
+    fusion_params_.use_static_map_obstacles = declare_parameter<bool>(
+      "use_static_map_obstacles", true);
+    allow_missing_static_map_ = declare_parameter<bool>("allow_missing_static_map", false);
     input_timeout_sec_ = std::max(0.0, declare_parameter<double>("input_timeout_sec", 2.0));
     input_sync_tolerance_sec_ = std::max(
       0.0, declare_parameter<double>("input_sync_tolerance_sec", 1.0));
@@ -506,12 +509,23 @@ private:
       *traversability, projection_grid.header.stamp);
     const bool slope_synchronized = slope && inputSynchronized(
       *slope, projection_grid.header.stamp);
-    if (!static_map) {
+    // The live odom layer is the obstacle owner.  A static PGM is optional
+    // guidance/relocalization input and must never gate local planning.
+    bool static_map_is_live_fallback = false;
+    if (!static_map && !allow_missing_static_map_) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Static map missing; cannot fuse planning grid");
       publishUnavailable("Terrain inputs are missing, stale, or unsynchronized");
       return;
+    }
+    if (!static_map) {
+      static_map = std::make_shared<nav_msgs::msg::OccupancyGrid>(projection_grid);
+      std::fill(static_map->data.begin(), static_map->data.end(), static_cast<std::int8_t>(-1));
+      static_map_is_live_fallback = true;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Static PGM unavailable; continuing with odom live projection only");
     }
     if (!traversability_fresh || !slope_fresh ||
       !traversability_synchronized || !slope_synchronized)
@@ -604,7 +618,7 @@ private:
 
     geometry_msgs::msg::TransformStamped static_from_projection;
     geometry_msgs::msg::TransformStamped static_from_robot;
-    if (!lookupAtProjectionStamp(
+    if (!static_map_is_live_fallback && !lookupAtProjectionStamp(
         static_map->header.frame_id, projection_grid.header.frame_id,
         projection_grid.header.stamp, static_from_projection)) {
       RCLCPP_WARN_THROTTLE(
@@ -613,6 +627,12 @@ private:
         static_map->header.frame_id.c_str(), projection_grid.header.frame_id.c_str());
       publishUnavailable("ROGMap projection transform is unavailable");
       return;
+    }
+    if (static_map_is_live_fallback) {
+      static_from_projection.header = projection_grid.header;
+      static_from_projection.header.frame_id = projection_grid.header.frame_id;
+      static_from_projection.child_frame_id = projection_grid.header.frame_id;
+      static_from_projection.transform.rotation.w = 1.0;
     }
     // The robot pose only centres the ego unknown-clearing circle. With the radius at its
     // default 0.0 it is unused, and requiring it made the grid unavailable whenever
@@ -929,6 +949,7 @@ private:
   bool require_localization_status_{false};
   bool require_terrain_inputs_{true};
   GroundProjectionFusionParams fusion_params_;
+  bool allow_missing_static_map_{false};
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
