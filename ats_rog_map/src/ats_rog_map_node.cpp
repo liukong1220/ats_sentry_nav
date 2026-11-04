@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -241,6 +242,8 @@ public:
     layer_config.save_persistence_ratio = declare_parameter<double>(
       "odom_layer.save_persistence_ratio", layer_config.save_persistence_ratio);
     odom_layer_ = std::make_unique<OdomLayerStore>(layer_config);
+    layer_hit_z_min_ = declare_parameter<double>("odom_layer.hit_z_min", 0.15);
+    layer_hit_z_max_ = declare_parameter<double>("odom_layer.hit_z_max", 0.70);
     save_odom_layer_on_shutdown_ = declare_parameter<bool>(
       "odom_layer.save_on_shutdown", false);
     odom_layer_output_prefix_ = declare_parameter<std::string>(
@@ -320,7 +323,15 @@ public:
     if (save_odom_layer_on_shutdown_ && odom_layer_ != nullptr &&
       !odom_layer_output_prefix_.empty())
     {
-      const bool saved = odom_layer_->save(odom_layer_output_prefix_, map_frame_);
+      bool saved = false;
+      try {
+        std::lock_guard<std::mutex> lock(layer_mutex_);
+        saved = odom_layer_->save(odom_layer_output_prefix_, map_frame_);
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(get_logger(), "odom layer shutdown save threw: %s", error.what());
+      } catch (...) {
+        RCLCPP_ERROR(get_logger(), "odom layer shutdown save threw an unknown exception");
+      }
       RCLCPP_INFO(
         get_logger(), "odom layer shutdown save prefix='%s' success=%d",
         odom_layer_output_prefix_.c_str(), saved ? 1 : 0);
@@ -434,20 +445,6 @@ private:
       map_updated = map_->update(
         cloud, poseFromTransform(map_from_base), poseFromTransform(map_from_sensor));
       if (map_updated) {
-        const double stamp_seconds = stamp.seconds();
-        const double frame_dt = last_layer_stamp_seconds_ > 0.0 ?
-          std::max(0.0, stamp_seconds - last_layer_stamp_seconds_) : 0.0;
-        for (const auto & point : cloud) {
-          const int cell_x = static_cast<int>(std::floor(
-              (static_cast<double>(point.x) - odom_layer_->config().origin_x) /
-              odom_layer_->config().resolution));
-          const int cell_y = static_cast<int>(std::floor(
-              (static_cast<double>(point.y) - odom_layer_->config().origin_y) /
-              odom_layer_->config().resolution));
-          odom_layer_->observeHit(cell_x, cell_y, stamp_seconds, frame_dt);
-        }
-        odom_layer_->tick(stamp_seconds);
-        last_layer_stamp_seconds_ = stamp_seconds;
         const auto & stats = map_->getLastRaycastDebugStats();
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
@@ -468,6 +465,47 @@ private:
       std::lock_guard<std::mutex> lock(input_mutex_);
       last_map_update_time_ = std::chrono::steady_clock::now();
     }
+    if (map_updated) {
+      accumulateOdomLayer(cloud, map_from_base.transform.translation.z, stamp.seconds());
+    }
+  }
+
+  // Runs outside map_mutex_ so the per-point loop never delays projection.  Only
+  // returns in [hit_z_min, hit_z_max] above the base plane count as obstacle hits,
+  // otherwise floor and ceiling echoes would be written as static occupancy.
+  // Limitation: height above the robot's own plane, so ramps ahead of the robot
+  // can exceed hit_z_min; ground-relative column semantics (appendix A.1) replace
+  // this later.
+  void accumulateOdomLayer(
+    const rog_map::PointCloud & cloud, const double base_z, const double stamp_seconds)
+  {
+    std::lock_guard<std::mutex> lock(layer_mutex_);
+    const double frame_dt = last_layer_stamp_seconds_ > 0.0 ?
+      std::max(0.0, stamp_seconds - last_layer_stamp_seconds_) : 0.0;
+    const auto & config = odom_layer_->config();
+    for (const auto & point : cloud) {
+      const double height = static_cast<double>(point.z) - base_z;
+      if (!(height >= layer_hit_z_min_ && height <= layer_hit_z_max_)) {
+        ++layer_height_rejected_;
+        continue;
+      }
+      const int cell_x = static_cast<int>(std::floor(
+          (static_cast<double>(point.x) - config.origin_x) / config.resolution));
+      const int cell_y = static_cast<int>(std::floor(
+          (static_cast<double>(point.y) - config.origin_y) / config.resolution));
+      if (!odom_layer_->validCell(cell_x, cell_y)) {
+        ++layer_out_of_range_;
+        continue;
+      }
+      odom_layer_->observeHit(cell_x, cell_y, stamp_seconds, frame_dt);
+    }
+    odom_layer_->tick(stamp_seconds);
+    last_layer_stamp_seconds_ = stamp_seconds;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "odom layer: height_rejected=%llu out_of_range=%llu",
+      static_cast<unsigned long long>(layer_height_rejected_),
+      static_cast<unsigned long long>(layer_out_of_range_));
   }
 
   sensor_msgs::msg::PointCloud2 makeCloud(
@@ -1168,6 +1206,11 @@ private:
   tf2_ros::TransformListener tf_listener_;
   std::unique_ptr<RogMapEngine> map_;
   std::unique_ptr<OdomLayerStore> odom_layer_;
+  std::mutex layer_mutex_;
+  double layer_hit_z_min_{0.15};
+  double layer_hit_z_max_{0.70};
+  std::uint64_t layer_height_rejected_{0};
+  std::uint64_t layer_out_of_range_{0};
   std::mutex map_mutex_;
   std::mutex input_mutex_;
   std::optional<SteadyTime> last_cloud_receive_time_;
