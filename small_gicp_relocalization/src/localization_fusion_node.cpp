@@ -106,8 +106,10 @@ public:
     const auto initial_samples = declare_parameter<int>("identity_initial_samples", 3);
     const auto retired_limit = declare_parameter<int>("identity_retired_limit", 5);
     identity_max_age_s_ = declare_parameter<double>("identity_max_age_s", 0.5);
+    identity_future_tolerance_s_ = declare_parameter<double>("identity_future_tolerance_s", 5.0);
     if (initial_samples < 1 || retired_limit < 0 || !std::isfinite(identity_max_age_s_) ||
-      identity_max_age_s_ <= 0.0)
+      identity_max_age_s_ <= 0.0 || !std::isfinite(identity_future_tolerance_s_) ||
+      identity_future_tolerance_s_ < 0.0)
     {
       throw std::invalid_argument("invalid identity safety parameters");
     }
@@ -240,6 +242,16 @@ public:
   }
 
 private:
+  // Ids are steady_clock start nanoseconds on this host and boot; none may lie in
+  // the receiver's future beyond the configured tolerance.
+  std::uint64_t instanceUpperBound() const
+  {
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto tolerance_ns = static_cast<std::int64_t>(identity_future_tolerance_s_ * 1e9);
+    return static_cast<std::uint64_t>(std::max<std::int64_t>(0, now_ns + tolerance_ns));
+  }
+
   void onIdentityMonitor(
     const ats_navigation_interfaces::msg::IdentifiedOdometry::SharedPtr message)
   {
@@ -252,7 +264,8 @@ private:
     }
     const double steady_now = std::chrono::duration<double>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
-    const auto result = odom_instance_tracker_.observe(message->instance_id, false, steady_now);
+    const auto result = odom_instance_tracker_.observe(
+      message->instance_id, false, steady_now, instanceUpperBound());
     if (result == OdomInstanceTracker::Result::kLatched) {
       enterLostLocked("concurrent odometry instances; restart fusion required");
     } else {
@@ -276,7 +289,8 @@ private:
       const bool fresh = valid_stamp && age >= 0.0 && age <= identity_max_age_s_;
       const double steady_now = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-      const auto result = odom_instance_tracker_.observe(message->instance_id, fresh, steady_now);
+      const auto result = odom_instance_tracker_.observe(
+        message->instance_id, fresh, steady_now, instanceUpperBound());
       using Result = OdomInstanceTracker::Result;
       if (result == Result::kLatched) {
         enterLostLocked("concurrent odometry instances; restart fusion required");
@@ -754,6 +768,7 @@ private:
 
   std::mutex mutex_;
   OdomInstanceTracker odom_instance_tracker_;
+  double identity_future_tolerance_s_{5.0};
   double identity_max_age_s_{0.5};
   std::deque<OdomPoseSample> odom_history_;
   std::optional<rclcpp::Time> latest_odom_stamp_;

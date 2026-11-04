@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <deque>
+#include <limits>
 
 namespace small_gicp_relocalization
 {
@@ -23,13 +24,25 @@ public:
   : initial_samples_(initial_samples ? initial_samples : 1),
     retired_limit_(retired_limit), window_seconds_(window_seconds) {}
 
-  Result observe(std::uint64_t instance, bool fresh = true, double now = 0.0)
+  static constexpr std::uint64_t kNoUpperBound = std::numeric_limits<std::uint64_t>::max();
+
+  // `now` (seconds, same clock for every call) and `upper_bound` are required on
+  // purpose: a forgotten `now` froze the retired-count window, and without an
+  // upper bound one absurdly large id would retire the real instance.  Ids are
+  // steady_clock start times, so a valid id can never exceed the receiver's own
+  // current steady_clock reading plus a small tolerance.
+  Result observe(std::uint64_t instance, bool fresh, double now, std::uint64_t upper_bound)
   {
     if (latched_) {
       return Result::kLatched;
     }
     if (instance == 0) {
       pending_count_ = 0;
+      return Result::kInvalid;
+    }
+    if (instance > upper_bound) {
+      pending_count_ = 0;
+      ++future_rejected_count_;
       return Result::kInvalid;
     }
     const auto floor = instance_ != 0 ? instance_ : pending_instance_;
@@ -75,6 +88,7 @@ public:
   std::uint64_t instance() const {return instance_;}
   std::uint64_t epoch() const {return epoch_;}
   std::uint64_t retiredCount() const {return retired_count_;}
+  std::uint64_t futureRejectedCount() const {return future_rejected_count_;}
   bool latched() const {return latched_;}
 
 private:
@@ -82,6 +96,7 @@ private:
   std::uint64_t epoch_{0};
   std::uint64_t pending_instance_{0};
   std::uint64_t retired_count_{0};
+  std::uint64_t future_rejected_count_{0};
   std::size_t pending_count_{0};
   std::size_t initial_samples_;
   std::size_t retired_limit_;
