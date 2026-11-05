@@ -14,6 +14,7 @@ def generate_launch_description():
     map_yaml_file = LaunchConfiguration("map")
     prior_pcd_file = LaunchConfiguration("prior_pcd_file")
     use_sim_time = LaunchConfiguration("use_sim_time")
+    use_identified_odometry = LaunchConfiguration("use_identified_odometry")
     params_file = LaunchConfiguration("params_file")
     use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -32,6 +33,7 @@ def generate_launch_description():
     slam = LaunchConfiguration("slam")
 
     declarations = [
+        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("map", description="Static map YAML path"),
         DeclareLaunchArgument("prior_pcd_file", default_value=""),
@@ -67,6 +69,7 @@ def generate_launch_description():
             "use_respawn": use_respawn,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
             "slam": slam,
+            "use_identified_odometry": use_identified_odometry,
             "launch_localization_fusion": launch_localization_fusion,
             "log_level": log_level,
         }.items(),
@@ -74,6 +77,8 @@ def generate_launch_description():
     navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "navigation_launch.py")),
         launch_arguments={
+            "mapping_mode": slam,
+            "use_identified_odometry": use_identified_odometry,
             "namespace": namespace,
             "use_sim_time": use_sim_time,
             "params_file": params_file,

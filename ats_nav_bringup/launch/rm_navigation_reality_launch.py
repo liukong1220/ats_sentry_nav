@@ -26,6 +26,7 @@ def generate_launch_description():
     map_yaml_file = LaunchConfiguration("map")
     prior_pcd_file = LaunchConfiguration("prior_pcd_file")
     use_sim_time = LaunchConfiguration("use_sim_time")
+    use_identified_odometry = LaunchConfiguration("use_identified_odometry")
     params_file = LaunchConfiguration("params_file")
     use_respawn = LaunchConfiguration("use_respawn")
     use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
@@ -48,6 +49,7 @@ def generate_launch_description():
     slam = LaunchConfiguration("slam")
 
     declarations = [
+        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("assets_dir", description="Root-owned maps, PCDs, parameters and RViz assets"),
         DeclareLaunchArgument("world", default_value="rmul"),
@@ -151,6 +153,7 @@ def generate_launch_description():
             "require_serial_link": require_serial_link,
             "require_gimbal_status": require_gimbal_status, "log_level": log_level,
             "slam": slam,
+            "use_identified_odometry": use_identified_odometry,
         }.items(),
     )
     joy = IncludeLaunchDescription(

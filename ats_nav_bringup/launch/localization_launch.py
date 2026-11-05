@@ -7,6 +7,7 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -14,6 +15,7 @@ def generate_launch_description():
     namespace = LaunchConfiguration("namespace")
     map_yaml_file = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
+    use_identified_odometry = LaunchConfiguration("use_identified_odometry")
     prior_pcd_file = LaunchConfiguration("prior_pcd_file")
     params_file = LaunchConfiguration("params_file")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -25,6 +27,7 @@ def generate_launch_description():
     slam = LaunchConfiguration("slam")
 
     declarations = [
+        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("map", description="Static map YAML path"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
@@ -79,7 +82,11 @@ def generate_launch_description():
         executable="static_transform_publisher",
         name="static_transform_publisher_map_to_odom",
         namespace=namespace,
-        condition=IfCondition(PythonExpression(["not ", launch_small_gicp_relocalization])),
+        condition=IfCondition(PythonExpression([
+            "'", launch_localization_fusion, "'.lower() == 'false' and '",
+            launch_small_gicp_relocalization, "'.lower() == 'false' and '",
+            slam, "'.lower() == 'false'",
+        ])),
         output="screen",
         arguments=[
             "--x", "0.0", "--y", "0.0", "--z", "0.0", "--roll", "0.0",
@@ -92,13 +99,18 @@ def generate_launch_description():
         executable="small_gicp_relocalization_node",
         name="small_gicp_relocalization",
         namespace=namespace,
-        condition=IfCondition(launch_small_gicp_relocalization),
+        condition=IfCondition(PythonExpression([
+            "'", slam, "'.lower() == 'true' or '",
+            launch_small_gicp_relocalization, "'.lower() == 'true'",
+        ])),
         output="screen",
         respawn=use_respawn,
         respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
             "prior_pcd_file": prior_pcd_file,
+            "mapping_mode": ParameterValue(slam, value_type=bool),
+            "require_odom_identity": ParameterValue(use_identified_odometry, value_type=bool),
             "publish_tf": PythonExpression(["not ", launch_localization_fusion]),
         }],
         arguments=["--ros-args", "--log-level", log_level],
@@ -108,13 +120,17 @@ def generate_launch_description():
         executable="localization_fusion_node",
         name="localization_fusion",
         namespace=namespace,
-        condition=IfCondition(PythonExpression([
-            launch_small_gicp_relocalization, " and ", launch_localization_fusion,
-        ])),
+        condition=IfCondition(launch_localization_fusion),
         output="screen",
         respawn=use_respawn,
         respawn_delay=2.0,
-        parameters=[params_file, {"use_sim_time": use_sim_time}],
+        parameters=[params_file, {
+            "use_sim_time": use_sim_time,
+            "use_identified_odometry": use_identified_odometry,
+            "identified_odom_topic": "odometry_identified",
+            "identity_monitor_topic": "aft_mapped_to_init_identified",
+            "use_initial_map_to_odom": ParameterValue(slam, value_type=bool),
+        }],
         arguments=["--ros-args", "--log-level", log_level],
     )
 

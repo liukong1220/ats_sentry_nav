@@ -102,6 +102,7 @@ def generate_launch_description():
             params_file,
             {"use_sim_time": use_sim_time},
             {"pcd_save.pcd_save_en": True},
+            {"pcd_save.interval": 200},
         ],
         arguments=["--ros-args", "--log-level", log_level],
     )

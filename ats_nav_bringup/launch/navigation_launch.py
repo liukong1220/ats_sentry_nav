@@ -3,11 +3,19 @@ from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVar
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import IfElseSubstitution, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     namespace = LaunchConfiguration("namespace")
     use_sim_time = LaunchConfiguration("use_sim_time")
+    use_identified_odometry = LaunchConfiguration("use_identified_odometry")
+    mapping_tolerance = ParameterValue(IfElseSubstitution(
+        LaunchConfiguration("mapping_mode"), "0.03", "0.08"), value_type=float)
+    mapping_control_tolerance = ParameterValue(IfElseSubstitution(
+        LaunchConfiguration("mapping_mode"), "0.01", "0.08"), value_type=float)
+    mapping_yaw_tolerance = ParameterValue(IfElseSubstitution(
+        LaunchConfiguration("mapping_mode"), "0.05", "0.15"), value_type=float)
     params_file = LaunchConfiguration("params_file")
     use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -24,6 +32,8 @@ def generate_launch_description():
     launch_terrain_analysis = LaunchConfiguration("launch_terrain_analysis")
 
     declarations = [
+        DeclareLaunchArgument("mapping_mode", default_value="false"),
+        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
@@ -106,12 +116,12 @@ def generate_launch_description():
     loam = Node(
         package="loam_interface", executable="loam_interface_node", name="loam_interface",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[params_file, common], arguments=["--ros-args", "--log-level", log_level],
+        parameters=[params_file, common, {"use_identified_odometry": use_identified_odometry}], arguments=["--ros-args", "--log-level", log_level],
     )
     scan_generation = Node(
         package="sensor_scan_generation", executable="sensor_scan_generation_node", name="sensor_scan_generation",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[params_file, common], arguments=["--ros-args", "--log-level", log_level],
+        parameters=[params_file, common, {"use_identified_odometry": use_identified_odometry}], arguments=["--ros-args", "--log-level", log_level],
     )
     fake_transform = Node(
         package="fake_vel_transform", executable="fake_vel_transform_node", name="fake_vel_transform",
@@ -146,7 +156,15 @@ def generate_launch_description():
     minco = Node(
         package="minco_planner", executable="minco_planner_node", name="minco_planner",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[params_file, {"use_sim_time": use_sim_time}],
+        parameters=[params_file, {
+            "use_sim_time": use_sim_time,
+            # Admitted endpoint offset + controller error must stay within
+            # the manager's original mapping success region.
+            "goal_admission_position_tolerance": ParameterValue(IfElseSubstitution(
+                LaunchConfiguration("mapping_mode"), "0.02", "0.08"), value_type=float),
+            "goal_admission_position_step": ParameterValue(IfElseSubstitution(
+                LaunchConfiguration("mapping_mode"), "0.005", "0.02"), value_type=float),
+        }],
         arguments=["--ros-args", "--log-level", log_level],
     )
     goal_manager = Node(
@@ -154,6 +172,7 @@ def generate_launch_description():
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
+            "goal_position_tolerance": mapping_tolerance,
             "require_gimbal_status": require_gimbal_status,
         }], arguments=["--ros-args", "--log-level", log_level],
     )
@@ -162,6 +181,8 @@ def generate_launch_description():
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
+            "goal_position_tolerance": mapping_control_tolerance,
+            "goal_yaw_tolerance": mapping_yaw_tolerance,
             "command_topic": mpc_cmd_vel_topic,
             "execution_command_topic": "/planner/execution_command",
             "require_gimbal_status": require_gimbal_status,
