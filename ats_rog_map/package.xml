@@ -10,6 +10,8 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
   <depend>ats_rog_map_interfaces</depend>
+  <depend>ats_navigation_interfaces</depend>
+  <depend>ats_rc_esdf</depend>
   <depend>eigen</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
@@ -22,6 +24,9 @@
   <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs_py</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -18,6 +18,8 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ats_rog_map_interfaces REQUIRED)
+find_package(ats_navigation_interfaces REQUIRED)
+find_package(ats_rc_esdf REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -41,6 +43,8 @@ set(ROG_MAP_CORE_SOURCES
   src/rog_map/rog_map.cpp
   src/rog_map/sliding_map.cpp
   src/odom_layer.cpp
+  src/ground_column.cpp
+  src/odom_layer_integration.cpp
 )
 
 add_library(${PROJECT_NAME}_core ${ROG_MAP_CORE_SOURCES})
@@ -60,7 +64,7 @@ ament_target_dependencies(${PROJECT_NAME}_core PUBLIC
 
 add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
 target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core)
-ament_target_dependencies(ats_rog_map_node ats_rog_map_interfaces visualization_msgs)
+ament_target_dependencies(ats_rog_map_node ats_rog_map_interfaces ats_navigation_interfaces ats_rc_esdf visualization_msgs)
 
 install(TARGETS ${PROJECT_NAME}_core ats_rog_map_node
   ARCHIVE DESTINATION lib
@@ -83,6 +87,12 @@ if(BUILD_TESTING)
   add_test(NAME prob_map_stale_decay_test COMMAND prob_map_stale_decay_test)
 
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_save_map_service test/test_save_map_service.py TIMEOUT 60)
+  ament_add_pytest_test(test_odom_epoch_route test/test_odom_epoch_route.py TIMEOUT 60)
+  ament_add_pytest_test(test_odom_layer_projection test/test_odom_layer_projection.py TIMEOUT 60)
+  ament_add_pytest_test(test_mapping_projection_rate test/test_mapping_projection_rate.py TIMEOUT 30)
+  ament_add_pytest_test(test_cloud_tf_wait test/test_cloud_tf_wait.py TIMEOUT 45)
   ament_add_gtest(test_split_robot_sensor_pose test/test_split_robot_sensor_pose.cpp)
   target_link_libraries(test_split_robot_sensor_pose ${PROJECT_NAME}_core)
   target_compile_definitions(test_split_robot_sensor_pose PRIVATE
@@ -95,12 +105,24 @@ if(BUILD_TESTING)
   target_link_libraries(test_rog_map_engine_snapshot ${PROJECT_NAME}_core)
   target_compile_definitions(test_rog_map_engine_snapshot PRIVATE
     ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
+  # The upstream core permits one ProbMap per process; epoch reset is tested
+  # in its own process without changing that production initialization rule.
+  ament_add_gtest(test_rog_map_epoch_reset test/test_rog_map_epoch_reset.cpp)
+  target_link_libraries(test_rog_map_epoch_reset ${PROJECT_NAME}_core)
+  target_compile_definitions(test_rog_map_epoch_reset PRIVATE
+    ATS_ROG_MAP_TEST_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/test/rog_map_test.yaml")
 
   ament_add_gtest(test_unknown_projection_audit test/test_unknown_projection_audit.cpp)
   target_link_libraries(test_unknown_projection_audit ${PROJECT_NAME}_core)
 
   ament_add_gtest(test_odom_layer test/test_odom_layer.cpp)
   target_link_libraries(test_odom_layer ${PROJECT_NAME}_core)
+  ament_add_gtest(test_ground_column test/test_ground_column.cpp)
+  target_link_libraries(test_ground_column ${PROJECT_NAME}_core)
+  ament_add_gtest(test_odom_layer_integration test/test_odom_layer_integration.cpp)
+  target_link_libraries(test_odom_layer_integration ${PROJECT_NAME}_core)
+  ament_add_gtest(test_odom_epoch_guard test/test_odom_epoch_guard.cpp)
+  target_include_directories(test_odom_epoch_guard PRIVATE include)
 
   ament_add_gtest(test_point_cloud_input test/test_point_cloud_input.cpp)
   target_link_libraries(test_point_cloud_input ${PROJECT_NAME}_core)

@@ -16,12 +16,18 @@
 
 #include "ats_rog_map/debug_viz.hpp"
 #include "ats_rog_map/odom_layer.hpp"
+#include "ats_rog_map/ground_column.hpp"
+#include "ats_rog_map/odom_epoch_guard.hpp"
+#include "ats_rog_map/odom_layer_integration.hpp"
+#include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
+#include "ats_navigation_interfaces/msg/localization_status.hpp"
 #include "ats_rog_map/point_cloud_input.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map/test_fault_authorization.hpp"
 #include "ats_rog_map/unknown_projection_audit.hpp"
 #include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
+#include "ats_rog_map_interfaces/srv/save_odom_map.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "pcl/point_types.h"
@@ -32,7 +38,9 @@
 #include "rog_map/rog_map.h"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/u_int64.hpp"
 #include "tf2/LinearMath/Transform.h"
+#include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
@@ -178,10 +186,13 @@ public:
     sensor_frame_ = declare_parameter<std::string>("sensor_frame", "front_mid360");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/localization");
     cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/registered_scan");
+    require_odom_identity_ = declare_parameter<bool>("require_odom_identity", false);
+    identity_timeout_sec_ = declare_parameter<double>("identity_timeout_sec", 1.0);
     cloud_timeout_sec_ = std::max(0.0, declare_parameter<double>("cloud_timeout_sec", 0.5));
     odom_timeout_sec_ = std::max(0.0, declare_parameter<double>("odom_timeout_sec", 0.5));
     tf_timeout_sec_ = std::max(0.0, declare_parameter<double>("tf_timeout_sec", 0.1));
     debug_rate_hz_ = std::max(0.0, declare_parameter<double>("debug_rate_hz", 2.0));
+    map_update_trace_enabled_ = declare_parameter<bool>("map_update_trace_enabled", false);
     esdf_visualization_height_ = declare_parameter<double>("esdf_visualization_height", 0.15);
     debug_viz_topic_ = declare_parameter<std::string>("debug_viz_topic", "rog_map/viz");
     debug_viz_stride_ = std::max<int>(
@@ -241,13 +252,31 @@ public:
       "odom_layer.max_frame_dt_seconds", layer_config.max_frame_dt_seconds);
     layer_config.save_persistence_ratio = declare_parameter<double>(
       "odom_layer.save_persistence_ratio", layer_config.save_persistence_ratio);
+    layer_config.cloud_clear_ray_radius = declare_parameter<double>(
+      "odom_layer.cloud_clear_ray_radius", layer_config.cloud_clear_ray_radius);
+    layer_config.cloud_clear_endpoint_margin = declare_parameter<double>(
+      "odom_layer.cloud_clear_endpoint_margin", layer_config.cloud_clear_endpoint_margin);
     odom_layer_ = std::make_unique<OdomLayerStore>(layer_config);
-    layer_hit_z_min_ = declare_parameter<double>("odom_layer.hit_z_min", 0.15);
-    layer_hit_z_max_ = declare_parameter<double>("odom_layer.hit_z_max", 0.70);
-    save_odom_layer_on_shutdown_ = declare_parameter<bool>(
-      "odom_layer.save_on_shutdown", false);
-    odom_layer_output_prefix_ = declare_parameter<std::string>(
-      "odom_layer.output_prefix", "");
+    GroundColumnConfig column_config;
+    column_config.surface_max = declare_parameter<double>(
+      "odom_layer.surface_max", column_config.surface_max);
+    column_config.robot_height = declare_parameter<double>(
+      "odom_layer.robot_height", column_config.robot_height);
+    column_config.top_margin = declare_parameter<double>(
+      "odom_layer.top_margin", column_config.top_margin);
+    column_config.max_ground_slope = declare_parameter<double>(
+      "odom_layer.max_ground_slope", column_config.max_ground_slope);
+    ground_columns_ = std::make_unique<GroundColumnGrid>(
+      layer_config.width, layer_config.height, layer_config.resolution,
+      layer_config.origin_x, layer_config.origin_y, column_config);
+    base_ground_offset_ = declare_parameter<double>("odom_layer.base_ground_offset", 0.0);
+    layer_window_x_ = declare_parameter<double>("odom_layer.window_x", 12.0);
+    layer_window_y_ = declare_parameter<double>("odom_layer.window_y", 12.0);
+    if (!std::isfinite(base_ground_offset_) || !std::isfinite(layer_window_x_) ||
+      !std::isfinite(layer_window_y_) || layer_window_x_ <= 0 || layer_window_y_ <= 0)
+    {throw std::invalid_argument("invalid ground offset or computation window");}
+    odom_layer_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+      "/rog_map/odom_layer", rclcpp::QoS(1).reliable().transient_local());
     if (!intensity_required_) {
       RCLCPP_INFO(
         get_logger(),
@@ -282,12 +311,17 @@ public:
     bounds_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       debug_bounds_topic_, debug_qos);
     stale_pub_ = create_publisher<std_msgs::msg::Bool>("rog_map/stale", rclcpp::QoS(1).reliable());
+    layer_updated_pub_ = create_publisher<std_msgs::msg::UInt64>(
+      "rog_map/odom_layer_updated", rclcpp::QoS(1).reliable());
     projection_service_ = create_service<ats_rog_map_interfaces::srv::GetRogMapProjection>(
       "rog_map/get_ground_projection",
       std::bind(
         &AtsRogMapNode::getGroundProjection, this, std::placeholders::_1,
         std::placeholders::_2),
       rmw_qos_profile_services_default, projection_callback_group_);
+    save_service_ = create_service<ats_rog_map_interfaces::srv::SaveOdomMap>(
+      "rog_map/save_map", std::bind(&AtsRogMapNode::saveMap, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     rclcpp::SubscriptionOptions odom_options;
     odom_options.callback_group = odom_callback_group_;
@@ -298,7 +332,13 @@ public:
     cloud_options.callback_group = cloud_callback_group_;
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud_topic_, input_qos,
-      std::bind(&AtsRogMapNode::cloudCallback, this, std::placeholders::_1), cloud_options);
+      std::bind(&AtsRogMapNode::deferCloud, this, std::placeholders::_1), cloud_options);
+    cloud_pending_timer_ = create_wall_timer(
+      std::chrono::milliseconds(1),
+      std::bind(&AtsRogMapNode::tryProcessCloud, this), cloud_callback_group_);
+    localization_sub_ = create_subscription<ats_navigation_interfaces::msg::LocalizationStatus>(
+      "/localization/status", rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&AtsRogMapNode::onLocalizationStatus, this, std::placeholders::_1));
 
     const auto health_period = std::chrono::milliseconds(100);
     health_timer_ = create_wall_timer(
@@ -318,29 +358,114 @@ public:
       sensor_frame_.c_str());
   }
 
-  ~AtsRogMapNode() override
+private:
+  void onLocalizationStatus(
+    const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr message)
   {
-    if (save_odom_layer_on_shutdown_ && odom_layer_ != nullptr &&
-      !odom_layer_output_prefix_.empty())
+    if (!require_odom_identity_) {return;}
+    std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+    const auto signal_ns = rclcpp::Time(message->header.stamp).nanoseconds();
+    if (signal_ns <= last_identity_signal_ns_) {return;}
+    last_identity_signal_ns_ = signal_ns;
+    last_identity_receive_ = std::chrono::steady_clock::now();
+    has_accepted_map_transform_ = rclcpp::Time(message->last_observation_stamp).nanoseconds() > 0 &&
+      !message->odom_identity_latched;
+    const bool changed = odom_epoch_guard_.update(
+      message->odom_instance_id, message->odom_epoch,
+      rclcpp::Time(message->odom_epoch_start_stamp).nanoseconds(), signal_ns,
+      message->odom_identity_latched);
+    if (!changed) {return;}
+    // epoch_mutex_ is always acquired before map/layer/input. A cloud decoded
+    // outside it must re-check its revision before either store can commit.
     {
-      bool saved = false;
-      try {
-        std::lock_guard<std::mutex> lock(layer_mutex_);
-        saved = odom_layer_->save(odom_layer_output_prefix_, map_frame_);
-      } catch (const std::exception & error) {
-        RCLCPP_ERROR(get_logger(), "odom layer shutdown save threw: %s", error.what());
-      } catch (...) {
-        RCLCPP_ERROR(get_logger(), "odom layer shutdown save threw an unknown exception");
+      std::lock_guard<std::mutex> map_lock(map_mutex_);
+      map_->resetForOdomEpoch();
+      has_map_data_ = false;
+      last_map_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    }
+    {
+      std::lock_guard<std::mutex> layer_lock(layer_mutex_);
+      odom_layer_->clear();
+      ground_columns_->clear();
+      last_layer_stamp_seconds_ = 0.0;
+      last_layer_source_stamp_ = builtin_interfaces::msg::Time{};
+    }
+    {
+      std::lock_guard<std::mutex> input_lock(input_mutex_);
+      last_map_update_time_.reset();
+      last_cloud_receive_time_.reset();
+      last_odom_receive_time_.reset();
+    }
+    RCLCPP_WARN(get_logger(),
+      "S3 odom epoch reset instance=%llu epoch=%llu: revoked ROGMap, columns and persistent cloud",
+      static_cast<unsigned long long>(odom_epoch_guard_.instance()),
+      static_cast<unsigned long long>(odom_epoch_guard_.epoch()));
+  }
+
+  void saveMap(
+    const ats_rog_map_interfaces::srv::SaveOdomMap::Request::SharedPtr request,
+    ats_rog_map_interfaces::srv::SaveOdomMap::Response::SharedPtr response)
+  {
+    try {
+      std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+      if (require_odom_identity_ &&
+        (!odom_epoch_guard_.valid() || !has_accepted_map_transform_ ||
+        !last_identity_receive_ || std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - *last_identity_receive_).count() > identity_timeout_sec_ ||
+        inputHealth().map_update_stale || inputHealth().odom_stale))
+      {
+        response->message = "map save requires a healthy frontend epoch and an accepted map transform";
+        return;
       }
+      response->map_from_odom = tf_buffer_.lookupTransform(
+        "map", map_frame_, tf2::TimePointZero);
+      const auto transform_stamp = rclcpp::Time(response->map_from_odom.header.stamp);
+      if (require_odom_identity_ && transform_stamp.nanoseconds() != 0 &&
+        ((now() - transform_stamp).seconds() > identity_timeout_sec_ ||
+        (now() - transform_stamp).seconds() < -0.2))
+      {
+        response->message = "map save transform is stale or from the future";
+        return;
+      }
+      OdomLayerTransform transform;
+      const auto & t = response->map_from_odom.transform;
+      transform.x = t.translation.x;
+      transform.y = t.translation.y;
+      transform.z = t.translation.z;
+      transform.yaw = tf2::getYaw(t.rotation);
+      tf2::Quaternion rotation;
+      tf2::fromMsg(t.rotation, rotation);
+      tf2::Matrix3x3(rotation).getRPY(transform.roll, transform.pitch, transform.yaw);
+      std::unique_ptr<OdomLayerStore> snapshot;
+      {
+        std::lock_guard<std::mutex> lock(layer_mutex_);
+        snapshot = std::make_unique<OdomLayerStore>(*odom_layer_);
+      }
+      OdomLayerSaveStats stats;
+      response->success = snapshot->save(request->output_prefix, "map", transform, &stats);
+      response->occupied_cells = stats.occupied_cells;
+      response->persistent_cells = stats.persistent_cells;
+      response->persistent_voxels = stats.persistent_voxels;
+      response->raster_occupied_cells = stats.raster_occupied_cells;
+      response->message = response->success ? "saved transformed immutable snapshot" : "save failed";
       RCLCPP_INFO(
-        get_logger(), "odom layer shutdown save prefix='%s' success=%d",
-        odom_layer_output_prefix_.c_str(), saved ? 1 : 0);
+        get_logger(), "S3 save prefix='%s' success=%d occupied_cells=%zu persistent_cells=%zu "
+        "persistent_voxels=%zu cells_pcd_points=%zu pcd_points=%zu raster_occupied_cells=%zu", request->output_prefix.c_str(),
+        response->success, stats.occupied_cells, stats.persistent_cells,
+        stats.persistent_voxels, stats.persistent_cells, stats.persistent_voxels,
+        stats.raster_occupied_cells);
+    } catch (const std::exception & error) {
+      response->success = false;
+      response->message = error.what();
+      RCLCPP_ERROR(get_logger(), "S3 save failed: %s", error.what());
     }
   }
 
-private:
-  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr)
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr message)
   {
+    std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+    if (require_odom_identity_ &&
+      !odom_epoch_guard_.accepts(rclcpp::Time(message->header.stamp).nanoseconds())) {return;}
     std::lock_guard<std::mutex> lock(input_mutex_);
     last_odom_receive_time_ = std::chrono::steady_clock::now();
   }
@@ -351,7 +476,7 @@ private:
   {
     try {
       transform = tf_buffer_.lookupTransform(
-        map_frame_, source_frame, stamp, rclcpp::Duration::from_seconds(tf_timeout_sec_));
+        map_frame_, source_frame, stamp, rclcpp::Duration::from_seconds(0.0));
       return true;
     } catch (const tf2::TransformException & exception) {
       RCLCPP_WARN_THROTTLE(
@@ -361,11 +486,56 @@ private:
     }
   }
 
-  void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+  void deferCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
+    // This subscription and the retry timer share a mutually exclusive group.
+    // Keep only the newest cloud while TF is pending, just as the input QoS
+    // bounds queued work. TF listener callbacks remain free to fill the buffer.
+    pending_cloud_ = msg;
+    pending_cloud_receive_time_ = std::chrono::steady_clock::now();
+    tryProcessCloud();
+  }
+
+  void tryProcessCloud()
+  {
+    if (!pending_cloud_) {return;}
+    const auto received = pending_cloud_receive_time_;
+    if (tf_timeout_sec_ > 0.0 && std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - received).count() >= tf_timeout_sec_)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "ROGMap discarded a cloud after its TF wait deadline.");
+      pending_cloud_.reset();
+      return;
+    }
+    const auto & frame = pending_cloud_->header.frame_id;
+    const rclcpp::Time stamp(pending_cloud_->header.stamp);
+    if (!frame.empty() &&
+      (!tf_buffer_.canTransform(map_frame_, base_frame_, stamp) ||
+      !tf_buffer_.canTransform(map_frame_, sensor_frame_, stamp) ||
+      !tf_buffer_.canTransform(map_frame_, frame, stamp)))
+    {
+      if (tf_timeout_sec_ == 0.0) {pending_cloud_.reset();}
+      return;
+    }
+    auto cloud = std::move(pending_cloud_);
+    cloudCallback(cloud, received);
+  }
+
+  void cloudCallback(
+    const sensor_msgs::msg::PointCloud2::SharedPtr msg, const SteadyTime & trace_begin)
+  {
+    std::uint64_t cloud_revision;
+    {
+      std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+      if (require_odom_identity_ &&
+        !odom_epoch_guard_.accepts(rclcpp::Time(msg->header.stamp).nanoseconds())) {return;}
+      cloud_revision = odom_epoch_guard_.revision();
+    }
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
-      last_cloud_receive_time_ = std::chrono::steady_clock::now();
+      last_cloud_receive_time_ = trace_begin;
     }
     if (msg->header.frame_id.empty()) {
       RCLCPP_WARN_THROTTLE(
@@ -383,6 +553,7 @@ private:
     {
       return;
     }
+    const auto trace_tf = std::chrono::steady_clock::now();
 
     // The isolated all-unknown fixture keeps sensor/TF cadence healthy while
     // withholding every numeric occupancy observation.  It is an explicit
@@ -391,12 +562,21 @@ private:
     const bool hold_all_unknown = test_fault_injection_enabled_ &&
       get_parameter("test_reset_to_unknown").as_bool();
     if (hold_all_unknown) {
+      std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+      if (cloud_revision != odom_epoch_guard_.revision()) {return;}
       {
         std::lock_guard<std::mutex> lock(map_mutex_);
         map_->resetToUnknownForTest();
         last_map_stamp_ = now();
         has_map_data_ = true;
         test_reset_to_unknown_active_ = true;
+      }
+      {
+        std::lock_guard<std::mutex> lock(layer_mutex_);
+        odom_layer_->clear();
+        ground_columns_->clear();
+        last_layer_stamp_seconds_ = 0.0;
+        last_layer_source_stamp_ = msg->header.stamp;
       }
       {
         std::lock_guard<std::mutex> lock(input_mutex_);
@@ -436,9 +616,16 @@ private:
       cloud.push_back(point);
     }
 
+    const auto trace_prepared = std::chrono::steady_clock::now();
     bool map_updated = false;
+    std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+    const auto trace_epoch = std::chrono::steady_clock::now();
+    if (cloud_revision != odom_epoch_guard_.revision() ||
+      (require_odom_identity_ && !odom_epoch_guard_.accepts(stamp.nanoseconds()))) {return;}
+    auto trace_map_locked = trace_epoch;
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
+      trace_map_locked = std::chrono::steady_clock::now();
       // Second, independent enforcement point: even if a value slipped in via a
       // parameter file, an unauthorized fixture stays ineffective here.
       test_reset_to_unknown_active_ = false;
@@ -461,51 +648,163 @@ private:
         has_map_data_ = true;
       }
     }
+    const auto trace_map_done = std::chrono::steady_clock::now();
     if (map_updated) {
       std::lock_guard<std::mutex> lock(input_mutex_);
       last_map_update_time_ = std::chrono::steady_clock::now();
     }
     if (map_updated) {
-      accumulateOdomLayer(cloud, map_from_base.transform.translation.z, stamp.seconds());
+      accumulateOdomLayer(cloud, map_from_base.transform.translation,
+        map_from_sensor.transform.translation, stamp);
+      std_msgs::msg::UInt64 update;
+      update.data = map_->generation();
+      layer_updated_pub_->publish(update);
+    }
+    if (map_update_trace_enabled_) {
+      const auto trace_end = std::chrono::steady_clock::now();
+      RCLCPP_INFO(get_logger(),
+        "S3 cloud_commit stamp_ns=%lld received_ns=%lld points=%zu tf_ms=%.3f "
+        "prepare_ms=%.3f epoch_wait_ms=%.3f map_wait_ms=%.3f map_update_ms=%.3f "
+        "layer_ms=%.3f total_ms=%.3f",
+        static_cast<long long>(stamp.nanoseconds()), static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(trace_begin.time_since_epoch()).count()),
+        cloud.size(),
+        1000.0 * std::chrono::duration<double>(trace_tf - trace_begin).count(),
+        1000.0 * std::chrono::duration<double>(trace_prepared - trace_tf).count(),
+        1000.0 * std::chrono::duration<double>(trace_epoch - trace_prepared).count(),
+        1000.0 * std::chrono::duration<double>(trace_map_locked - trace_epoch).count(),
+        1000.0 * std::chrono::duration<double>(trace_map_done - trace_map_locked).count(),
+        1000.0 * std::chrono::duration<double>(trace_end - trace_map_done).count(),
+        1000.0 * std::chrono::duration<double>(trace_end - trace_begin).count());
     }
   }
 
-  // Runs outside map_mutex_ so the per-point loop never delays projection.  Only
-  // returns in [hit_z_min, hit_z_max] above the base plane count as obstacle hits,
-  // otherwise floor and ceiling echoes would be written as static occupancy.
-  // Limitation: height above the robot's own plane, so ramps ahead of the robot
-  // can exceed hit_z_min; ground-relative column semantics (appendix A.1) replace
-  // this later.
+  // The global odom layer has independent synchronization. Its obstacle hits
+  // use ground-relative columns, including the headroom check, not base z.
   void accumulateOdomLayer(
-    const rog_map::PointCloud & cloud, const double base_z, const double stamp_seconds)
+    const rog_map::PointCloud & cloud, const geometry_msgs::msg::Vector3 & base,
+    const geometry_msgs::msg::Vector3 & sensor, const rclcpp::Time & stamp)
   {
     std::lock_guard<std::mutex> lock(layer_mutex_);
+    const double stamp_seconds = stamp.seconds();
     const double frame_dt = last_layer_stamp_seconds_ > 0.0 ?
       std::max(0.0, stamp_seconds - last_layer_stamp_seconds_) : 0.0;
-    const auto & config = odom_layer_->config();
-    for (const auto & point : cloud) {
-      const double height = static_cast<double>(point.z) - base_z;
-      if (!(height >= layer_hit_z_min_ && height <= layer_hit_z_max_)) {
-        ++layer_height_rejected_;
-        continue;
-      }
-      const int cell_x = static_cast<int>(std::floor(
-          (static_cast<double>(point.x) - config.origin_x) / config.resolution));
-      const int cell_y = static_cast<int>(std::floor(
-          (static_cast<double>(point.y) - config.origin_y) / config.resolution));
-      if (!odom_layer_->validCell(cell_x, cell_y)) {
-        ++layer_out_of_range_;
-        continue;
-      }
-      odom_layer_->observeHit(cell_x, cell_y, stamp_seconds, frame_dt);
+    std::vector<std::array<double, 3>> points;
+    points.reserve(cloud.size());
+    for (const auto & p : cloud) {points.push_back({p.x, p.y, p.z});}
+    const auto stats = integrateOdomLayerFrame(*odom_layer_, *ground_columns_, points,
+      {sensor.x, sensor.y, sensor.z}, {base.x, base.y, base.z - base_ground_offset_},
+      stamp_seconds, frame_dt);
+    if (map_update_trace_enabled_) {
+      RCLCPP_INFO(get_logger(),
+        "S3 layer_integrate prepare_ms=%.3f ray_ms=%.3f ground_ms=%.3f evidence_ms=%.3f",
+        stats.prepare_ms, stats.ray_ms, stats.ground_ms, stats.evidence_ms);
     }
-    odom_layer_->tick(stamp_seconds);
+    layer_height_rejected_ += stats.non_obstacle;
+    layer_out_of_range_ += stats.out_of_range;
+    if (stats.out_of_range_sample) {
+      const auto & p = *stats.out_of_range_sample;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "S3 global odom layer out_of_range=%llu frame_count=%zu sample_odom=(%.3f,%.3f,%.3f)",
+        static_cast<unsigned long long>(layer_out_of_range_), stats.out_of_range, p[0], p[1], p[2]);
+    }
+    layer_center_x_ = base.x;
+    layer_center_y_ = base.y;
     last_layer_stamp_seconds_ = stamp_seconds;
+    last_layer_source_stamp_ = stamp;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 5000,
-      "odom layer: height_rejected=%llu out_of_range=%llu",
+      "odom layer: column_non_obstacle=%llu out_of_range=%llu ray_cleared=%zu ray_voxels=%zu",
       static_cast<unsigned long long>(layer_height_rejected_),
-      static_cast<unsigned long long>(layer_out_of_range_));
+      static_cast<unsigned long long>(layer_out_of_range_), stats.ray_cleared_cells, stats.ray_voxels);
+  }
+
+  nav_msgs::msg::OccupancyGrid layerGrid(
+    double origin_x, double origin_y, std::uint32_t width, std::uint32_t height,
+    double resolution) const
+  {
+    nav_msgs::msg::OccupancyGrid grid;
+    grid.header.frame_id = map_frame_;
+    grid.header.stamp = last_layer_source_stamp_;
+    grid.info.resolution = resolution;
+    grid.info.width = width;
+    grid.info.height = height;
+    grid.info.origin.position.x = origin_x;
+    grid.info.origin.position.y = origin_y;
+    grid.info.origin.orientation.w = 1.0;
+    grid.data.resize(static_cast<std::size_t>(width) * height, -1);
+    for (std::uint32_t y = 0; y < height; ++y) {
+      for (std::uint32_t x = 0; x < width; ++x) {
+        grid.data[static_cast<std::size_t>(y) * width + x] = odom_layer_->sampleFootprint(
+          origin_x + x * resolution, origin_y + y * resolution,
+          origin_x + (x + 1) * resolution, origin_y + (y + 1) * resolution);
+      }
+    }
+    return grid;
+  }
+
+  void getOdomLayerProjection(
+    float requested_resolution, ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response)
+  {
+    const auto trace_begin = std::chrono::steady_clock::now();
+    // epoch_mutex_ fences the map generation and the layer commit together.
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      response.generation = map_->generation();
+      response.ready = has_map_data_ && map_->ensureCurrentEsdf();
+    }
+    const auto trace_esdf = std::chrono::steady_clock::now();
+    const auto health = inputHealth();
+    response.stale = health.map_update_stale || health.odom_stale;
+    if (!response.ready) {return;}
+    auto trace_grid = trace_esdf;
+    auto trace_debug = trace_esdf;
+    {
+      std::lock_guard<std::mutex> lock(layer_mutex_);
+      const auto & c = odom_layer_->config();
+      const double resolution = std::max(c.resolution, static_cast<double>(requested_resolution));
+      response.occupancy_grid = layerGrid(
+        std::floor((layer_center_x_ - 0.5 * layer_window_x_) / resolution) * resolution,
+        std::floor((layer_center_y_ - 0.5 * layer_window_y_) / resolution) * resolution,
+        static_cast<std::uint32_t>(std::ceil(layer_window_x_ / resolution)),
+        static_cast<std::uint32_t>(std::ceil(layer_window_y_ / resolution)), resolution);
+      trace_grid = std::chrono::steady_clock::now();
+      if (odom_layer_pub_->get_subscription_count() > 0) {
+        odom_layer_pub_->publish(layerGrid(c.origin_x, c.origin_y, c.width, c.height, c.resolution));
+      }
+      trace_debug = std::chrono::steady_clock::now();
+    }
+    ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
+    esdf.updateGrid(response.occupancy_grid, 50, true);
+    std::vector<double> field;
+    if (!esdf.copySignedDistanceField(field)) {response.ready = false; return;}
+    const auto & grid = response.occupancy_grid;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    response.signed_distance.resize(field.size(), nan);
+    response.gradient_x.resize(field.size(), nan);
+    response.gradient_y.resize(field.size(), nan);
+    for (std::size_t i = 0; i < field.size(); ++i) {
+      if (grid.data[i] < 0) {continue;}
+      response.signed_distance[i] = static_cast<float>(field[i]);
+      const auto gradient = esdf.getGradient(
+        grid.info.origin.position.x + (i % grid.info.width + 0.5) * grid.info.resolution,
+        grid.info.origin.position.y + (i / grid.info.width + 0.5) * grid.info.resolution);
+      response.gradient_x[i] = static_cast<float>(gradient.x());
+      response.gradient_y[i] = static_cast<float>(gradient.y());
+    }
+    response.odom_layer_included = true;
+    if (map_update_trace_enabled_) {
+      const auto trace_end = std::chrono::steady_clock::now();
+      RCLCPP_INFO(get_logger(),
+        "S3 layer_projection generation=%llu esdf3d_ms=%.3f grid_ms=%.3f debug_ms=%.3f "
+        "esdf2d_ms=%.3f total_ms=%.3f",
+        static_cast<unsigned long long>(response.generation),
+        1000.0 * std::chrono::duration<double>(trace_esdf - trace_begin).count(),
+        1000.0 * std::chrono::duration<double>(trace_grid - trace_esdf).count(),
+        1000.0 * std::chrono::duration<double>(trace_debug - trace_grid).count(),
+        1000.0 * std::chrono::duration<double>(trace_end - trace_debug).count(),
+        1000.0 * std::chrono::duration<double>(trace_end - trace_begin).count());
+    }
   }
 
   sensor_msgs::msg::PointCloud2 makeCloud(
@@ -910,6 +1209,29 @@ private:
     const std::shared_ptr<ats_rog_map_interfaces::srv::GetRogMapProjection::Request> request,
     std::shared_ptr<ats_rog_map_interfaces::srv::GetRogMapProjection::Response> response)
   {
+    const auto trace_begin = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
+    const auto trace_epoch = std::chrono::steady_clock::now();
+    response->odom_instance_id = odom_epoch_guard_.instance();
+    response->odom_epoch = odom_epoch_guard_.epoch();
+    if (require_odom_identity_ && (!odom_epoch_guard_.valid() || !last_identity_receive_ ||
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+      *last_identity_receive_).count() > identity_timeout_sec_))
+    {response->stale = true; return;}
+    if ((request->expected_odom_instance_id != 0 &&
+      request->expected_odom_instance_id != response->odom_instance_id) ||
+      (request->expected_odom_epoch != 0 && request->expected_odom_epoch != response->odom_epoch))
+    {return;}
+    if (request->use_odom_layer) {
+      getOdomLayerProjection(request->resolution, *response);
+      if (map_update_trace_enabled_) {
+        RCLCPP_INFO(get_logger(), "S3 projection_dispatch epoch_wait_ms=%.3f total_ms=%.3f",
+          1000.0 * std::chrono::duration<double>(trace_epoch - trace_begin).count(),
+          1000.0 * std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - trace_begin).count());
+      }
+      return;
+    }
     const auto projection_started = std::chrono::steady_clock::now();
     const rclcpp::Time projection_start_stamp = now();
     const std::uint64_t request_sequence = ++projection_request_sequence_;
@@ -1187,6 +1509,7 @@ private:
   double odom_timeout_sec_{0.5};
   double tf_timeout_sec_{0.1};
   double debug_rate_hz_{2.0};
+  bool map_update_trace_enabled_{false};
   double esdf_visualization_height_{0.15};
   std::string debug_viz_topic_;
   int debug_viz_stride_{1};
@@ -1206,9 +1529,12 @@ private:
   tf2_ros::TransformListener tf_listener_;
   std::unique_ptr<RogMapEngine> map_;
   std::unique_ptr<OdomLayerStore> odom_layer_;
+  std::unique_ptr<GroundColumnGrid> ground_columns_;
+  double base_ground_offset_{0.0};
+  double layer_window_x_{12.0}, layer_window_y_{12.0};
+  double layer_center_x_{0.0}, layer_center_y_{0.0};
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr odom_layer_pub_;
   std::mutex layer_mutex_;
-  double layer_hit_z_min_{0.15};
-  double layer_hit_z_max_{0.70};
   std::uint64_t layer_height_rejected_{0};
   std::uint64_t layer_out_of_range_{0};
   std::mutex map_mutex_;
@@ -1219,10 +1545,16 @@ private:
   std::uint64_t projection_request_sequence_{0};
   rclcpp::Time last_map_stamp_{0, 0, RCL_ROS_TIME};
   double last_layer_stamp_seconds_{0.0};
-  bool save_odom_layer_on_shutdown_{false};
-  std::string odom_layer_output_prefix_;
+  builtin_interfaces::msg::Time last_layer_source_stamp_;
   bool has_map_data_{false};
   bool intensity_required_{false};
+  bool require_odom_identity_{false};
+  bool has_accepted_map_transform_{false};
+  double identity_timeout_sec_{1.0};
+  std::int64_t last_identity_signal_ns_{0};
+  std::optional<SteadyTime> last_identity_receive_;
+  OdomEpochGuard odom_epoch_guard_;
+  std::mutex epoch_mutex_;
 
   rclcpp::CallbackGroup::SharedPtr odom_callback_group_;
   rclcpp::CallbackGroup::SharedPtr cloud_callback_group_;
@@ -1231,6 +1563,10 @@ private:
   rclcpp::CallbackGroup::SharedPtr debug_callback_group_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  sensor_msgs::msg::PointCloud2::SharedPtr pending_cloud_;
+  SteadyTime pending_cloud_receive_time_{};
+  rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::SharedPtr
+    localization_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occupied_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr inflated_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
@@ -1238,8 +1574,11 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr viz_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bounds_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stale_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr layer_updated_pub_;
   rclcpp::Service<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_service_;
+  rclcpp::Service<ats_rog_map_interfaces::srv::SaveOdomMap>::SharedPtr save_service_;
   rclcpp::TimerBase::SharedPtr health_timer_;
+  rclcpp::TimerBase::SharedPtr cloud_pending_timer_;
   rclcpp::TimerBase::SharedPtr debug_timer_;
 };
 

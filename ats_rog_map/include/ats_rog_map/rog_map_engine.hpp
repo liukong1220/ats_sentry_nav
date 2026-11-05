@@ -71,6 +71,13 @@ public:
   // the externally visible source-generation sequence.
   void resetToUnknownForTest()
   {
+    resetForOdomEpoch();
+  }
+
+  // A frontend process reset has no old_from_new transform. All numeric
+  // representations are revoked together, while generation stays monotonic.
+  void resetForOdomEpoch()
+  {
     resetLocalMap();
     if (inf_map_) {
       inf_map_->resetLocalMap();

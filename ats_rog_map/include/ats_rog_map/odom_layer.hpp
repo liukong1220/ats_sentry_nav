@@ -8,6 +8,8 @@
 #include <array>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <limits>
 
 namespace ats_rog_map
 {
@@ -39,6 +41,9 @@ struct OdomLayerConfig
   double dynamic_hold_seconds{3.0};
   double max_frame_dt_seconds{0.25};
   double save_persistence_ratio{0.8};
+  double cloud_resolution{0.10};
+  double cloud_clear_ray_radius{0.01};
+  double cloud_clear_endpoint_margin{0.20};
 };
 
 struct OdomLayerCell
@@ -59,6 +64,27 @@ struct OdomLayerTransform
   double x{0.0};
   double y{0.0};
   double yaw{0.0};
+  double z{0.0};
+  double roll{0.0};
+  double pitch{0.0};
+};
+
+struct OdomLayerSaveStats
+{
+  std::size_t occupied_cells{0};
+  std::size_t persistent_cells{0};
+  std::size_t persistent_voxels{0};
+  std::size_t raster_occupied_cells{0};
+};
+
+struct OdomVoxelKeyHash
+{
+  std::size_t operator()(const std::array<int, 3> & key) const
+  {
+    return static_cast<std::size_t>(key[0]) * 73856093U ^
+           static_cast<std::size_t>(key[1]) * 19349663U ^
+           static_cast<std::size_t>(key[2]) * 83492791U;
+  }
 };
 
 class OdomLayerStore
@@ -78,6 +104,18 @@ public:
   // A hit is an occupied observation.  Promotion uses accumulated hit time,
   // not continuous visibility time.
   bool observeHit(int x, int y, double stamp, double observed_dt);
+  bool observePoint(const std::array<double, 3> & point, double stamp, double observed_dt);
+  bool observeFree(int x, int y, double stamp, double observed_dt);
+  void clearCloudVoxel(const std::array<double, 3> & point, double stamp);
+  bool hasRayClearCandidate(const std::array<double, 3> & voxel_location, double stamp) const;
+  std::vector<std::array<int, 3>> rayClearCandidates(double stamp) const;
+  // Coarse voxel traversal alone is not a contradiction: a grazing beam may
+  // pass above a floor or beside a wall represented inside that voxel.
+  void clearCloudVoxelAlongRay(const std::array<double, 3> & voxel_location,
+    const std::array<double, 3> & sensor, const std::array<double, 3> & endpoint,
+    double stamp);
+  // Conservative area-overlap sampling in odom; outside and unobserved are unknown.
+  std::int8_t sampleFootprint(double min_x, double min_y, double max_x, double max_y) const;
 
   // Mark a cell as visible without asserting either a hit or a ray clear.
   bool observeVisible(int x, int y, double stamp);
@@ -98,13 +136,29 @@ public:
   // Only persistent static cells which have never been ray-cleared are saved.
   bool saveEligible(int x, int y) const;
 
-  // Writes the persistent odom layer as map_server-compatible PGM/YAML and
-  // an ASCII PCD containing the same persistent occupied cell centers.
-  bool save(const std::string & output_prefix, const std::string & frame_id) const;
+  // Transform a single immutable save snapshot. YAML retains the rotated grid
+  // origin exactly (no centre sampling or raster rounding); .pcd is persistent
+  // 3D scan evidence and .cells.pcd is the separate 2D debugging artifact.
+  bool save(const std::string & output_prefix, const std::string & frame_id,
+    const OdomLayerTransform & map_from_odom = {}, OdomLayerSaveStats * stats = nullptr) const;
 
 private:
   OdomLayerConfig config_;
   std::vector<OdomLayerCell> cells_;
+  struct CloudVoxel
+  {
+    std::array<double, 3> point;
+    OdomLayerCell evidence;
+    std::size_t candidate_index{std::numeric_limits<std::size_t>::max()};
+  };
+  struct RayClearCandidate
+  {
+    std::array<int, 3> key;
+    double last_hit_time;
+  };
+  void removeRayClearCandidate(CloudVoxel & voxel);
+  std::unordered_map<std::array<int, 3>, CloudVoxel, OdomVoxelKeyHash> cloud_voxels_;
+  std::vector<RayClearCandidate> ray_candidates_;
 };
 
 }  // namespace ats_rog_map

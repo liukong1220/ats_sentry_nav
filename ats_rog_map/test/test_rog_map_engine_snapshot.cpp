@@ -114,4 +114,5 @@ TEST(RogMapCoreParameters, PreservesLegacyConfigDerivations)
   EXPECT_EQ(explicit_config.spherical_neighbor.size(), legacy.spherical_neighbor.size());
 }
 
+
 }  // namespace
