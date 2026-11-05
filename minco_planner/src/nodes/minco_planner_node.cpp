@@ -138,9 +138,17 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   // Match adapter TRANSIENT_LOCAL publication. VOLATILE missed the first
   // /rc_esdf/planning_grid under DualMap-era ready races (recovery231:
   // ready=1 + snapshot log, but MINCO kept MAP_UNREADY / zero plans).
-  grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-    grid_topic_, rclcpp::QoS(1).reliable().transient_local(),
-    std::bind(&MincoPlannerNode::onGrid, this, std::placeholders::_1), map_options);
+  if (!planning_snapshot_topic_.empty()) {
+    planning_snapshot_sub_ =
+      create_subscription<ats_navigation_interfaces::msg::PlanningMapSnapshot>(
+      planning_snapshot_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&MincoPlannerNode::onPlanningSnapshot, this, std::placeholders::_1),
+      map_options);
+  } else {
+    grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      grid_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&MincoPlannerNode::onGrid, this, std::placeholders::_1), map_options);
+  }
   if (!goal_topic_.empty()) {
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       goal_topic_, rclcpp::QoS(10),
@@ -197,14 +205,15 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   publishEmergencyStop(true);
 
   RCLCPP_INFO(
-    get_logger(), "【规划器就绪】栅格='%s' 目标='%s' 请求='%s' 原始路径='%s' 参考路径='%s'",
-    grid_topic_.c_str(), goal_topic_.c_str(), goal_request_topic_.c_str(), raw_path_topic_.c_str(),
+    get_logger(), "【规划器就绪】地图输入='%s' 目标='%s' 请求='%s' 原始路径='%s' 参考路径='%s'",
+    planning_snapshot_topic_.empty() ? grid_topic_.c_str() : planning_snapshot_topic_.c_str(), goal_topic_.c_str(), goal_request_topic_.c_str(), raw_path_topic_.c_str(),
     reference_path_topic_.c_str());
 }
 
 void MincoPlannerNode::declareAndLoadParams()
 {
   declare_parameter<std::string>("grid_topic", grid_topic_);
+  declare_parameter<std::string>("planning_snapshot_topic", planning_snapshot_topic_);
   declare_parameter<std::string>("goal_topic", goal_topic_);
   declare_parameter<std::string>("goal_request_topic", goal_request_topic_);
   declare_parameter<std::string>("planner_status_topic", planner_status_topic_);
@@ -465,6 +474,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("local_repair_search_radius", repair_params.search_radius);
 
   get_parameter("grid_topic", grid_topic_);
+  get_parameter("planning_snapshot_topic", planning_snapshot_topic_);
   get_parameter("goal_topic", goal_topic_);
   get_parameter("goal_request_topic", goal_request_topic_);
   get_parameter("planner_status_topic", planner_status_topic_);
@@ -849,7 +859,8 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal,
   bool goal_pose_footprint_verified,
-  double & used_clearance)
+  double & used_clearance,
+  const std::vector<double> * blocked_squared)
 {
   // 显式配置的下限按用户意图使用;自动下限必须补上栅格量化余量,否则梯子会稳定产出
   // footprint gate 必然拒绝的路径,把"窄通道不可通行"表现成目标超时。
@@ -879,10 +890,11 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
           get_logger(), *get_clock(), log_throttle_ms_,
           "【规划回退】JPS 失败（jps failed: clearance=%.3f m reason=%s），改用 A*。",
           clearance, attempt.reason.c_str());
-        attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
+        attempt = astar_.planWithClearance(
+          planning_grid, start, goal, clearance, blocked_squared);
       }
     } else {
-      attempt = astar_.planWithClearance(planning_grid, start, goal, clearance);
+      attempt = astar_.planWithClearance(planning_grid, start, goal, clearance, blocked_squared);
     }
     if (attempt.success) {
       used_clearance = clearance;
@@ -918,14 +930,16 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
         relaxed_astar.min_safe_distance = relaxed_endpoint_min;
         relaxed_astar.relax_endpoint_clearance = true;
         attempt =
-          GridAstar(relaxed_astar).planWithClearance(planning_grid, start, goal, effective_floor);
+          GridAstar(relaxed_astar).planWithClearance(
+          planning_grid, start, goal, effective_floor, blocked_squared);
       }
     } else {
       GridAstarParams relaxed_astar = astar_params_cache_;
       relaxed_astar.min_safe_distance = relaxed_endpoint_min;
       relaxed_astar.relax_endpoint_clearance = true;
       attempt =
-        GridAstar(relaxed_astar).planWithClearance(planning_grid, start, goal, effective_floor);
+        GridAstar(relaxed_astar).planWithClearance(
+          planning_grid, start, goal, effective_floor, blocked_squared);
     }
     if (attempt.success) {
       used_clearance = effective_floor;
@@ -947,6 +961,55 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
   const auto received_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
+  ingestMapSnapshot(
+    [this, &msg](std::uint64_t generation) {
+      return PlanningMapSnapshot::create(
+        generation, *msg, obstacle_value_threshold_, unknown_is_obstacle_);
+    }, msg->header.stamp, received_steady_ns);
+}
+
+void MincoPlannerNode::onPlanningSnapshot(
+  const ats_navigation_interfaces::msg::PlanningMapSnapshot::SharedPtr msg)
+{
+  const auto received_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!msg->ready) {
+    // 地图所有者撤回地图（输入过期、epoch 变化、融合失败），与 ready=false 心跳同一结果：
+    // 已提交快照与参考不再可用。
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      invalidateMapLocked();
+      publishEmergencyStop(true);
+    }
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【规划快照不可用】地图所有者发布 ready=false（epoch=%llu sequence=%llu），已急停。",
+      static_cast<unsigned long long>(msg->localization_epoch),
+      static_cast<unsigned long long>(msg->publication_sequence));
+    return;
+  }
+  if (msg->occupied_value_threshold != obstacle_value_threshold_ ||
+    msg->unknown_is_obstacle != unknown_is_obstacle_)
+  {
+    // 距离场按快照声明的阻塞语义计算；与规划器不同就不能复用，fromMessage 返回空并急停。
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), log_throttle_ms_,
+      "【规划快照策略不一致】快照阈值=%d unknown_is_obstacle=%d，规划器阈值=%d "
+      "unknown_is_obstacle=%d，拒绝使用。",
+      static_cast<int>(msg->occupied_value_threshold), static_cast<int>(msg->unknown_is_obstacle),
+      obstacle_value_threshold_, static_cast<int>(unknown_is_obstacle_));
+  }
+  ingestMapSnapshot(
+    [this, &msg](std::uint64_t generation) {
+      return PlanningMapSnapshot::fromMessage(
+        generation, *msg, obstacle_value_threshold_, unknown_is_obstacle_);
+    }, msg->source_stamp, received_steady_ns);
+}
+
+void MincoPlannerNode::ingestMapSnapshot(
+  const SnapshotBuilder & build, const builtin_interfaces::msg::Time & source_stamp,
+  std::int64_t received_steady_ns)
+{
   std::uint64_t candidate_generation = 0;
   std::uint64_t candidate_health_epoch = 0;
   {
@@ -954,8 +1017,7 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     candidate_generation = next_map_generation_ + 1;
     candidate_health_epoch = map_health_epoch_;
   }
-  const auto snapshot = PlanningMapSnapshot::create(
-    candidate_generation, *msg, obstacle_value_threshold_, unknown_is_obstacle_);
+  const auto snapshot = build(candidate_generation);
   if (!snapshot) {
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
@@ -1056,7 +1118,7 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       std::chrono::steady_clock::now().time_since_epoch()).count();
     RCLCPP_INFO(get_logger(),
       "S3 map_commit stamp_ns=%lld received_steady_ns=%lld committed_steady_ns=%lld digest=%s",
-      static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()),
+      static_cast<long long>(rclcpp::Time(source_stamp).nanoseconds()),
       static_cast<long long>(received_steady_ns), static_cast<long long>(committed_steady_ns),
       snapshot->safety_content_digest.c_str());
   }
@@ -1648,7 +1710,8 @@ void MincoPlannerNode::planGoal(
   double used_clearance = preferred_search_clearance_;
   const GridAstarResult search_result =
     runGraphSearch(
-    planning_grid, start, goal, goal_pose_footprint_verified, used_clearance);
+    planning_grid, start, goal, goal_pose_footprint_verified, used_clearance,
+    map_snapshot->blocked_squared_cells.get());
   if (!search_result.success) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
@@ -2134,7 +2197,7 @@ void MincoPlannerNode::planGoal(
   const std::uint8_t yaw_authority = selectYawAuthority(
     reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
   PlannerCommitTelemetry telemetry;
-  telemetry.grid_topic = grid_topic_;
+  telemetry.grid_topic = planning_snapshot_topic_.empty() ? grid_topic_ : planning_snapshot_topic_;
   telemetry.validation_frame = planning_grid.header.frame_id.empty() ?
     global_frame_ : planning_grid.header.frame_id;
   telemetry.gate_collision_count =

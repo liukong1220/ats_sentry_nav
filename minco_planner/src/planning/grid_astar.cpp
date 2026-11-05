@@ -61,14 +61,16 @@ GridAstarResult GridAstar::planWithClearance(
   const nav_msgs::msg::OccupancyGrid & grid,
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal,
-  double clearance_override) const
+  double clearance_override,
+  const std::vector<double> * precomputed_blocked_squared) const
 {
   if (clearance_override >= 0.0 &&
     std::abs(clearance_override - params_.safe_distance) > 1e-9)
   {
     GridAstarParams relaxed = params_;
     relaxed.safe_distance = clearance_override;
-    return GridAstar(relaxed).planWithClearance(grid, start, goal, -1.0);
+    return GridAstar(relaxed).planWithClearance(
+      grid, start, goal, -1.0, precomputed_blocked_squared);
   }
 
   GridAstarResult result;
@@ -110,7 +112,7 @@ GridAstarResult GridAstar::planWithClearance(
     relaxed.safe_distance = goal_clearance;
     relaxed.relax_endpoint_clearance = false;
     GridAstarResult relaxed_result =
-      GridAstar(relaxed).planWithClearance(grid, start, goal, -1.0);
+      GridAstar(relaxed).planWithClearance(grid, start, goal, -1.0, precomputed_blocked_squared);
     if (relaxed_result.success) {
       return relaxed_result;
     }
@@ -121,7 +123,15 @@ GridAstarResult GridAstar::planWithClearance(
   const std::size_t cell_count =
     static_cast<std::size_t>(grid.info.width) * static_cast<std::size_t>(grid.info.height);
   // 一次精确距离变换，同时用于可通行判定（与 hasGridClearance 等价）和离墙代价。
-  const std::vector<double> blocked_squared = computeBlockedSquaredDistanceCells(grid, policy);
+  // 规划快照已带同一张场时直接复用，不再重算。
+  std::vector<double> local_blocked_squared;
+  if (precomputed_blocked_squared == nullptr ||
+    precomputed_blocked_squared->size() != cell_count)
+  {
+    local_blocked_squared = computeBlockedSquaredDistanceCells(grid, policy);
+  }
+  const std::vector<double> & blocked_squared = local_blocked_squared.empty() ?
+    *precomputed_blocked_squared : local_blocked_squared;
   std::vector<double> g_score(cell_count, std::numeric_limits<double>::infinity());
   std::vector<int> parent(cell_count, -1);
   std::vector<uint8_t> closed(cell_count, 0);

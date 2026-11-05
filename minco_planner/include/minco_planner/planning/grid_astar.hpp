@@ -85,11 +85,16 @@ public:
     const geometry_msgs::msg::PoseStamped & goal) const;
 
   /// Plan with a one-off clearance override; negative keeps the configured value.
+  ///
+  /// `blocked_squared` may carry the field computeBlockedSquaredDistanceCells would
+  /// return for this grid and this planner's occupancy policy (the caller owns that
+  /// match). A null pointer or a size mismatch computes the field locally.
   GridAstarResult planWithClearance(
     const nav_msgs::msg::OccupancyGrid & grid,
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal,
-    double clearance_override) const;
+    double clearance_override,
+    const std::vector<double> * blocked_squared = nullptr) const;
 
 private:
   struct GridIndex

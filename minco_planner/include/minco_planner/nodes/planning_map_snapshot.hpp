@@ -8,8 +8,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
@@ -128,6 +130,10 @@ struct PlanningMapSnapshot
   std::string safety_content_digest;
   nav_msgs::msg::OccupancyGrid grid;
   std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> clearance_esdf;
+  // Squared cell distance from each cell centre to the nearest blocked centre (out-of-grid
+  // blocked), the field graph search uses. Derived from the same distance field as
+  // clearance_esdf, so A* and MINCO cannot disagree on clearance.
+  std::shared_ptr<const std::vector<double>> blocked_squared_cells;
 
   bool hasSameSafetyContent(const PlanningMapSnapshot & other) const
   {
@@ -138,6 +144,16 @@ struct PlanningMapSnapshot
   static std::shared_ptr<const PlanningMapSnapshot> create(
     std::uint64_t generation,
     const nav_msgs::msg::OccupancyGrid & grid,
+    int obstacle_value_threshold,
+    bool unknown_is_obstacle);
+
+  // Builds the local snapshot from the map owner's numeric snapshot without running a
+  // distance transform. Returns null when the message is not ready, breaks the
+  // PlanningMapSnapshot contract, or declares a different occupancy policy than the
+  // planner's (fail-closed: the caller must stop).
+  static std::shared_ptr<const PlanningMapSnapshot> fromMessage(
+    std::uint64_t generation,
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot & message,
     int obstacle_value_threshold,
     bool unknown_is_obstacle);
 };

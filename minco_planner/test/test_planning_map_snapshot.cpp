@@ -1,9 +1,13 @@
 // Copyright 2026
 
+#include <cmath>
 #include <limits>
+#include <random>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "minco_planner/nodes/planning_map_snapshot.hpp"
+#include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"
 #include "minco_planner/trajectory/reference_trajectory.hpp"
 
@@ -20,6 +24,166 @@ nav_msgs::msg::OccupancyGrid makeGrid()
   grid.info.origin.orientation.w = 1.0;
   grid.data.assign(25, 0);
   return grid;
+}
+
+// 地图所有者一侧的做法：同一个 provider 算场，按 float32 装进消息。
+ats_navigation_interfaces::msg::PlanningMapSnapshot makeMessage(
+  const nav_msgs::msg::OccupancyGrid & grid, int threshold, bool unknown_is_obstacle)
+{
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+  provider.updateGrid(grid, threshold, unknown_is_obstacle);
+  std::vector<double> field;
+  EXPECT_TRUE(provider.copySignedDistanceField(field));
+  ats_navigation_interfaces::msg::PlanningMapSnapshot message;
+  message.header.frame_id = grid.header.frame_id;
+  message.source_stamp = grid.header.stamp;
+  message.ready = true;
+  message.unknown_is_obstacle = unknown_is_obstacle;
+  message.occupied_value_threshold = static_cast<std::int8_t>(threshold);
+  message.localization_epoch = 1U;
+  message.source_generation = 3U;
+  message.publication_sequence = 5U;
+  message.info = grid.info;
+  message.occupancy = grid.data;
+  message.signed_distance_m.assign(field.begin(), field.end());
+  message.gradient_x.assign(field.size(), 0.0F);
+  message.gradient_y.assign(field.size(), 0.0F);
+  return message;
+}
+
+nav_msgs::msg::OccupancyGrid makeRandomGrid(std::mt19937 & rng, unsigned width, unsigned height)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = "odom";
+  grid.header.stamp.sec = 42;
+  grid.info.resolution = 0.1F;
+  grid.info.width = width;
+  grid.info.height = height;
+  grid.info.origin.position.x = -2.05;
+  grid.info.origin.position.y = 1.3;
+  grid.info.origin.orientation.w = 1.0;
+  grid.data.assign(static_cast<std::size_t>(width) * height, 0);
+  // 若干矩形障碍与 unknown 块，加少量散点。
+  std::uniform_int_distribution<unsigned> px(0U, width - 1U);
+  std::uniform_int_distribution<unsigned> py(0U, height - 1U);
+  std::uniform_int_distribution<unsigned> extent(1U, 6U);
+  for (int block = 0; block < 14; ++block) {
+    const unsigned x0 = px(rng);
+    const unsigned y0 = py(rng);
+    const unsigned w = extent(rng);
+    const unsigned h = extent(rng);
+    const std::int8_t value = block % 4 == 0 ? -1 : (block % 4 == 1 ? 60 : 100);
+    for (unsigned y = y0; y < std::min(height, y0 + h); ++y) {
+      for (unsigned x = x0; x < std::min(width, x0 + w); ++x) {
+        grid.data[static_cast<std::size_t>(y) * width + x] = value;
+      }
+    }
+  }
+  for (int dot = 0; dot < 20; ++dot) {
+    grid.data[static_cast<std::size_t>(py(rng)) * width + px(rng)] = 30;
+  }
+  return grid;
+}
+
+geometry_msgs::msg::PoseStamped poseAt(
+  const nav_msgs::msg::OccupancyGrid & grid, unsigned x, unsigned y)
+{
+  geometry_msgs::msg::PoseStamped pose;
+  pose.header = grid.header;
+  pose.pose.position.x = grid.info.origin.position.x + (x + 0.5) * grid.info.resolution;
+  pose.pose.position.y = grid.info.origin.position.y + (y + 0.5) * grid.info.resolution;
+  pose.pose.orientation.w = 1.0;
+  return pose;
+}
+
+TEST(PlanningMapSnapshotMessage, ReproducesTheLocallyComputedFields)
+{
+  std::mt19937 rng(11U);
+  for (int trial = 0; trial < 20; ++trial) {
+    const bool unknown_is_obstacle = trial % 3 != 0;
+    const auto grid = makeRandomGrid(rng, 60U, 45U);
+    const auto local = minco_planner::PlanningMapSnapshot::create(
+      9U, grid, 50, unknown_is_obstacle);
+    const auto loaded = minco_planner::PlanningMapSnapshot::fromMessage(
+      9U, makeMessage(grid, 50, unknown_is_obstacle), 50, unknown_is_obstacle);
+    ASSERT_NE(local, nullptr);
+    ASSERT_NE(loaded, nullptr) << "trial " << trial;
+    EXPECT_EQ(loaded->grid.data, grid.data);
+    EXPECT_EQ(loaded->grid.header.stamp.sec, 42);
+    EXPECT_EQ(loaded->safety_content_digest, local->safety_content_digest);
+    ASSERT_EQ(*loaded->blocked_squared_cells, *local->blocked_squared_cells) << "trial " << trial;
+    // 双线性插值只在格心之间定义：x 格心 [-2.0, 3.9]，y 格心 [1.35, 5.75]。
+    for (double y = 1.36; y < 5.74; y += 0.053) {
+      for (double x = -1.99; x < 3.89; x += 0.047) {
+        ASSERT_TRUE(std::isfinite(local->clearance_esdf->getDistance(x, y))) << x << "," << y;
+        EXPECT_NEAR(
+          loaded->clearance_esdf->getDistance(x, y), local->clearance_esdf->getDistance(x, y),
+          1e-5);
+      }
+    }
+  }
+}
+
+TEST(PlanningMapSnapshotMessage, RejectsNotReadyBrokenOrForeignPolicySnapshots)
+{
+  std::mt19937 rng(3U);
+  const auto grid = makeRandomGrid(rng, 20U, 16U);
+  const auto good = makeMessage(grid, 50, true);
+  ASSERT_NE(minco_planner::PlanningMapSnapshot::fromMessage(1U, good, 50, true), nullptr);
+
+  auto message = good;
+  message.ready = false;
+  EXPECT_EQ(minco_planner::PlanningMapSnapshot::fromMessage(1U, message, 50, true), nullptr);
+  message = good;
+  message.signed_distance_m[7] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_EQ(minco_planner::PlanningMapSnapshot::fromMessage(1U, message, 50, true), nullptr);
+  message = good;
+  message.signed_distance_m.pop_back();
+  EXPECT_EQ(minco_planner::PlanningMapSnapshot::fromMessage(1U, message, 50, true), nullptr);
+  // 阻塞语义与规划器参数不同：场不能复用。
+  EXPECT_EQ(minco_planner::PlanningMapSnapshot::fromMessage(1U, good, 60, true), nullptr);
+  EXPECT_EQ(minco_planner::PlanningMapSnapshot::fromMessage(1U, good, 50, false), nullptr);
+}
+
+TEST(PlanningMapSnapshotMessage, GraphSearchOnTheSnapshotFieldMatchesTheLocalTransform)
+{
+  std::mt19937 rng(29U);
+  int successes = 0;
+  for (int trial = 0; trial < 60; ++trial) {
+    const bool unknown_is_obstacle = trial % 2 == 0;
+    const auto grid = makeRandomGrid(rng, 50U, 40U);
+    const auto loaded = minco_planner::PlanningMapSnapshot::fromMessage(
+      1U, makeMessage(grid, 50, unknown_is_obstacle), 50, unknown_is_obstacle);
+    ASSERT_NE(loaded, nullptr);
+    minco_planner::GridAstarParams params;
+    params.unknown_is_obstacle = unknown_is_obstacle;
+    params.safe_distance = 0.25;
+    params.min_safe_distance = 0.1;
+    params.clearance_cost_weight = trial % 3 == 0 ? 0.0 : 2.0;
+    params.clearance_cost_distance = 0.6;
+    params.start_escape_max_steps = trial % 4 == 0 ? 0 : 8;
+    const minco_planner::GridAstar astar(params);
+    const auto start = poseAt(grid, 2U + trial % 5, 3U);
+    const auto goal = poseAt(grid, 46U - trial % 7, 36U);
+    for (const double clearance : {-1.0, 0.15}) {
+      const auto own = astar.planWithClearance(grid, start, goal, clearance);
+      const auto shared = astar.planWithClearance(
+        grid, start, goal, clearance, loaded->blocked_squared_cells.get());
+      ASSERT_EQ(own.success, shared.success) << "trial " << trial << " " << own.reason;
+      EXPECT_EQ(own.reason, shared.reason);
+      EXPECT_EQ(own.expanded_nodes, shared.expanded_nodes);
+      EXPECT_DOUBLE_EQ(own.length, shared.length);
+      ASSERT_EQ(own.path.poses.size(), shared.path.poses.size());
+      for (std::size_t i = 0; i < own.path.poses.size(); ++i) {
+        EXPECT_DOUBLE_EQ(own.path.poses[i].pose.position.x, shared.path.poses[i].pose.position.x);
+        EXPECT_DOUBLE_EQ(own.path.poses[i].pose.position.y, shared.path.poses[i].pose.position.y);
+      }
+      successes += own.success ? 1 : 0;
+    }
+  }
+  // 随机图要同时覆盖成功与失败分支，否则差分没有意义。
+  EXPECT_GT(successes, 10);
+  EXPECT_LT(successes, 120);
 }
 
 TEST(PlanningMapSnapshot, KeepsGridAndEsdfImmutableAcrossGenerations)

@@ -10,7 +10,9 @@ minco_planner:
     # 实车使用 wall clock；混用 /clock 会让 0.5 s lease 与 stale 判据失效。
     use_sim_time: false
 
-    # RC-ESDF/ROGMap adapter 融合后的规划栅格；JPS、MINCO 与足迹检查共用它。
+    # 地图所有者的数值快照（融合占据 + 带符号距离场）；JPS、A*、MINCO 与足迹检查共用它。
+    planning_snapshot_topic: /rog_map_adapter/planning_snapshot
+    # 只在 planning_snapshot_topic 为空时使用（离线 sandbox）。
     grid_topic: /rc_esdf/planning_grid
     # 唯一目标入口是 ats_goal_manager 的带编号请求。
     goal_topic: ""

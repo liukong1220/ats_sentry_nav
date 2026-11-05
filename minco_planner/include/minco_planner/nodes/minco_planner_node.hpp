@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -14,6 +15,7 @@
 #include <Eigen/Core>
 #include "ats_navigation_interfaces/msg/planner_goal.hpp"
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "builtin_interfaces/msg/time.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -72,8 +74,19 @@ private:
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal,
     bool goal_pose_footprint_verified,
-    double & used_clearance);
+    double & used_clearance,
+    const std::vector<double> * blocked_squared = nullptr);
+  // Offline/sandbox input: builds the local snapshot (and its distance fields) from a grid.
   void onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+  // Production input: the map owner's numeric snapshot; no distance transform runs here.
+  void onPlanningSnapshot(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot::SharedPtr msg);
+  using SnapshotBuilder =
+    std::function<std::shared_ptr<const PlanningMapSnapshot>(std::uint64_t)>;
+  // Shared commit path for both inputs. `build` receives the candidate local generation.
+  void ingestMapSnapshot(
+    const SnapshotBuilder & build, const builtin_interfaces::msg::Time & source_stamp,
+    std::int64_t received_steady_ns);
   void onMapReady(const std_msgs::msg::Bool::SharedPtr msg);
   void onMapReadyWatchdog();
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
@@ -157,6 +170,8 @@ private:
   void declareAndLoadParams();
 
   std::string grid_topic_ = "traversability_grid";
+  // Non-empty: subscribe to the numeric planning snapshot and ignore grid_topic.
+  std::string planning_snapshot_topic_ = "/rog_map_adapter/planning_snapshot";
   std::string goal_topic_ = "goal_pose";
   std::string goal_request_topic_;
   std::string planner_status_topic_;
@@ -275,6 +290,8 @@ private:
   ReferenceTrajectory alignedToCurrentTf(const ActiveSafetyReference & reference);
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
+  rclcpp::Subscription<ats_navigation_interfaces::msg::PlanningMapSnapshot>::SharedPtr
+    planning_snapshot_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerGoal>::SharedPtr goal_request_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
