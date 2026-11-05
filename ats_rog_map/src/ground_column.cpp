@@ -3,6 +3,7 @@
 #include "ats_rog_map/ground_column.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <queue>
 #include <stdexcept>
 #include <utility>
@@ -151,10 +152,23 @@ ColumnState GroundColumnGrid::state(int x, int y) const
 
 void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point)
 {
+  clearVoxel(point, -std::numeric_limits<double>::infinity());
+}
+
+void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point, double ray_z)
+{
   const int x = static_cast<int>(std::floor((point[0] - origin_x_) / resolution_));
   const int y = static_cast<int>(std::floor((point[1] - origin_y_) / resolution_));
   if (!valid(x, y)) {return;}
-  columns_[index(x, y)].erase(static_cast<int>(std::floor(point[2] / config_.voxel_resolution)));
+  auto & column = columns_[index(x, y)];
+  const auto found = column.find(static_cast<int>(std::floor(point[2] / config_.voxel_resolution)));
+  if (found == column.end()) {return;}
+  // A ray passing above the stored return does not contradict it: a grazing ray
+  // inside the same voxel would otherwise erase a horizontal surface (a platform
+  // edge) and leave the column empty and ray-observed, i.e. falsely free. Only a
+  // ray at or below the stored height shows that return is gone.
+  if (std::isfinite(ray_z) && ray_z > found->second + 1e-9) {return;}
+  column.erase(found);
 }
 
 void GroundColumnGrid::observeRayCell(int x, int y)

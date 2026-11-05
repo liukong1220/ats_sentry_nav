@@ -94,6 +94,100 @@ TEST(GroundColumn, NearbyFloatingPlateCannotSeedItsOwnGround)
   EXPECT_NE(grid.state(5, 2), ColumnState::kFree);
 }
 
+namespace
+{
+// Flat ground (x < 0.3 m) joined to a 0.2 m platform: column (3, y) is the
+// platform's upper edge, a step the robot cannot drive onto.
+ats_rog_map::GroundColumnGrid makePlatformGrid()
+{
+  GroundColumnConfig config;
+  ats_rog_map::GroundColumnGrid grid(10, 6, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 10; ++x) {
+    for (int y = 0; y < 6; ++y) {
+      points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, x < 3 ? 0.0 : 0.20});
+    }
+  }
+  grid.observe(points, {0.05, 0.25, 0.0});
+  return grid;
+}
+}  // namespace
+
+TEST(GroundColumn, RayClearingSupportingGroundVoxelDoesNotOpenAStep)
+{
+  auto grid = makePlatformGrid();
+  ASSERT_EQ(grid.state(3, 2), ColumnState::kOccupied);
+  ASSERT_TRUE(grid.ground(3, 2).has_value());
+  // A grazing ray inside the platform surface voxel passes above the stored
+  // return at z = 0.20 m: it does not show the surface is gone.
+  grid.clearVoxel({0.35, 0.25, 0.225}, 0.22);
+  grid.observeRayCell(3, 2);
+  EXPECT_EQ(grid.state(3, 2), ColumnState::kOccupied);
+  EXPECT_TRUE(grid.ground(3, 2).has_value());
+}
+
+TEST(GroundColumn, RayAtOrBelowStoredReturnClearsIt)
+{
+  GroundColumnConfig config;
+  ats_rog_map::GroundColumnGrid grid(10, 6, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 10; ++x) {
+    for (int y = 0; y < 6; ++y) {
+      points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, 0.0});
+    }
+  }
+  points.push_back({0.55, 0.25, 0.24});
+  grid.observe(points, {0.05, 0.25, 0.0});
+  ASSERT_EQ(grid.state(5, 2), ColumnState::kOccupied);
+  grid.clearVoxel({0.55, 0.25, 0.225}, 0.21);
+  grid.observeRayCell(5, 2);
+  EXPECT_EQ(grid.state(5, 2), ColumnState::kFree);
+}
+
+TEST(GroundColumn, RayClearingDynamicObstacleAboveGroundStillFrees)
+{
+  GroundColumnConfig config;
+  ats_rog_map::GroundColumnGrid grid(10, 6, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 10; ++x) {
+    for (int y = 0; y < 6; ++y) {
+      points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, 0.0});
+    }
+  }
+  for (const double z : {0.15, 0.20, 0.25}) {points.push_back({0.55, 0.25, z});}
+  grid.observe(points, {0.05, 0.25, 0.0});
+  ASSERT_EQ(grid.state(5, 2), ColumnState::kOccupied);
+  for (const double z : {0.15, 0.20, 0.25}) {grid.clearVoxel({0.55, 0.25, z}, z - 0.01);}
+  grid.observeRayCell(5, 2);
+  EXPECT_EQ(grid.state(5, 2), ColumnState::kFree);
+}
+
+TEST(GroundColumn, RayClearingRampGroundVoxelKeepsRampFree)
+{
+  GroundColumnConfig config;
+  ats_rog_map::GroundColumnGrid grid(30, 8, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 30; ++x) {
+    for (int y = 0; y < 8; ++y) {
+      points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, x * 0.03});
+    }
+  }
+  grid.observe(points, {0.05, 0.35, 0.0});
+  ASSERT_EQ(grid.state(25, 3), ColumnState::kFree);
+  grid.clearVoxel({2.55, 0.35, 25 * 0.03 + 0.01}, 25 * 0.03 + 0.012);
+  grid.observeRayCell(25, 3);
+  EXPECT_EQ(grid.state(25, 3), ColumnState::kFree);
+}
+
+TEST(GroundColumn, ClearedGroundVoxelDoesNotLetFloatingPlateSeedGround)
+{
+  auto grid = makePlatformGrid();
+  grid.clearVoxel({0.55, 0.25, 0.225}, 0.21);
+  grid.observeRayCell(5, 2);
+  // The platform interior still has no ground of its own below it.
+  EXPECT_NE(grid.state(5, 2), ColumnState::kFree);
+}
+
 TEST(GroundColumn, InvalidGeometryIsRejectedBeforeAllocation)
 {
   GroundColumnConfig config;

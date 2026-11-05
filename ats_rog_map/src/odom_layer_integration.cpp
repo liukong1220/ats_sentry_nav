@@ -211,7 +211,7 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         }
         const Point center{(k[0] + 0.5) * r, (k[1] + 0.5) * r, (k[2] + 0.5) * r};
         if (!mask.clearOnce(k)) {return;}
-        columns.clearVoxel(center);
+        columns.clearVoxel(center, actual[2]);
         };
       ray(sensor, p, r, clear_column);
       if (r != c.cloud_resolution) {

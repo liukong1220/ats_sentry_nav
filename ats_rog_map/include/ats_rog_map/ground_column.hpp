@@ -48,6 +48,8 @@ public:
   std::optional<double> ground(int x, int y) const;
   void clear();
   void clearVoxel(const std::array<double, 3> & point);
+  // Clears the voxel only when the ray crossing it is not above the stored return.
+  void clearVoxel(const std::array<double, 3> & point, double ray_z);
   void observeRayCell(int x, int y);
   std::size_t outOfRange() const {return out_of_range_;}
   const GroundColumnConfig & config() const {return config_;}
