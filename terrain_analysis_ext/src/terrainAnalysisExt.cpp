@@ -24,6 +24,7 @@
 #include "tf2_ros/transform_broadcaster.h"
 
 #include "terrain_analysis_ext/overhead_filter.hpp"
+#include "terrain_analysis_ext/self_filter.hpp"
 #include "terrain_analysis_ext/planar_lattice.hpp"
 
 double scanVoxelSize = 0.1;
@@ -57,6 +58,7 @@ int traversabilityMinPointCount = 3;
 // 相对本体素地面高于该值（m）的点是头顶面（悬空板/桥），不进体素高度统计，
 // 因此不会触发硬障碍；取"车高 + 小于实测最小净空余量的余量"。0 = 关闭（实车默认）。
 double traversabilityOverheadHeight = 0.0;
+double selfFilterRadius = 0.0;
 bool traversabilityUnknownAsOccupied = false;
 bool publishTraversabilityDebugGrids = true;
 double slopeGridMaxDeg = 45.0;
@@ -195,6 +197,10 @@ void laserCloudHandler(
 
     float dis = sqrt((pointX - vehicleX) * (pointX - vehicleX) +
                      (pointY - vehicleY) * (pointY - vehicleY));
+    if (terrain_analysis_ext::insideSelfFilter(
+            pointX, pointY, vehicleX, vehicleY, selfFilterRadius)) {
+      continue;
+    }
     if (pointZ - vehicleZ > lowerBoundZ - disRatioZ * dis &&
         pointZ - vehicleZ < upperBoundZ + disRatioZ * dis &&
         dis < terrainVoxelSize * (terrainVoxelHalfWidth + 1)) {
@@ -559,6 +565,7 @@ int main(int argc, char **argv) {
                                 traversabilityDebugOccupancyRatioCap);
   nh->declare_parameter<int>("traversabilityMinPointCount",
                              traversabilityMinPointCount);
+  nh->declare_parameter<double>("selfFilterRadius", selfFilterRadius);
   nh->declare_parameter<double>("traversabilityOverheadHeight",
                                 traversabilityOverheadHeight);
   nh->declare_parameter<bool>("traversabilityUnknownAsOccupied",
@@ -608,6 +615,7 @@ int main(int argc, char **argv) {
                     traversabilityDebugOccupancyRatioCap);
   nh->get_parameter("traversabilityMinPointCount",
                     traversabilityMinPointCount);
+  nh->get_parameter("selfFilterRadius", selfFilterRadius);
   nh->get_parameter("traversabilityOverheadHeight",
                     traversabilityOverheadHeight);
   nh->get_parameter("traversabilityUnknownAsOccupied",
