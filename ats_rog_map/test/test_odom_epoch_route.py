@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026
-"""Real ROGMap + adapter: frontend reset cannot resurrect an old map."""
+"""Real ROGMap + in-process planning publisher: frontend reset cannot resurrect an old map."""
+import re
 import signal
 import subprocess
 import tempfile
@@ -9,7 +10,6 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from ats_navigation_interfaces.msg import LocalizationStatus
-from ats_rog_map_interfaces.srv import GetRogMapProjection
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 import rclpy
@@ -26,7 +26,7 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
     processes, logs = [], []
 
     def start(package, executable, arguments):
-        log = tempfile.TemporaryFile(mode="w+")
+        log = tempfile.NamedTemporaryFile(mode="w+")
         logs.append(log)
         processes.append(subprocess.Popen(
             [str(Path(get_package_prefix(package)) / "lib" / package / executable),
@@ -37,9 +37,9 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         start("ats_rog_map", "ats_rog_map_node", [
             "--params-file", str(config), "-p", "use_sim_time:=false",
             "-p", "debug_rate_hz:=0.0", "-p", "require_odom_identity:=true",
-            "-p", "identity_timeout_sec:=2.0"])
-        start("ats_rog_map_adapter", "ats_rog_map_adapter_node", [
-            "-p", "mapping_mode:=true", "-p", "require_odom_identity:=true",
+            "-p", "identity_timeout_sec:=2.0",
+            # Parameters of the co-located planning publisher (ats_rog_map_adapter).
+            "-p", "mapping_mode:=true",
             "-p", "allow_missing_static_map:=true", "-p", "require_terrain_inputs:=false",
             "-p", "projection_rate_hz:=10.0", "-p", "localization_status_timeout_sec:=2.0"])
         broadcaster = StaticTransformBroadcaster(node)
@@ -58,8 +58,11 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         odom_pub = node.create_publisher(Odometry, "/localization", 10)
         ready = []
         node.create_subscription(Bool, "/rog_map_adapter/ready", lambda m: ready.append(m.data), qos)
-        client = node.create_client(GetRogMapProjection, "/rog_map/get_ground_projection")
-        assert client.wait_for_service(timeout_sec=15.0)
+
+        def projection_ends():
+            with open(logs[0].name, encoding="utf-8", errors="replace") as text:
+                return [dict(re.findall(r"(\w+)=(\S+)", line))
+                        for line in text if "P2 adapter projection end" in line]
         points = [(x / 100, y / 100, 0.0) for x in range(50, 120, 5) for y in range(-20, 25, 5)]
         points += [(1.05, 0.05, z / 100) for z in range(0, 55, 5)]
         boundary = node.get_clock().now().to_msg()
@@ -95,14 +98,12 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         ready.clear()
         drive(20, 2, 0.8, cloud_stamp=old_stamp)
         assert ready and not any(ready), "queued old cloud revived reset map"
-        request = GetRogMapProjection.Request(min_height=0.1, max_height=0.8, resolution=0.1,
-            expected_odom_instance_id=20, expected_odom_epoch=2)
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(node, future, timeout_sec=5.0)
-        assert future.done()
-        response = future.result()
-        assert (response.odom_instance_id, response.odom_epoch) == (20, 2)
-        assert not response.ready
+        # The publisher asked the map for the new identity and got a not-ready
+        # projection: the reset map has no new-epoch evidence yet.
+        new_epoch = [e for e in projection_ends()
+                     if (e["odom_instance_id"], e["odom_epoch"]) == ("20", "2")]
+        assert new_epoch, "no projection was requested for the reset frontend epoch"
+        assert new_epoch[0]["ready"] == "0"
         drive(20, 2, 1.2)
         assert ready[-1]
         ready.clear()

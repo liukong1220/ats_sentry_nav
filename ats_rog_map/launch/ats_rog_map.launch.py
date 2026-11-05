@@ -21,12 +21,21 @@ def generate_launch_description() -> LaunchDescription:
                 FindPackageShare("ats_rog_map"), "config", "rog_map_ground_planning_mujoco.yaml",
             ]),
         ),
+        # Parameters of the in-process planning-map owner (node ats_rog_map_adapter).
+        DeclareLaunchArgument(
+            "planning_params_file",
+            default_value=PathJoinSubstitution([
+                FindPackageShare("ats_rog_map"), "config", "rog_map_ground_planning.yaml",
+            ]),
+        ),
+        # No `name=`: the override dict then lands under '/**' and reaches both
+        # nodes of the process (/ats_rog_map and /ats_rog_map_adapter).
         Node(
             package="ats_rog_map",
             executable="ats_rog_map_node",
-            name="ats_rog_map",
             output="screen",
-            parameters=[LaunchConfiguration("params_file"), {
+            parameters=[LaunchConfiguration("params_file"),
+                        LaunchConfiguration("planning_params_file"), {
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
                 "map_frame": LaunchConfiguration("map_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),

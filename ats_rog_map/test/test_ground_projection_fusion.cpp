@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-#include "ats_rog_map_adapter/ground_projection_fusion.hpp"
+#include "ats_rog_map/planning/ground_projection_fusion.hpp"
 #include "gtest/gtest.h"
 
 namespace
@@ -44,10 +44,10 @@ TEST(GroundProjectionFusion, ConservativelyFusesUnknownWallsTerrainAndSlope)
   slope.data[3] = 100;
   terrain.data[4] = 100;
 
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
-  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 1.0;
-  ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
     rog, terrain, slope, static_map, identityTransform(), params, result));
   EXPECT_EQ(result.planning_grid.data[1], -1);
   EXPECT_EQ(result.planning_grid.data[2], 100);
@@ -82,11 +82,11 @@ TEST(GroundProjectionFusion, ProjectionFrameKeepsRotatedFineStaticAndRealtimeObs
   transform.transform.translation.y = -2.0;
   transform.transform.rotation.z = std::sin(M_PI / 4);
   transform.transform.rotation.w = std::cos(M_PI / 4);
-  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 0.1;
   params.output_in_projection_frame = true;
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
-  ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
     rog, terrain, slope, prior, transform, params, result));
   EXPECT_EQ(result.planning_grid.header.frame_id, "odom");
   ASSERT_EQ(result.planning_grid.info.width, 4U);
@@ -98,7 +98,7 @@ TEST(GroundProjectionFusion, ProjectionFrameKeepsRotatedFineStaticAndRealtimeObs
 TEST(GroundProjectionFusion, OrientedRobotRectangleClearsOnlyInsideUnknownAndKeepsOccupied)
 {
   for (const double yaw : {0.0, M_PI / 4, -0.7}) {
-    ats_rog_map_adapter::GroundProjectionFusionResult result;
+    ats_rog_map::planning::GroundProjectionFusionResult result;
     result.planning_grid = makeGrid(-1);
     auto & grid = result.planning_grid;
     grid.info.resolution = 0.1;
@@ -107,7 +107,7 @@ TEST(GroundProjectionFusion, OrientedRobotRectangleClearsOnlyInsideUnknownAndKee
     grid.data.assign(1600, -1);
     grid.data[20 * 40 + 20] = 100;
     result.occupied_cells = 1; result.unknown_cells = 1599;
-    const auto cleared = ats_rog_map_adapter::GroundProjectionFusion::clearUnknownFootprint(
+    const auto cleared = ats_rog_map::planning::GroundProjectionFusion::clearUnknownFootprint(
       result, 0.0, 0.0, yaw, 0.70, 0.55, 0.10);
     EXPECT_GT(cleared, 0U);
     EXPECT_EQ(result.occupied_cells, 1U);
@@ -144,10 +144,10 @@ TEST(GroundProjectionFusion, UsesAnyKnownFreeEvidenceButKeepsAllUnknownCellsUnkn
   slope.data[7] = -1;
   static_map.data[7] = -1;
 
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
-  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 1.0;
-  ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
     rog, terrain, slope, static_map, identityTransform(), params, result));
   EXPECT_EQ(result.planning_grid.data[1], 0);
   EXPECT_EQ(result.planning_grid.data[2], 0);
@@ -168,11 +168,11 @@ TEST(GroundProjectionFusion, FallsBackToStaticMapOutsideRogWindowDespiteTerrainU
   rog.info.height = 1;
   rog.data.assign(1, 0);
 
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
-  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 1.0;
   params.use_static_map_obstacles = true;
-  ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
     rog, terrain, slope, static_map, identityTransform(), params, result));
   EXPECT_EQ(result.planning_grid.data[0], 0);
   EXPECT_EQ(result.planning_grid.data[15], 0);
@@ -195,12 +195,12 @@ TEST(GroundProjectionFusion, PreservesFinerStaticObstacleAcrossRotatedOutputFoot
   static_map.data.assign(25, 0);
   static_map.data[2U * static_map.info.width + 2U] = 100;
 
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
-  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 0.10;
   params.use_static_map_obstacles = true;
   ASSERT_TRUE(
-    ats_rog_map_adapter::GroundProjectionFusion::fuse(
+    ats_rog_map::planning::GroundProjectionFusion::fuse(
       rog, terrain, slope, static_map, identityTransform(), params, result));
 
   ASSERT_EQ(result.planning_grid.info.width, 2U);
@@ -217,19 +217,19 @@ TEST(GroundProjectionFusion, PreservesFinerStaticObstacleAcrossRotatedOutputFoot
 
 TEST(GroundProjectionFusion, ClearsOnlyUnknownCellsUnderCurrentRobot)
 {
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
   result.planning_grid = makeGrid(-1);
   result.planning_grid.data[5] = 100;
   result.unknown_cells = 15;
   result.occupied_cells = 1;
 
   EXPECT_EQ(
-    ats_rog_map_adapter::GroundProjectionFusion::clearUnknownCircle(
+    ats_rog_map::planning::GroundProjectionFusion::clearUnknownCircle(
       result, 1.5, 1.5, 0.2),
     0U);
   EXPECT_EQ(result.planning_grid.data[5], 100);
   EXPECT_EQ(
-    ats_rog_map_adapter::GroundProjectionFusion::clearUnknownCircle(
+    ats_rog_map::planning::GroundProjectionFusion::clearUnknownCircle(
       result, 2.5, 1.5, 0.2),
     1U);
   EXPECT_EQ(result.planning_grid.data[6], 0);
@@ -239,7 +239,7 @@ TEST(GroundProjectionFusion, ClearsOnlyUnknownCellsUnderCurrentRobot)
 
 TEST(GroundProjectionFusion, ZeroUnknownClearRadiusLeavesGridAndCountersUnchanged)
 {
-  ats_rog_map_adapter::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
   result.planning_grid = makeGrid(-1);
   result.planning_grid.data[5] = 100;
   result.unknown_cells = 15;
@@ -247,7 +247,7 @@ TEST(GroundProjectionFusion, ZeroUnknownClearRadiusLeavesGridAndCountersUnchange
   const auto original_data = result.planning_grid.data;
 
   EXPECT_EQ(
-    ats_rog_map_adapter::GroundProjectionFusion::clearUnknownCircle(
+    ats_rog_map::planning::GroundProjectionFusion::clearUnknownCircle(
       result, 1.5, 1.5, 0.0),
     0U);
   EXPECT_EQ(result.planning_grid.data, original_data);
@@ -258,7 +258,7 @@ TEST(GroundProjectionFusion, ZeroUnknownClearRadiusLeavesGridAndCountersUnchange
 
 TEST(RogMapEsdfSnapshot, PreservesGenerationSignedDistanceUnknownAndGradient)
 {
-  ats_rog_map_interfaces::srv::GetRogMapProjection::Response response;
+  ats_rog_map::GroundProjection response;
   response.generation = 42;
   response.ready = true;
   response.stale = false;
@@ -271,7 +271,7 @@ TEST(RogMapEsdfSnapshot, PreservesGenerationSignedDistanceUnknownAndGradient)
   response.gradient_x[1] = std::numeric_limits<float>::quiet_NaN();
   response.gradient_y[1] = std::numeric_limits<float>::quiet_NaN();
 
-  const auto snapshot = ats_rog_map_adapter::RogMapEsdfSnapshot::fromResponse(response);
+  const auto snapshot = ats_rog_map::planning::RogMapEsdfSnapshot::fromResponse(response);
   ASSERT_TRUE(snapshot.valid());
   EXPECT_TRUE(snapshot.available());
   EXPECT_EQ(snapshot.generation, 42U);
@@ -283,16 +283,16 @@ TEST(RogMapEsdfSnapshot, PreservesGenerationSignedDistanceUnknownAndGradient)
   EXPECT_FLOAT_EQ(snapshot.gradient_y[0], -0.5F);
 
   const auto known = snapshot.query(0.5, 0.5);
-  EXPECT_EQ(known.status, ats_rog_map_adapter::RogMapEsdfQueryStatus::kKnown);
+  EXPECT_EQ(known.status, ats_rog_map::planning::RogMapEsdfQueryStatus::kKnown);
   EXPECT_FLOAT_EQ(known.signed_distance, 1.0F);
   EXPECT_FLOAT_EQ(known.gradient_x, 0.5F);
   EXPECT_FLOAT_EQ(known.gradient_y, -0.5F);
   EXPECT_EQ(
     snapshot.query(1.5, 0.5).status,
-    ats_rog_map_adapter::RogMapEsdfQueryStatus::kUnknown);
+    ats_rog_map::planning::RogMapEsdfQueryStatus::kUnknown);
   EXPECT_EQ(
     snapshot.query(5.0, 0.5).status,
-    ats_rog_map_adapter::RogMapEsdfQueryStatus::kOutside);
+    ats_rog_map::planning::RogMapEsdfQueryStatus::kOutside);
 }
 
 }  // namespace

@@ -4,24 +4,25 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
-#include "ats_rog_map_adapter/mapping_health.hpp"
+#include "ats_rog_map/planning/mapping_health.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
-#include "ats_rog_map_adapter/ground_projection_fusion.hpp"
-#include "ats_rog_map_adapter/planning_map_snapshot.hpp"
-#include "ats_rog_map_adapter/test_fault_authorization.hpp"
-#include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
+#include "ats_rog_map/planning/ground_projection_fusion.hpp"
+#include "ats_rog_map/planning/planning_map_snapshot.hpp"
+#include "ats_rog_map/planning/planning_map_publisher.hpp"
+#include "ats_rog_map/test_fault_authorization.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
@@ -34,7 +35,7 @@
 #include "tf2_ros/transform_listener.h"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
-namespace ats_rog_map_adapter
+namespace ats_rog_map::planning
 {
 
 /// @brief Test-only parameters that may not be set without startup authorization.
@@ -42,6 +43,7 @@ const std::vector<std::string> & kGuardedTestParameters()
 {
   static const std::vector<std::string> names{
     "test_mask_secondary_evidence",
+    "test_stall_projection",
     "test_inject_dynamic_obstacle",
     "test_dynamic_obstacle_x",
     "test_dynamic_obstacle_y",
@@ -49,14 +51,16 @@ const std::vector<std::string> & kGuardedTestParameters()
   return names;
 }
 
-class AtsRogMapAdapterNode final : public rclcpp::Node
+class PlanningMapPublisher final : public rclcpp::Node
 {
 public:
-  AtsRogMapAdapterNode()
-  : Node("ats_rog_map_adapter"), tf_buffer_(get_clock()), tf_listener_(tf_buffer_)
+  PlanningMapPublisher(GroundProjectionProvider provider, const rclcpp::NodeOptions & options)
+  : Node("ats_rog_map_adapter", options), tf_buffer_(get_clock()), tf_listener_(tf_buffer_),
+    projection_provider_(std::move(provider))
   {
-    projection_service_ = declare_parameter<std::string>(
-      "projection_service", "/rog_map/get_ground_projection");
+    if (!projection_provider_) {
+      throw std::invalid_argument("planning map publisher needs a ground projection provider");
+    }
     projection_rate_hz_ = std::max(0.1, declare_parameter<double>("projection_rate_hz", 2.0));
     projection_request_timeout_sec_ = std::max(
       0.1, declare_parameter<double>("projection_request_timeout_sec", 2.0));
@@ -151,6 +155,10 @@ public:
     // masked before the normal truth table runs; the fused output is never
     // overwritten after fusion.  Gated by enable_test_fault_injection.
     declare_parameter<bool>("test_mask_secondary_evidence", false);
+    // Stands in for the former "projection service does not answer" fault: the
+    // projection worker waits before computing until this is cleared, so the
+    // request deadline below fires exactly as it did for a stalled service.
+    declare_parameter<bool>("test_stall_projection", false);
     // P4 runtime swept-volume injection.  These values are only sampled when
     // explicitly enabled at runtime and never affect the normal map contract.
     declare_parameter<bool>("test_inject_dynamic_obstacle", false);
@@ -201,7 +209,7 @@ public:
         create_subscription<ats_navigation_interfaces::msg::LocalizationStatus>(
             localization_status_topic_,
             rclcpp::QoS(1).reliable().transient_local(),
-            std::bind(&AtsRogMapAdapterNode::onLocalizationStatus, this,
+            std::bind(&PlanningMapPublisher::onLocalizationStatus, this,
                       std::placeholders::_1));
 
     const auto output_qos = rclcpp::QoS(1).reliable().transient_local();
@@ -222,28 +230,45 @@ public:
             map_status_topic_, output_qos);
     planning_snapshot_pub_ = create_publisher<
       ats_navigation_interfaces::msg::PlanningMapSnapshot>(planning_snapshot_topic_, output_qos);
-    projection_client_ = create_client<ats_rog_map_interfaces::srv::GetRogMapProjection>(
-      projection_service_);
+    projection_worker_ = std::thread([this]() {runProjectionWorker();});
     if (mapping_mode_) {
       layer_updated_sub_ = create_subscription<std_msgs::msg::UInt64>(
         "/rog_map/odom_layer_updated", rclcpp::QoS(1).reliable(),
         [this](std_msgs::msg::UInt64::ConstSharedPtr) {
+          std::lock_guard<std::recursive_mutex> lock(state_mutex_);
           if (request_pending_) {mapping_update_pending_ = true; return;}
           requestProjection();
         });
     }
 
-    publishMapStatus(false, 0, "waiting for first projection");
+    {
+      std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+      publishMapStatus(false, 0, "waiting for first projection");
+    }
     const auto period = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::duration<double>(1.0 / projection_rate_hz_));
     projection_timer_ = create_wall_timer(
       std::max(period, std::chrono::milliseconds(1)),
-      std::bind(&AtsRogMapAdapterNode::requestProjection, this));
+      [this]() {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+        requestProjection();
+      });
     RCLCPP_INFO(
       get_logger(),
-      "ROGMap ground adapter ready: service='%s' planning_grid='%s' height=[%.2f, %.2f] m",
-      projection_service_.c_str(), planning_grid_topic_.c_str(), projection_min_height_,
-      projection_max_height_);
+      "ROGMap ground adapter ready: in-process projection planning_grid='%s' height=[%.2f, %.2f] m",
+      planning_grid_topic_.c_str(), projection_min_height_, projection_max_height_);
+  }
+
+  ~PlanningMapPublisher() override
+  {
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      worker_stop_ = true;
+    }
+    worker_cv_.notify_all();
+    if (projection_worker_.joinable()) {
+      projection_worker_.join();
+    }
   }
 
 private:
@@ -261,6 +286,7 @@ private:
   void onLocalizationStatus(
       const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr
           message) {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex_);
     // Always bookkeep epoch/state so map_status.localization_epoch stays
     // aligned with /localization/status. Gazebo may disable
     // require_localization_status to keep planning through GICP flicker;
@@ -287,10 +313,8 @@ private:
       return;
     }
     if (epoch_changed || odom_changed || !localizationReady()) {
-      if (request_pending_) {
-        projection_client_->remove_pending_request(active_request_id_);
-        request_pending_ = false;
-      }
+      // Bumping the epoch makes an in-flight projection result unusable.
+      request_pending_ = false;
       ++active_request_epoch_;
       RogMapEsdfSnapshot invalidated_snapshot;
       last_numeric_snapshot_ = std::move(invalidated_snapshot);
@@ -364,6 +388,15 @@ private:
            std::abs((input_stamp - rog_stamp).seconds()) <= input_sync_tolerance_sec_;
   }
 
+  struct ProjectionJob
+  {
+    GroundProjectionRequest request;
+    std::uint64_t epoch{0};
+    std::uint64_t localization_epoch{0};
+    rclcpp::Time start_stamp;
+  };
+
+  // Caller holds state_mutex_.
   void requestProjection()
   {
     if (!localizationReady()) {
@@ -377,91 +410,163 @@ private:
       if (elapsed <= projection_request_timeout_sec_) {
         return;
       }
-      projection_client_->remove_pending_request(active_request_id_);
+      // Deadline expired: drop the request and fence its late result by epoch.
       request_pending_ = false;
+      ++active_request_epoch_;
       publishUnavailable("ROGMap projection request timed out");
       return;
     }
-    if (!projection_client_->service_is_ready()) {
-      publishUnavailable("ROGMap projection service is unavailable");
-      return;
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      if (worker_busy_ || pending_job_) {
+        // A timed-out projection is still running; it cannot be preempted.
+        publishUnavailable("ROGMap projection worker is still busy");
+        return;
+      }
     }
-    auto request = std::make_shared<ats_rog_map_interfaces::srv::GetRogMapProjection::Request>();
-    request->min_height = static_cast<float>(projection_min_height_);
-    request->max_height = static_cast<float>(projection_max_height_);
-    request->resolution = static_cast<float>(planning_resolution_);
-    request->use_odom_layer = use_odom_layer_;
+    ProjectionJob job;
+    job.request.min_height = static_cast<float>(projection_min_height_);
+    job.request.max_height = static_cast<float>(projection_max_height_);
+    job.request.resolution = static_cast<float>(planning_resolution_);
+    job.request.use_odom_layer = use_odom_layer_;
     if (mapping_mode_ || require_odom_identity_) {
-      request->expected_odom_instance_id = odom_instance_id_;
-      request->expected_odom_epoch = odom_epoch_;
+      job.request.expected_odom_instance_id = odom_instance_id_;
+      job.request.expected_odom_epoch = odom_epoch_;
     }
-    const std::uint64_t epoch = ++next_request_epoch_;
-    const std::uint64_t localization_epoch = localization_epoch_;
-    const rclcpp::Time request_start_stamp = now();
-    active_request_epoch_ = epoch;
+    job.epoch = ++next_request_epoch_;
+    job.localization_epoch = localization_epoch_;
+    job.start_stamp = now();
+    active_request_epoch_ = job.epoch;
     active_request_sent_time_ = std::chrono::steady_clock::now();
     request_pending_ = true;
-    try {
-      const auto pending = projection_client_->async_send_request(
-          request,
-          [this, epoch, localization_epoch, request_start_stamp](
-              rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::
-                  SharedFuture future) {
-            if (!request_pending_ || epoch != active_request_epoch_) {
-              return;
-            }
-            request_pending_ = false;
-            try {
-              if (!localizationReady() ||
-                  localization_epoch != localization_epoch_) {
-                publishUnavailable(
-                    "discarded projection from an obsolete localization epoch");
-                return;
-              }
-              const auto & response = *future.get();
-              const rclcpp::Time response_stamp = now();
-              const double round_trip_ms = 1000.0 * std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - active_request_sent_time_).count();
-              RCLCPP_INFO(
-                get_logger(),
-                "P2 adapter projection end request=%llu start_ns=%lld end_ns=%lld "
-                "round_trip_ms=%.1f source_generation=%llu source_stamp_ns=%lld ready=%d stale=%d",
-                static_cast<unsigned long long>(epoch),
-                static_cast<long long>(request_start_stamp.nanoseconds()),
-                static_cast<long long>(response_stamp.nanoseconds()), round_trip_ms,
-                static_cast<unsigned long long>(response.generation),
-                static_cast<long long>(rclcpp::Time(response.occupancy_grid.header.stamp).nanoseconds()),
-                response.ready ? 1 : 0, response.stale ? 1 : 0);
-              processProjection(response, localization_epoch, epoch);
-              if (mapping_update_pending_) {
-                mapping_update_pending_ = false;
-                requestProjection();
-              }
-            } catch (const std::exception &exception) {
-              RCLCPP_ERROR(get_logger(),
-                           "ROGMap projection response failed: %s",
-                           exception.what());
-              publishUnavailable("ROGMap projection response failed");
-            }
-          });
-      active_request_id_ = pending.request_id;
-      RCLCPP_INFO(
-        get_logger(),
-        "P2 adapter projection begin request=%llu request_id=%ld start_ns=%lld "
-        "localization_epoch=%llu deadline_sec=%.3f",
-        static_cast<unsigned long long>(epoch), static_cast<long>(active_request_id_),
-        static_cast<long long>(request_start_stamp.nanoseconds()),
-        static_cast<unsigned long long>(localization_epoch), projection_request_timeout_sec_);
-    } catch (const std::exception & exception) {
-      request_pending_ = false;
-      RCLCPP_ERROR(get_logger(), "ROGMap projection request failed: %s", exception.what());
-      publishUnavailable("ROGMap projection request failed");
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 adapter projection begin request=%llu request_id=%llu start_ns=%lld "
+      "localization_epoch=%llu deadline_sec=%.3f",
+      static_cast<unsigned long long>(job.epoch), static_cast<unsigned long long>(job.epoch),
+      static_cast<long long>(job.start_stamp.nanoseconds()),
+      static_cast<unsigned long long>(job.localization_epoch), projection_request_timeout_sec_);
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      pending_job_ = std::move(job);
+    }
+    worker_cv_.notify_one();
+  }
+
+  void runProjectionWorker()
+  {
+    while (true) {
+      ProjectionJob job;
+      {
+        std::unique_lock<std::mutex> lock(worker_mutex_);
+        worker_cv_.wait(lock, [this]() {return worker_stop_ || pending_job_.has_value();});
+        if (worker_stop_) {return;}
+        job = std::move(*pending_job_);
+        pending_job_.reset();
+        worker_busy_ = true;
+      }
+      bool stall_logged = false;
+      while (test_fault_injection_enabled_ && !workerStopping() &&
+        get_parameter("test_stall_projection").as_bool())
+      {
+        if (!stall_logged) {
+          RCLCPP_WARN(get_logger(), "P2 adapter test projection stall active request=%llu",
+            static_cast<unsigned long long>(job.epoch));
+          stall_logged = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      GroundProjection response;
+      bool computed = true;
+      try {
+        projection_provider_(job.request, response);
+      } catch (const std::exception & exception) {
+        computed = false;
+        RCLCPP_ERROR(get_logger(), "ROGMap projection failed: %s", exception.what());
+      }
+      {
+        std::lock_guard<std::mutex> lock(worker_mutex_);
+        worker_busy_ = false;
+      }
+      if (workerStopping()) {return;}
+      std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+      completeProjection(job, response, computed);
     }
   }
 
+  bool workerStopping()
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    return worker_stop_;
+  }
+
+  // Caller holds state_mutex_. Same checks as the former service response callback.
+  void completeProjection(
+    const ProjectionJob & job, const GroundProjection & response, bool computed)
+  {
+    if (!request_pending_ || job.epoch != active_request_epoch_) {
+      return;
+    }
+    request_pending_ = false;
+    if (!computed) {
+      publishUnavailable("ROGMap projection response failed");
+      return;
+    }
+    try {
+      if (!localizationReady() || job.localization_epoch != localization_epoch_) {
+        publishUnavailable("discarded projection from an obsolete localization epoch");
+        return;
+      }
+      const rclcpp::Time response_stamp = now();
+      const double round_trip_ms = 1000.0 * std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - active_request_sent_time_).count();
+      RCLCPP_INFO(
+        get_logger(),
+        "P2 adapter projection end request=%llu start_ns=%lld end_ns=%lld "
+        "round_trip_ms=%.1f source_generation=%llu source_stamp_ns=%lld ready=%d stale=%d "
+        "odom_instance_id=%llu odom_epoch=%llu odom_layer_included=%d frame=%s size=%ux%u",
+        static_cast<unsigned long long>(job.epoch),
+        static_cast<long long>(job.start_stamp.nanoseconds()),
+        static_cast<long long>(response_stamp.nanoseconds()), round_trip_ms,
+        static_cast<unsigned long long>(response.generation),
+        static_cast<long long>(rclcpp::Time(response.occupancy_grid.header.stamp).nanoseconds()),
+        response.ready ? 1 : 0, response.stale ? 1 : 0,
+        static_cast<unsigned long long>(response.odom_instance_id),
+        static_cast<unsigned long long>(response.odom_epoch),
+        response.odom_layer_included ? 1 : 0, response.occupancy_grid.header.frame_id.c_str(),
+        response.occupancy_grid.info.width, response.occupancy_grid.info.height);
+      logNumericProjectionEvidence(response);
+      processProjection(response, job.localization_epoch, job.epoch);
+      if (mapping_update_pending_) {
+        mapping_update_pending_ = false;
+        requestProjection();
+      }
+    } catch (const std::exception & exception) {
+      RCLCPP_ERROR(get_logger(), "ROGMap projection response failed: %s", exception.what());
+      publishUnavailable("ROGMap projection response failed");
+    }
+  }
+
+  // Test-only replacement for the former numeric service query: with the startup
+  // fault gate open, every raw ROGMap projection is audited by the same strict
+  // all-unknown predicate before any masking or fusion runs.
+  void logNumericProjectionEvidence(const GroundProjection & response)
+  {
+    if (!test_fault_injection_enabled_) {return;}
+    const auto evidence = evaluateSourceUnknownEvidence(
+      RogMapEsdfSnapshot::fromResponse(response), 0U);
+    RCLCPP_INFO(
+      get_logger(),
+      "P2 rog numeric projection structurally_valid=%d all_unknown=%d cells=%zu unknown=%zu "
+      "free=%zu occupied=%zu out_of_range=%zu finite_numeric=%zu generation=%llu reason=%s",
+      evidence.structurally_valid ? 1 : 0, evidence.all_unknown ? 1 : 0, evidence.cell_count,
+      evidence.unknown_cells, evidence.free_cells, evidence.occupied_cells,
+      evidence.out_of_range_cells, evidence.finite_numeric_cells,
+      static_cast<unsigned long long>(response.generation), evidence.reason.c_str());
+  }
+
   void processProjection(
-      const ats_rog_map_interfaces::srv::GetRogMapProjection::Response
-          &response,
+      const GroundProjection &response,
       std::uint64_t localization_epoch, std::uint64_t request_epoch) {
     if (use_odom_layer_ && response.ready && !response.odom_layer_included) {
       publishUnavailable("global odom layer was requested but missing from projection");
@@ -987,7 +1092,6 @@ private:
       static_cast<long long>(rclcpp::Time(status.header.stamp).nanoseconds()), reason.c_str());
   }
 
-  std::string projection_service_;
   std::string static_map_topic_;
   std::string traversability_grid_topic_;
   std::string slope_grid_topic_;
@@ -1039,8 +1143,9 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr slope_grid_;
   nav_msgs::msg::OccupancyGrid last_blocking_grid_;
   RogMapEsdfSnapshot last_numeric_snapshot_;
+  // Guards every field below that callbacks and the projection worker share.
+  std::recursive_mutex state_mutex_;
   bool request_pending_{false};
-  std::int64_t active_request_id_{0};
   std::uint64_t next_request_epoch_{0};
   std::uint64_t active_request_epoch_{0};
   std::uint64_t localization_epoch_{0};
@@ -1074,16 +1179,21 @@ private:
       SharedPtr map_status_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapSnapshot>::
       SharedPtr planning_snapshot_pub_;
-  rclcpp::Client<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_client_;
   rclcpp::TimerBase::SharedPtr projection_timer_;
+
+  GroundProjectionProvider projection_provider_;
+  std::mutex worker_mutex_;
+  std::condition_variable worker_cv_;
+  std::optional<ProjectionJob> pending_job_;
+  bool worker_busy_{false};
+  bool worker_stop_{false};
+  std::thread projection_worker_;
 };
 
-}  // namespace ats_rog_map_adapter
-
-int main(int argc, char ** argv)
+std::shared_ptr<rclcpp::Node> makePlanningMapPublisher(
+  GroundProjectionProvider provider, const rclcpp::NodeOptions & options)
 {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ats_rog_map_adapter::AtsRogMapAdapterNode>());
-  rclcpp::shutdown();
-  return 0;
+  return std::make_shared<PlanningMapPublisher>(std::move(provider), options);
 }
+
+}  // namespace ats_rog_map::planning

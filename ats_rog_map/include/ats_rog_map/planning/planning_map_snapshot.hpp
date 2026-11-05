@@ -1,7 +1,7 @@
 // Copyright 2026
 
-#ifndef ATS_ROG_MAP_ADAPTER__PLANNING_MAP_SNAPSHOT_HPP_
-#define ATS_ROG_MAP_ADAPTER__PLANNING_MAP_SNAPSHOT_HPP_
+#ifndef ATS_ROG_MAP__PLANNING__PLANNING_MAP_SNAPSHOT_HPP_
+#define ATS_ROG_MAP__PLANNING__PLANNING_MAP_SNAPSHOT_HPP_
 
 #include <cmath>
 #include <cstddef>
@@ -13,7 +13,7 @@
 #include "builtin_interfaces/msg/time.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 
-namespace ats_rog_map_adapter
+namespace ats_rog_map::planning
 {
 
 inline ats_navigation_interfaces::msg::PlanningMapSnapshot makeUnavailablePlanningMapSnapshot(
@@ -140,6 +140,6 @@ inline ats_navigation_interfaces::msg::PlanningMapSnapshot makePlanningMapSnapsh
   return snapshot;
 }
 
-}  // namespace ats_rog_map_adapter
+}  // namespace ats_rog_map::planning
 
-#endif  // ATS_ROG_MAP_ADAPTER__PLANNING_MAP_SNAPSHOT_HPP_
+#endif  // ATS_ROG_MAP__PLANNING__PLANNING_MAP_SNAPSHOT_HPP_

@@ -1,6 +1,6 @@
 // Copyright 2026
 
-#include "ats_rog_map_adapter/ground_projection_fusion.hpp"
+#include "ats_rog_map/planning/ground_projection_fusion.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-namespace ats_rog_map_adapter
+namespace ats_rog_map::planning
 {
 namespace
 {
@@ -226,7 +226,7 @@ RogMapEsdfQuery RogMapEsdfSnapshot::query(double world_x, double world_y) const
 }
 
 RogMapEsdfSnapshot RogMapEsdfSnapshot::fromResponse(
-  const ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response)
+  const ats_rog_map::GroundProjection & response)
 {
   RogMapEsdfSnapshot snapshot;
   snapshot.header = response.occupancy_grid.header;
@@ -516,4 +516,4 @@ std::size_t GroundProjectionFusion::clearUnknownCircle(
   return cleared;
 }
 
-}  // namespace ats_rog_map_adapter
+}  // namespace ats_rog_map::planning

@@ -1,19 +1,19 @@
 // Copyright 2026
 
-#ifndef ATS_ROG_MAP_ADAPTER__GROUND_PROJECTION_FUSION_HPP_
-#define ATS_ROG_MAP_ADAPTER__GROUND_PROJECTION_FUSION_HPP_
+#ifndef ATS_ROG_MAP__PLANNING__GROUND_PROJECTION_FUSION_HPP_
+#define ATS_ROG_MAP__PLANNING__GROUND_PROJECTION_FUSION_HPP_
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
+#include "ats_rog_map/ground_projection.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "std_msgs/msg/header.hpp"
 
-namespace ats_rog_map_adapter
+namespace ats_rog_map::planning
 {
 
 enum class RogMapEsdfQueryStatus
@@ -49,7 +49,7 @@ struct RogMapEsdfSnapshot
   RogMapEsdfQuery query(double world_x, double world_y) const;
 
   static RogMapEsdfSnapshot fromResponse(
-    const ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response);
+    const ats_rog_map::GroundProjection & response);
 };
 
 /// @brief Structured audit of whether a ROGMap numeric projection is genuinely
@@ -126,6 +126,6 @@ public:
     double length, double width, double margin);
 };
 
-}  // namespace ats_rog_map_adapter
+}  // namespace ats_rog_map::planning
 
-#endif  // ATS_ROG_MAP_ADAPTER__GROUND_PROJECTION_FUSION_HPP_
+#endif  // ATS_ROG_MAP__PLANNING__GROUND_PROJECTION_FUSION_HPP_

@@ -12,7 +12,6 @@ find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "srv/GetRogMapProjection.srv"
   "srv/SaveOdomMap.srv"
   DEPENDENCIES nav_msgs geometry_msgs
 )

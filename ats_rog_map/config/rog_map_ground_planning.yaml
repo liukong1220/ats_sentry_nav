@@ -1,11 +1,10 @@
 ats_rog_map_adapter:
   ros__parameters:
-    # 这份文件同时被实车 `bringup.launch.py` 与 MuJoCo 入口引用，两处都显式覆盖
-    # `use_sim_time`。文件级默认取实车值 false：投影快照的 deadline、心跳 10 Hz 与
-    # 0.5 s steady-clock 租约都以挂钟为基准，默认 true 会在覆盖失效时把 stale
+    # 只有独立入口 `ats_rog_map.launch.py`（planning_params_file）加载这份文件；
+    # 实车与 MuJoCo 正式入口用 node_params.yaml 的同名段。文件级默认取实车值
+    # false：投影快照的 deadline、心跳 10 Hz 与 0.5 s steady-clock 租约都以挂钟为基准，默认 true 会在覆盖失效时把 stale
     # 判据整体失真。仿真侧由 launch 的 use_sim_time 参数负责置 true。
     use_sim_time: false
-    projection_service: /rog_map/get_ground_projection
     # The 100 x 100 x 7 numerical projection takes 0.9--3.2 s in the
     # MuJoCo CPU profile. Do not queue another request while its immutable
     # snapshot is still being built; ROGMap's 2.0 s source-health gate

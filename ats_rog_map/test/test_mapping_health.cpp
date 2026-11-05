@@ -4,11 +4,11 @@
 #include <gtest/gtest.h>
 #include <limits>
 
-#include "ats_rog_map_adapter/mapping_health.hpp"
+#include "ats_rog_map/planning/mapping_health.hpp"
 
 TEST(MappingHealth, RejectsUnknownOrStaleFrontend)
 {
-  using ats_rog_map_adapter::mappingInputHealthy;
+  using ats_rog_map::planning::mappingInputHealthy;
   EXPECT_FALSE(mappingInputHealthy(0, 1, 0.1, 0.1, 1.0));
   EXPECT_FALSE(mappingInputHealthy(1, 0, 0.1, 0.1, 1.0));
   EXPECT_FALSE(mappingInputHealthy(1, 1, 0.8, 0.3, 1.0));
@@ -19,7 +19,7 @@ TEST(MappingHealth, RejectsUnknownOrStaleFrontend)
 
 TEST(MappingHealth, ProjectionMustBelongToCurrentFrontendEpoch)
 {
-  using ats_rog_map_adapter::projectionIdentityMatches;
+  using ats_rog_map::planning::projectionIdentityMatches;
   EXPECT_TRUE(projectionIdentityMatches(10, 2, 10, 2));
   EXPECT_FALSE(projectionIdentityMatches(10, 2, 10, 1));
   EXPECT_FALSE(projectionIdentityMatches(20, 3, 10, 2));

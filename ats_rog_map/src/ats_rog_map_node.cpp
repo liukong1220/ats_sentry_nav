@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,7 +27,8 @@
 #include "ats_rog_map/rog_map_engine.hpp"
 #include "ats_rog_map/test_fault_authorization.hpp"
 #include "ats_rog_map/unknown_projection_audit.hpp"
-#include "ats_rog_map_interfaces/srv/get_rog_map_projection.hpp"
+#include "ats_rog_map/ground_projection.hpp"
+#include "ats_rog_map/planning/planning_map_publisher.hpp"
 #include "ats_rog_map_interfaces/srv/save_odom_map.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
@@ -205,6 +207,12 @@ public:
       1, static_cast<int>(declare_parameter<int>("debug_qos_depth", 1)));
     input_qos_reliable_ = declare_parameter<bool>("input_qos_reliable", false);
     debug_qos_reliable_ = declare_parameter<bool>("debug_qos_reliable", false);
+    // rog_map: this process also runs the planning-map owner (ats_rog_map_adapter).
+    // rc_esdf: it does not, so a different owner can publish the planning grid.
+    planning_grid_owner_ = declare_parameter<std::string>("planning_grid_owner", "rog_map");
+    if (planning_grid_owner_ != "rog_map" && planning_grid_owner_ != "rc_esdf") {
+      throw std::invalid_argument("planning_grid_owner must be 'rog_map' or 'rc_esdf'");
+    }
     // Startup-only authorization gate.  It is latched once here and never
     // re-read, so no live client can raise it.  Default false keeps nominal,
     // real-vehicle and default-launch runs from ever clearing the map.
@@ -285,8 +293,6 @@ public:
 
     odom_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     cloud_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    projection_callback_group_ =
-      create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     health_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     debug_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
@@ -313,12 +319,6 @@ public:
     stale_pub_ = create_publisher<std_msgs::msg::Bool>("rog_map/stale", rclcpp::QoS(1).reliable());
     layer_updated_pub_ = create_publisher<std_msgs::msg::UInt64>(
       "rog_map/odom_layer_updated", rclcpp::QoS(1).reliable());
-    projection_service_ = create_service<ats_rog_map_interfaces::srv::GetRogMapProjection>(
-      "rog_map/get_ground_projection",
-      std::bind(
-        &AtsRogMapNode::getGroundProjection, this, std::placeholders::_1,
-        std::placeholders::_2),
-      rmw_qos_profile_services_default, projection_callback_group_);
     save_service_ = create_service<ats_rog_map_interfaces::srv::SaveOdomMap>(
       "rog_map/save_map", std::bind(&AtsRogMapNode::saveMap, this,
         std::placeholders::_1, std::placeholders::_2));
@@ -744,7 +744,7 @@ private:
   }
 
   void getOdomLayerProjection(
-    float requested_resolution, ats_rog_map_interfaces::srv::GetRogMapProjection::Response & response)
+    float requested_resolution, GroundProjection & response)
   {
     const auto trace_begin = std::chrono::steady_clock::now();
     // epoch_mutex_ fences the map generation and the layer commit together.
@@ -1205,10 +1205,15 @@ private:
     return health;
   }
 
-  void getGroundProjection(
-    const std::shared_ptr<ats_rog_map_interfaces::srv::GetRogMapProjection::Request> request,
-    std::shared_ptr<ats_rog_map_interfaces::srv::GetRogMapProjection::Response> response)
+public:
+  /// Computes one ground projection for the in-process planning publisher.
+  /// Calls must not overlap; the publisher runs them on one worker thread.
+  bool ownsPlanningGrid() const {return planning_grid_owner_ == "rog_map";}
+
+  void getGroundProjection(const GroundProjectionRequest & request_in, GroundProjection & response_out)
   {
+    const GroundProjectionRequest * const request = &request_in;
+    GroundProjection * const response = &response_out;
     const auto trace_begin = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
     const auto trace_epoch = std::chrono::steady_clock::now();
@@ -1500,6 +1505,7 @@ private:
     }
   }
 
+private:
   std::string map_frame_;
   std::string base_frame_;
   std::string sensor_frame_;
@@ -1522,6 +1528,7 @@ private:
   bool debug_qos_reliable_{false};
   bool test_reset_to_unknown_active_{false};
   bool test_fault_injection_enabled_{false};
+  std::string planning_grid_owner_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
     test_fault_parameter_callback_;
 
@@ -1558,7 +1565,6 @@ private:
 
   rclcpp::CallbackGroup::SharedPtr odom_callback_group_;
   rclcpp::CallbackGroup::SharedPtr cloud_callback_group_;
-  rclcpp::CallbackGroup::SharedPtr projection_callback_group_;
   rclcpp::CallbackGroup::SharedPtr health_callback_group_;
   rclcpp::CallbackGroup::SharedPtr debug_callback_group_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -1575,7 +1581,6 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr bounds_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stale_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr layer_updated_pub_;
-  rclcpp::Service<ats_rog_map_interfaces::srv::GetRogMapProjection>::SharedPtr projection_service_;
   rclcpp::Service<ats_rog_map_interfaces::srv::SaveOdomMap>::SharedPtr save_service_;
   rclcpp::TimerBase::SharedPtr health_timer_;
   rclcpp::TimerBase::SharedPtr cloud_pending_timer_;
@@ -1588,9 +1593,28 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<ats_rog_map::AtsRogMapNode>();
+  // The planning-map owner lives in this process and calls the projection
+  // directly; there is no projection service. Its node name is pinned locally so
+  // a launch-level `__node` remap for this executable cannot rename it as well.
+  rclcpp::NodeOptions planning_options;
+  planning_options.arguments({"--ros-args", "-r", "__node:=ats_rog_map_adapter"});
+  ats_rog_map::AtsRogMapNode * const map_node = node.get();
+  std::shared_ptr<rclcpp::Node> planning_node;
+  if (node->ownsPlanningGrid()) {
+    planning_node = ats_rog_map::planning::makePlanningMapPublisher(
+      [map_node](const ats_rog_map::GroundProjectionRequest & request,
+      ats_rog_map::GroundProjection & response) {
+        map_node->getGroundProjection(request, response);
+      }, planning_options);
+  }
   rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4U);
   executor.add_node(node);
+  if (planning_node) {
+    executor.add_node(planning_node);
+  }
   executor.spin();
+  // Stop the projection worker before the map node it calls is destroyed.
+  planning_node.reset();
   rclcpp::shutdown();
   return 0;
 }

@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-#include "ats_rog_map_adapter/planning_map_snapshot.hpp"
+#include "ats_rog_map/planning/planning_map_snapshot.hpp"
 #include "gtest/gtest.h"
 
 namespace
@@ -33,7 +33,7 @@ TEST(PlanningMapSnapshot, PreservesIdentityAndCarriesUnknownAsBlockedDistance)
 {
   const auto grid = makeGrid();
   const std::vector<double> signed_distance = {1.0, -0.5, -0.5, 2.0};
-  const auto snapshot = ats_rog_map_adapter::makePlanningMapSnapshot(
+  const auto snapshot = ats_rog_map::planning::makePlanningMapSnapshot(
     grid, signed_distance, stamp(), 9U, 17U, 23U, true, 50);
 
   EXPECT_TRUE(snapshot.ready);
@@ -55,17 +55,17 @@ TEST(PlanningMapSnapshot, RejectsInconsistentOrNonFiniteSignedDistance)
 {
   const auto grid = makeGrid();
   // occupied cell with positive distance
-  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+  EXPECT_FALSE(ats_rog_map::planning::makePlanningMapSnapshot(
       grid, std::vector<double>{1.0, 0.5, -0.5, 2.0}, stamp(), 1U, 2U, 3U, true, 50).ready);
   // unknown cell treated as obstacle but given positive distance
-  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+  EXPECT_FALSE(ats_rog_map::planning::makePlanningMapSnapshot(
       grid, std::vector<double>{1.0, -0.5, 0.5, 2.0}, stamp(), 1U, 2U, 3U, true, 50).ready);
   // NaN anywhere
-  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+  EXPECT_FALSE(ats_rog_map::planning::makePlanningMapSnapshot(
       grid, std::vector<double>{1.0, -0.5, std::numeric_limits<double>::quiet_NaN(), 2.0},
       stamp(), 1U, 2U, 3U, true, 50).ready);
   // unknown is free when unknown_is_obstacle is false
-  EXPECT_TRUE(ats_rog_map_adapter::makePlanningMapSnapshot(
+  EXPECT_TRUE(ats_rog_map::planning::makePlanningMapSnapshot(
       grid, std::vector<double>{1.0, -0.5, 0.5, 2.0}, stamp(), 1U, 2U, 3U, false, 50).ready);
 }
 
@@ -76,7 +76,7 @@ TEST(PlanningMapSnapshot, RotatesLocalGradientIntoWorldFrame)
   const double yaw = 0.5 * pi;
   grid.info.origin.orientation.z = std::sin(0.5 * yaw);
   grid.info.origin.orientation.w = std::cos(0.5 * yaw);
-  const auto snapshot = ats_rog_map_adapter::makePlanningMapSnapshot(
+  const auto snapshot = ats_rog_map::planning::makePlanningMapSnapshot(
     grid, std::vector<double>{0.0, -1.0, 0.0, 1.0}, stamp(), 1U, 2U, 3U, true, 50);
 
   ASSERT_TRUE(snapshot.ready);
@@ -86,7 +86,7 @@ TEST(PlanningMapSnapshot, RotatesLocalGradientIntoWorldFrame)
 
 TEST(PlanningMapSnapshot, UnavailableSnapshotNeverClaimsReady)
 {
-  const auto snapshot = ats_rog_map_adapter::makeUnavailablePlanningMapSnapshot(
+  const auto snapshot = ats_rog_map::planning::makeUnavailablePlanningMapSnapshot(
     makeGrid(), stamp(), 4U, 5U, 6U, true, 50);
   EXPECT_FALSE(snapshot.ready);
   EXPECT_TRUE(snapshot.occupancy.empty());
@@ -98,7 +98,7 @@ TEST(PlanningMapSnapshot, BlockedUnavailableSnapshotRetainsUnknownAuditPayload)
 {
   auto grid = makeGrid();
   grid.data.assign(grid.data.size(), -1);
-  const auto snapshot = ats_rog_map_adapter::makeBlockedUnavailablePlanningMapSnapshot(
+  const auto snapshot = ats_rog_map::planning::makeBlockedUnavailablePlanningMapSnapshot(
     grid, stamp(), 4U, 5U, 6U, true, 50);
 
   EXPECT_FALSE(snapshot.ready);

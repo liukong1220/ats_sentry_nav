@@ -62,11 +62,26 @@ ament_target_dependencies(${PROJECT_NAME}_core PUBLIC
   geometry_msgs nav_msgs pcl_conversions rclcpp sensor_msgs std_msgs tf2 tf2_geometry_msgs tf2_ros
 )
 
-add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
-target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core)
-ament_target_dependencies(ats_rog_map_node ats_rog_map_interfaces ats_navigation_interfaces ats_rc_esdf visualization_msgs)
+# Planning-map owner (formerly the ats_rog_map_adapter package): fusion of the
+# in-process ROGMap projection with static/terrain/slope layers.
+add_library(${PROJECT_NAME}_planning
+  src/planning/ground_projection_fusion.cpp
+  src/planning/planning_map_publisher.cpp
+)
+target_include_directories(${PROJECT_NAME}_planning PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(${PROJECT_NAME}_planning PUBLIC
+  ats_navigation_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs std_msgs tf2
+  tf2_geometry_msgs tf2_ros ats_rc_esdf
+)
 
-install(TARGETS ${PROJECT_NAME}_core ats_rog_map_node
+add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
+target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core ${PROJECT_NAME}_planning)
+ament_target_dependencies(ats_rog_map_node ats_rog_map_interfaces ats_navigation_interfaces ats_rc_esdf visualization_msgs tf2_ros)
+
+install(TARGETS ${PROJECT_NAME}_core ${PROJECT_NAME}_planning ats_rog_map_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -91,7 +106,6 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_save_map_service test/test_save_map_service.py TIMEOUT 60)
   ament_add_pytest_test(test_odom_epoch_route test/test_odom_epoch_route.py TIMEOUT 60)
   ament_add_pytest_test(test_odom_layer_projection test/test_odom_layer_projection.py TIMEOUT 60)
-  ament_add_pytest_test(test_mapping_projection_rate test/test_mapping_projection_rate.py TIMEOUT 30)
   ament_add_pytest_test(test_cloud_tf_wait test/test_cloud_tf_wait.py TIMEOUT 45)
   ament_add_gtest(test_split_robot_sensor_pose test/test_split_robot_sensor_pose.cpp)
   target_link_libraries(test_split_robot_sensor_pose ${PROJECT_NAME}_core)
@@ -126,9 +140,21 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_point_cloud_input test/test_point_cloud_input.cpp)
   target_link_libraries(test_point_cloud_input ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_mapping_health test/test_mapping_health.cpp)
+  target_include_directories(test_mapping_health PRIVATE include)
+  ament_add_gtest(test_ground_projection_fusion test/test_ground_projection_fusion.cpp)
+  target_link_libraries(test_ground_projection_fusion ${PROJECT_NAME}_planning)
+  ament_add_gtest(test_source_unknown_fixture test/test_source_unknown_fixture.cpp)
+  target_link_libraries(test_source_unknown_fixture ${PROJECT_NAME}_planning)
+  ament_add_gtest(test_planning_map_snapshot test/test_planning_map_snapshot.cpp)
+  target_include_directories(test_planning_map_snapshot PRIVATE include)
+  ament_target_dependencies(test_planning_map_snapshot ats_navigation_interfaces nav_msgs)
+  ament_add_gtest(test_planning_publisher_rate test/test_planning_publisher_rate.cpp TIMEOUT 60)
+  target_link_libraries(test_planning_publisher_rate ${PROJECT_NAME}_planning)
 endif()
 
 ament_export_include_directories(include)
-ament_export_libraries(${PROJECT_NAME}_core)
-ament_export_dependencies(Eigen3)
+ament_export_libraries(${PROJECT_NAME}_core ${PROJECT_NAME}_planning)
+ament_export_dependencies(Eigen3 nav_msgs ats_rc_esdf)
 ament_package()

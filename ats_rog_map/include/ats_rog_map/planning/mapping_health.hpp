@@ -1,13 +1,13 @@
 // Copyright 2026
 // Licensed under the Apache License, Version 2.0.
 
-#ifndef ATS_ROG_MAP_ADAPTER__MAPPING_HEALTH_HPP_
-#define ATS_ROG_MAP_ADAPTER__MAPPING_HEALTH_HPP_
+#ifndef ATS_ROG_MAP__PLANNING__MAPPING_HEALTH_HPP_
+#define ATS_ROG_MAP__PLANNING__MAPPING_HEALTH_HPP_
 
 #include <cmath>
 #include <cstdint>
 
-namespace ats_rog_map_adapter
+namespace ats_rog_map::planning
 {
 
 inline bool projectionIdentityMatches(
@@ -27,6 +27,6 @@ inline bool mappingInputHealthy(
          odom_silence + status_age <= timeout;
 }
 
-}  // namespace ats_rog_map_adapter
+}  // namespace ats_rog_map::planning
 
-#endif  // ATS_ROG_MAP_ADAPTER__MAPPING_HEALTH_HPP_
+#endif  // ATS_ROG_MAP__PLANNING__MAPPING_HEALTH_HPP_
