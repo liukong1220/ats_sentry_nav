@@ -218,6 +218,7 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("emergency_stop_topic", emergency_stop_topic_);
   declare_parameter<double>("map_ready_timeout_sec", map_ready_timeout_sec_);
   declare_parameter<std::int64_t>("log_throttle_ms", static_cast<std::int64_t>(log_throttle_ms_));
+  map_commit_trace_enabled_ = declare_parameter<bool>("map_commit_trace_enabled", false);
   declare_parameter<double>(
     "emergency_stop_heartbeat_period_sec", emergency_stop_heartbeat_period_sec_);
   declare_parameter<double>("runtime_safety_recheck_hz", runtime_safety_recheck_hz_);
@@ -944,6 +945,8 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
 
 void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 {
+  const auto received_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
   std::uint64_t candidate_generation = 0;
   std::uint64_t candidate_health_epoch = 0;
   {
@@ -1047,6 +1050,15 @@ void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
       }
       publishEmergencyStop(safety_state_.emergencyStopRequired());
     }
+  }
+  if (map_commit_trace_enabled_) {
+    const auto committed_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+    RCLCPP_INFO(get_logger(),
+      "S3 map_commit stamp_ns=%lld received_steady_ns=%lld committed_steady_ns=%lld digest=%s",
+      static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()),
+      static_cast<long long>(received_steady_ns), static_cast<long long>(committed_steady_ns),
+      snapshot->safety_content_digest.c_str());
   }
   if (retain_candidate && !retained_reference && !retained_identical_snapshot) {
     RCLCPP_WARN_THROTTLE(
@@ -2552,6 +2564,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     invalidateMapLocked();
   }
   const bool publish = heartbeat_fresh && snapshot && latest_map_snapshot_ &&
+    safety_reference.header.frame_id == snapshot->grid.header.frame_id &&
     safety_state_.mapSnapshotUsable(snapshot->generation) &&
     map_health_epoch == map_health_epoch_ &&
     snapshot->generation == latest_map_snapshot_->generation;

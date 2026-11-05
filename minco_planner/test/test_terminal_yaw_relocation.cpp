@@ -469,6 +469,18 @@ TEST(TerminalYawRelocation, RelocationClearsTheTerminalRotationCollision)
   EXPECT_NEAR(candidate.points.back().yaw, 0.0, 1e-9);
 }
 
+TEST(TerminalYawRelocation, PreservesTheInputFrameAndObservationStamp)
+{
+  const auto params = makeParams();
+  auto trajectory = makeGoalEightAnalogue(params);
+  trajectory.header.frame_id = "odom";
+  trajectory.header.stamp.sec = 42;
+  trajectory.header.stamp.nanosec = 123456789U;
+  ReferenceTrajectory candidate;
+  ASSERT_TRUE(relocateTerminalYawRotation(trajectory, 0.0, 0U, params, &candidate));
+  EXPECT_EQ(candidate.header, trajectory.header);
+}
+
 TEST(TerminalYawRelocation, StatusQuoCandidateStillFailsTheSameGate)
 {
   // 同一门禁下,候选族最晚的那个(等价于现状)必须仍然不安全。否则这个用例

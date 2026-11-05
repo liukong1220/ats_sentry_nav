@@ -60,7 +60,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_planning_snapshot_safety test/test_planning_snapshot_safety.cpp)
   target_include_directories(test_planning_snapshot_safety PRIVATE include)
-  ament_target_dependencies(test_planning_snapshot_safety ats_navigation_interfaces geometry_msgs)
+  ament_target_dependencies(test_planning_snapshot_safety ats_navigation_interfaces geometry_msgs nav_msgs)
 
   ament_add_pytest_test(test_goal_manager_epoch test/test_goal_manager_epoch.py
     TIMEOUT 40
@@ -68,6 +68,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_goal_manager_replacement test/test_goal_manager_replacement.py
     TIMEOUT 40
   )
+  ament_add_pytest_test(test_goal_manager_mapping test/test_goal_manager_mapping.py TIMEOUT 40)
+  ament_add_pytest_test(test_goal_manager_retarget test/test_goal_manager_retarget.py TIMEOUT 40)
+  ament_add_pytest_test(test_goal_manager_fast_maps test/test_goal_manager_fast_maps.py TIMEOUT 40)
 endif()
 
 ament_package()

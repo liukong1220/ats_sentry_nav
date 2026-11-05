@@ -149,6 +149,7 @@ bool relocateTerminalYawRotation(
   }
 
   ReferenceTrajectory result;
+  result.header = input.header;
   result.points.reserve(input.points.size());
   for (std::size_t index = 0U; index <= rotation_index; ++index) {
     result.points.push_back(input.points[index]);

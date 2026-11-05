@@ -326,6 +326,34 @@ TEST_F(OnGridBranchTest, RetainsReferenceWhenRemainingSegmentStaysSafe)
   EXPECT_FALSE(node_->replan_advised_reference_stamp_.has_value()) << "no advisory when fully safe";
 }
 
+TEST_F(OnGridBranchTest, RetainsRelocatedYawReferenceAcrossHarmlessMapUpdates)
+{
+  ASSERT_NO_FATAL_FAILURE(startAndCommit(/*retain=*/true, /*advisory=*/true));
+  minco_planner::ReferenceTrajectory relocated;
+  ASSERT_TRUE(minco_planner::relocateTerminalYawRotation(
+      committed_.trajectory, 0.2, 0U, {}, &relocated));
+  ASSERT_TRUE(node_->remainingReferenceSafeOn(relocated, arenaWithSideBlock()));
+  node_->active_safety_reference_->trajectory = relocated;
+  committed_ = *node_->active_safety_reference_;
+
+  feed(arenaWithSideBlock());
+
+  ASSERT_NO_FATAL_FAILURE(expectRetained(2));
+}
+
+TEST_F(OnGridBranchTest, RejectsSafetyReferenceWithMissingOrDifferentGridFrame)
+{
+  ASSERT_NO_FATAL_FAILURE(startAndCommit(/*retain=*/true, /*advisory=*/true));
+  for (const std::string & frame : {std::string(), std::string("other_frame")}) {
+    auto reference = committed_.trajectory;
+    reference.header.frame_id = frame;
+    EXPECT_FALSE(node_->publishReferenceIfCurrent(
+        node_->latest_map_snapshot_, node_->map_health_epoch_, node_->toPath(reference),
+        reference, kGoalId, 1, 2, 1, PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW, false));
+    EXPECT_TRUE(node_->safety_state_.emergencyStopRequired());
+  }
+}
+
 // advise: obstacle only on the far part of the reference, runtime window still safe.
 TEST_F(OnGridBranchTest, AdvisesReplanWhenOnlyFarSegmentConflicts)
 {

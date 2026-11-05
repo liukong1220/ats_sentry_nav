@@ -11,6 +11,7 @@
 
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "geometry_msgs/msg/pose.hpp"
+#include "nav_msgs/msg/path.hpp"
 
 namespace ats_goal_manager
 {
@@ -170,6 +171,119 @@ inline PlanningSnapshotSafetyResult checkPlanningSnapshotFootprint(
   }
   result.footprint_safe = true;
   return result;
+}
+
+// Commit-time revalidation on a newer immutable map. Check the whole rectangle
+// against every overlapping cell, then interpolate sparse path samples so a
+// new obstacle between candidate poses cannot escape the check. Unknown and
+// outside-map remain forbidden even in mapping mode. This is an extra gate;
+// it does not replace MINCO's original clearance/footprint validation.
+inline bool planningSnapshotReferenceSafe(
+  const ats_navigation_interfaces::msg::PlanningMapSnapshot & snapshot,
+  const nav_msgs::msg::Path & path,
+  const PlanningSnapshotSafetyParams & params)
+{
+  if (!validPlanningSnapshot(snapshot) || path.poses.size() < 2U ||
+    path.header.frame_id != snapshot.header.frame_id ||
+    !std::isfinite(params.footprint_length) || !std::isfinite(params.footprint_width) ||
+    !std::isfinite(params.footprint_safety_margin) || params.footprint_length < 0.0 ||
+    params.footprint_width < 0.0 || params.footprint_safety_margin < 0.0)
+  {
+    return false;
+  }
+  const auto yawOf = [](const auto & q) {
+      return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+               1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    };
+  const double resolution = snapshot.info.resolution;
+  const double half_x = (0.5 * params.footprint_length + params.footprint_safety_margin) /
+    resolution;
+  const double half_y = (0.5 * params.footprint_width + params.footprint_safety_margin) /
+    resolution;
+  const auto & origin = snapshot.info.origin;
+  const double origin_yaw = yawOf(origin.orientation);
+  const double co = std::cos(origin_yaw);
+  const double so = std::sin(origin_yaw);
+  const auto freeRectangle = [&](double x, double y, double yaw) {
+      const double dx = x - origin.position.x;
+      const double dy = y - origin.position.y;
+      const double cx = (co * dx + so * dy) / resolution;
+      const double cy = (-so * dx + co * dy) / resolution;
+      const double c = std::cos(yaw - origin_yaw);
+      const double s = std::sin(yaw - origin_yaw);
+      const double ac = std::abs(c);
+      const double as = std::abs(s);
+      const double extent_x = ac * half_x + as * half_y;
+      const double extent_y = as * half_x + ac * half_y;
+      if (cx - extent_x < 0.0 || cy - extent_y < 0.0 ||
+        cx + extent_x >= snapshot.info.width || cy + extent_y >= snapshot.info.height)
+      {
+        return false;
+      }
+      for (int iy = static_cast<int>(std::floor(cy - extent_y));
+        iy <= static_cast<int>(std::floor(cy + extent_y)); ++iy)
+      {
+        for (int ix = static_cast<int>(std::floor(cx - extent_x));
+          ix <= static_cast<int>(std::floor(cx + extent_x)); ++ix)
+        {
+          const double cell_dx = ix + 0.5 - cx;
+          const double cell_dy = iy + 0.5 - cy;
+          // Separating axes of the oriented footprint and the axis-aligned cell.
+          if (std::abs(c * cell_dx + s * cell_dy) > half_x + 0.5 * (ac + as) ||
+            std::abs(-s * cell_dx + c * cell_dy) > half_y + 0.5 * (ac + as))
+          {
+            continue;
+          }
+          if (!snapshotCellFree(snapshot, ix, iy)) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+  double previous_x = 0.0;
+  double previous_y = 0.0;
+  double previous_yaw = 0.0;
+  bool first = true;
+  for (const auto & stamped : path.poses) {
+    const auto & p = stamped.pose;
+    const auto & q = p.orientation;
+    const double norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if ((!stamped.header.frame_id.empty() && stamped.header.frame_id != path.header.frame_id) ||
+      !std::isfinite(p.position.x) || !std::isfinite(p.position.y) ||
+      !std::isfinite(norm) || std::abs(norm - 1.0) > 1e-3)
+    {
+      return false;
+    }
+    const double yaw = yawOf(q);
+    if (!freeRectangle(p.position.x, p.position.y, yaw)) {
+      return false;
+    }
+    if (!first) {
+      const double yaw_delta = std::atan2(
+        std::sin(yaw - previous_yaw), std::cos(yaw - previous_yaw));
+      const double travel = std::hypot(p.position.x - previous_x, p.position.y - previous_y) +
+        resolution * std::hypot(half_x, half_y) * std::abs(yaw_delta);
+      const double intervals = std::ceil(travel / (0.5 * resolution));
+      if (!std::isfinite(intervals) || intervals > 1000000.0) {
+        return false;
+      }
+      const int steps = std::max(1, static_cast<int>(intervals));
+      for (int i = 1; i < steps; ++i) {
+        const double t = static_cast<double>(i) / steps;
+        if (!freeRectangle(previous_x + t * (p.position.x - previous_x),
+          previous_y + t * (p.position.y - previous_y), previous_yaw + t * yaw_delta))
+        {
+          return false;
+        }
+      }
+    }
+    previous_x = p.position.x;
+    previous_y = p.position.y;
+    previous_yaw = yaw;
+    first = false;
+  }
+  return true;
 }
 
 // 擦边接触判定，与 minco_planner escapePrefixContactShallow 同一口径：足迹每边内缩

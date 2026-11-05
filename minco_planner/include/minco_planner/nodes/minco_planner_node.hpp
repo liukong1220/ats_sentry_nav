@@ -185,6 +185,7 @@ private:
   double map_ready_timeout_sec_ = 3.0;
   // 运行日志默认每 2 s 最多输出一次；结构化关键字仍保留，便于回归脚本解析。
   std::uint64_t log_throttle_ms_{2000};
+  bool map_commit_trace_enabled_{false};
   double emergency_stop_heartbeat_period_sec_ = 0.1;
   double runtime_safety_recheck_hz_ = 10.0;
   double runtime_safety_horizon_sec_ = 1.0;

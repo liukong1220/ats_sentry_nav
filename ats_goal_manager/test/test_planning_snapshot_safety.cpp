@@ -46,6 +46,59 @@ TEST(PlanningSnapshotSafety, RequiresCompleteNumericSnapshot)
   EXPECT_FALSE(ats_goal_manager::validPlanningSnapshot(snapshot));
 }
 
+TEST(PlanningSnapshotSafety, ReferenceRecheckIncludesSparseSegmentsAndUnknown)
+{
+  auto snapshot = makeSnapshot();
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "odom";
+  geometry_msgs::msg::PoseStamped sample;
+  sample.pose = poseAt(1.5, 3.5);
+  path.poses.push_back(sample);
+  sample.pose = poseAt(6.5, 3.5);
+  path.poses.push_back(sample);
+  ats_goal_manager::PlanningSnapshotSafetyParams params;
+  EXPECT_TRUE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  const auto middle = 3U * snapshot.info.width + 4U;
+  snapshot.occupancy[middle] = 100;
+  snapshot.signed_distance_m[middle] = -1.0F;
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  snapshot.occupancy[middle] = -1;
+  snapshot.signed_distance_m[middle] = std::numeric_limits<float>::quiet_NaN();
+  snapshot.gradient_x[middle] = snapshot.gradient_y[middle] =
+    std::numeric_limits<float>::quiet_NaN();
+  snapshot.unknown_is_obstacle = false;
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+}
+
+TEST(PlanningSnapshotSafety, ReferenceRecheckRejectsFrameQuaternionBoundaryAndRotation)
+{
+  auto snapshot = makeSnapshot();
+  nav_msgs::msg::Path path;
+  path.header.frame_id = "odom";
+  geometry_msgs::msg::PoseStamped sample;
+  sample.pose = poseAt(3.5, 3.5);
+  path.poses.assign(2, sample);
+  const auto params = ats_goal_manager::PlanningSnapshotSafetyParams{};
+  EXPECT_TRUE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  path.header.frame_id = "map";
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  path.header.frame_id = "odom";
+  path.poses.back().pose.orientation.w = 0.0;
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  path.poses.back().pose = poseAt(-0.1, 3.5);
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
+  // A long rectangle swings over an occupied cell between two free end yaws.
+  auto wide = params;
+  wide.footprint_length = 2.8;
+  wide.footprint_width = 0.1;
+  wide.footprint_safety_margin = 0.0;
+  path.poses.front().pose = poseAt(3.5, 3.5, 0.0);
+  path.poses.back().pose = poseAt(3.5, 3.5, 1.5707963267948966);
+  snapshot.occupancy[4U * 8U + 4U] = 100;
+  snapshot.signed_distance_m[4U * 8U + 4U] = -1.0F;
+  EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, wide));
+}
+
 TEST(PlanningSnapshotSafety, RejectsOutsideUnknownAndOccupiedRobotCells)
 {
   const auto params = ats_goal_manager::PlanningSnapshotSafetyParams{};

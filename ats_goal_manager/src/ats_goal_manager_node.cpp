@@ -242,6 +242,9 @@ private:
     std::uint64_t wait_for_publication_after{0};
     // 当前已下发执行的参考对应的规划请求序号。
     std::uint64_t committed_plan_request_sequence{0};
+    // Keep the requested target separate from MINCO's relocated endpoint.
+    std::optional<geometry_msgs::msg::PoseStamped> requested_planning_target{std::nullopt};
+    std::optional<geometry_msgs::msg::PoseStamped> committed_planning_target{std::nullopt};
     // 无停车重规划进行中：旧参考继续执行，expected_plan_request_sequence 指向新请求。
     bool replacement_pending{false};
   };
@@ -284,6 +287,11 @@ private:
         0.1, declare_parameter<double>("localization_status_timeout_sec", 1.0));
     require_localization_status_ =
         declare_parameter<bool>("require_localization_status", false);
+    require_accepted_localization_ = declare_parameter<bool>("require_accepted_localization", false);
+    planner_start_in_planning_frame_ = declare_parameter<bool>("planner_start_in_planning_frame", false);
+    retarget_threshold_ = std::max(0.0, declare_parameter<double>("retarget_threshold", 0.03));
+    map_transform_timeout_sec_ = std::max(0.1,
+      declare_parameter<double>("map_transform_timeout_sec", 1.0));
     require_map_status_ = declare_parameter<bool>("require_map_status", true);
     require_gimbal_status_ = declare_parameter<bool>("require_gimbal_status", true);
     gimbal_status_timeout_sec_ = std::max(
@@ -526,13 +534,20 @@ private:
         required_snapshot_sequence : map_status_publication_sequence_;
       request.plan_request_sequence = ++active_goal_->next_plan_request_sequence;
       active_goal_->expected_plan_request_sequence = request.plan_request_sequence;
-      request.start_pose = current_pose_;
+      active_goal_->requested_planning_target = target;
+      request.start_pose = planner_start_in_planning_frame_ ? current_planning_pose_ : current_pose_;
       request.start_pose.header.stamp = current_localization_stamp_;
       request.start_twist.linear.x = current_world_vx_;
       request.start_twist.linear.y = current_world_vy_;
       request.start_twist.angular.z = current_world_wz_;
     }
     request.goal_pose = target;
+    RCLCPP_INFO(get_logger(),
+      "S3 goal dispatch goal=%llu epoch=%llu request=%llu map_tf_stamp_ns=%lld target=(%.3f,%.3f) frame=%s",
+      static_cast<unsigned long long>(id), static_cast<unsigned long long>(localization_epoch),
+      static_cast<unsigned long long>(request.plan_request_sequence),
+      static_cast<long long>(rclcpp::Time(target.header.stamp).nanoseconds()),
+      target.pose.position.x, target.pose.position.y, planning_frame_.c_str());
     planner_goal_pub_->publish(request);
     return true;
   }
@@ -670,6 +685,23 @@ private:
     }
     if (message->state == PlannerStatus::STATE_ACCEPTED &&
         message->failure_reason != PlannerStatus::FAILURE_NONE) {
+      bool never_committed = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        never_committed = active_goal_ && !active_execution_command_ &&
+          active_goal_->id == message->goal_id &&
+          active_goal_->localization_epoch == message->localization_epoch &&
+          active_goal_->expected_plan_request_sequence == message->plan_request_sequence;
+      }
+      if (never_committed) {
+        // MINCO may still guard a candidate rejected by this final authority.
+        // Without an EXECUTE there is no old reference to keep driving; use
+        // the ordinary failure/recovery path instead of waiting indefinitely.
+        auto failed = std::make_shared<PlannerStatus>(*message);
+        failed->state = PlannerStatus::STATE_FAILED;
+        onPlannerStatus(failed);
+        return;
+      }
       // 无停车重规划的替换请求失败（规划器以 ACCEPTED 报告，旧参考仍受守护）：
       // 清除替换标记继续执行，等待下一次建议。
       std::lock_guard<std::mutex> lock(mutex_);
@@ -877,6 +909,8 @@ private:
       last_localization_status_signal_ = std::chrono::steady_clock::now();
       localization_status_ = message->state;
       localization_epoch_ = message->epoch;
+      has_accepted_localization_ = rclcpp::Time(message->last_observation_stamp).nanoseconds() > 0 &&
+        !message->odom_identity_latched;
       return;
     }
     bool stop_active = false;
@@ -889,7 +923,10 @@ private:
       last_localization_status_signal_ = std::chrono::steady_clock::now();
       localization_status_ = message->state;
       localization_epoch_ = message->epoch;
-      const bool healthy = localizationStateAllowsPlanning(message->state);
+      has_accepted_localization_ = rclcpp::Time(message->last_observation_stamp).nanoseconds() > 0 &&
+        !message->odom_identity_latched;
+      const bool healthy = localizationStateAllowsPlanning(message->state) &&
+        (!require_accepted_localization_ || has_accepted_localization_);
       if (active_goal_ && (!healthy || epoch_changed || !previously_healthy)) {
         candidate_reference_.reset();
         planner_ready_status_.reset();
@@ -958,7 +995,7 @@ private:
     geometry_msgs::msg::PoseStamped normalized;
     geometry_msgs::msg::PoseStamped planning_normalized;
     std::string reason;
-    if (!normalizePose(input, goal_frame_, normalized, reason, false) ||
+    if (!normalizePose(input, goal_frame_, normalized, reason) ||
       !normalizePose(input, planning_frame_, planning_normalized, reason, false)) {
       std::optional<std::uint64_t> suspend_goal_id;
       {
@@ -994,8 +1031,10 @@ private:
       rclcpp::Time(message->header.stamp).seconds(),
       planning_normalized.pose.position.x, planning_normalized.pose.position.y,
       tf2::getYaw(planning_normalized.pose.orientation));
-    current_world_vx_ = vx_body * std::cos(yaw) - vy_body * std::sin(yaw);
-    current_world_vy_ = vx_body * std::sin(yaw) + vy_body * std::cos(yaw);
+    const double start_yaw = planner_start_in_planning_frame_ ?
+      tf2::getYaw(planning_normalized.pose.orientation) : yaw;
+    current_world_vx_ = vx_body * std::cos(start_yaw) - vy_body * std::sin(start_yaw);
+    current_world_vy_ = vx_body * std::sin(start_yaw) + vy_body * std::cos(start_yaw);
     current_world_wz_ = wz;
     current_linear_velocity_ = std::hypot(vx_body, vy_body);
     current_angular_velocity_ = std::abs(wz);
@@ -1050,7 +1089,8 @@ private:
       // A candidate may see its immutable snapshot before the corresponding
       // status callback.  Wait for that status rather than treating the
       // half-pair as a failure.  Once a newer status is installed, an older
-      // candidate must never regain authority over the latest map snapshot.
+      // candidate needs a complete footprint recheck on the latest immutable
+      // snapshot. Wait for the coherent latest status/snapshot pair first.
       if (active_goal_ && candidate_reference_ && planner_ready_status_ &&
           planner_ready_status_->goal_id == active_goal_->id &&
           planner_ready_status_->localization_epoch == active_goal_->localization_epoch &&
@@ -1059,7 +1099,10 @@ private:
           (planner_ready_status_->map_publication_sequence == 0U ||
            (map_status_publication_sequence_ != 0U &&
             planner_ready_status_->map_publication_sequence <
-              map_status_publication_sequence_))) {
+              map_status_publication_sequence_ &&
+            (!require_planning_snapshot_ || planningSnapshotUsableLocked(
+              map_status_publication_sequence_, active_goal_->localization_epoch)) &&
+            !candidateReferenceMapUsableLocked()))) {
         stale_candidate_goal = active_goal_->id;
         candidate_publication_sequence =
           planner_ready_status_->map_publication_sequence;
@@ -1115,12 +1158,7 @@ private:
         (localization_epoch_ &&
          planner_ready_status_->localization_epoch != *localization_epoch_) ||
         planner_ready_status_->map_publication_sequence == 0U ||
-        planner_ready_status_->map_publication_sequence !=
-          map_status_publication_sequence_ ||
-        (require_planning_snapshot_ &&
-         !planningSnapshotUsableLocked(
-           planner_ready_status_->map_publication_sequence,
-           planner_ready_status_->localization_epoch)) ||
+        !candidateReferenceMapUsableLocked() ||
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
@@ -1179,6 +1217,16 @@ private:
     // the final retimed reference and all version fields in one DDS sample;
     // the legacy Path/Bool topics below are diagnostics only.
     nav_msgs::msg::Path committed = *candidate_reference_;
+    if (planner_ready_status_->map_publication_sequence < map_status_publication_sequence_) {
+      RCLCPP_INFO(get_logger(),
+        "S3 candidate revalidated goal=%llu request=%llu planned_publication=%llu "
+        "validated_publication=%llu frame=%s",
+        static_cast<unsigned long long>(active_goal_->id),
+        static_cast<unsigned long long>(planner_ready_status_->plan_request_sequence),
+        static_cast<unsigned long long>(planner_ready_status_->map_publication_sequence),
+        static_cast<unsigned long long>(map_status_publication_sequence_),
+        committed.header.frame_id.c_str());
+    }
     rebasePathTimestamps(committed, now());
     ExecutionCommand command;
     command.header = committed.header;
@@ -1202,6 +1250,7 @@ private:
     active_goal_->recovering = false;
     active_goal_->wait_for_publication_after = 0;
     active_goal_->committed_plan_request_sequence = planner_ready_status_->plan_request_sequence;
+    active_goal_->committed_planning_target = active_goal_->requested_planning_target;
     if (replacing) {
       RCLCPP_INFO(
         get_logger(), "【无停车重规划】目标=%llu 新参考已替换（请求序号=%llu），全程未急停。",
@@ -1259,6 +1308,18 @@ private:
   }
 
   void onTick() {
+    std::optional<ActiveGoal> transform_goal;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      transform_goal = active_goal_;
+    }
+    geometry_msgs::msg::PoseStamped latest_target;
+    std::string transform_reason;
+    if (transform_goal && !normalizePose(transform_goal->target, planning_frame_, latest_target, transform_reason)) {
+      suspendActiveGoal("latest_goal_transform_unavailable", transform_goal->id);
+      return;
+    }
+    std::optional<PlannerStatus> endpoint_retarget;
     std::optional<ActiveGoal> snapshot;
     bool dispatch = false;
     bool cancel = false;
@@ -1390,14 +1451,13 @@ private:
           }
         }
         if (lifecycle_.state() == GoalLifecycleState::kTracking &&
-            has_current_pose_) {
-          distance = std::hypot(active_goal_->target.pose.position.x -
-                                    current_pose_.pose.position.x,
-                                active_goal_->target.pose.position.y -
-                                    current_pose_.pose.position.y);
+            has_current_pose_ && has_current_planning_pose_ && transform_goal &&
+            transform_goal->id == active_goal_->id) {
+          distance = std::hypot(latest_target.pose.position.x - current_planning_pose_.pose.position.x,
+            latest_target.pose.position.y - current_planning_pose_.pose.position.y);
           const double yaw_delta =
-              tf2::getYaw(active_goal_->target.pose.orientation) -
-              tf2::getYaw(current_pose_.pose.orientation);
+              tf2::getYaw(latest_target.pose.orientation) -
+              tf2::getYaw(current_planning_pose_.pose.orientation);
           const double yaw_error =
               std::abs(std::atan2(std::sin(yaw_delta), std::cos(yaw_delta)));
           const bool pose_converged = distance <= goal_position_tolerance_ &&
@@ -1435,6 +1495,27 @@ private:
           // replan storms stop inside the hold disk so tracking can finish
           // closing the last metres; SUCCEEDED still requires the success disk.
           const bool in_progress_hold = distance <= progress_hold_distance_m_;
+          if (replan_without_stop_enabled_ && active_execution_command_ && !fail_stop_ &&
+            !active_goal_->replacement_pending &&
+            active_goal_->committed_planning_target &&
+            active_execution_command_->reference.header.frame_id == planning_frame_ &&
+            !active_execution_command_->reference.poses.empty())
+          {
+            const auto & requested = active_goal_->committed_planning_target->pose.position;
+            const double drift = std::hypot(requested.x - latest_target.pose.position.x,
+              requested.y - latest_target.pose.position.y);
+            if (drift > retarget_threshold_) {
+              endpoint_retarget = PlannerStatus();
+              endpoint_retarget->goal_id = active_goal_->id;
+              endpoint_retarget->localization_epoch = active_goal_->localization_epoch;
+              endpoint_retarget->plan_request_sequence = active_goal_->committed_plan_request_sequence;
+              terminal_converged_since_.reset();
+              reached = false;
+              RCLCPP_INFO(get_logger(), "S3 endpoint retarget drift=%.4f threshold=%.4f goal=%llu map_tf_stamp_ns=%lld",
+                drift, retarget_threshold_, static_cast<unsigned long long>(active_goal_->id),
+                static_cast<long long>(rclcpp::Time(latest_target.header.stamp).nanoseconds()));
+            }
+          }
           if (pose_converged || in_progress_hold) {
             // 目标圈内没有"推进"可言，但也不是停滞：刷新停滞计时。看门狗只在圈外被调用，
             // 不刷新的话，车停在圈内、定位抖动让距离短暂越过圈沿时，会拿陈旧计时当场判停滞，
@@ -1637,6 +1718,9 @@ private:
       if (!publishPlannerGoal(snapshot->id, dispatch_epoch, snapshot->target)) {
         suspendActiveGoal("tick_dispatch_failed", snapshot->id, snapshot->waiting_since);
       }
+    }
+    if (endpoint_retarget && !progress_replan && !progress_suspend_goal_id && !gimbal_recovery_goal_id) {
+      onReplanAdvised(*endpoint_retarget);
     }
     if (progress_replan) {
       publishEmergencyStop(true);
@@ -1869,6 +1953,23 @@ private:
       planning_snapshot_timeout_sec_;
   }
 
+  bool candidateReferenceMapUsableLocked() const {
+    if (!planner_ready_status_ || !candidate_reference_ ||
+      planner_ready_status_->map_publication_sequence == 0U ||
+      planner_ready_status_->map_publication_sequence > map_status_publication_sequence_)
+    {
+      return false;
+    }
+    if (planner_ready_status_->map_publication_sequence == map_status_publication_sequence_) {
+      return !require_planning_snapshot_ || planningSnapshotUsableLocked(
+        map_status_publication_sequence_, planner_ready_status_->localization_epoch);
+    }
+    return require_planning_snapshot_ && planningSnapshotUsableLocked(
+      map_status_publication_sequence_, planner_ready_status_->localization_epoch) &&
+      planningSnapshotReferenceSafe(
+      *planning_snapshot_, *candidate_reference_, planning_snapshot_safety_params_);
+  }
+
   bool recoverySnapshotReadyLocked(const ActiveGoal & goal) const {
     if (goal.wait_for_publication_after == 0U) {
       return true;
@@ -1890,6 +1991,7 @@ private:
         secondsToDuration(localization_status_timeout_sec_);
     return lease_ok &&
            localizationStateAllowsPlanning(localization_status_) &&
+           (!require_accepted_localization_ || has_accepted_localization_) &&
            odom_tf_healthy_;
   }
 
@@ -1974,6 +2076,13 @@ private:
                                        target_frame, source.header.frame_id,
                                        rclcpp::Time(source.header.stamp),
                                        rclcpp::Duration::from_seconds(0.1));
+      if (use_latest_transform && rclcpp::Time(transform.header.stamp).nanoseconds() > 0) {
+        const double age = (now() - rclcpp::Time(transform.header.stamp)).seconds();
+        if (age > map_transform_timeout_sec_ || age < -0.2) {
+          reason = "latest goal transform is stale or future dated";
+          return false;
+        }
+      }
       tf2::doTransform(source, output, transform);
       output.header.frame_id = target_frame;
       return finitePose(output.pose);
@@ -2181,6 +2290,11 @@ private:
   double planning_snapshot_timeout_sec_{5.0};
   double gimbal_status_timeout_sec_{0.5};
   bool require_localization_status_{false};
+  bool require_accepted_localization_{false};
+  bool planner_start_in_planning_frame_{false};
+  bool has_accepted_localization_{false};
+  double retarget_threshold_{0.03};
+  double map_transform_timeout_sec_{1.0};
   bool require_map_status_{true};
   bool require_gimbal_status_{true};
   bool require_planning_snapshot_{false};
