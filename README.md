@@ -17,10 +17,9 @@ ROGMap 只做环境表示，不做定位；位姿来自 `/localization`。
 | `sensor_scan_generation` | 由 `/lidar_odometry` 和 `/registered_scan` 生成 `/odometry`、`/sensor_scan` 与相关 TF。 |
 | `small_gicp_relocalization` | `small_gicp_relocalization_node` 用先验 PCD 做 GICP 重定位；`localization_fusion_node` 融合出 `/localization`、`/localization/status` 和 `map -> odom`。small_gicp 头文件放在包内 `include/small_gicp`，不需要另装。 |
 | `terrain_analysis` / `terrain_analysis_ext` | 地形分析。`terrain_analysis_ext` 输出 `/traversability_grid` 等栅格，供 adapter 融合；`terrain_analysis` 默认不启动。 |
-| `ats_rog_map` | ROG-Map 封装：概率占据、膨胀、三维 ESDF，通过 `/rog_map/get_ground_projection` 服务提供数值地面投影。 |
-| `ats_rog_map_interfaces` | 上述 projection 服务的 schema（`GetRogMapProjection.srv`）。 |
-| `ats_rog_map_adapter` | 融合 ROGMap 地面投影、terrain 栅格和静态图，发布 `/rc_esdf/planning_grid` 与 `/rog_map_adapter/*` 状态。 |
-| `ats_rc_esdf` | 二维 signed distance、gradient、unknown 与静态图融合的算法库，被 `ats_rog_map_adapter` 和 `minco_planner` 依赖，没有自己的节点。 |
+| `ats_rog_map` | ROG-Map 封装：概率占据、膨胀、三维 ESDF。同一进程 `ats_rog_map_node` 里还运行规划地图所有者（节点名 `ats_rog_map_adapter`）：进程内调用地面投影，融合 terrain 栅格和静态图，发布 `/rc_esdf/planning_grid` 与 `/rog_map_adapter/*`。 |
+| `ats_rog_map_interfaces` | 显式保存地图服务的 schema（`SaveOdomMap.srv`）。 |
+| `ats_rc_esdf` | 二维 signed distance、gradient、unknown 与静态图融合的算法库，被 `ats_rog_map` 和 `minco_planner` 依赖，没有自己的节点。 |
 | `ats_goal_manager` | `/ats_navigate_to_pose` action server、目标状态机、候选参考的提交复核、急停与 `ExecutionCommand` 执行授权。 |
 | `minco_planner` | JPS/A* 图搜索、MINCO 轨迹优化、独立 yaw、矩形足迹门禁与局部修复，详见 [minco_planner/README.md](./minco_planner/README.md)。 |
 | `ats_swerve_mpc` | 全向 SE2 MPC（约束 iLQR），输出 `/cmd_vel/autonomy_raw`；OSQP LTV-QP 只有诊断用的 `qp_shadow` 模式，详见 [ats_swerve_mpc/README.md](./ats_swerve_mpc/README.md)。 |
@@ -47,9 +46,10 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
 定位   small_gicp_relocalization (/registered_scan + 先验 PCD) -> relocalization_observation
        localization_fusion (/odometry + observation) -> /localization, /localization/status, TF map -> odom
 
-地图   ats_rog_map (/localization + /registered_scan) -> 服务 /rog_map/get_ground_projection
-       terrain_analysis_ext (/lidar_odometry + /registered_scan) -> /traversability_grid 等
-       ats_rog_map_adapter (ROGMap 投影 + terrain 栅格 + /map 静态图，用 ats_rc_esdf)
+地图   terrain_analysis_ext (/lidar_odometry + /registered_scan) -> /traversability_grid 等
+       ats_rog_map_node 进程：
+         /ats_rog_map (/localization + /registered_scan) -> 进程内地面投影
+         /ats_rog_map_adapter (ROGMap 投影 + terrain 栅格 + /map 静态图，用 ats_rc_esdf)
          -> /rc_esdf/planning_grid, /rc_esdf/signed_distance_grid, /rog_map_adapter/{ready,status,planning_snapshot,generation}
 
 规划   /ats_navigate_to_pose -> ats_goal_manager -> /ats_goal_manager/planner_goal
@@ -68,7 +68,7 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
 - 速度变换两层各由一个 launch 开关控制，MPC 输出 topic 随之变化，见“启动入口”一节的速度链表。
 - 唯一权威：`/rc_esdf/planning_grid` 只由 adapter 发布，`/cmd_vel/selected` 只由 arbiter 发布。
 - 失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度；`/rog_map_adapter/ready` 是持续续租的 heartbeat，不是永久状态。
-- `ats_rog_map` 与 `ats_rog_map_adapter` 由根仓 `bringup.launch.py` 启动，不在本仓 `navigation_launch.py` 里。
+- `ats_rog_map_node`（含 `/ats_rog_map` 与 `/ats_rog_map_adapter` 两个节点）由根仓 `bringup.launch.py` 启动，不在本仓 `navigation_launch.py` 里。
 
 ## 构建
 
@@ -124,8 +124,8 @@ ros2 launch ats_sentry_bringup real_robot_navigation.launch.py \
 `launch_small_gicp_relocalization`、`launch_localization_fusion`、`launch_cmd_vel_arbiter`、`require_serial_link`、
 `mpc_cmd_vel_topic`、`fake_vel_output_topic`、`chassis_vel_input_topic`、`chassis_vel_output_topic`、
 `launch_lidar_static_tf` 及其外参 `lidar_static_tf_x/y/z/roll/pitch/yaw`、`rviz_config_file`、`use_respawn`、`log_level`。
-它启动的内容：串口驱动（`use_robot_state_pub:=False` 时）、雷达静态 TF（`use_sim_time:=False` 且 `launch_lidar_static_tf` 为真时）、云台状态桥（`require_gimbal_status` 为真时）、`ats_rog_map`、
-`ats_rog_map_adapter`、本仓的 `rm_navigation_reality_launch.py`、行为节点、RViz、rosbag 录制。
+它启动的内容：串口驱动（`use_robot_state_pub:=False` 时）、雷达静态 TF（`use_sim_time:=False` 且 `launch_lidar_static_tf` 为真时）、云台状态桥（`require_gimbal_status` 为真时）、`ats_rog_map_node`
+（`/ats_rog_map` 与 `/ats_rog_map_adapter`）、本仓的 `rm_navigation_reality_launch.py`、行为节点、RViz、rosbag 录制。
 
 根仓另有 `decision_vision_test.launch.py`、`record_rosbag_launch.py`、`rviz_launch.py`。
 
@@ -179,7 +179,7 @@ arbiter 订阅的自主输入 `autonomy_cmd_vel_topic` 默认是 `/cmd_vel/auton
 
 ### 各包独立 launch
 
-`ros2 launch ats_rog_map ats_rog_map.launch.py`、`ats_rog_map_adapter ats_rog_map_adapter.launch.py`、
+`ros2 launch ats_rog_map ats_rog_map.launch.py`（地图与规划地图所有者一起，后者参数取 `planning_params_file`）、
 `ats_swerve_mpc ats_swerve_mpc.launch.py` 可单独启动对应节点。包内的 `config/*.yaml`
 （如 `ats_goal_manager/config`、`ats_swerve_mpc/config/*_reality.yaml`）不是正式入口的第二配置源，只在独立调试或测试时显式传入。
 
@@ -204,7 +204,7 @@ RViz 配置是 `rviz_cfg/point_lio_replay.rviz`。这个 launch 不被任何实�
 | `livox_ros_driver2`、`point_lio`、`loam_interface`、`sensor_scan_generation` | 雷达与 IMU topic、frame、里程计输出。 |
 | `small_gicp_relocalization`、`localization_fusion` | 重定位、融合、状态与 timeout。 |
 | `terrain_analysis`、`terrain_analysis_ext` | 地形与可通行栅格。 |
-| `ats_rog_map`、`ats_rog_map_adapter` | 地图尺寸、分辨率、概率、膨胀、projection 服务、栅格 topic、ready/lease。 |
+| `ats_rog_map`、`ats_rog_map_adapter` | 地图尺寸、分辨率、概率、膨胀、投影请求 deadline、栅格 topic、ready/lease。 |
 | `minco_planner` | JPS、MINCO、yaw、足迹、修复、输入输出 topic。 |
 | `ats_goal_manager` | action、goal/planning frame、heartbeat、提交复核、执行授权。 |
 | `ats_swerve_mpc` | SE2 模型、horizon、权重、约束、watchdog、输出 topic。 |
@@ -242,7 +242,7 @@ ros2 launch <pkg> <file> --show-args
 ```text
 ats_sentry_nav/
 ├── ats_navigation_interfaces/    ats_rog_map_interfaces/
-├── ats_rog_map/    ats_rog_map_adapter/    ats_rc_esdf/
+├── ats_rog_map/    ats_rc_esdf/
 ├── minco_planner/    ats_goal_manager/    ats_swerve_mpc/    ats_cmd_vel_arbiter/
 ├── ats_nav_bringup/    ats_sentry_nav/    ats_teleop_twist_joy/
 ├── point_lio/    loam_interface/    sensor_scan_generation/    small_gicp_relocalization/
