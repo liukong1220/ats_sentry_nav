@@ -18,8 +18,19 @@ uint64 epoch
 # epoch 由 fusion 对接受的实例递增；0 表示未建立有效身份，不可用于规划。
 uint64 odom_instance_id
 uint64 odom_epoch
+# First accepted odometry stamp in this frontend epoch, in the ROS/sim clock.
+# Consumers exclude queued scans older than this boundary.
+builtin_interfaces/Time odom_epoch_start_stamp
+# True only for the concurrent-source latch; restarting fusion is required.
+bool odom_identity_latched
 uint64 observation_sequence
 builtin_interfaces/Time last_observation_stamp
+# Actual fusion transform at this status publication, including the case where
+# an accepted observation is below the update threshold and leaves TF unchanged.
+# header.stamp equals the status stamp; frames are map -> odom. Consumers must
+# match observation_sequence AND last_observation_stamp before committing scans.
+bool map_to_odom_valid
+geometry_msgs/TransformStamped map_to_odom
 # 以下 silence 使用 steady clock 计算，不受 /clock 暂停或回拨影响。
 float64 odometry_silence_sec
 float64 observation_silence_sec

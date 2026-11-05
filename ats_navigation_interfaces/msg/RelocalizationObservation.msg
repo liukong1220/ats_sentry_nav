@@ -4,6 +4,9 @@
 std_msgs/Header header
 string child_frame_id
 uint64 sequence
+# Source frontend identity; mandatory when fusion uses IdentifiedOdometry.
+uint64 odom_instance_id
+uint64 odom_epoch
 
 # 协方差顺序遵循 geometry_msgs/PoseWithCovariance 的 [x,y,z,rx,ry,rz]。
 # small_gicp 使用最终信息矩阵逆与残差尺度给出近似值，不代表已完成实车统计标定。

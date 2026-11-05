@@ -1,0 +1,10 @@
+# Save a consistent odom snapshot, transformed once into map.
+string output_prefix
+---
+bool success
+string message
+uint64 occupied_cells
+uint64 persistent_cells
+uint64 persistent_voxels
+uint64 raster_occupied_cells
+geometry_msgs/TransformStamped map_from_odom
