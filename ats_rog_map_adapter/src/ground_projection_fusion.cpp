@@ -3,6 +3,7 @@
 #include "ats_rog_map_adapter/ground_projection_fusion.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -109,6 +110,59 @@ void aggregateStaticFootprint(
         known_free = true;
         value = std::max(value, static_value);
       }
+    }
+  }
+}
+
+void aggregateTransformedFootprint(
+  const nav_msgs::msg::OccupancyGrid & source,
+  const nav_msgs::msg::OccupancyGrid & output, unsigned int mx, unsigned int my,
+  const tf2::Transform & source_from_output, int threshold,
+  bool & occupied, bool & known_free, int & value)
+{
+  tf2::Transform source_origin, output_origin;
+  tf2::fromMsg(source.info.origin, source_origin);
+  tf2::fromMsg(output.info.origin, output_origin);
+  const auto local_from_output = source_origin.inverse() * source_from_output * output_origin;
+  std::array<tf2::Vector3, 4> polygon;
+  double xmin = std::numeric_limits<double>::infinity(), ymin = xmin;
+  double xmax = -xmin, ymax = -xmin;
+  const double r = output.info.resolution;
+  for (int i = 0; i < 4; ++i) {
+    polygon[i] = local_from_output * tf2::Vector3(
+      (mx + (i == 1 || i == 2 ? 1.0 : 0.0)) * r,
+      (my + (i >= 2 ? 1.0 : 0.0)) * r, 0.0);
+    xmin = std::min(xmin, polygon[i].x()); xmax = std::max(xmax, polygon[i].x());
+    ymin = std::min(ymin, polygon[i].y()); ymax = std::max(ymax, polygon[i].y());
+  }
+  const double sr = source.info.resolution;
+  const int x0 = std::max(0, static_cast<int>(std::floor(xmin / sr)));
+  const int y0 = std::max(0, static_cast<int>(std::floor(ymin / sr)));
+  const int x1 = std::min(static_cast<int>(source.info.width) - 1,
+      static_cast<int>(std::ceil(xmax / sr)) - 1);
+  const int y1 = std::min(static_cast<int>(source.info.height) - 1,
+      static_cast<int>(std::ceil(ymax / sr)) - 1);
+  for (int y = y0; y <= y1; ++y) {
+    for (int x = x0; x <= x1; ++x) {
+      bool overlaps = true;
+      for (int a = 0; a < 6 && overlaps; ++a) {
+        tf2::Vector3 axis(a == 0 ? 1 : 0, a == 1 ? 1 : 0, 0);
+        if (a >= 2) {
+          const auto edge = polygon[(a - 1) % 4] - polygon[a - 2];
+          axis = tf2::Vector3(-edge.y(), edge.x(), 0);
+        }
+        double low = std::numeric_limits<double>::infinity(), high = -low;
+        for (const auto & p : polygon) {
+          low = std::min(low, p.dot(axis)); high = std::max(high, p.dot(axis));
+        }
+        const double center = ((x + 0.5) * axis.x() + (y + 0.5) * axis.y()) * sr;
+        const double radius = 0.5 * sr * (std::abs(axis.x()) + std::abs(axis.y()));
+        overlaps = std::min(high, center + radius) - std::max(low, center - radius) > 1e-10;
+      }
+      if (!overlaps) {continue;}
+      const int sample = source.data[static_cast<std::size_t>(y) * source.info.width + x];
+      if (sample >= threshold) {occupied = true; return;}
+      if (sample >= 0) {known_free = true; value = std::max(value, sample);}
     }
   }
 }
@@ -296,14 +350,15 @@ bool GroundProjectionFusion::fuse(
     return false;
   }
 
-  result.planning_grid = static_map;
+  const auto & geometry = params.output_in_projection_frame ? rog_projection : static_map;
+  result.planning_grid = geometry;
   result.planning_grid.header = rog_projection.header;
-  result.planning_grid.header.frame_id = static_map.header.frame_id;
+  result.planning_grid.header.frame_id = geometry.header.frame_id;
   result.planning_grid.info.resolution = std::max(params.planning_resolution, 0.01);
   const double static_extent_x =
-    static_cast<double>(static_map.info.width) * static_map.info.resolution;
+    static_cast<double>(geometry.info.width) * geometry.info.resolution;
   const double static_extent_y =
-    static_cast<double>(static_map.info.height) * static_map.info.resolution;
+    static_cast<double>(geometry.info.height) * geometry.info.resolution;
   result.planning_grid.info.width = static_cast<std::uint32_t>(
     std::ceil(static_extent_x / result.planning_grid.info.resolution));
   result.planning_grid.info.height = static_cast<std::uint32_t>(
@@ -332,12 +387,18 @@ bool GroundProjectionFusion::fuse(
       bool occupied = false;
       bool known_free = false;
       if (params.use_static_map_obstacles) {
-        aggregateStaticFootprint(
-          static_map, result.planning_grid, mx, my, static_threshold,
-          occupied, known_free, value);
+        if (params.output_in_projection_frame) {
+          aggregateTransformedFootprint(static_map, result.planning_grid, mx, my,
+            static_from_projection_transform, static_threshold, occupied, known_free, value);
+        } else {
+          aggregateStaticFootprint(
+            static_map, result.planning_grid, mx, my, static_threshold,
+            occupied, known_free, value);
+        }
       }
 
       const tf2::Vector3 projection_point =
+        params.output_in_projection_frame ? tf2::Vector3(static_x, static_y, 0.0) :
         projection_from_static_transform * tf2::Vector3(static_x, static_y, 0.0);
       int8_t rog_value = -1;
       if (sampleGrid(
@@ -393,6 +454,34 @@ bool GroundProjectionFusion::fuse(
     }
   }
   return true;
+}
+
+std::size_t GroundProjectionFusion::clearUnknownFootprint(
+  GroundProjectionFusionResult & result, double world_x, double world_y, double yaw,
+  double length, double width, double margin)
+{
+  if (!validGrid(result.planning_grid) || !std::isfinite(world_x) ||
+    !std::isfinite(world_y) || !std::isfinite(yaw) || !std::isfinite(length) ||
+    !std::isfinite(width) || !std::isfinite(margin) || length <= 0 || width <= 0 || margin < 0)
+  {return 0;}
+  std::size_t cleared = 0;
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  auto & grid = result.planning_grid;
+  for (unsigned int y = 0; y < grid.info.height; ++y) {
+    for (unsigned int x = 0; x < grid.info.width; ++x) {
+      const auto index = static_cast<std::size_t>(y) * grid.info.width + x;
+      if (grid.data[index] >= 0) {continue;}
+      double wx, wy;
+      projectionCellCenter(grid, x, y, wx, wy);
+      const double dx = wx - world_x, dy = wy - world_y;
+      if (std::abs(c * dx + s * dy) > 0.5 * length + margin + 1e-8 ||
+        std::abs(-s * dx + c * dy) > 0.5 * width + margin + 1e-8) {continue;}
+      grid.data[index] = 0; ++cleared;
+    }
+  }
+  result.unknown_cells -= std::min(cleared, result.unknown_cells);
+  result.known_free_cells += cleared;
+  return cleared;
 }
 
 std::size_t GroundProjectionFusion::clearUnknownCircle(

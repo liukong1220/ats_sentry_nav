@@ -96,6 +96,8 @@ struct GroundProjectionFusionParams
   // Default true keeps the P2 contract (static walls block planning).  O1/S3 may
   // set false only after the odom global layer feeds the planning grid.
   bool use_static_map_obstacles{true};
+  // Keep the legacy static-map geometry unless production selects the local odom window.
+  bool output_in_projection_frame{false};
 };
 
 struct GroundProjectionFusionResult
@@ -119,6 +121,9 @@ public:
     GroundProjectionFusionResult & result);
   static std::size_t clearUnknownCircle(
     GroundProjectionFusionResult & result, double world_x, double world_y, double radius);
+  static std::size_t clearUnknownFootprint(
+    GroundProjectionFusionResult & result, double world_x, double world_y, double yaw,
+    double length, double width, double margin);
 };
 
 }  // namespace ats_rog_map_adapter

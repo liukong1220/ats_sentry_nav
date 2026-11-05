@@ -10,6 +10,13 @@
 namespace ats_rog_map_adapter
 {
 
+inline bool projectionIdentityMatches(
+  std::uint64_t instance, std::uint64_t epoch,
+  std::uint64_t source_instance, std::uint64_t source_epoch)
+{
+  return instance != 0 && epoch != 0 && instance == source_instance && epoch == source_epoch;
+}
+
 inline bool mappingInputHealthy(
   std::uint64_t instance, std::uint64_t epoch, double odom_silence,
   double status_age, double timeout)

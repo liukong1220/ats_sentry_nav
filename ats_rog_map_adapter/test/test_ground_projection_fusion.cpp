@@ -58,6 +58,72 @@ TEST(GroundProjectionFusion, ConservativelyFusesUnknownWallsTerrainAndSlope)
   EXPECT_EQ(result.known_free_cells, 12U);
 }
 
+TEST(GroundProjectionFusion, ProjectionFrameKeepsRotatedFineStaticAndRealtimeObstacles)
+{
+  auto rog = makeGrid(-1);
+  rog.info.resolution = 0.1;
+  rog.info.origin.position.y = -0.2;
+  rog.data[15] = 100;
+  auto terrain = rog;
+  auto slope = rog;
+  terrain.data.assign(16, -1);
+  slope.data.assign(16, -1);
+  auto prior = makeGrid(-1);
+  prior.header.frame_id = "map";
+  prior.info.resolution = 0.04;
+  prior.info.width = prior.info.height = 5;
+  prior.info.origin.position.x = 4.9;
+  prior.info.origin.position.y = -1.9;
+  prior.data.assign(25, -1);
+  prior.data[12] = 100;
+  auto transform = identityTransform();
+  transform.header.frame_id = "map";
+  transform.transform.translation.x = 5.0;
+  transform.transform.translation.y = -2.0;
+  transform.transform.rotation.z = std::sin(M_PI / 4);
+  transform.transform.rotation.w = std::cos(M_PI / 4);
+  ats_rog_map_adapter::GroundProjectionFusionParams params;
+  params.planning_resolution = 0.1;
+  params.output_in_projection_frame = true;
+  ats_rog_map_adapter::GroundProjectionFusionResult result;
+  ASSERT_TRUE(ats_rog_map_adapter::GroundProjectionFusion::fuse(
+    rog, terrain, slope, prior, transform, params, result));
+  EXPECT_EQ(result.planning_grid.header.frame_id, "odom");
+  ASSERT_EQ(result.planning_grid.info.width, 4U);
+  EXPECT_EQ(result.planning_grid.data[15], 100);
+  for (const auto index : {5, 6, 9, 10}) {EXPECT_EQ(result.planning_grid.data[index], 100);}
+  EXPECT_EQ(result.planning_grid.data[0], -1);
+}
+
+TEST(GroundProjectionFusion, OrientedRobotRectangleClearsOnlyInsideUnknownAndKeepsOccupied)
+{
+  for (const double yaw : {0.0, M_PI / 4, -0.7}) {
+    ats_rog_map_adapter::GroundProjectionFusionResult result;
+    result.planning_grid = makeGrid(-1);
+    auto & grid = result.planning_grid;
+    grid.info.resolution = 0.1;
+    grid.info.width = grid.info.height = 40;
+    grid.info.origin.position.x = grid.info.origin.position.y = -2.0;
+    grid.data.assign(1600, -1);
+    grid.data[20 * 40 + 20] = 100;
+    result.occupied_cells = 1; result.unknown_cells = 1599;
+    const auto cleared = ats_rog_map_adapter::GroundProjectionFusion::clearUnknownFootprint(
+      result, 0.0, 0.0, yaw, 0.70, 0.55, 0.10);
+    EXPECT_GT(cleared, 0U);
+    EXPECT_EQ(result.occupied_cells, 1U);
+    EXPECT_EQ(result.unknown_cells + cleared, 1599U);
+    for (unsigned y = 0; y < 40; ++y) {
+      for (unsigned x = 0; x < 40; ++x) {
+        const double wx = -2 + (x + 0.5) * grid.info.resolution;
+        const double wy = -2 + (y + 0.5) * grid.info.resolution;
+        const bool inside = std::abs(std::cos(yaw) * wx + std::sin(yaw) * wy) <= 0.45 + 1e-8 &&
+          std::abs(-std::sin(yaw) * wx + std::cos(yaw) * wy) <= 0.375 + 1e-8;
+        EXPECT_EQ(grid.data[y * 40 + x], x == 20 && y == 20 ? 100 : (inside ? 0 : -1));
+      }
+    }
+  }
+}
+
 TEST(GroundProjectionFusion, UsesAnyKnownFreeEvidenceButKeepsAllUnknownCellsUnknown)
 {
   auto rog = makeGrid(0);

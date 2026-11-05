@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "ats_navigation_interfaces/msg/localization_status.hpp"
+#include "ats_rog_map_adapter/mapping_health.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
 #include "ats_rog_map_adapter/ground_projection_fusion.hpp"
@@ -27,6 +28,8 @@
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/u_int64.hpp"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
@@ -95,6 +98,12 @@ public:
         "localization_status_topic", "/localization/status");
     require_localization_status_ =
         declare_parameter<bool>("require_localization_status", false);
+    mapping_mode_ = declare_parameter<bool>("mapping_mode", false);
+    const double mapping_rate = std::max(
+      0.1, declare_parameter<double>("mapping_projection_rate_hz", 40.0));
+    if (mapping_mode_) {projection_rate_hz_ = mapping_rate;}
+    use_odom_layer_ = declare_parameter<bool>("use_odom_layer", false) || mapping_mode_;
+    require_odom_identity_ = declare_parameter<bool>("require_odom_identity", false);
     // When false (Gazebo GT sim), missing/stale terrain+slope become all-unknown
     // placeholders so static+ROGMap projection can still fuse. Production keeps
     // true: terrain sync failure remains fail-closed.
@@ -112,6 +121,8 @@ public:
       "slope_obstacle_degrees", 28.0);
     fusion_params_.planning_resolution = planning_resolution_;
     fusion_params_.unknown_is_obstacle = declare_parameter<bool>("unknown_is_obstacle", true);
+    fusion_params_.output_in_projection_frame =
+      declare_parameter<bool>("output_in_projection_frame", false) || mapping_mode_;
     fusion_params_.use_static_map_obstacles = declare_parameter<bool>(
       "use_static_map_obstacles", true);
     allow_missing_static_map_ = declare_parameter<bool>("allow_missing_static_map", false);
@@ -127,6 +138,10 @@ public:
     robot_frame_ = declare_parameter<std::string>("robot_frame", "gimbal_yaw_odom");
     robot_unknown_clear_radius_ = std::max(
       0.0, declare_parameter<double>("robot_unknown_clear_radius", 0.0));
+    robot_unknown_clear_footprint_ = declare_parameter<bool>("robot_unknown_clear_footprint", false);
+    robot_clear_length_ = declare_parameter<double>("robot_unknown_clear_length", 0.70);
+    robot_clear_width_ = declare_parameter<double>("robot_unknown_clear_width", 0.55);
+    robot_clear_margin_ = declare_parameter<double>("robot_unknown_clear_margin", 0.10);
     // Startup-only authorization gate for every test fixture below.  It is
     // latched once here and never re-read, so a live client cannot raise it.
     // Default false keeps nominal, real-vehicle and default-launch runs clean.
@@ -209,6 +224,14 @@ public:
       ats_navigation_interfaces::msg::PlanningMapSnapshot>(planning_snapshot_topic_, output_qos);
     projection_client_ = create_client<ats_rog_map_interfaces::srv::GetRogMapProjection>(
       projection_service_);
+    if (mapping_mode_) {
+      layer_updated_sub_ = create_subscription<std_msgs::msg::UInt64>(
+        "/rog_map/odom_layer_updated", rclcpp::QoS(1).reliable(),
+        [this](std_msgs::msg::UInt64::ConstSharedPtr) {
+          if (request_pending_) {mapping_update_pending_ = true; return;}
+          requestProjection();
+        });
+    }
 
     publishMapStatus(false, 0, "waiting for first projection");
     const auto period = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -245,14 +268,25 @@ private:
     // epoch>=1 and permanently failed the health probe (stable=0/3).
     const bool epoch_changed =
         has_localization_status_ && message->epoch != localization_epoch_;
+    const auto signal_ns = rclcpp::Time(message->header.stamp).nanoseconds();
+    if ((mapping_mode_ || require_odom_identity_) && signal_ns <= last_identity_signal_ns_) {return;}
+    const bool odom_changed = message->odom_instance_id != odom_instance_id_ ||
+      message->odom_epoch != odom_epoch_;
+    last_identity_signal_ns_ = signal_ns;
+    odom_identity_stable_ = !odom_changed && message->odom_instance_id != 0 &&
+      message->odom_epoch != 0;
+    odom_instance_id_ = message->odom_instance_id;
+    odom_epoch_ = message->odom_epoch;
+    odom_identity_latched_ = message->odom_identity_latched;
+    odometry_silence_sec_ = message->odometry_silence_sec;
     has_localization_status_ = true;
     localization_epoch_ = message->epoch;
     localization_state_ = message->state;
     last_localization_status_signal_ = std::chrono::steady_clock::now();
-    if (!require_localization_status_) {
+    if (!require_localization_status_ && !mapping_mode_ && !require_odom_identity_) {
       return;
     }
-    if (epoch_changed || !localizationStateAllowsPlanning(message->state)) {
+    if (epoch_changed || odom_changed || !localizationReady()) {
       if (request_pending_) {
         projection_client_->remove_pending_request(active_request_id_);
         request_pending_ = false;
@@ -268,6 +302,17 @@ private:
   }
 
   bool localizationReady() const {
+    if (mapping_mode_ || require_odom_identity_) {
+      const double status_age = last_localization_status_signal_ ? std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - *last_localization_status_signal_).count() :
+        std::numeric_limits<double>::infinity();
+      if (!odom_identity_stable_ || odom_identity_latched_ || !mappingInputHealthy(
+          odom_instance_id_, odom_epoch_, odometry_silence_sec_, status_age,
+          localization_status_timeout_sec_)) {return false;}
+      // Growing-map registration can build while global localization is in
+      // BOOTSTRAP/LOST. Goal dispatch still requires accepted map evidence.
+      if (mapping_mode_) {return true;}
+    }
     if (!require_localization_status_) {
       return true;
     }
@@ -345,6 +390,11 @@ private:
     request->min_height = static_cast<float>(projection_min_height_);
     request->max_height = static_cast<float>(projection_max_height_);
     request->resolution = static_cast<float>(planning_resolution_);
+    request->use_odom_layer = use_odom_layer_;
+    if (mapping_mode_ || require_odom_identity_) {
+      request->expected_odom_instance_id = odom_instance_id_;
+      request->expected_odom_epoch = odom_epoch_;
+    }
     const std::uint64_t epoch = ++next_request_epoch_;
     const std::uint64_t localization_epoch = localization_epoch_;
     const rclcpp::Time request_start_stamp = now();
@@ -383,6 +433,10 @@ private:
                 static_cast<long long>(rclcpp::Time(response.occupancy_grid.header.stamp).nanoseconds()),
                 response.ready ? 1 : 0, response.stale ? 1 : 0);
               processProjection(response, localization_epoch, epoch);
+              if (mapping_update_pending_) {
+                mapping_update_pending_ = false;
+                requestProjection();
+              }
             } catch (const std::exception &exception) {
               RCLCPP_ERROR(get_logger(),
                            "ROGMap projection response failed: %s",
@@ -409,6 +463,16 @@ private:
       const ats_rog_map_interfaces::srv::GetRogMapProjection::Response
           &response,
       std::uint64_t localization_epoch, std::uint64_t request_epoch) {
+    if (use_odom_layer_ && response.ready && !response.odom_layer_included) {
+      publishUnavailable("global odom layer was requested but missing from projection");
+      return;
+    }
+    if ((mapping_mode_ || require_odom_identity_) && !projectionIdentityMatches(
+        odom_instance_id_, odom_epoch_, response.odom_instance_id, response.odom_epoch))
+    {
+      publishUnavailable("projection belongs to a different frontend epoch");
+      return;
+    }
     const RogMapEsdfSnapshot numeric_snapshot = RogMapEsdfSnapshot::fromResponse(response);
     if (response.occupancy_grid.info.width > 0 && response.occupancy_grid.info.height > 0 &&
       !response.occupancy_grid.data.empty())
@@ -509,8 +573,7 @@ private:
       *traversability, projection_grid.header.stamp);
     const bool slope_synchronized = slope && inputSynchronized(
       *slope, projection_grid.header.stamp);
-    // The live odom layer is the obstacle owner.  A static PGM is optional
-    // guidance/relocalization input and must never gate local planning.
+    // Missing prior maps are allowed only by the explicit mapping-mode override.
     bool static_map_is_live_fallback = false;
     if (!static_map && !allow_missing_static_map_) {
       RCLCPP_WARN_THROTTLE(
@@ -639,8 +702,9 @@ private:
     // odom -> robot TF lagged the projection stamp by more than 0.1 s: in MuJoCo lio runs that
     // was 106 of 161 moving stops (report 5.1.10 item 2), each a ready=false heartbeat that the
     // planner turns into FAILURE_MAP_UNREADY and the MPC into a fail-stop.
-    if (robot_unknown_clear_radius_ > 0.0 &&
+    if ((robot_unknown_clear_radius_ > 0.0 || robot_unknown_clear_footprint_) &&
       !lookupAtProjectionStamp(
+        fusion_params_.output_in_projection_frame ? projection_grid.header.frame_id :
         static_map->header.frame_id, robot_frame_, projection_grid.header.stamp,
         static_from_robot)) {
       RCLCPP_WARN_THROTTLE(
@@ -659,9 +723,15 @@ private:
       publishUnavailable("ROGMap terrain fusion failed");
       return;
     }
-    const std::size_t ego_unknown_cleared = GroundProjectionFusion::clearUnknownCircle(
+    std::size_t ego_unknown_cleared = GroundProjectionFusion::clearUnknownCircle(
       fusion, static_from_robot.transform.translation.x, static_from_robot.transform.translation.y,
       robot_unknown_clear_radius_);
+    if (robot_unknown_clear_footprint_) {
+      ego_unknown_cleared += GroundProjectionFusion::clearUnknownFootprint(
+        fusion, static_from_robot.transform.translation.x, static_from_robot.transform.translation.y,
+        tf2::getYaw(static_from_robot.transform.rotation), robot_clear_length_, robot_clear_width_,
+        robot_clear_margin_);
+    }
     last_blocking_grid_ = fusion.planning_grid;
     if (fusion.known_free_cells == 0) {
       publishUnavailable("ROGMap terrain fusion produced no known-free cells", true);
@@ -947,6 +1017,16 @@ private:
   double robot_unknown_clear_radius_{0.0};
   double localization_status_timeout_sec_{1.0};
   bool require_localization_status_{false};
+  bool mapping_mode_{false};
+  bool use_odom_layer_{false};
+  bool robot_unknown_clear_footprint_{false};
+  double robot_clear_length_{0.70}, robot_clear_width_{0.55}, robot_clear_margin_{0.10};
+  bool require_odom_identity_{false};
+  bool odom_identity_stable_{false};
+  bool odom_identity_latched_{false};
+  std::uint64_t odom_instance_id_{0}, odom_epoch_{0};
+  std::int64_t last_identity_signal_ns_{0};
+  double odometry_silence_sec_{std::numeric_limits<double>::infinity()};
   bool require_terrain_inputs_{true};
   GroundProjectionFusionParams fusion_params_;
   bool allow_missing_static_map_{false};
@@ -978,6 +1058,8 @@ private:
   std::chrono::steady_clock::time_point active_request_sent_time_{};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr static_map_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt64>::SharedPtr layer_updated_sub_;
+  bool mapping_update_pending_{false};
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr traversability_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr slope_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
