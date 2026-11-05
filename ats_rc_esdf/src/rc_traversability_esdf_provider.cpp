@@ -75,17 +75,21 @@ void squaredDistanceTransform1d(
     if (!std::isfinite(input[static_cast<std::size_t>(query)])) {
       continue;
     }
+    // 每弹出一个站点，都要用新栈顶重新计算交点再判断；沿用已弹出站点的旧交点会让
+    // 下包络出错，使距离偏大（偏向不安全一侧）。
     double intersection = 0.0;
-    do {
+    while (true) {
       const int site = sites[site_count];
       intersection =
         ((input[static_cast<std::size_t>(query)] + static_cast<double>(query * query)) -
         (input[static_cast<std::size_t>(site)] + static_cast<double>(site * site))) /
         static_cast<double>(2 * (query - site));
-      if (intersection <= boundaries[site_count]) {
-        --site_count;
+      // boundaries[0] 是 -inf，栈底不会被弹出。
+      if (intersection > boundaries[site_count]) {
+        break;
       }
-    } while (site_count >= 0 && intersection <= boundaries[site_count]);
+      --site_count;
+    }
     ++site_count;
     sites[site_count] = query;
     boundaries[site_count] = intersection;

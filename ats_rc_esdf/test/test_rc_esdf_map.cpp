@@ -2,7 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
+#include <random>
+#include <vector>
 
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 #include "ats_rc_esdf/esdf/static_map_fusion.hpp"
@@ -42,6 +46,104 @@ TEST(RcTraversabilityEsdfProvider, ProducesExactSignedEuclideanDistances)
   EXPECT_NEAR(provider.getDistance(2.5, 2.5), -1.0, 1e-9);
   EXPECT_NEAR(provider.getDistance(3.5, 2.5), 1.0, 1e-9);
   EXPECT_NEAR(provider.getDistance(3.5, 3.5), std::sqrt(2.0), 1e-9);
+}
+
+// 暴力解：自由格到最近障碍格心的欧氏距离，障碍格到最近自由格心的距离取负。
+// 一维变换在站点被弹出后必须对新栈顶重算交点；用旧交点判断会让下包络出错，
+// 距离偏大（偏向不安全一侧）。只有 5x5 单障碍的用例走不到弹出分支。
+std::vector<double> bruteForceSignedDistance(
+  const nav_msgs::msg::OccupancyGrid & grid, int threshold, bool unknown_is_obstacle)
+{
+  const int width = static_cast<int>(grid.info.width);
+  const int height = static_cast<int>(grid.info.height);
+  const auto blocked = [&](int index) {
+      const int value = grid.data[static_cast<std::size_t>(index)];
+      return value >= threshold || (unknown_is_obstacle && value < 0);
+    };
+  std::vector<double> expected(static_cast<std::size_t>(width) * height, 0.0);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const bool own = blocked(y * width + x);
+      double best = std::numeric_limits<double>::infinity();
+      for (int yy = 0; yy < height; ++yy) {
+        for (int xx = 0; xx < width; ++xx) {
+          if (blocked(yy * width + xx) != own) {
+            best = std::min(best, std::hypot(double(x - xx), double(y - yy)));
+          }
+        }
+      }
+      expected[static_cast<std::size_t>(y) * width + x] =
+        (own ? -best : best) * grid.info.resolution;
+    }
+  }
+  return expected;
+}
+
+TEST(RcTraversabilityEsdfProvider, SingleObstacleBesideWallsMatchesBruteForce)
+{
+  auto grid = makeGrid(40, 40);
+  for (unsigned int i = 0; i < 40U; ++i) {
+    grid.data[i] = 100;
+    grid.data[39U * 40U + i] = 100;
+    grid.data[i * 40U] = 100;
+    grid.data[i * 40U + 39U] = 100;
+  }
+  grid.data[20U * 40U + 30U] = 100;
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+  provider.updateGrid(grid, 50, true, 50);
+  std::vector<double> field;
+  ASSERT_TRUE(provider.copySignedDistanceField(field));
+  // 行 y=20、x=20 到 x=30 的障碍是 10 格；旧实现在这里给出 19 格。
+  EXPECT_NEAR(field[20U * 40U + 20U], 10.0, 1e-9);
+  const auto expected = bruteForceSignedDistance(grid, 50, true);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_NEAR(field[i], expected[i], 1e-9) << "cell " << i;
+  }
+}
+
+TEST(RcTraversabilityEsdfProvider, RandomGridsMatchBruteForce)
+{
+  constexpr unsigned int kSeed = 20261105U;
+  std::mt19937 rng(kSeed);
+  std::uniform_int_distribution<int> box(2, 6);
+  for (int mode = 0; mode < 2; ++mode) {
+    for (int trial = 0; trial < 12; ++trial) {
+      const int width = 48;
+      const int height = 36;
+      auto grid = makeGrid(width, height);
+      grid.info.resolution = 0.1F;
+      if (mode == 1) {
+        // 类 S3：中间一块已知自由区，其余 unknown。
+        grid.data.assign(grid.data.size(), -1);
+        for (int y = 9; y < 27; ++y) {
+          for (int x = 12; x < 36; ++x) {grid.data[y * width + x] = 0;}
+        }
+      } else {
+        for (int x = 0; x < width; ++x) {
+          grid.data[x] = 100;
+          grid.data[(height - 1) * width + x] = 100;
+        }
+      }
+      for (int i = 0; i < 10; ++i) {
+        const int bw = box(rng);
+        const int bh = box(rng);
+        const int x0 = static_cast<int>(rng() % (width - bw));
+        const int y0 = static_cast<int>(rng() % (height - bh));
+        for (int y = y0; y < y0 + bh; ++y) {
+          for (int x = x0; x < x0 + bw; ++x) {grid.data[y * width + x] = 100;}
+        }
+      }
+      ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+      provider.updateGrid(grid, 50, true, 50);
+      std::vector<double> field;
+      ASSERT_TRUE(provider.copySignedDistanceField(field)) << "mode " << mode << " trial " << trial;
+      const auto expected = bruteForceSignedDistance(grid, 50, true);
+      for (std::size_t i = 0; i < expected.size(); ++i) {
+        ASSERT_NEAR(field[i], expected[i], 1e-6)
+          << "seed " << kSeed << " mode " << mode << " trial " << trial << " cell " << i;
+      }
+    }
+  }
 }
 
 // RMUC terrain 契约：`0..99` 是连续风险，只有 `100` 是硬障碍。调用方用
