@@ -29,10 +29,10 @@ builtin_interfaces::msg::Time stamp()
   return value;
 }
 
-TEST(PlanningMapSnapshot, PreservesIdentityAndMarksUnknownPayload)
+TEST(PlanningMapSnapshot, PreservesIdentityAndCarriesUnknownAsBlockedDistance)
 {
   const auto grid = makeGrid();
-  const std::vector<double> signed_distance = {1.0, -0.5, 0.0, 2.0};
+  const std::vector<double> signed_distance = {1.0, -0.5, -0.5, 2.0};
   const auto snapshot = ats_rog_map_adapter::makePlanningMapSnapshot(
     grid, signed_distance, stamp(), 9U, 17U, 23U, true, 50);
 
@@ -45,23 +45,28 @@ TEST(PlanningMapSnapshot, PreservesIdentityAndMarksUnknownPayload)
   EXPECT_EQ(snapshot.occupancy[0], 0);
   EXPECT_EQ(snapshot.occupancy[1], 100);
   EXPECT_EQ(snapshot.occupancy[2], -1);
-  EXPECT_TRUE(std::isnan(snapshot.signed_distance_m[2]));
-  EXPECT_TRUE(std::isnan(snapshot.gradient_x[2]));
+  EXPECT_FLOAT_EQ(snapshot.signed_distance_m[2], -0.5F);
+  EXPECT_TRUE(std::isfinite(snapshot.gradient_x[2]));
   EXPECT_EQ(snapshot.header.stamp.sec, 12);
   EXPECT_EQ(snapshot.header.stamp.nanosec, 34U);
 }
 
-TEST(PlanningMapSnapshot, RejectsInconsistentSignedDistanceAsUnknown)
+TEST(PlanningMapSnapshot, RejectsInconsistentOrNonFiniteSignedDistance)
 {
-  auto grid = makeGrid();
-  std::vector<double> signed_distance = {1.0, 0.5, 0.0, 2.0};
-  const auto snapshot = ats_rog_map_adapter::makePlanningMapSnapshot(
-    grid, signed_distance, stamp(), 1U, 2U, 3U, true, 50);
-
-  EXPECT_TRUE(snapshot.ready);
-  EXPECT_EQ(snapshot.occupancy[1], -1);
-  EXPECT_TRUE(std::isnan(snapshot.signed_distance_m[1]));
-  EXPECT_TRUE(std::isnan(snapshot.gradient_y[1]));
+  const auto grid = makeGrid();
+  // occupied cell with positive distance
+  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+      grid, std::vector<double>{1.0, 0.5, -0.5, 2.0}, stamp(), 1U, 2U, 3U, true, 50).ready);
+  // unknown cell treated as obstacle but given positive distance
+  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+      grid, std::vector<double>{1.0, -0.5, 0.5, 2.0}, stamp(), 1U, 2U, 3U, true, 50).ready);
+  // NaN anywhere
+  EXPECT_FALSE(ats_rog_map_adapter::makePlanningMapSnapshot(
+      grid, std::vector<double>{1.0, -0.5, std::numeric_limits<double>::quiet_NaN(), 2.0},
+      stamp(), 1U, 2U, 3U, true, 50).ready);
+  // unknown is free when unknown_is_obstacle is false
+  EXPECT_TRUE(ats_rog_map_adapter::makePlanningMapSnapshot(
+      grid, std::vector<double>{1.0, -0.5, 0.5, 2.0}, stamp(), 1U, 2U, 3U, false, 50).ready);
 }
 
 TEST(PlanningMapSnapshot, RotatesLocalGradientIntoWorldFrame)

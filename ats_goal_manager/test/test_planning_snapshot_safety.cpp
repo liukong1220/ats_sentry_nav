@@ -44,6 +44,18 @@ TEST(PlanningSnapshotSafety, RequiresCompleteNumericSnapshot)
   EXPECT_TRUE(ats_goal_manager::validPlanningSnapshot(snapshot));
   snapshot.gradient_x.pop_back();
   EXPECT_FALSE(ats_goal_manager::validPlanningSnapshot(snapshot));
+
+  // Unknown cells carry finite distances whose sign follows unknown_is_obstacle.
+  snapshot = makeSnapshot();
+  snapshot.occupancy[9] = -1;
+  snapshot.signed_distance_m[9] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(ats_goal_manager::validPlanningSnapshot(snapshot));
+  snapshot.signed_distance_m[9] = 0.5F;
+  EXPECT_TRUE(ats_goal_manager::validPlanningSnapshot(snapshot));
+  snapshot.unknown_is_obstacle = true;
+  EXPECT_FALSE(ats_goal_manager::validPlanningSnapshot(snapshot));
+  snapshot.signed_distance_m[9] = -0.5F;
+  EXPECT_TRUE(ats_goal_manager::validPlanningSnapshot(snapshot));
 }
 
 TEST(PlanningSnapshotSafety, ReferenceRecheckIncludesSparseSegmentsAndUnknown)
@@ -63,10 +75,10 @@ TEST(PlanningSnapshotSafety, ReferenceRecheckIncludesSparseSegmentsAndUnknown)
   snapshot.signed_distance_m[middle] = -1.0F;
   EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
   snapshot.occupancy[middle] = -1;
-  snapshot.signed_distance_m[middle] = std::numeric_limits<float>::quiet_NaN();
-  snapshot.gradient_x[middle] = snapshot.gradient_y[middle] =
-    std::numeric_limits<float>::quiet_NaN();
+  snapshot.signed_distance_m[middle] = 0.0F;
+  snapshot.gradient_x[middle] = snapshot.gradient_y[middle] = 0.0F;
   snapshot.unknown_is_obstacle = false;
+  ASSERT_TRUE(ats_goal_manager::validPlanningSnapshot(snapshot));
   EXPECT_FALSE(ats_goal_manager::planningSnapshotReferenceSafe(snapshot, path, params));
 }
 
@@ -113,12 +125,10 @@ TEST(PlanningSnapshotSafety, RejectsOutsideUnknownAndOccupiedRobotCells)
   EXPECT_FALSE(outside.footprint_safe);
 
   snapshot.occupancy[1U * snapshot.info.width + 1U] = -1;
-  snapshot.signed_distance_m[1U * snapshot.info.width + 1U] =
-    std::numeric_limits<float>::quiet_NaN();
-  snapshot.gradient_x[1U * snapshot.info.width + 1U] =
-    std::numeric_limits<float>::quiet_NaN();
-  snapshot.gradient_y[1U * snapshot.info.width + 1U] =
-    std::numeric_limits<float>::quiet_NaN();
+  snapshot.signed_distance_m[1U * snapshot.info.width + 1U] = 0.0F;
+  snapshot.gradient_x[1U * snapshot.info.width + 1U] = 0.0F;
+  snapshot.gradient_y[1U * snapshot.info.width + 1U] = 0.0F;
+  ASSERT_TRUE(ats_goal_manager::validPlanningSnapshot(snapshot));
   const auto unknown = ats_goal_manager::checkPlanningSnapshotFootprint(
     snapshot, poseAt(1.5, 1.5), params);
   EXPECT_TRUE(unknown.inside_map);

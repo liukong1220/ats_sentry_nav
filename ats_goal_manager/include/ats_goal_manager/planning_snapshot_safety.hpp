@@ -59,18 +59,11 @@ inline bool validPlanningSnapshot(
     if (occupancy < -1 || occupancy > 100) {
       return false;
     }
-    if (occupancy == -1) {
-      if (std::isfinite(distance) || std::isfinite(gradient_x) ||
-        std::isfinite(gradient_y))
-      {
-        return false;
-      }
-      continue;
-    }
+    // Ready payloads are finite everywhere; unknown follows unknown_is_obstacle.
+    const bool blocked = occupancy >= snapshot.occupied_value_threshold ||
+      (occupancy == -1 && snapshot.unknown_is_obstacle);
     if (!std::isfinite(distance) || !std::isfinite(gradient_x) ||
-      !std::isfinite(gradient_y) ||
-      (occupancy >= snapshot.occupied_value_threshold && distance > 0.0F) ||
-      (occupancy < snapshot.occupied_value_threshold && distance < 0.0F))
+      !std::isfinite(gradient_y) || (blocked ? distance > 0.0F : distance < 0.0F))
     {
       return false;
     }

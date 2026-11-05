@@ -64,17 +64,13 @@ inline bool validPlanningMapSnapshot(
     if (occupancy < -1 || occupancy > 100) {
       return false;
     }
-    if (occupancy == -1) {
-      if (finite(distance) || finite(gradient_x) || finite(gradient_y)) {
-        return false;
-      }
-      continue;
-    }
+    // Ready payloads are finite everywhere; unknown follows unknown_is_obstacle.
+    const bool blocked = occupancy >= snapshot.occupied_value_threshold ||
+                         (occupancy == -1 && snapshot.unknown_is_obstacle);
     if (!finite(distance) || !finite(gradient_x) || !finite(gradient_y)) {
       return false;
     }
-    if ((occupancy >= snapshot.occupied_value_threshold && distance > 0.0F) ||
-        (occupancy < snapshot.occupied_value_threshold && distance < 0.0F)) {
+    if (blocked ? distance > 0.0F : distance < 0.0F) {
       return false;
     }
   }

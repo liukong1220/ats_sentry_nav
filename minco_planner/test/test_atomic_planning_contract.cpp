@@ -26,10 +26,10 @@ ats_navigation_interfaces::msg::PlanningMapSnapshot makeSnapshot() {
   snapshot.info.height = 2;
   snapshot.info.origin.orientation.w = 1.0;
   snapshot.occupancy = {0, 100, -1, 0};
-  const auto nan = std::numeric_limits<float>::quiet_NaN();
-  snapshot.signed_distance_m = {0.5F, -0.1F, nan, 0.3F};
-  snapshot.gradient_x = {1.0F, 0.0F, nan, 0.5F};
-  snapshot.gradient_y = {0.0F, 1.0F, nan, -0.5F};
+  // unknown_is_obstacle: the unknown cell carries a finite non-positive distance.
+  snapshot.signed_distance_m = {0.5F, -0.1F, -0.1F, 0.3F};
+  snapshot.gradient_x = {1.0F, 0.0F, 0.0F, 0.5F};
+  snapshot.gradient_y = {0.0F, 1.0F, 1.0F, -0.5F};
   return snapshot;
 }
 
@@ -91,6 +91,18 @@ TEST(AtomicPlanningContract, RejectsMixedGenerationAndEsdfSemantics) {
   snapshot = makeSnapshot();
   snapshot.signed_distance_m[1] = 0.1F;
   EXPECT_FALSE(minco_planner::validPlanningMapSnapshot(snapshot));
+
+  // A NaN unknown cell was the old contract; it is no longer a ready payload.
+  snapshot = makeSnapshot();
+  snapshot.signed_distance_m[2] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(minco_planner::validPlanningMapSnapshot(snapshot));
+
+  // With unknown treated as free the same cell must be non-negative.
+  snapshot = makeSnapshot();
+  snapshot.unknown_is_obstacle = false;
+  EXPECT_FALSE(minco_planner::validPlanningMapSnapshot(snapshot));
+  snapshot.signed_distance_m[2] = 0.0F;
+  EXPECT_TRUE(minco_planner::validPlanningMapSnapshot(snapshot));
 }
 
 TEST(AtomicPlanningContract,

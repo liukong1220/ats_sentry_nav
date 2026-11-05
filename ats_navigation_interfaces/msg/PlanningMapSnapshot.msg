@@ -14,8 +14,11 @@ uint64 publication_sequence
 nav_msgs/MapMetaData info
 # -1 is unknown. Every ready payload has width * height cells.
 int8[] occupancy
-# Per-cell numeric RC-ESDF values in metres. Unknown cells use NaN in all three
-# numeric arrays; known free values are non-negative and occupied values are non-positive.
+# Per-cell numeric RC-ESDF values in metres, finite in every cell of a ready payload.
+# A cell is blocked when occupancy >= occupied_value_threshold, or occupancy == -1 while
+# unknown_is_obstacle holds; blocked values are non-positive and all others non-negative.
+# Cells outside the grid count as blocked, so a free edge cell is at most one cell from
+# the nearest blocked centre. Not-ready payloads may carry NaN for audit only.
 float32[] signed_distance_m
 float32[] gradient_x
 float32[] gradient_y
