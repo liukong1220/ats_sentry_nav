@@ -29,6 +29,13 @@
 namespace small_gicp_relocalization
 {
 
+inline bool observationMatchesFrontend(
+  std::uint64_t instance, std::uint64_t epoch,
+  std::uint64_t current_instance, std::uint64_t current_epoch)
+{
+  return instance != 0 && epoch != 0 && instance == current_instance && epoch == current_epoch;
+}
+
 struct OdomPoseSample
 {
   rclcpp::Time stamp;
@@ -136,6 +143,14 @@ inline CorrectionDelta correctionDelta(const tf2::Transform & newer, const tf2::
   return delta;
 }
 
+inline bool correctionWithinLimits(const CorrectionDelta & delta, double translation, double yaw)
+{
+  return std::isfinite(delta.translation) && std::isfinite(delta.yaw) &&
+         delta.translation >= 0.0 && delta.yaw >= 0.0 &&
+         (translation <= 0.0 || delta.translation <= translation) &&
+         (yaw <= 0.0 || delta.yaw <= yaw);
+}
+
 // continuous_max_translation/yaw > 0 时，超过 epoch 阈值但不超过该上界的修正按连续修正应用：
 // map->odom 改变而 epoch 不变。MPC 在 odom 里执行，不受 map->odom 影响；规划器对已提交参考的
 // 复检按当前 TF 重新表达，GoalManager 的位姿门也用当前 TF，所以这类修正不必作废整条参考链。
@@ -155,8 +170,11 @@ inline CorrectionUpdate selectCorrectionUpdate(
 
   update.map_to_odom = *current;
   update.delta = correctionDelta(candidate, *current);
-  const bool beyond_threshold = update.delta.translation > std::max(0.0, translation_threshold) ||
-    update.delta.yaw > std::max(0.0, yaw_threshold);
+  const auto reaches = [](double delta, double threshold) {
+      return delta > 0.0 && delta >= std::max(0.0, threshold);
+    };
+  const bool beyond_threshold = reaches(update.delta.translation, translation_threshold) ||
+    reaches(update.delta.yaw, yaw_threshold);
   const bool continuous_enabled = continuous_max_translation > 0.0 && continuous_max_yaw > 0.0;
   update.continuous = beyond_threshold && continuous_enabled &&
     update.delta.translation <= continuous_max_translation &&

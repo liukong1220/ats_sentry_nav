@@ -158,6 +158,16 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("odom_frame", "odom");
   this->declare_parameter("robot_base_frame", "");
   this->declare_parameter("prior_pcd_file", "");
+  mapping_mode_ = this->declare_parameter<bool>("mapping_mode", false);
+  require_odom_identity_ = this->declare_parameter<bool>("require_odom_identity", false);
+  const auto growing_capacity = this->declare_parameter<int>("mapping.max_voxels", 500000);
+  const auto growing_size = this->declare_parameter<std::vector<double>>(
+    "mapping.size", {40.0, 30.0, 20.0});
+  const auto growing_origin = this->declare_parameter<std::vector<double>>(
+    "mapping.origin", {-20.0, -15.0, -10.0});
+  if (growing_size.size() != 3) {throw std::invalid_argument("mapping.size requires xyz");}
+  if (growing_origin.size() != 3) {throw std::invalid_argument("mapping.origin requires xyz");}
+  if (growing_capacity <= 0) {throw std::invalid_argument("mapping.max_voxels must be positive");}
   this->declare_parameter("init_pose", std::vector<double>{0., 0., 0., 0., 0., 0.});
 
   // Coarse-to-fine windowed registration (borrowed from BIT icp_relocalization).
@@ -406,6 +416,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
       Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()).toRotationMatrix();
   }
   previous_result_t_ = result_t_;
+  growing_seed_transform_ = growing_fused_transform_ = result_t_;
   last_registration_robot_base_to_odom_ = Eigen::Isometry3d::Identity();
   need_coarse_alignment_ = true;
   has_accepted_alignment_ = false;
@@ -418,7 +429,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
-  if (!loadGlobalMap(prior_pcd_file_)) {
+  if (!mapping_mode_ && !loadGlobalMap(prior_pcd_file_)) {
     if (!rclcpp::ok(this->get_node_base_interface()->get_context())) {
       // Return an inert node so the component executable can unwind normally.
       // No registration timers, subscriptions, or observation publisher exist yet.
@@ -427,6 +438,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     throw std::runtime_error("Global map unavailable");
   }
 
+  if (mapping_mode_) {
+    growing_map_ = std::make_unique<GrowingMapStore>(global_leaf_size_, growing_capacity,
+      std::array<double, 3>{growing_size[0], growing_size[1], growing_size[2]},
+      std::array<double, 3>{growing_origin[0], growing_origin[1], growing_origin[2]});
+  } else {
   target_ = small_gicp::voxelgrid_sampling_omp<
     pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(
     *global_map_, global_leaf_size_);
@@ -435,6 +451,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     target_, small_gicp::KdTreeBuilderOMP(recovery_num_threads_));
+  }
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
     "registered_scan", rclcpp::SensorDataQoS().keep_last(1),
@@ -506,6 +523,21 @@ bool SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
   return true;
 }
 
+void SmallGicpRelocalizationNode::rebuildGrowingTarget()
+{
+  global_map_->clear();
+  for (const auto & p : growing_map_->points()) {
+    global_map_->push_back(pcl::PointXYZ(p[0], p[1], p[2]));
+  }
+  target_ = small_gicp::voxelgrid_sampling_omp<
+    pcl::PointCloud<pcl::PointXYZ>, PointCovarianceCloud>(*global_map_, global_leaf_size_);
+  small_gicp::estimate_covariances_omp(*target_, num_neighbors_, recovery_num_threads_);
+  target_tree_ = std::make_shared<PointKdTree>(
+    target_, small_gicp::KdTreeBuilderOMP(recovery_num_threads_));
+  RCLCPP_INFO(get_logger(), "S3 growing map target=%zu dropped=%zu (fusion-committed growth)",
+    target_->size(), growing_map_->dropped());
+}
+
 void SmallGicpRelocalizationNode::registeredPcdCallback(
   const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
@@ -523,6 +555,20 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
   input_config.max_z_m = scan_max_z_m_;
   input_config.min_valid_ratio = min_scan_valid_ratio_;
   const std::int64_t stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+  if ((mapping_mode_ || require_odom_identity_) && (odom_instance_id_ == 0 ||
+    odom_epoch_ == 0 || odom_identity_latched_ || stamp_ns < odom_epoch_start_ns_))
+  {recordDroppedScan("unknown, latched or obsolete frontend epoch"); return;}
+  if (mapping_reseed_needed_) {
+    const auto odom_to_base = getOdomToRobotBase(rclcpp::Time(msg->header.stamp));
+    if (!odom_to_base || !mapping_last_map_base_) {return;}
+    previous_result_t_ = result_t_ = *mapping_last_map_base_ * odom_to_base->inverse();
+    growing_seed_transform_ = previous_result_t_;
+    mapping_reseed_needed_ = false;
+  } else if (mapping_mode_ && has_accepted_alignment_) {
+    if (const auto odom_to_base = getOdomToRobotBase(rclcpp::Time(msg->header.stamp))) {
+      mapping_last_map_base_ = growing_fused_transform_ * *odom_to_base;
+    }
+  }
   const std::int64_t now_ns = this->now().nanoseconds();
   const std::string metadata_error = validateScanMetadata(
     msg->header.frame_id, stamp_ns, now_ns, last_received_scan_stamp_ns_, input_config);
@@ -634,6 +680,7 @@ bool SmallGicpRelocalizationNode::simRelaxAllowed() const
 
 bool SmallGicpRelocalizationNode::preferMultiGuess() const
 {
+  if (mapping_mode_) {return false;}
   using LS = ats_navigation_interfaces::msg::LocalizationStatus;
   // Pending confirmation owns the registration path: refine that hypothesis only.
   // Leaving LOST for RELOCALIZING/BOOTSTRAP must not fall through to fine_only,
@@ -1405,6 +1452,15 @@ void SmallGicpRelocalizationNode::performRegistration()
   if (!source_ || !source_tree_ || source_->empty()) {
     return;
   }
+  if (mapping_mode_ && !target_) {
+    GrowingMapStore::Points points;
+    for (const auto & p : source_->points) {points.push_back({p.x, p.y, p.z});}
+    if (growing_map_->seed(points, growing_seed_transform_)) {rebuildGrowingTarget();}
+    // The seed window is never registered against itself and never publishes
+    // an accepted observation. A disjoint later window must pass every gate.
+    clearAccumulation();
+    return;
+  }
 
   if (isRecoveringLocalization()) {
     need_coarse_alignment_ = true;
@@ -1721,6 +1777,7 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
          Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()))
           .toRotationMatrix();
     }
+    if (mapping_mode_) {prior = growing_seed_transform_;}
     const double dxy =
       (candidate.translation() - prior.translation()).head<2>().norm();
     const double dyaw = yawDistance(candidate, prior);
@@ -1851,6 +1908,13 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
     scan_time, true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
     "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
     result_t_ * *odom_to_robot_base, covariance);
+  if (mapping_mode_) {
+    growing_pending_source_.clear();
+    for (const auto & p : source_->points) {growing_pending_source_.push_back({p.x, p.y, p.z});}
+    growing_pending_transform_ = result_t_;
+    growing_pending_sequence_ = observation_sequence_;
+    growing_pending_scan_ns_ = scan_time.nanoseconds();
+  }
 }
 
 void SmallGicpRelocalizationNode::publishTransform()
@@ -1927,6 +1991,8 @@ void SmallGicpRelocalizationNode::publishObservation(
   observation.header.frame_id = map_frame_;
   observation.child_frame_id = robot_base_frame_;
   observation.sequence = ++observation_sequence_;
+  observation.odom_instance_id = odom_instance_id_;
+  observation.odom_epoch = odom_epoch_;
   observation.accepted = effective_accepted;
   observation.status = effective_status;
   observation.inlier_count = static_cast<std::uint32_t>(
@@ -2013,6 +2079,46 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   }
   last_status_stamp_ns_ =
     static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec;
+  const bool frontend_changed = odom_instance_id_ != msg->odom_instance_id ||
+    odom_epoch_ != msg->odom_epoch;
+  if ((mapping_mode_ || require_odom_identity_) && frontend_changed) {
+    invalidateRecovery();
+    clearAccumulation();
+    has_received_scan_ = false;
+    last_received_scan_stamp_ns_ = 0;
+    has_accepted_alignment_ = false;
+    need_coarse_alignment_ = true;
+    growing_pending_source_.clear();
+    mapping_reseed_needed_ = mapping_mode_ && mapping_last_map_base_.has_value();
+  }
+  odom_instance_id_ = msg->odom_instance_id;
+  odom_epoch_ = msg->odom_epoch;
+  odom_epoch_start_ns_ = rclcpp::Time(msg->odom_epoch_start_stamp).nanoseconds();
+  odom_identity_latched_ = msg->odom_identity_latched;
+  if (mapping_mode_ && !growing_pending_source_.empty() && !odom_identity_latched_ &&
+    msg->observation_sequence == growing_pending_sequence_ &&
+    rclcpp::Time(msg->last_observation_stamp).nanoseconds() == growing_pending_scan_ns_ &&
+    msg->map_to_odom_valid && msg->map_to_odom.header.frame_id == map_frame_ &&
+    msg->map_to_odom.child_frame_id == odom_frame_ &&
+    msg->map_to_odom.header.stamp == msg->header.stamp)
+  {
+    const auto & rotation = msg->map_to_odom.transform.rotation;
+    const Eigen::Quaterniond quaternion(rotation.w, rotation.x, rotation.y, rotation.z);
+    const auto committed = tf2::transformToEigen(msg->map_to_odom.transform);
+    if (committed.matrix().allFinite() && std::isfinite(quaternion.norm()) &&
+      std::abs(quaternion.norm() - 1.0) < 1e-6)
+    {
+      if (growing_map_->appendAccepted(growing_pending_source_, committed, true)) {
+        rebuildGrowingTarget();
+      }
+      growing_fused_transform_ = committed;
+      RCLCPP_DEBUG(get_logger(), "S3 committed growth observation=%llu candidate_tf_delta=%.6f",
+        static_cast<unsigned long long>(growing_pending_sequence_),
+        (committed.translation() - growing_pending_transform_.translation()).norm());
+      result_t_ = previous_result_t_ = committed;
+      growing_pending_source_.clear();
+    }
+  }
   const std::uint8_t previous = localization_state_;
   const bool epoch_changed = localization_epoch_ != msg->epoch;
   localization_state_ = msg->state;

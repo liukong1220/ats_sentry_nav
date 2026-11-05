@@ -76,6 +76,13 @@ if(BUILD_TESTING)
     test/test_scan_input_core.cpp
   )
   target_include_directories(test_scan_input_core PUBLIC include)
+  ament_add_gtest(test_growing_map test/test_growing_map.cpp)
+  target_include_directories(test_growing_map PRIVATE include)
+  ament_target_dependencies(test_growing_map tf2_eigen)
+  ament_add_gtest(test_mapping_fusion_commit test/test_mapping_fusion_commit.cpp)
+  target_link_libraries(test_mapping_fusion_commit ${PROJECT_NAME})
+  ament_target_dependencies(test_mapping_fusion_commit
+    ats_navigation_interfaces rclcpp sensor_msgs geometry_msgs pcl_conversions tf2_ros tf2_eigen)
 
   ament_add_gtest(test_relocalization_frame_contract
     test/test_relocalization_frame_contract.cpp
@@ -95,6 +102,7 @@ if(BUILD_TESTING)
     test/test_fusion_identified_odometry.py
     TIMEOUT 40
   )
+  ament_add_pytest_test(test_mapping_registration test/test_mapping_registration.py TIMEOUT 60)
 
   ament_add_pytest_test(test_localization_fusion_cold_seed
     test/test_localization_fusion_cold_seed.py

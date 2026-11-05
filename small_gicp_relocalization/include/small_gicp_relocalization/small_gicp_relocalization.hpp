@@ -41,6 +41,7 @@
 #include "small_gicp/registration/registration.hpp"
 #include "small_gicp_relocalization/relocalization_candidate_core.hpp"
 #include "small_gicp_relocalization/scan_input_core.hpp"
+#include "small_gicp_relocalization/growing_map.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -56,6 +57,7 @@ public:
 
 private:
   friend class SmallGicpRelocalizationFrameTest;
+  friend class SmallGicpMappingCommitTest;
 
   using PointCovarianceCloud = pcl::PointCloud<pcl::PointCovariance>;
   using PointKdTree = small_gicp::KdTree<PointCovarianceCloud>;
@@ -137,6 +139,7 @@ private:
 
   void registeredPcdCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   bool loadGlobalMap(const std::string & file_name);
+  void rebuildGrowingTarget();
   void performRegistration();
   void publishTransform();
   void publishObservation(
@@ -324,6 +327,20 @@ private:
   std::string map_frame_;
   std::string odom_frame_;
   std::string prior_pcd_file_;
+  bool mapping_mode_{false};
+  bool require_odom_identity_{false};
+  std::uint64_t odom_instance_id_{0}, odom_epoch_{0};
+  std::int64_t odom_epoch_start_ns_{0};
+  bool odom_identity_latched_{false};
+  std::unique_ptr<GrowingMapStore> growing_map_;
+  GrowingMapStore::Points growing_pending_source_;
+  std::uint64_t growing_pending_sequence_{0};
+  std::int64_t growing_pending_scan_ns_{0};
+  Eigen::Isometry3d growing_pending_transform_{Eigen::Isometry3d::Identity()};
+  Eigen::Isometry3d growing_seed_transform_{Eigen::Isometry3d::Identity()};
+  Eigen::Isometry3d growing_fused_transform_{Eigen::Isometry3d::Identity()};
+  std::optional<Eigen::Isometry3d> mapping_last_map_base_;
+  bool mapping_reseed_needed_{false};
   std::string robot_base_frame_;
   std::string current_scan_frame_id_;
   rclcpp::Time last_scan_time_;

@@ -305,6 +305,9 @@ private:
       if (result == Result::kInvalid || result == Result::kPending) {
         return;
       }
+      if (result == Result::kFirst || result == Result::kChanged) {
+        odom_epoch_start_stamp_ = message->header.stamp;
+      }
       if (result == Result::kChanged) {
         odom_history_.clear();
         latest_odom_stamp_.reset();
@@ -384,6 +387,14 @@ private:
   void onObservation(const RelocalizationObservation::SharedPtr message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (get_parameter("use_identified_odometry").as_bool() && !observationMatchesFrontend(
+        message->odom_instance_id, message->odom_epoch, odom_instance_tracker_.instance(),
+        odom_instance_tracker_.epoch()))
+    {
+      recordRejectionLocked("relocalization observation from obsolete frontend epoch", true);
+      publishStatusLocked();
+      return;
+    }
     if (odom_instance_tracker_.latched()) {
       enterLostLocked("concurrent odometry instances; restart fusion required");
       publishStatusLocked();
@@ -493,9 +504,7 @@ private:
       const bool lost = lost_latched_;
       const double max_xy = lost ? lost_max_correction_translation_ : max_correction_translation_;
       const double max_yaw = lost ? lost_max_correction_yaw_ : max_correction_yaw_;
-      if (
-        has_map_to_odom_ && ((max_xy > 0.0 && correction.delta.translation > max_xy) ||
-                             (max_yaw > 0.0 && correction.delta.yaw > max_yaw))) {
+      if (has_map_to_odom_ && !correctionWithinLimits(correction.delta, max_xy, max_yaw)) {
         recordRejectionLocked(
           lost ? "LOST relocalization correction exceeded lost plausibility gate"
                : "relocalization correction exceeded plausibility gate",
@@ -707,7 +716,13 @@ private:
     status.epoch = epoch_;
     status.odom_instance_id = odom_instance_tracker_.instance();
     status.odom_epoch = odom_instance_tracker_.epoch();
+    status.odom_epoch_start_stamp = odom_epoch_start_stamp_;
+    status.odom_identity_latched = odom_instance_tracker_.latched();
     status.observation_sequence = last_observation_sequence_.value_or(0);
+    status.map_to_odom_valid = has_map_to_odom_;
+    status.map_to_odom.header = status.header;
+    status.map_to_odom.child_frame_id = odom_frame_;
+    status.map_to_odom.transform = tf2::toMsg(map_to_odom_);
     status.odometry_silence_sec = last_odom_receive_time_
                                     ? std::max(0.0, steadySecondsSince(*last_odom_receive_time_))
                                     : std::numeric_limits<double>::infinity();
@@ -768,6 +783,7 @@ private:
 
   std::mutex mutex_;
   OdomInstanceTracker odom_instance_tracker_;
+  builtin_interfaces::msg::Time odom_epoch_start_stamp_;
   double identity_future_tolerance_s_{5.0};
   double identity_max_age_s_{0.5};
   std::deque<OdomPoseSample> odom_history_;

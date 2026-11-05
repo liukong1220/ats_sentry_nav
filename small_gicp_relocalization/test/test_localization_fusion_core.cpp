@@ -17,8 +17,20 @@
 #include <cmath>
 #include <deque>
 #include <optional>
+#include <limits>
 
 #include "small_gicp_relocalization/localization_fusion_core.hpp"
+
+TEST(MapCorrectionLimits, RejectsTranslationYawAndNonFiniteDeltas)
+{
+  using small_gicp_relocalization::CorrectionDelta;
+  using small_gicp_relocalization::correctionWithinLimits;
+  EXPECT_TRUE(correctionWithinLimits(CorrectionDelta{0.30, 0.10}, 2.0, 1.0));
+  EXPECT_FALSE(correctionWithinLimits(CorrectionDelta{2.01, 0.0}, 2.0, 1.0));
+  EXPECT_FALSE(correctionWithinLimits(CorrectionDelta{0.0, 1.01}, 2.0, 1.0));
+  EXPECT_FALSE(correctionWithinLimits(
+    CorrectionDelta{std::numeric_limits<double>::quiet_NaN(), 0.0}, 2.0, 1.0));
+}
 #include "small_gicp_relocalization/localization_status_input_core.hpp"
 #include "small_gicp_relocalization/odom_instance_tracker.hpp"
 
@@ -204,6 +216,18 @@ TEST(LocalizationFusionCore, ContinuousBandAppliesWithoutAdvancingEpoch)
   EXPECT_FALSE(disabled.continuous);
 }
 
+TEST(LocalizationFusionCore, ContinuousBandIncludesExactDeadbandBoundary)
+{
+  const auto current = makeTransform(0.0, 0.0);
+  const auto boundary = selectCorrectionUpdate(
+    makeTransform(0.05, 0.0), current, 0.05, 0.05, 0.20, 0.10);
+  EXPECT_TRUE(boundary.apply);
+  EXPECT_TRUE(boundary.continuous);
+  EXPECT_FALSE(boundary.advance_epoch);
+  const auto zero = selectCorrectionUpdate(current, current, 0.0, 0.0, 0.20, 0.10);
+  EXPECT_FALSE(zero.apply);
+}
+
 TEST(LocalizationFusionCore, AppliesOnlyCorrectionsThatAdvanceEpoch)
 {
   const tf2::Transform current = makeTransform(1.0, 0.10);
@@ -319,4 +343,13 @@ TEST(OdomInstanceTracker, RetiredWindowExpiresWhenTimeAdvances)
   EXPECT_EQ(tracker.observe(100, true, 0.2, none), Result::kRetired);
   EXPECT_EQ(tracker.observe(100, true, 5.0, none), Result::kRetired);
   EXPECT_FALSE(tracker.latched());
+}
+
+TEST(LocalizationFusionIdentity, RejectsDelayedObservationFromPreviousFrontend)
+{
+  using small_gicp_relocalization::observationMatchesFrontend;
+  EXPECT_TRUE(observationMatchesFrontend(20, 2, 20, 2));
+  EXPECT_FALSE(observationMatchesFrontend(10, 1, 20, 2));
+  EXPECT_FALSE(observationMatchesFrontend(20, 1, 20, 2));
+  EXPECT_FALSE(observationMatchesFrontend(0, 0, 0, 0));
 }
