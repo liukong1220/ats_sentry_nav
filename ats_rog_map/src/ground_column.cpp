@@ -163,11 +163,20 @@ void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point, double ra
   auto & column = columns_[index(x, y)];
   const auto found = column.find(static_cast<int>(std::floor(point[2] / config_.voxel_resolution)));
   if (found == column.end()) {return;}
-  // A ray passing above the stored return does not contradict it: a grazing ray
-  // inside the same voxel would otherwise erase a horizontal surface (a platform
-  // edge) and leave the column empty and ray-observed, i.e. falsely free. Only a
-  // ray at or below the stored height shows that return is gone.
-  if (std::isfinite(ray_z) && ray_z > found->second + 1e-9) {return;}
+  // A ray passing above a stored ground-surface return does not contradict it: a
+  // grazing ray inside the same voxel would otherwise erase a horizontal surface
+  // (a platform edge) and leave the column empty and ray-observed, i.e. falsely
+  // free. Only a ray at or below the stored height shows that return is gone.
+  // The protection is for the column's own ground. A return above ground +
+  // surface_max is an obstacle, and the few rays that reach a low face voxel pass
+  // just above it, so an obstacle voxel is cleared by any ray that crosses it.
+  if (std::isfinite(ray_z) && ray_z > found->second + 1e-9) {
+    // The column's own connected ground, not the 3x3 minimum: beside a step the
+    // minimum belongs to the lower neighbour and would make the upper surface
+    // look like an obstacle. Without own ground the voxel stays protected.
+    const auto & floor = ground_[index(x, y)];
+    if (!floor || found->second <= *floor + config_.surface_max + 1e-9) {return;}
+  }
   column.erase(found);
 }
 

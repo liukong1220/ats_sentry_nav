@@ -162,6 +162,27 @@ TEST(GroundColumn, RayClearingDynamicObstacleAboveGroundStillFrees)
   EXPECT_EQ(grid.state(5, 2), ColumnState::kFree);
 }
 
+TEST(GroundColumn, RayJustAboveLowObstacleReturnStillClearsIt)
+{
+  GroundColumnConfig config;
+  ats_rog_map::GroundColumnGrid grid(10, 6, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 10; ++x) {
+    for (int y = 0; y < 6; ++y) {
+      points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, 0.0});
+    }
+  }
+  // Lowest face return of a removed box, 0.20 m above the ground of its column.
+  points.push_back({0.55, 0.25, 0.20});
+  grid.observe(points, {0.05, 0.25, 0.0});
+  ASSERT_EQ(grid.state(5, 2), ColumnState::kOccupied);
+  // Mid360 rays that reach this height are rare and nearly all pass a few
+  // centimetres above the stored return; that must still remove an obstacle.
+  grid.clearVoxel({0.55, 0.25, 0.225}, 0.22);
+  grid.observeRayCell(5, 2);
+  EXPECT_EQ(grid.state(5, 2), ColumnState::kFree);
+}
+
 TEST(GroundColumn, RayClearingRampGroundVoxelKeepsRampFree)
 {
   GroundColumnConfig config;
