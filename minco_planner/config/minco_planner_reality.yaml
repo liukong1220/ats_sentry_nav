@@ -12,8 +12,6 @@ minco_planner:
 
     # 地图所有者的数值快照（融合占据 + 带符号距离场）；JPS、A*、MINCO 与足迹检查共用它。
     planning_snapshot_topic: /rog_map_adapter/planning_snapshot
-    # 只在 planning_snapshot_topic 为空时使用（离线 sandbox）。
-    grid_topic: /rc_esdf/planning_grid
     # 唯一目标入口是 ats_goal_manager 的带编号请求。
     goal_topic: ""
     goal_request_topic: /ats_goal_manager/planner_goal

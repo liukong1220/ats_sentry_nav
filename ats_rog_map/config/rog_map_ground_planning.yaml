@@ -25,9 +25,8 @@ ats_rog_map_adapter:
     static_map_topic: /map
     traversability_grid_topic: /traversability_grid
     traversability_slope_grid_topic: /traversability_slope_grid
-    planning_grid_topic: /rc_esdf/planning_grid
-    signed_distance_grid_topic: /rc_esdf/signed_distance_grid
-    footprint_clearance_grid_topic: /rc_esdf/footprint_clearance_grid
+    # RViz-only view of the snapshot occupancy, encoded only while subscribed.
+    planning_grid_viz_topic: /rog_map_adapter/viz/planning_grid
     ready_topic: /rog_map_adapter/ready
     generation_topic: /rog_map_adapter/generation
     map_status_topic: /rog_map_adapter/status

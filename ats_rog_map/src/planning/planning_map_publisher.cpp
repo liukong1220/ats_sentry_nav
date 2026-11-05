@@ -83,13 +83,13 @@ public:
       "traversability_grid_topic", "/traversability_grid");
     slope_grid_topic_ = declare_parameter<std::string>(
       "traversability_slope_grid_topic", "/traversability_slope_grid");
-    planning_grid_topic_ = declare_parameter<std::string>(
-      "planning_grid_topic", "/rc_esdf/planning_grid");
-    signed_distance_grid_topic_ = declare_parameter<std::string>(
-      "signed_distance_grid_topic", "/rc_esdf/signed_distance_grid");
-    footprint_clearance_grid_topic_ = declare_parameter<std::string>(
-      "footprint_clearance_grid_topic", "/rc_esdf/footprint_clearance_grid");
-    // 仅用于 RViz 的彩色 ESDF 点云（障碍/足迹禁入带/净空梯度/地形风险）；空字符串关闭。
+    // M4: planning_snapshot is the only planning-map contract. The two topics
+    // below are RViz-only views of the same publication, encoded only while
+    // someone subscribes; nothing on the planning or safety path reads them.
+    // An empty string disables a view.
+    planning_grid_viz_topic_ = declare_parameter<std::string>(
+      "planning_grid_viz_topic", "/rog_map_adapter/viz/planning_grid");
+    // 彩色 ESDF 点云（障碍/足迹禁入带/净空梯度/地形风险）。
     esdf_cloud_topic_ = declare_parameter<std::string>("esdf_cloud_topic", "");
     ready_topic_ = declare_parameter<std::string>("ready_topic", "/rog_map_adapter/ready");
     generation_topic_ = declare_parameter<std::string>(
@@ -213,12 +213,10 @@ public:
                       std::placeholders::_1));
 
     const auto output_qos = rclcpp::QoS(1).reliable().transient_local();
-    planning_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
-      planning_grid_topic_, output_qos);
-    signed_distance_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
-      signed_distance_grid_topic_, output_qos);
-    footprint_clearance_grid_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
-      footprint_clearance_grid_topic_, output_qos);
+    if (!planning_grid_viz_topic_.empty()) {
+      planning_grid_viz_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+        planning_grid_viz_topic_, output_qos);
+    }
     if (!esdf_cloud_topic_.empty()) {
       esdf_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         esdf_cloud_topic_, rclcpp::QoS(1).reliable().transient_local());
@@ -255,8 +253,8 @@ public:
       });
     RCLCPP_INFO(
       get_logger(),
-      "ROGMap ground adapter ready: in-process projection planning_grid='%s' height=[%.2f, %.2f] m",
-      planning_grid_topic_.c_str(), projection_min_height_, projection_max_height_);
+      "ROGMap ground adapter ready: in-process projection planning_snapshot='%s' height=[%.2f, %.2f] m",
+      planning_snapshot_topic_.c_str(), projection_min_height_, projection_max_height_);
   }
 
   ~PlanningMapPublisher() override
@@ -872,14 +870,10 @@ private:
       publishUnavailable("fused planning snapshot serialization failed");
       return;
     }
-    planning_grid_pub_->publish(fusion.planning_grid);
-    signed_distance_grid_pub_->publish(
-      encodeDistanceGrid(fusion.planning_grid, signed_distance, 0.0));
+    publishPlanningGridViz(fusion.planning_grid);
     const double footprint_radius = std::hypot(
       0.5 * footprint_length_ + footprint_safety_margin_,
       0.5 * footprint_width_ + footprint_safety_margin_);
-    footprint_clearance_grid_pub_->publish(
-      encodeDistanceGrid(fusion.planning_grid, signed_distance, footprint_radius));
     if (esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U) {
       esdf_cloud_pub_->publish(
         encodeEsdfCloud(fusion.planning_grid, signed_distance, footprint_radius));
@@ -955,24 +949,6 @@ private:
     return injected;
   }
 
-  nav_msgs::msg::OccupancyGrid encodeDistanceGrid(
-    const nav_msgs::msg::OccupancyGrid & planning_grid,
-    const std::vector<double> & distance_field, double clearance_offset) const
-  {
-    nav_msgs::msg::OccupancyGrid encoded = planning_grid;
-    encoded.data.assign(planning_grid.data.size(), -1);
-    const std::size_t size = std::min(planning_grid.data.size(), distance_field.size());
-    for (std::size_t index = 0; index < size; ++index) {
-      if (planning_grid.data[index] < 0 || !std::isfinite(distance_field[index])) {
-        continue;
-      }
-      const double normalized = std::clamp(
-        (distance_field[index] - clearance_offset) / signed_distance_max_m_, -1.0, 1.0);
-      encoded.data[index] = static_cast<int8_t>(std::lround(50.0 + 50.0 * normalized));
-    }
-    return encoded;
-  }
-
   // 每个已知格一个点，RGB 编码：硬障碍品红；足迹外接半径内（中心不可达带）橙粉；
   // 其外 0.25 m 过渡为浅黄；再往外按距离从青绿渐变到近白。0..99 的地形风险按
   // 风险值向淡紫混色，让坡面/台阶在自由区也可见。未知格不画。
@@ -1037,14 +1013,28 @@ private:
     return cloud;
   }
 
+  bool planningGridVizWanted() const
+  {
+    return planning_grid_viz_pub_ && planning_grid_viz_pub_->get_subscription_count() > 0U;
+  }
+
+  void publishPlanningGridViz(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    if (planningGridVizWanted()) {
+      planning_grid_viz_pub_->publish(grid);
+    }
+  }
+
   void publishBlockedGrid(const nav_msgs::msg::OccupancyGrid & source)
   {
-    if (source.info.width == 0 || source.info.height == 0 || source.data.empty()) {
+    if (!planningGridVizWanted() || source.info.width == 0 || source.info.height == 0 ||
+      source.data.empty())
+    {
       return;
     }
     nav_msgs::msg::OccupancyGrid blocked = source;
     blocked.data.assign(source.data.size(), -1);
-    planning_grid_pub_->publish(blocked);
+    planning_grid_viz_pub_->publish(blocked);
   }
 
   void publishUnavailable(const char * reason, bool include_blocking_grid = false)
@@ -1095,10 +1085,8 @@ private:
   std::string static_map_topic_;
   std::string traversability_grid_topic_;
   std::string slope_grid_topic_;
-  std::string planning_grid_topic_;
+  std::string planning_grid_viz_topic_;
   std::string planning_grid_owner_;
-  std::string signed_distance_grid_topic_;
-  std::string footprint_clearance_grid_topic_;
   std::string esdf_cloud_topic_;
   std::string ready_topic_;
   std::string generation_topic_;
@@ -1169,10 +1157,8 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr slope_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
       SharedPtr localization_status_sub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_pub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr signed_distance_grid_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_viz_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_cloud_pub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr footprint_clearance_grid_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::

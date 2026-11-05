@@ -5,9 +5,11 @@ and uses `sensor_frame` as the raycasting origin. It consumes an externally
 registered cloud and external odometry/TF; it never publishes robot-pose TF.
 
 The node publishes occupied, inflated, unknown, and ESDF debug clouds under
-`rog_map/*`, plus `rog_map/stale`. It intentionally does not publish
-`/rc_esdf/planning_grid`; the existing RC-ESDF node remains the single owner
-of that planning contract until the terrain-fusion adapter is introduced.
+`rog_map/*`, plus `rog_map/stale`. The same process also runs the planning-map
+owner (node `ats_rog_map_adapter`, `src/planning/`), which fuses the in-process
+ground projection with terrain and static layers and publishes the only
+planning-map contract, `/rog_map_adapter/planning_snapshot`, plus
+subscriber-gated RViz views under `/rog_map_adapter/viz/`.
 
 `config/rog_map.yaml` is the default 10 cm startup profile, while
 `config/rog_map_mujoco.yaml` lowers `p_occ` for sparse MuJoCo scans.

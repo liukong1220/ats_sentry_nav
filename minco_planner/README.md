@@ -1,6 +1,6 @@
 # minco_planner
 
-ATS 四舵轮哨兵的规划节点。它在 `/rc_esdf/planning_grid` 与同一快照的 RC-ESDF 上生成
+ATS 四舵轮哨兵的规划节点。它在 `/rog_map_adapter/planning_snapshot`（占据与带符号距离同一快照）上生成
 带时间戳、带独立 yaw 的参考轨迹，经矩形足迹门禁后作为候选交给 `ats_goal_manager` 复核
 提交，再由 `ats_swerve_mpc` 跟踪。车辆足迹默认 `0.58 x 0.58 m`，安全余量 `0.05 m`。
 

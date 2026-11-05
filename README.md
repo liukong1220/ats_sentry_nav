@@ -50,10 +50,11 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
        ats_rog_map_node 进程：
          /ats_rog_map (/localization + /registered_scan) -> 进程内地面投影
          /ats_rog_map_adapter (ROGMap 投影 + terrain 栅格 + /map 静态图，用 ats_rc_esdf)
-         -> /rc_esdf/planning_grid, /rc_esdf/signed_distance_grid, /rog_map_adapter/{ready,status,planning_snapshot,generation}
+         -> /rog_map_adapter/{ready,status,planning_snapshot,generation}
+            （RViz 视图 /rog_map_adapter/viz/{planning_grid,esdf_cloud}，有订阅者才编码）
 
 规划   /ats_navigate_to_pose -> ats_goal_manager -> /ats_goal_manager/planner_goal
-       -> minco_planner (读 /rc_esdf/planning_grid) -> /minco/planning_status, /minco/reference_path_candidate
+       -> minco_planner (读 /rog_map_adapter/planning_snapshot) -> /minco/planning_status, /minco/reference_path_candidate
        -> ats_goal_manager 复核并提交 -> /minco/reference_path, /planner/execution_command, /planner/emergency_stop
 
 控制   ats_swerve_mpc (/localization + /minco/reference_path + /planner/execution_command) -> /cmd_vel/autonomy_raw
@@ -66,7 +67,7 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
 
 - 目标在 `map` 系，规划与 ROGMap 在 `odom` 系（`ats_goal_manager` 的 `goal_frame`、`planning_frame`，`ats_rog_map` 的 `map_frame`）。
 - 速度变换两层各由一个 launch 开关控制，MPC 输出 topic 随之变化，见“启动入口”一节的速度链表。
-- 唯一权威：`/rc_esdf/planning_grid` 只由 adapter 发布，`/cmd_vel/selected` 只由 arbiter 发布。
+- 唯一权威：`/rog_map_adapter/planning_snapshot` 只由 adapter 发布（MINCO、goal manager、行为层都读它），`/cmd_vel/selected` 只由 arbiter 发布。
 - 失去地图、定位、有效 reference、执行授权或 heartbeat 时，安全结果是确定性零速度；`/rog_map_adapter/ready` 是持续续租的 heartbeat，不是永久状态。
 - `ats_rog_map_node`（含 `/ats_rog_map` 与 `/ats_rog_map_adapter` 两个节点）由根仓 `bringup.launch.py` 启动，不在本仓 `navigation_launch.py` 里。
 

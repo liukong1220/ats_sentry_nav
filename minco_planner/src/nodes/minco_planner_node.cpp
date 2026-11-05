@@ -136,7 +136,7 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   health_options.callback_group = health_callback_group_;
 
   // Match adapter TRANSIENT_LOCAL publication. VOLATILE missed the first
-  // /rc_esdf/planning_grid under DualMap-era ready races (recovery231:
+  // planning grid under DualMap-era ready races (recovery231:
   // ready=1 + snapshot log, but MINCO kept MAP_UNREADY / zero plans).
   if (!planning_snapshot_topic_.empty()) {
     planning_snapshot_sub_ =
