@@ -279,4 +279,21 @@ TEST(OdomLayerSave, OccupiedCountAndSaveEligibleCountAreExplicitlyDifferent)
   EXPECT_NE(data.find("POINTS 306\n"), std::string::npos);
 }
 
+// 持久比按"本次占据期"计算：先被长时间观测为 free（未被射线清除计数的
+// 纯 free 观测）、之后连续被命中的格，应在命中累计达到比例后可保存。
+TEST(OdomLayerSave, RatioIsPerOccupancyEpisodeNotLifetimeFreeTime)
+{
+  auto store = makeStore();
+  // Cell (2,3) is observed free for about 45 s through the free-space path.
+  for (int t = 1; t <= 45; ++t) {
+    store.observeFree(2, 3, static_cast<double>(t), 1.0);
+  }
+  EXPECT_EQ(store.cell(2, 3)->state, OdomCellState::kFree);
+  for (int t = 46; t <= 52; ++t) {
+    ASSERT_TRUE(store.observeHit(2, 3, static_cast<double>(t), 1.0));
+  }
+  EXPECT_EQ(store.cell(2, 3)->layer, OdomCellLayer::kStatic);
+  EXPECT_TRUE(store.saveEligible(2, 3));
+}
+
 }  // namespace

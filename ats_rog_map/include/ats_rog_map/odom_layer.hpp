@@ -75,6 +75,9 @@ struct OdomLayerSaveStats
   std::size_t persistent_cells{0};
   std::size_t persistent_voxels{0};
   std::size_t raster_occupied_cells{0};
+  std::size_t occupied_dynamic{0};
+  std::size_t occupied_cleared_once{0};
+  std::size_t occupied_other{0};
 };
 
 struct OdomVoxelKeyHash

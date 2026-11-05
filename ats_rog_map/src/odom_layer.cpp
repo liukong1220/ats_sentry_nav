@@ -66,6 +66,8 @@ bool OdomLayerStore::observeHit(
   if (value->state != OdomCellState::kOccupied) {
     value->first_hit_time = stamp;
     value->hit_time_accum = 0.0;
+    // 持久比按本次占据期计算：之前的 free 观测时间不应稀释新出现的障碍。
+    value->observed_time = 0.0;
     value->layer = OdomCellLayer::kDynamic;
   }
   value->hit_time_accum += bounded_dt;
@@ -376,6 +378,8 @@ bool OdomLayerStore::save(
     return false;
   }
   std::vector<unsigned char> pixels(cells_.size(), 205U);
+  std::ofstream ineligible(prefix.string() + ".ineligible.csv");
+  ineligible << "x,y,reason,hit_time,observed_time,clear_count\n";
   for (std::uint32_t row = 0; row < config_.height; ++row) {
     // PGM row zero is the top row; OccupancyGrid y zero is the bottom row.
     const std::uint32_t y = config_.height - 1U - row;
@@ -383,7 +387,23 @@ bool OdomLayerStore::save(
       const auto & value = cells_[index(static_cast<int>(x), static_cast<int>(y))];
       if (value.state == OdomCellState::kOccupied) {++counts.occupied_cells;}
       unsigned char pixel = 205U;  // unknown
-      if (saveEligible(static_cast<int>(x), static_cast<int>(y))) {
+      const bool eligible = saveEligible(static_cast<int>(x), static_cast<int>(y));
+      if (value.state == OdomCellState::kOccupied && !eligible) {
+        // Why an occupied cell is left out of the saved raster, so a missing
+        // obstacle can be traced to dynamic layer, a past ray clear or low ratio.
+        const char * reason = value.cleared_once ? "cleared_once" :
+          value.layer != OdomCellLayer::kStatic ? "dynamic" :
+          value.observed_time <= 0.0 ? "unobserved" : "low_ratio";
+        const auto q = map_point(
+          config_.origin_x + (static_cast<double>(x) + 0.5) * config_.resolution,
+          config_.origin_y + (static_cast<double>(y) + 0.5) * config_.resolution, 0.0);
+        ineligible << q[0] << "," << q[1] << "," << reason << "," << value.hit_time_accum
+                   << "," << value.observed_time << "," << value.clear_count << "\n";
+        if (reason[0] == 'c') {++counts.occupied_cleared_once;}
+        else if (reason[0] == 'd') {++counts.occupied_dynamic;}
+        else {++counts.occupied_other;}
+      }
+      if (eligible) {
         pixel = 0U;
         ++counts.persistent_cells;
         points.push_back(transform(
@@ -529,6 +549,9 @@ bool OdomLayerStore::save(
   yaml << "occupied_cells: " << counts.occupied_cells << "\npersistent_cells: "
        << counts.persistent_cells << "\npersistent_voxels: " << counts.persistent_voxels << "\n";
   yaml << "raster_occupied_cells: " << counts.raster_occupied_cells << "\n";
+  yaml << "occupied_not_saved_dynamic: " << counts.occupied_dynamic
+       << "\noccupied_not_saved_cleared_once: " << counts.occupied_cleared_once
+       << "\noccupied_not_saved_other: " << counts.occupied_other << "\n";
   if (stats) {*stats = counts;}
   return write_pcd(pcd_path, points) && pgm.good() && yaml.good();
 }
