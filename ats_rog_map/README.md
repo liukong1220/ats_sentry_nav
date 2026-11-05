@@ -9,7 +9,9 @@ The node publishes occupied, inflated, unknown, and ESDF debug clouds under
 owner (node `ats_rog_map_adapter`, `src/planning/`), which fuses the in-process
 ground projection with terrain and static layers and publishes the only
 planning-map contract, `/rog_map_adapter/planning_snapshot`, plus
-subscriber-gated RViz views under `/rog_map_adapter/viz/`.
+subscriber-gated RViz views under `/rog_map_adapter/viz/` (`planning_grid`,
+`esdf_cloud` coloured by distance, `clearance_contours` for the inscribed and
+circumscribed radii).
 
 `config/rog_map.yaml` is the default 10 cm startup profile, while
 `config/rog_map_mujoco.yaml` lowers `p_occ` for sparse MuJoCo scans.

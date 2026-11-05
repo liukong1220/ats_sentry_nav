@@ -74,7 +74,7 @@ target_include_directories(${PROJECT_NAME}_planning PUBLIC
 )
 ament_target_dependencies(${PROJECT_NAME}_planning PUBLIC
   ats_navigation_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs std_msgs tf2
-  tf2_geometry_msgs tf2_ros ats_rc_esdf
+  tf2_geometry_msgs tf2_ros ats_rc_esdf visualization_msgs
 )
 
 add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
@@ -135,6 +135,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_ground_column ${PROJECT_NAME}_core)
   ament_add_gtest(test_odom_layer_integration test/test_odom_layer_integration.cpp)
   target_link_libraries(test_odom_layer_integration ${PROJECT_NAME}_core)
+  ament_add_gtest(test_distance_viz test/test_distance_viz.cpp)
+  target_include_directories(test_distance_viz PRIVATE include)
   ament_add_gtest(test_odom_epoch_guard test/test_odom_epoch_guard.cpp)
   target_include_directories(test_odom_epoch_guard PRIVATE include)
 

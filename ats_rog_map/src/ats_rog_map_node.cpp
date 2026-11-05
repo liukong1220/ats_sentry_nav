@@ -759,6 +759,10 @@ private:
     if (!response.ready) {return;}
     auto trace_grid = trace_esdf;
     auto trace_debug = trace_esdf;
+    // The full-layer debug grid is copied once under layer_mutex_ and only while
+    // someone subscribes; serialization and publish happen after the lock is
+    // released so RViz cannot stall cloud integration (report 2.2.1 H).
+    std::optional<nav_msgs::msg::OccupancyGrid> odom_layer_debug;
     {
       std::lock_guard<std::mutex> lock(layer_mutex_);
       const auto & c = odom_layer_->config();
@@ -770,10 +774,13 @@ private:
         static_cast<std::uint32_t>(std::ceil(layer_window_y_ / resolution)), resolution);
       trace_grid = std::chrono::steady_clock::now();
       if (odom_layer_pub_->get_subscription_count() > 0) {
-        odom_layer_pub_->publish(layerGrid(c.origin_x, c.origin_y, c.width, c.height, c.resolution));
+        odom_layer_debug = layerGrid(c.origin_x, c.origin_y, c.width, c.height, c.resolution);
       }
-      trace_debug = std::chrono::steady_clock::now();
     }
+    if (odom_layer_debug) {
+      odom_layer_pub_->publish(*odom_layer_debug);
+    }
+    trace_debug = std::chrono::steady_clock::now();
     ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
     esdf.updateGrid(response.occupancy_grid, 50, true);
     std::vector<double> field;

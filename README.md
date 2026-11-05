@@ -51,7 +51,7 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
          /ats_rog_map (/localization + /registered_scan) -> 进程内地面投影
          /ats_rog_map_adapter (ROGMap 投影 + terrain 栅格 + /map 静态图，用 ats_rc_esdf)
          -> /rog_map_adapter/{ready,status,planning_snapshot,generation}
-            （RViz 视图 /rog_map_adapter/viz/{planning_grid,esdf_cloud}，有订阅者才编码）
+            （RViz 视图 /rog_map_adapter/viz/{planning_grid,esdf_cloud,clearance_contours}，有订阅者才编码）
 
 规划   /ats_navigate_to_pose -> ats_goal_manager -> /ats_goal_manager/planner_goal
        -> minco_planner (读 /rog_map_adapter/planning_snapshot) -> /minco/planning_status, /minco/reference_path_candidate

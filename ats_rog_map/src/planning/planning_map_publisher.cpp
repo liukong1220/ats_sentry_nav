@@ -1,6 +1,7 @@
 // Copyright 2026
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include "ats_rog_map/planning/mapping_health.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_navigation_interfaces/msg/planning_map_status.hpp"
+#include "ats_rog_map/planning/distance_viz.hpp"
 #include "ats_rog_map/planning/ground_projection_fusion.hpp"
 #include "ats_rog_map/planning/planning_map_snapshot.hpp"
 #include "ats_rog_map/planning/planning_map_publisher.hpp"
@@ -33,6 +35,7 @@
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace ats_rog_map::planning
@@ -89,8 +92,11 @@ public:
     // An empty string disables a view.
     planning_grid_viz_topic_ = declare_parameter<std::string>(
       "planning_grid_viz_topic", "/rog_map_adapter/viz/planning_grid");
-    // 彩色 ESDF 点云（障碍/足迹禁入带/净空梯度/地形风险）。
+    // 彩色距离点云（占据黑/外接半径内红/黄到绿/未知灰）与两条净空等值线
+    // （内切半宽、外接半径）。
     esdf_cloud_topic_ = declare_parameter<std::string>("esdf_cloud_topic", "");
+    clearance_contour_topic_ = declare_parameter<std::string>(
+      "clearance_contour_topic", "/rog_map_adapter/viz/clearance_contours");
     ready_topic_ = declare_parameter<std::string>("ready_topic", "/rog_map_adapter/ready");
     generation_topic_ = declare_parameter<std::string>(
       "generation_topic", "/rog_map_adapter/generation");
@@ -220,6 +226,10 @@ public:
     if (!esdf_cloud_topic_.empty()) {
       esdf_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         esdf_cloud_topic_, rclcpp::QoS(1).reliable().transient_local());
+    }
+    if (!clearance_contour_topic_.empty()) {
+      clearance_contour_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+        clearance_contour_topic_, rclcpp::QoS(1).reliable().transient_local());
     }
     ready_pub_ = create_publisher<std_msgs::msg::Bool>(ready_topic_, output_qos);
     generation_pub_ = create_publisher<std_msgs::msg::UInt64>(generation_topic_, output_qos);
@@ -878,6 +888,12 @@ private:
       esdf_cloud_pub_->publish(
         encodeEsdfCloud(fusion.planning_grid, signed_distance, footprint_radius));
     }
+    if (clearance_contour_pub_ && clearance_contour_pub_->get_subscription_count() > 0U) {
+      const double inscribed_radius =
+        0.5 * std::min(footprint_length_, footprint_width_) + footprint_safety_margin_;
+      clearance_contour_pub_->publish(encodeClearanceContours(
+        fusion.planning_grid, signed_distance, inscribed_radius, footprint_radius));
+    }
     std_msgs::msg::UInt64 generation;
     generation.data = response.generation;
     generation_pub_->publish(generation);
@@ -949,9 +965,8 @@ private:
     return injected;
   }
 
-  // 每个已知格一个点，RGB 编码：硬障碍品红；足迹外接半径内（中心不可达带）橙粉；
-  // 其外 0.25 m 过渡为浅黄；再往外按距离从青绿渐变到近白。0..99 的地形风险按
-  // 风险值向淡紫混色，让坡面/台阶在自由区也可见。未知格不画。
+  // 每格一个点，颜色见 distance_viz.hpp：占据黑，外接半径内红，到
+  // kGreenDistanceM 由黄渐变到绿，未知灰。点位按栅格 origin 的 yaw 旋转。
   sensor_msgs::msg::PointCloud2 encodeEsdfCloud(
     const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & distance_field,
     double footprint_radius) const
@@ -961,11 +976,7 @@ private:
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
     const std::size_t size = std::min(grid.data.size(), distance_field.size());
-    std::size_t known = 0;
-    for (std::size_t index = 0; index < size; ++index) {
-      known += grid.data[index] >= 0 ? 1U : 0U;
-    }
-    modifier.resize(known);
+    modifier.resize(size);
     sensor_msgs::PointCloud2Iterator<float> it_x(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> it_y(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> it_z(cloud, "z");
@@ -973,44 +984,81 @@ private:
     sensor_msgs::PointCloud2Iterator<std::uint8_t> it_g(cloud, "g");
     sensor_msgs::PointCloud2Iterator<std::uint8_t> it_b(cloud, "b");
     const auto & info = grid.info;
-    const auto lerp = [](double a, double b, double t) {return a + (b - a) * t;};
     for (std::size_t index = 0; index < size; ++index) {
-      const int value = grid.data[index];
-      if (value < 0) {
-        continue;
-      }
       const double column = static_cast<double>(index % info.width) + 0.5;
       const double row = static_cast<double>(index / info.width) + 0.5;
-      *it_x = static_cast<float>(info.origin.position.x + column * info.resolution);
-      *it_y = static_cast<float>(info.origin.position.y + row * info.resolution);
+      const auto point = cellToFrame(info, column, row);
+      *it_x = static_cast<float>(point[0]);
+      *it_y = static_cast<float>(point[1]);
       *it_z = static_cast<float>(info.origin.position.z - 0.02);
-      double r = 0.0;
-      double g = 0.0;
-      double b = 0.0;
-      const double distance = std::isfinite(distance_field[index]) ? distance_field[index] : 0.0;
-      if (value >= fusion_params_.terrain_obstacle_value_threshold || distance <= 0.0) {
-        r = 225.0; g = 0.0; b = 120.0;
-      } else if (distance < footprint_radius) {
-        r = 245.0; g = 150.0; b = 125.0;
-      } else if (distance < footprint_radius + 0.25) {
-        const double t = (distance - footprint_radius) / 0.25;
-        r = lerp(250.0, 170.0, t); g = lerp(215.0, 240.0, t); b = lerp(140.0, 190.0, t);
-      } else {
-        const double t = std::clamp(
-          (distance - footprint_radius - 0.25) / std::max(0.1, signed_distance_max_m_), 0.0, 1.0);
-        r = lerp(150.0, 235.0, t); g = lerp(235.0, 250.0, t); b = lerp(200.0, 245.0, t);
-      }
-      if (value > 0 && value < fusion_params_.terrain_obstacle_value_threshold) {
-        const double risk = std::clamp(static_cast<double>(value) / 99.0, 0.0, 1.0);
-        const double w = 0.25 + 0.6 * risk;
-        r = lerp(r, 205.0, w); g = lerp(g, 150.0, w); b = lerp(b, 230.0, w);
-      }
-      *it_r = static_cast<std::uint8_t>(std::lround(r));
-      *it_g = static_cast<std::uint8_t>(std::lround(g));
-      *it_b = static_cast<std::uint8_t>(std::lround(b));
+      const auto color = distanceColor(
+        grid.data[index], distance_field[index], fusion_params_.terrain_obstacle_value_threshold,
+        footprint_radius, kGreenDistanceM);
+      *it_r = color.r;
+      *it_g = color.g;
+      *it_b = color.b;
       ++it_x; ++it_y; ++it_z; ++it_r; ++it_g; ++it_b;
     }
     return cloud;
+  }
+
+  // (column, row) in cell units -> grid frame, honouring the origin yaw.
+  static std::array<double, 2> cellToFrame(
+    const nav_msgs::msg::MapMetaData & info, double column, double row)
+  {
+    const double yaw = tf2::getYaw(info.origin.orientation);
+    const double lx = column * info.resolution;
+    const double ly = row * info.resolution;
+    return {
+      info.origin.position.x + std::cos(yaw) * lx - std::sin(yaw) * ly,
+      info.origin.position.y + std::sin(yaw) * lx + std::cos(yaw) * ly};
+  }
+
+  // Two iso-distance lines: inscribed half-width (any yaw collides inside it)
+  // and circumscribed radius (no yaw collides outside it).
+  visualization_msgs::msg::MarkerArray encodeClearanceContours(
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & distance_field,
+    double inscribed_radius, double circumscribed_radius) const
+  {
+    visualization_msgs::msg::MarkerArray markers;
+    const struct
+    {
+      const char * ns;
+      double level;
+      float r, g, b;
+    } lines[] = {
+      {"inscribed", inscribed_radius, 0.90F, 0.10F, 0.10F},
+      {"circumscribed", circumscribed_radius, 1.00F, 0.65F, 0.00F}};
+    for (const auto & line : lines) {
+      visualization_msgs::msg::Marker marker;
+      marker.header = grid.header;
+      marker.ns = line.ns;
+      marker.id = 0;
+      marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 0.03;
+      marker.color.r = line.r;
+      marker.color.g = line.g;
+      marker.color.b = line.b;
+      marker.color.a = 1.0F;
+      const auto segments = distanceContourSegments(
+        distance_field, grid.data, grid.info.width, grid.info.height, line.level);
+      marker.action = segments.empty() ?
+        visualization_msgs::msg::Marker::DELETE : visualization_msgs::msg::Marker::ADD;
+      marker.points.reserve(2U * segments.size());
+      for (const auto & segment : segments) {
+        for (int end = 0; end < 2; ++end) {
+          const auto point = cellToFrame(grid.info, segment[2 * end], segment[2 * end + 1]);
+          geometry_msgs::msg::Point p;
+          p.x = point[0];
+          p.y = point[1];
+          p.z = grid.info.origin.position.z + 0.01;
+          marker.points.push_back(p);
+        }
+      }
+      markers.markers.push_back(std::move(marker));
+    }
+    return markers;
   }
 
   bool planningGridVizWanted() const
@@ -1088,6 +1136,7 @@ private:
   std::string planning_grid_viz_topic_;
   std::string planning_grid_owner_;
   std::string esdf_cloud_topic_;
+  std::string clearance_contour_topic_;
   std::string ready_topic_;
   std::string generation_topic_;
   std::string map_status_topic_;
@@ -1159,6 +1208,8 @@ private:
       SharedPtr localization_status_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_viz_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_cloud_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr clearance_contour_pub_;
+  static constexpr double kGreenDistanceM = 1.0;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::
