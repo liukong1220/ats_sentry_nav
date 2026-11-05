@@ -147,6 +147,35 @@ void exactEuclideanDistanceTransform(
   }
 }
 
+// 栅格外按阻塞：在四周补一圈阻塞格再做变换，与 A* 的 computeBlockedSquaredDistanceCells
+// 是同一条规则，两处读到的自由格距离逐格相同。
+void blockedDistanceTransformWithBlockedBorder(
+  const std::vector<uint8_t> & obstacle_mask, unsigned int width, unsigned int height,
+  double resolution, std::vector<double> & distance_field)
+{
+  const unsigned int padded_width = width + 2U;
+  const unsigned int padded_height = height + 2U;
+  std::vector<uint8_t> padded(
+    static_cast<std::size_t>(padded_width) * static_cast<std::size_t>(padded_height), 1U);
+  for (unsigned int y = 0; y < height; ++y) {
+    for (unsigned int x = 0; x < width; ++x) {
+      padded[static_cast<std::size_t>(y + 1U) * padded_width + x + 1U] =
+        obstacle_mask[static_cast<std::size_t>(y) * width + x];
+    }
+  }
+  std::vector<double> padded_field;
+  exactEuclideanDistanceTransform(padded, padded_width, padded_height, resolution, padded_field);
+  distance_field.assign(
+    static_cast<std::size_t>(width) * static_cast<std::size_t>(height),
+    std::numeric_limits<double>::infinity());
+  for (unsigned int y = 0; y < height; ++y) {
+    for (unsigned int x = 0; x < width; ++x) {
+      distance_field[static_cast<std::size_t>(y) * width + x] =
+        padded_field[static_cast<std::size_t>(y + 1U) * padded_width + x + 1U];
+    }
+  }
+}
+
 }  // namespace
 
 void RcTraversabilityEsdfProvider::configureRollingWindow(bool enabled, double size_x, double size_y)
@@ -276,34 +305,56 @@ void RcTraversabilityEsdfProvider::updateGrid(
 
   const bool has_obstacles = std::any_of(
     obstacle_mask.begin(), obstacle_mask.end(), [](uint8_t value) { return value != 0; });
-  if (!has_obstacles) {
-    const bool has_known_free = std::any_of(
-      known_free_mask.begin(), known_free_mask.end(), [](uint8_t value) { return value != 0; });
-    if (!has_known_free) {
-      // An all-unknown local grid is not evidence of free space. Keep the provider
-      // unavailable so callers fall back to the stable global path or their own
-      // conservative safety policy.
-      return;
-    }
-
-    // A known-free local snapshot can legitimately contain no obstacle samples.
-    // Keep RC-ESDF queryable in that case: every cell has large positive clearance
-    // and a zero gradient, so the elastic optimizer preserves its guide instead of
-    // treating a clear corridor as an ESDF failure.
-    const double clear_distance = std::hypot(
-      static_cast<double>(width_) * resolution_,
-      static_cast<double>(height_) * resolution_);
-    distance_field_.assign(cell_count, clear_distance);
-    distance_to_obstacle_field_ = distance_field_;
-    distance_to_free_field_.assign(cell_count, 0.0);
-    smoothed_distance_field_ = distance_field_;
-    available_ = true;
+  const bool has_known_free = std::any_of(
+    known_free_mask.begin(), known_free_mask.end(), [](uint8_t value) { return value != 0; });
+  if (!has_obstacles && !has_known_free) {
+    // An all-unknown local grid is not evidence of free space. Keep the provider
+    // unavailable so callers fall back to their own conservative safety policy.
     return;
   }
 
   rebuildSignedDistanceField(obstacle_mask, free_mask);
   rebuildSmoothedDistanceField();
   available_ = true;
+}
+
+bool RcTraversabilityEsdfProvider::loadSignedDistanceField(
+  const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & signed_distance)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  available_ = false;
+  distance_field_.clear();
+  distance_to_obstacle_field_.clear();
+  distance_to_free_field_.clear();
+  smoothed_distance_field_.clear();
+  slope_field_.clear();
+  width_ = grid.info.width;
+  height_ = grid.info.height;
+  resolution_ = grid.info.resolution;
+  origin_x_ = grid.info.origin.position.x;
+  origin_y_ = grid.info.origin.position.y;
+  frame_id_ = grid.header.frame_id;
+  stamp_nanoseconds_ = timeToNanoseconds(grid.header.stamp);
+  updateRollingWindowBoundsUnlocked();
+  const std::size_t cell_count =
+    static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
+  if (cell_count == 0U || !(resolution_ > 0.0) || signed_distance.size() != cell_count ||
+    !std::all_of(signed_distance.begin(), signed_distance.end(),
+    [](double value) {return std::isfinite(value);}))
+  {
+    return false;
+  }
+  distance_field_ = signed_distance;
+  distance_to_obstacle_field_.resize(cell_count);
+  distance_to_free_field_.resize(cell_count);
+  for (std::size_t i = 0; i < cell_count; ++i) {
+    distance_to_obstacle_field_[i] = std::max(0.0, signed_distance[i]);
+    distance_to_free_field_[i] = std::max(0.0, -signed_distance[i]);
+  }
+  slope_field_.assign(cell_count, std::numeric_limits<double>::quiet_NaN());
+  rebuildSmoothedDistanceField();
+  available_ = true;
+  return true;
 }
 
 bool RcTraversabilityEsdfProvider::available() const
@@ -625,7 +676,7 @@ void RcTraversabilityEsdfProvider::rebuildSignedDistanceField(
 
   // This is an exact separable Euclidean distance transform at cell centres,
   // not a costmap potential or an 8-neighbour path-distance approximation.
-  exactEuclideanDistanceTransform(
+  blockedDistanceTransformWithBlockedBorder(
     obstacle_mask, width_, height_, resolution_, distance_to_obstacle_field_);
   exactEuclideanDistanceTransform(
     free_mask, width_, height_, resolution_, distance_to_free_field_);

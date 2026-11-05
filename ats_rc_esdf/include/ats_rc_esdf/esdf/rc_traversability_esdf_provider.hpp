@@ -46,6 +46,12 @@ public:
     const nav_msgs::msg::OccupancyGrid * ground_confidence_grid = nullptr,
     const nav_msgs::msg::OccupancyGrid * slope_grid = nullptr);
 
+  // Loads a signed field computed by updateGrid elsewhere (same row-major order,
+  // metres, positive in free space). Only the smoothed gradient field is rebuilt;
+  // no distance transform runs. Every value must be finite.
+  bool loadSignedDistanceField(
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & signed_distance);
+
   bool available() const override;
   double getDistance(double x, double y) const override;
   Eigen::Vector2d getGradient(double x, double y) const override;

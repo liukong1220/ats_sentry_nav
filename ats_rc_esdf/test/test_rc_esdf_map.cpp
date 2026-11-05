@@ -48,7 +48,7 @@ TEST(RcTraversabilityEsdfProvider, ProducesExactSignedEuclideanDistances)
   EXPECT_NEAR(provider.getDistance(3.5, 3.5), std::sqrt(2.0), 1e-9);
 }
 
-// 暴力解：自由格到最近障碍格心的欧氏距离，障碍格到最近自由格心的距离取负。
+// 暴力解：自由格到最近阻塞格心的欧氏距离（栅格外一圈按阻塞），障碍格到最近自由格心的距离取负。
 // 一维变换在站点被弹出后必须对新栈顶重算交点；用旧交点判断会让下包络出错，
 // 距离偏大（偏向不安全一侧）。只有 5x5 单障碍的用例走不到弹出分支。
 std::vector<double> bruteForceSignedDistance(
@@ -65,6 +65,9 @@ std::vector<double> bruteForceSignedDistance(
     for (int x = 0; x < width; ++x) {
       const bool own = blocked(y * width + x);
       double best = std::numeric_limits<double>::infinity();
+      if (!own) {
+        best = std::min({double(x + 1), double(width - x), double(y + 1), double(height - y)});
+      }
       for (int yy = 0; yy < height; ++yy) {
         for (int xx = 0; xx < width; ++xx) {
           if (blocked(yy * width + xx) != own) {
@@ -99,6 +102,75 @@ TEST(RcTraversabilityEsdfProvider, SingleObstacleBesideWallsMatchesBruteForce)
   for (std::size_t i = 0; i < expected.size(); ++i) {
     ASSERT_NEAR(field[i], expected[i], 1e-9) << "cell " << i;
   }
+}
+
+TEST(RcTraversabilityEsdfProvider, OutsideGridIsBlockedOnOpenGrid)
+{
+  // 开阔栅格：边缘格到栅格外只差一格。旧实现给出到中心障碍的距离（6 m），
+  // A* 给出 0.1 m，两处不一致。
+  auto grid = makeGrid(120, 120);
+  grid.info.resolution = 0.1F;
+  grid.data[60U * 120U + 60U] = 100;
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+  provider.updateGrid(grid, 50, true);
+  std::vector<double> field;
+  ASSERT_TRUE(provider.copySignedDistanceField(field));
+  EXPECT_NEAR(field[60U * 120U + 0U], 0.1, 1e-6);
+  EXPECT_NEAR(field[0U], 0.1, 1e-6);
+  EXPECT_NEAR(field[60U * 120U + 59U], 0.1, 1e-6);
+  EXPECT_NEAR(field[30U * 120U + 30U], 3.1, 1e-6);
+}
+
+TEST(RcTraversabilityEsdfProvider, KnownFreeGridWithoutObstaclesMeasuresTheBorder)
+{
+  auto grid = makeGrid(9, 7);
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
+  provider.updateGrid(grid, 50, true);
+  std::vector<double> field;
+  ASSERT_TRUE(provider.copySignedDistanceField(field));
+  const auto expected = bruteForceSignedDistance(grid, 50, true);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    ASSERT_NEAR(field[i], expected[i], 1e-9) << "cell " << i;
+  }
+  EXPECT_NEAR(field[3U * 9U + 4U], 4.0, 1e-9);
+}
+
+TEST(RcTraversabilityEsdfProvider, LoadedFieldReproducesComputedQueries)
+{
+  std::mt19937 rng(7U);
+  auto grid = makeGrid(30, 24);
+  grid.info.resolution = 0.1F;
+  grid.info.origin.position.x = -1.3;
+  grid.info.origin.position.y = 0.7;
+  for (auto & cell : grid.data) {
+    const auto draw = rng() % 10U;
+    cell = draw == 0U ? 100 : (draw == 1U ? -1 : 0);
+  }
+  ats_rc_esdf::RcTraversabilityEsdfProvider computed;
+  computed.updateGrid(grid, 50, true);
+  std::vector<double> field;
+  ASSERT_TRUE(computed.copySignedDistanceField(field));
+  // 传输用 float32；装载后距离与梯度应与本地计算一致到 float 精度。
+  std::vector<double> transported(field.size());
+  for (std::size_t i = 0; i < field.size(); ++i) {
+    transported[i] = static_cast<double>(static_cast<float>(field[i]));
+  }
+  ats_rc_esdf::RcTraversabilityEsdfProvider loaded;
+  ASSERT_TRUE(loaded.loadSignedDistanceField(grid, transported));
+  for (double y = 0.8; y < 2.95; y += 0.037) {
+    for (double x = -1.2; x < 1.55; x += 0.041) {
+      ASSERT_TRUE(std::isfinite(computed.getDistance(x, y))) << x << "," << y;
+      EXPECT_NEAR(loaded.getDistance(x, y), computed.getDistance(x, y), 1e-5);
+      const auto a = loaded.getGradient(x, y);
+      const auto b = computed.getGradient(x, y);
+      EXPECT_NEAR(a.x(), b.x(), 1e-4);
+      EXPECT_NEAR(a.y(), b.y(), 1e-4);
+    }
+  }
+  std::vector<double> nan_field = transported;
+  nan_field[5] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(loaded.loadSignedDistanceField(grid, nan_field));
+  EXPECT_FALSE(loaded.available());
 }
 
 TEST(RcTraversabilityEsdfProvider, RandomGridsMatchBruteForce)
@@ -151,22 +223,23 @@ TEST(RcTraversabilityEsdfProvider, RandomGridsMatchBruteForce)
 // 栅格上离散 footprint gate 与 ESDF clearance 会给出互相矛盾的结论。
 TEST(RcTraversabilityEsdfProvider, RiskBandBelowDeclaredThresholdIsNotAnEsdfObstacle)
 {
-  auto grid = makeGrid(5, 5);
-  grid.data[1U * grid.info.width + 1U] = 60;   // 连续风险，不是硬障碍
-  grid.data[3U * grid.info.width + 3U] = 100;  // 硬障碍
+  // 9x9：栅格外按阻塞后，风险格到边界 4 格，比到硬障碍的 sqrt(8) 远。
+  auto grid = makeGrid(9, 9);
+  grid.data[3U * grid.info.width + 3U] = 60;   // 连续风险，不是硬障碍
+  grid.data[5U * grid.info.width + 5U] = 100;  // 硬障碍
 
   ats_rc_esdf::RcTraversabilityEsdfProvider strict;
   strict.updateGrid(grid, 100, false, 100);
   ASSERT_TRUE(strict.available());
-  // 风险格自身必须是正 clearance，且只由 (3,3) 的硬障碍决定距离。
-  EXPECT_NEAR(strict.getDistance(1.5, 1.5), std::sqrt(8.0), 1e-9);
-  EXPECT_NEAR(strict.getDistance(3.5, 3.5), -1.0, 1e-9);
+  // 风险格自身必须是正 clearance，且只由 (5,5) 的硬障碍决定距离。
+  EXPECT_NEAR(strict.getDistance(3.5, 3.5), std::sqrt(8.0), 1e-9);
+  EXPECT_NEAR(strict.getDistance(5.5, 5.5), -1.0, 1e-9);
 
   // threshold=50 的既有调用点行为不变：60 仍然是障碍。
   ats_rc_esdf::RcTraversabilityEsdfProvider permissive;
   permissive.updateGrid(grid, 50, false, 50);
   ASSERT_TRUE(permissive.available());
-  EXPECT_NEAR(permissive.getDistance(1.5, 1.5), -1.0, 1e-9);
+  EXPECT_NEAR(permissive.getDistance(3.5, 3.5), -1.0, 1e-9);
 }
 
 // unknown 的归属只由 unknown_is_obstacle 决定。语义分对 unknown 返回 -1.0，阈值降到
