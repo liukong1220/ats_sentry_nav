@@ -3,8 +3,11 @@
 #include "loam_interface/loam_interface.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "pcl_ros/transforms.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -25,6 +28,23 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
   // the ground point below base_frame, so odom z=0 is the floor rather than the
   // gimbal / lidar mount height consumed by ROGMap projection and the planners.
   this->declare_parameter<double>("base_frame_height", 0.0);
+  // Point-LIO publishes the IMU state. Legacy lidar-pose producers keep the
+  // identity defaults. These are T_state<-lidar, matching mapping.extrinsic_T/R.
+  const auto state_to_lidar = this->declare_parameter<std::vector<double>>(
+    "state_to_lidar_translation", {0.0, 0.0, 0.0});
+  const auto state_to_lidar_rpy = this->declare_parameter<std::vector<double>>(
+    "state_to_lidar_rpy", {0.0, 0.0, 0.0});
+  const auto finite_three = [](const std::vector<double> & values) {
+      return values.size() == 3 && std::all_of(values.begin(), values.end(),
+        [](double value) {return std::isfinite(value);});
+    };
+  if (!finite_three(state_to_lidar) || !finite_three(state_to_lidar_rpy)) {
+    throw std::invalid_argument("state-to-lidar extrinsics must contain three finite values");
+  }
+  tf2::Quaternion state_rotation;
+  state_rotation.setRPY(state_to_lidar_rpy[0], state_to_lidar_rpy[1], state_to_lidar_rpy[2]);
+  tf_state_to_lidar_ = tf2::Transform(state_rotation, tf2::Vector3(
+    state_to_lidar[0], state_to_lidar[1], state_to_lidar[2]));
 
   this->get_parameter("state_estimation_topic", state_estimation_topic_);
   this->get_parameter("use_identified_odometry", use_identified_odometry_);
@@ -75,7 +95,7 @@ void LoamInterfaceNode::pointCloudCallback(const sensor_msgs::msg::PointCloud2::
   // Here we transform it to the REAL `odom` frame
   // 以 unique_ptr 发布：开 intra-process 时 publish(const T &) 会整帧深拷贝一次。
   auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
-  pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_lidar_odom_, *msg, *out);
+  pcl_ros::transformPointCloud(odom_frame_, tf_odom_to_state_world_, *msg, *out);
   pcd_pub_->publish(std::move(out));
   if (!use_identified_odometry_) {
     odom_pub_->publish(
@@ -126,7 +146,8 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
       const tf2::Transform tf_odom_to_base_frame(
         tf2::Quaternion::getIdentity(), tf2::Vector3(0.0, 0.0, base_frame_height_));
-      tf_odom_to_lidar_odom_ = tf_odom_to_base_frame * tf_base_frame_to_lidar;
+      tf_odom_to_state_world_ =
+        tf_odom_to_base_frame * tf_base_frame_to_lidar * tf_state_to_lidar_.inverse();
       base_frame_to_lidar_initialized_ = true;
     } catch (tf2::TransformException & ex) {
       RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());
@@ -135,9 +156,10 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
   }
 
   // Transform the odometry_msg (based lidar_odom) to the odom frame
-  tf2::Transform tf_lidar_odom_to_lidar;
-  tf2::fromMsg(msg->pose.pose, tf_lidar_odom_to_lidar);
-  tf2::Transform tf_odom_to_lidar = tf_odom_to_lidar_odom_ * tf_lidar_odom_to_lidar;
+  tf2::Transform tf_world_to_state;
+  tf2::fromMsg(msg->pose.pose, tf_world_to_state);
+  tf2::Transform tf_odom_to_lidar =
+    tf_odom_to_state_world_ * tf_world_to_state * tf_state_to_lidar_;
 
   std::lock_guard<std::mutex> lock(odom_buffer_mutex_);
   odom_buffer_.push_back(OdomSample{rclcpp::Time(msg->header.stamp), tf_odom_to_lidar});

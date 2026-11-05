@@ -67,7 +67,8 @@ private:
   std::string base_frame_;
 
   bool base_frame_to_lidar_initialized_;
-  tf2::Transform tf_odom_to_lidar_odom_;
+  tf2::Transform tf_odom_to_state_world_;
+  tf2::Transform tf_state_to_lidar_;
   std::deque<OdomSample> odom_buffer_;
   std::mutex odom_buffer_mutex_;
   static constexpr std::size_t kMaxOdomBufferSize = 4096;
