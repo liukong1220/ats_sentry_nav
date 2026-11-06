@@ -511,12 +511,28 @@ bool GroundProjectionFusion::fuse(
         }
       }
 
+      bool corridor_static_free = false;
+      if (!occupied && known_free && !params.terrain_free_override_rects.empty()) {
+        const tf2::Vector3 static_point = params.output_in_projection_frame ?
+          static_from_projection_transform * tf2::Vector3(static_x, static_y, 0.0) :
+          tf2::Vector3(static_x, static_y, 0.0);
+        for (std::size_t r = 0; r + 3 < params.terrain_free_override_rects.size(); r += 4) {
+          const auto & q = params.terrain_free_override_rects;
+          if (static_point.x() >= q[r] && static_point.x() <= q[r + 2] &&
+            static_point.y() >= q[r + 1] && static_point.y() <= q[r + 3])
+          {
+            corridor_static_free = true;
+            break;
+          }
+        }
+      }
+
       int8_t terrain_value = -1;
       if (sampleGrid(
           traversability_grid, projection_point.x(), projection_point.y(), terrain_value))
       {
         if (terrain_value >= terrain_threshold) {
-          occupied = true;
+          if (!corridor_static_free) {occupied = true;}
         } else if (terrain_value >= 0) {
           known_free = true;
           value = std::max(value, static_cast<int>(terrain_value));
@@ -529,7 +545,7 @@ bool GroundProjectionFusion::fuse(
         if (static_cast<double>(slope_value) * slope_scale / 100.0 >=
           params.slope_obstacle_degrees)
         {
-          occupied = true;
+          if (!corridor_static_free) {occupied = true;}
         } else if (slope_value >= 0) {
           known_free = true;
         }

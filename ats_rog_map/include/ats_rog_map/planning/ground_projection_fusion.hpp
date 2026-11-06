@@ -98,6 +98,9 @@ struct GroundProjectionFusionParams
   bool use_static_map_obstacles{true};
   // Keep the legacy static-map geometry unless production selects the local odom window.
   bool output_in_projection_frame{false};
+  // 平铺 [xmin, ymin, xmax, ymax]*N，静态图坐标系。矩形内静态图明确 free 的格，terrain 与坡度
+  // 的硬障碍不再生效（隧道走廊被 0.2 m terrain 栅格膨胀成假墙）。静态占据、ROG 占据不受影响。
+  std::vector<double> terrain_free_override_rects;
 };
 
 /// @brief Plan A for single-frame terrain hard-obstacle spikes.

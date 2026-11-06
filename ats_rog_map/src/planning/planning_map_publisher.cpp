@@ -140,6 +140,12 @@ public:
       declare_parameter<bool>("output_in_projection_frame", false) || mapping_mode_;
     fusion_params_.use_static_map_obstacles = declare_parameter<bool>(
       "use_static_map_obstacles", true);
+    fusion_params_.terrain_free_override_rects = declare_parameter<std::vector<double>>(
+      "terrain_free_override_rects", std::vector<double>{});
+    if (fusion_params_.terrain_free_override_rects.size() % 4 != 0) {
+      RCLCPP_ERROR(get_logger(), "terrain_free_override_rects 长度不是 4 的倍数，已忽略。");
+      fusion_params_.terrain_free_override_rects.clear();
+    }
     allow_missing_static_map_ = declare_parameter<bool>("allow_missing_static_map", false);
     input_timeout_sec_ = std::max(0.0, declare_parameter<double>("input_timeout_sec", 2.0));
     input_sync_tolerance_sec_ = std::max(

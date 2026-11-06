@@ -307,6 +307,46 @@ TEST(GroundProjectionFusion, PreservesFinerStaticObstacleAcrossRotatedOutputFoot
   EXPECT_EQ(result.unknown_cells, 0U);
 }
 
+TEST(GroundProjectionFusion, TerrainHardCellDoesNotOverrideStaticFreeInsideCorridorRect)
+{
+  auto rog = makeGrid(0);
+  auto terrain = makeGrid(0);
+  auto slope = makeGrid(0);
+  auto static_map = makeGrid(0);
+  terrain.data[5] = 100;   // 走廊内，静态图 free：忽略
+  slope.data[5] = 100;     // 同格坡度硬障碍：同样忽略
+  terrain.data[10] = 100;  // 走廊外：保持占据
+  terrain.data[6] = 100;   // 走廊内，但静态图占据：保持占据
+  static_map.data[6] = 100;
+  rog.data[7] = 100;       // 走廊内的 ROG 实时占据：保持占据
+
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
+  params.planning_resolution = 1.0;
+  params.terrain_free_override_rects = {1.0, 1.0, 4.0, 2.0};
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+    rog, terrain, slope, static_map, identityTransform(), params, result));
+  EXPECT_EQ(result.planning_grid.data[5], 0);
+  EXPECT_EQ(result.planning_grid.data[6], 100);
+  EXPECT_EQ(result.planning_grid.data[7], 100);
+  EXPECT_EQ(result.planning_grid.data[10], 100);
+}
+
+TEST(GroundProjectionFusion, EmptyCorridorRectsKeepLegacyTerrainBehaviour)
+{
+  auto rog = makeGrid(0);
+  auto terrain = makeGrid(0);
+  auto slope = makeGrid(0);
+  auto static_map = makeGrid(0);
+  terrain.data[5] = 100;
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
+  params.planning_resolution = 1.0;
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+    rog, terrain, slope, static_map, identityTransform(), params, result));
+  EXPECT_EQ(result.planning_grid.data[5], 100);
+}
+
 TEST(GroundProjectionFusion, ClearsOnlyUnknownCellsUnderCurrentRobot)
 {
   ats_rog_map::planning::GroundProjectionFusionResult result;
