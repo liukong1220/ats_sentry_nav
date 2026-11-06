@@ -21,6 +21,8 @@ ReferenceTrajectory line(std::size_t count, double dt, double clearance)
     p.t = dt * static_cast<double>(i);
     p.s = 0.1 * static_cast<double>(i);
     p.x = p.s;
+    p.v = 1.0;
+    p.vx = 1.0;
     p.yaw = 0.2;
     p.clearance = clearance;
   }
@@ -184,6 +186,104 @@ TEST(SpinYaw, StopsSpinningAheadOfTheNarrowPointByTheConfiguredDistance)
   EXPECT_LT(trajectory.points[20].yaw_rate, params.rate);
   for (std::size_t i = 20; i < trajectory.points.size(); ++i) {
     EXPECT_LT(trajectory.points[i].yaw_rate, params.rate);
+  }
+}
+
+TEST(SpinYaw, StoppedGoalRestoresRequestedYawAndZeroRate)
+{
+  auto trajectory = line(81, 0.1, 1.0);
+  auto & terminal = trajectory.points.back();
+  terminal.v = terminal.vx = 0.0;
+  terminal.yaw = -2.9;
+  SpinYawParams params;
+  params.angular_accel = 1.5;
+  params.blend_rate_limit = 2.0;
+  const double end_time = terminal.t;
+  const double end_x = terminal.x;
+  ASSERT_TRUE(applySpinYaw(trajectory, params));
+  ASSERT_TRUE(trajectory.valid());
+  EXPECT_GT(trajectory.points.back().t, end_time);
+  EXPECT_NEAR(wrapAngle(trajectory.points.back().yaw + 2.9), 0.0, 1e-9);
+  EXPECT_DOUBLE_EQ(trajectory.points.back().yaw_rate, 0.0);
+  bool translating_spin = false;
+  for (std::size_t i = 1; i < trajectory.points.size(); ++i) {
+    const auto & a = trajectory.points[i - 1];
+    const auto & b = trajectory.points[i];
+    EXPECT_LE(std::abs(b.yaw_rate - a.yaw_rate),
+      params.angular_accel * (b.t - a.t) + 1e-9) << i;
+    EXPECT_LE(std::abs(b.yaw_rate), params.rate + 1e-9);
+    translating_spin |= b.v > 0.1 && b.yaw_rate >= 2.99;
+    if (b.t > end_time) {
+      EXPECT_DOUBLE_EQ(b.x, end_x);
+      EXPECT_DOUBLE_EQ(b.v, 0.0);
+      EXPECT_DOUBLE_EQ(b.vx, 0.0);
+      EXPECT_DOUBLE_EQ(b.vy, 0.0);
+    }
+  }
+  EXPECT_TRUE(translating_spin);
+}
+
+TEST(SpinYaw, PureStationaryYawReferenceIsNotReplacedBySpin)
+{
+  auto trajectory = line(21, 0.1, 1.0);
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    auto & p = trajectory.points[i];
+    p.x = p.s = p.v = p.vx = 0.0;
+    p.yaw = 0.1 * static_cast<double>(i);
+  }
+  const auto original = trajectory;
+  EXPECT_FALSE(applySpinYaw(trajectory, SpinYawParams{}));
+  ASSERT_EQ(trajectory.points.size(), original.points.size());
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    EXPECT_DOUBLE_EQ(trajectory.points[i].yaw, original.points[i].yaw);
+  }
+}
+
+TEST(SpinYaw, ReplacesStationarySuffixWithoutRestartingSpin)
+{
+  auto trajectory = line(41, 0.1, 1.0);
+  for (std::size_t i = 20; i < trajectory.points.size(); ++i) {
+    auto & p = trajectory.points[i];
+    p.x = p.s = 2.0;
+    p.v = p.vx = 0.0;
+    p.yaw = -0.4;
+  }
+  SpinYawParams params;
+  params.angular_accel = 1.5;
+  ASSERT_TRUE(applySpinYaw(trajectory, params));
+  EXPECT_GE(trajectory.points.back().t, 4.0);
+  EXPECT_NEAR(wrapAngle(trajectory.points.back().yaw + 0.4), 0.0, 1e-9);
+  EXPECT_DOUBLE_EQ(trajectory.points.back().yaw_rate, 0.0);
+  for (std::size_t i = 21; i < trajectory.points.size(); ++i) {
+    EXPECT_DOUBLE_EQ(trajectory.points[i].x, 2.0);
+    EXPECT_DOUBLE_EQ(trajectory.points[i].vx, 0.0);
+  }
+}
+
+TEST(SpinYaw, ShortStoppedReferenceWithContinuingSpinStillFinishesAtRest)
+{
+  auto trajectory = line(2, 0.1, 1.0);
+  trajectory.points.back().v = trajectory.points.back().vx = 0.0;
+  SpinYawParams params;
+  params.initial_rate = 3.0;
+  params.angular_accel = 1.5;
+  ASSERT_TRUE(applySpinYaw(trajectory, params));
+  EXPECT_TRUE(trajectory.valid());
+  EXPECT_NEAR(wrapAngle(trajectory.points.back().yaw - 0.2), 0.0, 1e-9);
+  EXPECT_DOUBLE_EQ(trajectory.points.back().yaw_rate, 0.0);
+}
+
+TEST(SpinYaw, ImpossibleTerminalLimitsLeaveOriginalReferenceUntouched)
+{
+  auto trajectory = line(11, 0.1, 1.0);
+  trajectory.points.back().v = trajectory.points.back().vx = 0.0;
+  const auto original = trajectory;
+  SpinYawParams params;
+  params.angular_accel = 0.0;
+  EXPECT_FALSE(applySpinYaw(trajectory, params));
+  ASSERT_EQ(trajectory.points.size(), original.points.size());
+  for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
+    EXPECT_DOUBLE_EQ(trajectory.points[i].yaw, original.points[i].yaw);
   }
 }
 
