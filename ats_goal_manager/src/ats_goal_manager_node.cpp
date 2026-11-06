@@ -1167,7 +1167,8 @@ private:
     const std::uint8_t yaw_authority = planner_ready_status_->yaw_authority;
     const bool requires_gimbal_lock = planner_ready_status_->requires_gimbal_lock;
     if (yaw_authority != PlannerStatus::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
-        yaw_authority != PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW) {
+        yaw_authority != PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW &&
+        yaw_authority != PlannerStatus::YAW_AUTHORITY_SPIN) {
       fail_stop_ = true;
       noteStopReason("commit_unsupported_yaw_authority");
       return;

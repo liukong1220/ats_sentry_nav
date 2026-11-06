@@ -745,7 +745,9 @@ void AtsSwerveMpcNode::onExecutionCommand(
       (message->yaw_authority !=
         ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED &&
        message->yaw_authority !=
-        ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_BODY_YAW_FOLLOW) ||
+        ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_BODY_YAW_FOLLOW &&
+       message->yaw_authority !=
+        ats_navigation_interfaces::msg::ExecutionCommand::YAW_AUTHORITY_SPIN) ||
       !gimbalExecutionValidLocked(*message) ||
       !mapExecutionValidLocked(*message) ||
       (require_localization_status_ &&
