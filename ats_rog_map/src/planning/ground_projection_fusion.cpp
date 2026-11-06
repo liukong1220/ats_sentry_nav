@@ -6,7 +6,9 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "tf2/LinearMath/Transform.h"
 #include "tf2/utils.h"
@@ -327,6 +329,103 @@ SourceUnknownEvidence evaluateSourceUnknownEvidence(
   evidence.reason = "ROGMap numeric projection is strictly all-unknown across " +
     std::to_string(cell_count) + " cells at generation " + std::to_string(snapshot.generation);
   return evidence;
+}
+
+TerrainSpikeFilter::TerrainSpikeFilter(int confirm_frames, int obstacle_threshold)
+: confirm_frames_(std::max(confirm_frames, 1)),
+  obstacle_threshold_(std::clamp(obstacle_threshold, 0, 100))
+{
+}
+
+void TerrainSpikeFilter::reset(const nav_msgs::msg::OccupancyGrid & frame)
+{
+  if (initialized_) {
+    ++resets_;
+  }
+  const std::size_t cells = frame.data.size();
+  counts_.assign(cells, 0);
+  last_soft_.assign(cells, -1);
+}
+
+nav_msgs::msg::OccupancyGrid TerrainSpikeFilter::process(
+  const nav_msgs::msg::OccupancyGrid & frame)
+{
+  suppressed_cells_ = 0;
+  if (confirm_frames_ <= 1 || !validGrid(frame)) {
+    return frame;
+  }
+  const std::int64_t stamp_ns =
+    static_cast<std::int64_t>(frame.header.stamp.sec) * 1000000000LL + frame.header.stamp.nanosec;
+  const bool same_geometry = initialized_ && frame.header.frame_id == frame_id_ &&
+    frame.info.resolution == resolution_ && frame.info.width == width_ &&
+    frame.info.height == height_;
+  int shift_x = 0;
+  int shift_y = 0;
+  bool shiftable = same_geometry;
+  if (same_geometry) {
+    const double fx = (frame.info.origin.position.x - origin_x_) / resolution_;
+    const double fy = (frame.info.origin.position.y - origin_y_) / resolution_;
+    shift_x = static_cast<int>(std::lround(fx));
+    shift_y = static_cast<int>(std::lround(fy));
+    shiftable = std::abs(fx - shift_x) < 1e-3 && std::abs(fy - shift_y) < 1e-3;
+  }
+  const bool rewound = initialized_ && stamp_ns < last_stamp_ns_;
+  if (!same_geometry || !shiftable || rewound) {
+    reset(frame);
+    shift_x = 0;
+    shift_y = 0;
+  } else if (shift_x != 0 || shift_y != 0) {
+    // Cell (ix, iy) of the new frame is cell (ix + shift_x, iy + shift_y) of the old one.
+    std::vector<std::uint16_t> counts(counts_.size(), 0);
+    std::vector<int8_t> soft(last_soft_.size(), -1);
+    const int w = static_cast<int>(width_);
+    const int h = static_cast<int>(height_);
+    for (int iy = 0; iy < h; ++iy) {
+      for (int ix = 0; ix < w; ++ix) {
+        const int ox = ix + shift_x;
+        const int oy = iy + shift_y;
+        if (ox < 0 || oy < 0 || ox >= w || oy >= h) {
+          continue;
+        }
+        counts[static_cast<std::size_t>(iy) * w + ix] = counts_[static_cast<std::size_t>(oy) * w + ox];
+        soft[static_cast<std::size_t>(iy) * w + ix] = last_soft_[static_cast<std::size_t>(oy) * w + ox];
+      }
+    }
+    counts_ = std::move(counts);
+    last_soft_ = std::move(soft);
+  }
+  const bool new_stamp = !initialized_ || stamp_ns != last_stamp_ns_ || rewound;
+  initialized_ = true;
+  frame_id_ = frame.header.frame_id;
+  resolution_ = frame.info.resolution;
+  origin_x_ = frame.info.origin.position.x;
+  origin_y_ = frame.info.origin.position.y;
+  width_ = frame.info.width;
+  height_ = frame.info.height;
+  last_stamp_ns_ = stamp_ns;
+
+  auto output = frame;
+  const auto confirm = static_cast<std::uint16_t>(std::min(confirm_frames_, 65535));
+  for (std::size_t i = 0; i < frame.data.size(); ++i) {
+    const int8_t value = frame.data[i];
+    const bool hard = value >= obstacle_threshold_;
+    if (new_stamp) {
+      if (hard) {
+        if (counts_[i] < confirm) {
+          ++counts_[i];
+        }
+      } else {
+        counts_[i] = 0;
+      }
+    }
+    if (!hard) {
+      last_soft_[i] = value;
+    } else if (counts_[i] < confirm) {
+      output.data[i] = last_soft_[i];
+      ++suppressed_cells_;
+    }
+  }
+  return output;
 }
 
 bool GroundProjectionFusion::fuse(

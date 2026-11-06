@@ -58,6 +58,98 @@ TEST(GroundProjectionFusion, ConservativelyFusesUnknownWallsTerrainAndSlope)
   EXPECT_EQ(result.known_free_cells, 12U);
 }
 
+nav_msgs::msg::OccupancyGrid terrainFrame(int8_t value, int64_t stamp_ms)
+{
+  auto grid = makeGrid(0);
+  grid.header.stamp.sec = static_cast<int32_t>(stamp_ms / 1000);
+  grid.header.stamp.nanosec = static_cast<uint32_t>((stamp_ms % 1000) * 1000000);
+  grid.data[5] = value;
+  return grid;
+}
+
+using ats_rog_map::planning::TerrainSpikeFilter;
+
+TEST(TerrainSpikeFilter, SingleFrameHardCellIsPlannedAsFreeWhileFusionStaysFree)
+{
+  TerrainSpikeFilter filter(3, 50);
+  EXPECT_EQ(filter.process(terrainFrame(0, 1000)).data[5], 0);
+  const auto spike = filter.process(terrainFrame(100, 1100));
+  EXPECT_LT(spike.data[5], 50);
+  EXPECT_EQ(spike.data[5], 0);
+  EXPECT_EQ(filter.suppressedCells(), 1U);
+  EXPECT_EQ(filter.process(terrainFrame(0, 1200)).data[5], 0);
+
+  auto rog = makeGrid(0);
+  auto slope = makeGrid(0);
+  auto static_map = makeGrid(0);
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ats_rog_map::planning::GroundProjectionFusionParams params;
+  params.planning_resolution = 1.0;
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+    rog, spike, slope, static_map, identityTransform(), params, result));
+  EXPECT_EQ(result.planning_grid.data[5], 0);
+}
+
+TEST(TerrainSpikeFilter, PersistentHardCellBecomesObstacleOnTheNthDistinctFrame)
+{
+  TerrainSpikeFilter filter(3, 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1000)).data[5], 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1100)).data[5], 50);
+  EXPECT_EQ(filter.process(terrainFrame(100, 1200)).data[5], 100);
+  EXPECT_EQ(filter.process(terrainFrame(100, 1300)).data[5], 100);
+  // One soft frame drops the cell immediately.
+  EXPECT_LT(filter.process(terrainFrame(0, 1400)).data[5], 50);
+}
+
+TEST(TerrainSpikeFilter, RepeatedStampCountsOnceAndGapsRestartTheRun)
+{
+  TerrainSpikeFilter filter(2, 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1000)).data[5], 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1000)).data[5], 50);
+  EXPECT_EQ(filter.process(terrainFrame(100, 1100)).data[5], 100);
+  EXPECT_LT(filter.process(terrainFrame(0, 1200)).data[5], 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1300)).data[5], 50);
+  // An unknown frame in between also breaks the run.
+  EXPECT_LT(filter.process(terrainFrame(-1, 1400)).data[5], 50);
+  EXPECT_LT(filter.process(terrainFrame(100, 1500)).data[5], 50);
+}
+
+TEST(TerrainSpikeFilter, NeverSeenSoftValueFallsBackToNoEvidence)
+{
+  TerrainSpikeFilter filter(3, 50);
+  EXPECT_EQ(filter.process(terrainFrame(100, 1000)).data[5], -1);
+}
+
+TEST(TerrainSpikeFilter, DisabledAtOneFramePassesHardCellsThrough)
+{
+  TerrainSpikeFilter filter(1, 50);
+  EXPECT_EQ(filter.process(terrainFrame(100, 1000)).data[5], 100);
+}
+
+TEST(TerrainSpikeFilter, OriginShiftKeepsCountsAndNonIntegerShiftOrTimeRewindResets)
+{
+  TerrainSpikeFilter filter(2, 50);
+  auto first = terrainFrame(100, 1000);
+  first.data[5] = 100;
+  EXPECT_LT(filter.process(first).data[5], 50);
+  // The window moved one cell in +x: the same world cell is now index 4.
+  auto moved = terrainFrame(0, 1100);
+  moved.info.origin.position.x = 1.0;
+  moved.data[4] = 100;
+  EXPECT_EQ(filter.process(moved).data[4], 100);
+
+  TerrainSpikeFilter fractional(2, 50);
+  EXPECT_LT(fractional.process(terrainFrame(100, 1000)).data[5], 50);
+  auto off = terrainFrame(100, 1100);
+  off.info.origin.position.x = 0.4;
+  EXPECT_LT(fractional.process(off).data[5], 50);
+
+  TerrainSpikeFilter rewind(2, 50);
+  EXPECT_LT(rewind.process(terrainFrame(100, 2000)).data[5], 50);
+  EXPECT_LT(rewind.process(terrainFrame(100, 1000)).data[5], 50);
+  EXPECT_EQ(rewind.resets(), 1U);
+}
+
 TEST(GroundProjectionFusion, ProjectionFrameKeepsRotatedFineStaticAndRealtimeObstacles)
 {
   auto rog = makeGrid(-1);

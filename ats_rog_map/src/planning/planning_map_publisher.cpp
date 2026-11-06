@@ -125,6 +125,11 @@ public:
       "static_obstacle_value_threshold", 50);
     fusion_params_.terrain_obstacle_value_threshold = declare_parameter<int>(
       "terrain_obstacle_value_threshold", 50);
+    // Plan A: a terrain hard obstacle needs this many consecutive frames with distinct
+    // stamps before it blocks planning.  1 keeps the legacy single-frame behaviour.
+    terrain_spike_filter_ = TerrainSpikeFilter(
+      declare_parameter<int>("terrain_confirm_frames", 1),
+      fusion_params_.terrain_obstacle_value_threshold);
     fusion_params_.slope_grid_max_degrees = declare_parameter<double>(
       "slope_grid_max_degrees", 45.0);
     fusion_params_.slope_obstacle_degrees = declare_parameter<double>(
@@ -203,6 +208,13 @@ public:
       traversability_grid_topic_, rclcpp::QoS(10).reliable(),
       [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(input_mutex_);
+        // Every terrain frame passes through the spike filter, not only the one the
+        // projection timer happens to sample, so consecutive-frame counts are exact.
+        if (terrain_spike_filter_.confirmFrames() > 1) {
+          msg = std::make_shared<nav_msgs::msg::OccupancyGrid>(
+            terrain_spike_filter_.process(*msg));
+          terrain_suppressed_cells_ = terrain_spike_filter_.suppressedCells();
+        }
         traversability_grid_ = std::move(msg);
       });
     slope_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -1177,6 +1189,8 @@ private:
   std::mutex input_mutex_;
   nav_msgs::msg::OccupancyGrid::SharedPtr static_map_;
   nav_msgs::msg::OccupancyGrid::SharedPtr traversability_grid_;
+  TerrainSpikeFilter terrain_spike_filter_;
+  std::size_t terrain_suppressed_cells_{0};
   nav_msgs::msg::OccupancyGrid::SharedPtr slope_grid_;
   nav_msgs::msg::OccupancyGrid last_blocking_grid_;
   RogMapEsdfSnapshot last_numeric_snapshot_;

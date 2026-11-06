@@ -100,6 +100,46 @@ struct GroundProjectionFusionParams
   bool output_in_projection_frame{false};
 };
 
+/// @brief Plan A for single-frame terrain hard-obstacle spikes.
+/// @details A terrain cell at or above `obstacle_threshold` is passed to the planner
+///          only after `confirm_frames` consecutive frames with distinct, increasing
+///          header stamps all reported it as a hard obstacle.  Until then the cell
+///          carries its last non-obstacle terrain value (or -1 when it never had
+///          one), so the other evidence sources decide it.  The same stamp seen twice
+///          counts once; a non-increasing stamp, a geometry change that is not a
+///          whole-cell shift of the origin, or a frame change resets all counters.
+///          `confirm_frames <= 1` disables the filter and returns the frame unchanged.
+class TerrainSpikeFilter
+{
+public:
+  TerrainSpikeFilter() = default;
+  TerrainSpikeFilter(int confirm_frames, int obstacle_threshold);
+
+  nav_msgs::msg::OccupancyGrid process(const nav_msgs::msg::OccupancyGrid & frame);
+
+  int confirmFrames() const {return confirm_frames_;}
+  std::size_t suppressedCells() const {return suppressed_cells_;}
+  std::size_t resets() const {return resets_;}
+
+private:
+  void reset(const nav_msgs::msg::OccupancyGrid & frame);
+
+  int confirm_frames_{1};
+  int obstacle_threshold_{50};
+  std::size_t suppressed_cells_{0};
+  std::size_t resets_{0};
+  bool initialized_{false};
+  std::int64_t last_stamp_ns_{0};
+  std::string frame_id_;
+  double resolution_{0.0};
+  double origin_x_{0.0};
+  double origin_y_{0.0};
+  std::uint32_t width_{0};
+  std::uint32_t height_{0};
+  std::vector<std::uint16_t> counts_;
+  std::vector<int8_t> last_soft_;
+};
+
 struct GroundProjectionFusionResult
 {
   nav_msgs::msg::OccupancyGrid planning_grid;
