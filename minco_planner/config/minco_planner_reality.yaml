@@ -102,6 +102,13 @@ minco_planner:
     # 抬轮 HIL 期间若 require_gimbal_status:=false，则禁止 BODY_YAW_FOLLOW，
     # 因此此处必须保持 false，不得由 profile 强制车体跟随。
     force_body_yaw_follow: false
+    # 小陀螺参数；实车默认关闭，台架/空旷场地验证并确认后再置 true。
+    spin_enabled: false
+    spin_rate: 3.0
+    spin_min_clearance: 0.55
+    spin_align_lookahead: 3.0
+    spin_blend_rate_limit: 2.0
+    spin_angular_accel: 1.5
     local_repair_enabled: false
     local_repair_max_iterations: 2
     local_repair_search_radius: 0.35

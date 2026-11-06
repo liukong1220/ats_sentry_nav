@@ -243,6 +243,13 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("deviation_max", replan_start_params_.deviation_max_m);
   declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   declare_parameter<bool>("force_body_yaw_follow", force_body_yaw_follow_);
+  declare_parameter<bool>("spin_enabled", spin_policy_.enabled);
+  declare_parameter<double>("spin_rate", spin_yaw_params_.rate);
+  declare_parameter<double>("spin_min_clearance", spin_policy_.min_clearance);
+  declare_parameter<double>("spin_align_lookahead", spin_policy_.align_lookahead_m);
+  declare_parameter<double>("spin_blend_rate_limit", spin_yaw_params_.blend_rate_limit);
+  declare_parameter<double>("spin_angular_accel", spin_yaw_params_.angular_accel);
+  declare_parameter<double>("spin_resume_after", spin_yaw_params_.resume_after_narrow_m);
   declare_parameter<std::string>("global_frame", global_frame_);
   declare_parameter<std::string>("robot_frame", robot_frame_);
   declare_parameter<std::string>("search_algorithm", search_algorithm_);
@@ -513,6 +520,17 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("body_yaw_follow_clearance", body_yaw_follow_clearance_);
   body_yaw_follow_clearance_ = std::max(0.0, body_yaw_follow_clearance_);
   get_parameter("force_body_yaw_follow", force_body_yaw_follow_);
+  get_parameter("spin_enabled", spin_policy_.enabled);
+  get_parameter("spin_rate", spin_yaw_params_.rate);
+  get_parameter("spin_min_clearance", spin_policy_.min_clearance);
+  get_parameter("spin_align_lookahead", spin_policy_.align_lookahead_m);
+  get_parameter("spin_blend_rate_limit", spin_yaw_params_.blend_rate_limit);
+  get_parameter("spin_angular_accel", spin_yaw_params_.angular_accel);
+  get_parameter("spin_resume_after", spin_yaw_params_.resume_after_narrow_m);
+  spin_policy_.min_clearance = std::max(0.0, spin_policy_.min_clearance);
+  spin_policy_.align_lookahead_m = std::max(0.0, spin_policy_.align_lookahead_m);
+  spin_yaw_params_.rate = std::max(0.0, spin_yaw_params_.rate);
+  spin_yaw_params_.min_clearance = spin_policy_.min_clearance;
   get_parameter("global_frame", global_frame_);
   get_parameter("robot_frame", robot_frame_);
   get_parameter("search_algorithm", search_algorithm_);
@@ -2184,6 +2202,36 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
+  // 小陀螺：开启时对整条参考生成自旋 yaw（开阔段自旋，窄段前 spin_align_lookahead 起回到规划 yaw，
+  // 窄段后 spin_resume_after 再自旋），重做轮速时间缩放和足迹门禁；门禁不过就沿用规划 yaw，
+  // 授权按原规则判定。
+  std::uint8_t yaw_authority = selectYawAuthority(
+    reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
+  bool spin_now = false;
+  if (spin_policy_.enabled && !force_body_yaw_follow_) {
+    ReferenceTrajectory spun = reference;
+    SpinYawParams spin_params = spin_yaw_params_;
+    spin_params.initial_rate = spin_continuing_.load() ? spin_params.rate : 0.0;
+    spin_params.stop_before_narrow_m = spin_policy_.align_lookahead_m;
+    bool spin_ok = applySpinYaw(spun, spin_params);
+    const bool attempted = spin_ok;
+    if (spin_ok) {
+      applyWheelSpeedTimeScaling(spun, wheel_speed_time_scaling_params_);
+      annotateClearance(spun, *map_snapshot);
+      spin_ok = spun.valid() && safety_checker_.check(spun, planning_grid).safe;
+    }
+    if (spin_ok) {
+      spin_now = spun.points.size() > 1 &&
+        spun.points[1].yaw_rate >= 0.5 * spin_yaw_params_.rate;
+      reference = std::move(spun);
+      yaw_authority = ats_navigation_interfaces::msg::PlannerStatus::YAW_AUTHORITY_SPIN;
+    } else if (attempted) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), log_throttle_ms_,
+        "【小陀螺回退】自旋 yaw 未通过足迹门禁或序列无效，沿用规划 yaw。");
+    }
+  }
+  spin_continuing_.store(spin_now);
   nav_msgs::msg::Path control_reference;
   geometry_msgs::msg::TransformStamped control_from_grid;
   control_from_grid.header.frame_id.clear();
@@ -2194,8 +2242,6 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
-  const std::uint8_t yaw_authority = selectYawAuthority(
-    reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
   PlannerCommitTelemetry telemetry;
   telemetry.grid_topic = planning_snapshot_topic_.empty() ? grid_topic_ : planning_snapshot_topic_;
   telemetry.validation_frame = planning_grid.header.frame_id.empty() ?

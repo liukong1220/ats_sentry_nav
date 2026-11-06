@@ -79,7 +79,7 @@ ats_swerve_mpc:
     # 可行域：出口级（底盘/变换级）不得比这里更宽松。
     max_vx: 1.5
     max_vy: 1.5
-    max_wz: 2.0
+    max_wz: 3.0
     max_ax: 2.0
     max_ay: 2.0
     max_awz: 3.0

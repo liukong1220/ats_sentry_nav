@@ -3,6 +3,7 @@
 #ifndef MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 #define MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -29,6 +30,7 @@
 #include "minco_planner/safety/local_collision_repair.hpp"
 #include "minco_planner/trajectory/minco_trajectory_optimizer.hpp"
 #include "minco_planner/trajectory/replan_start.hpp"
+#include "minco_planner/trajectory/spin_yaw.hpp"
 #include "minco_planner/trajectory/terminal_yaw_relocation.hpp"
 #include "minco_planner/trajectory/trajectory_quality_evaluator.hpp"
 #include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
@@ -221,6 +223,9 @@ private:
   double reference_window_backward_sec_{0.0};
   double body_yaw_follow_clearance_ = 0.55;
   bool force_body_yaw_follow_ = false;
+  SpinPolicy spin_policy_;
+  SpinYawParams spin_yaw_params_;
+  std::atomic<bool> spin_continuing_{false};
   /// Preferred graph-search clearance (circumscribed all-yaw footprint radius).
   double preferred_search_clearance_ = 0.0;
   /// Lowest clearance the graduated ladder may fall back to (inscribed half-width).
