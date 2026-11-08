@@ -435,7 +435,8 @@ bool GroundProjectionFusion::fuse(
   const nav_msgs::msg::OccupancyGrid & static_map,
   const geometry_msgs::msg::TransformStamped & static_from_projection,
   const GroundProjectionFusionParams & params,
-  GroundProjectionFusionResult & result)
+  GroundProjectionFusionResult & result,
+  const geometry_msgs::msg::TransformStamped * override_from_projection)
 {
   result.planning_grid = nav_msgs::msg::OccupancyGrid();
   result.known_free_cells = 0;
@@ -472,6 +473,17 @@ bool GroundProjectionFusion::fuse(
   tf2::fromMsg(static_from_projection.transform, static_from_projection_transform);
   const tf2::Transform projection_from_static_transform =
     static_from_projection_transform.inverse();
+  const bool override_enabled =
+    (!(params.mapping_mode || !params.has_static_map) ||
+    params.diagnostic_allow_terrain_free_override) &&
+    override_from_projection != nullptr && !params.terrain_free_override_frame.empty() &&
+    override_from_projection->header.frame_id == params.terrain_free_override_frame &&
+    override_from_projection->child_frame_id == rog_projection.header.frame_id &&
+    override_from_projection->header.stamp == rog_projection.header.stamp;
+  tf2::Transform override_transform;
+  if (override_enabled) {
+    tf2::fromMsg(override_from_projection->transform, override_transform);
+  }
 
   for (unsigned int my = 0; my < result.planning_grid.info.height; ++my) {
     for (unsigned int mx = 0; mx < result.planning_grid.info.width; ++mx) {
@@ -512,10 +524,9 @@ bool GroundProjectionFusion::fuse(
       }
 
       bool corridor_static_free = false;
-      if (!occupied && known_free && !params.terrain_free_override_rects.empty()) {
-        const tf2::Vector3 static_point = params.output_in_projection_frame ?
-          static_from_projection_transform * tf2::Vector3(static_x, static_y, 0.0) :
-          tf2::Vector3(static_x, static_y, 0.0);
+      if (!occupied && known_free && override_enabled &&
+        !params.terrain_free_override_rects.empty()) {
+        const tf2::Vector3 static_point = override_transform * projection_point;
         for (std::size_t r = 0; r + 3 < params.terrain_free_override_rects.size(); r += 4) {
           const auto & q = params.terrain_free_override_rects;
           if (static_point.x() >= q[r] && static_point.x() <= q[r + 2] &&

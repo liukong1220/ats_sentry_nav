@@ -142,6 +142,16 @@ public:
       "use_static_map_obstacles", true);
     fusion_params_.terrain_free_override_rects = declare_parameter<std::vector<double>>(
       "terrain_free_override_rects", std::vector<double>{});
+    fusion_params_.mapping_mode = mapping_mode_;
+    fusion_params_.terrain_free_override_frame = declare_parameter<std::string>(
+      "terrain_free_override_frame", "map");
+    fusion_params_.diagnostic_allow_terrain_free_override = declare_parameter<bool>(
+      "diagnostic_allow_terrain_free_override", false);
+    if (mapping_mode_ && !fusion_params_.terrain_free_override_rects.empty()) {
+      RCLCPP_WARN(get_logger(), "Terrain rectangle prior in mapping mode: %s",
+        fusion_params_.diagnostic_allow_terrain_free_override ?
+        "diagnostic A/B enabled; not a prior-free acceptance run" : "disabled");
+    }
     if (fusion_params_.terrain_free_override_rects.size() % 4 != 0) {
       RCLCPP_ERROR(get_logger(), "terrain_free_override_rects 长度不是 4 的倍数，已忽略。");
       fusion_params_.terrain_free_override_rects.clear();
@@ -846,10 +856,37 @@ private:
       return;
     }
 
+    // This prior has its own strict, timestamped TF. Never borrow the static-map
+    // identity fallback or the bounded latest-TF policy above. Missing TF only
+    // disables this optional prior; the planning grid must still be produced.
+    auto current_fusion_params = fusion_params_;
+    current_fusion_params.has_static_map = !static_map_is_live_fallback;
+    geometry_msgs::msg::TransformStamped override_from_projection;
+    const geometry_msgs::msg::TransformStamped * override_transform = nullptr;
+    if (!fusion_params_.terrain_free_override_rects.empty() &&
+      (!(mapping_mode_ || static_map_is_live_fallback) ||
+      fusion_params_.diagnostic_allow_terrain_free_override) &&
+      !fusion_params_.terrain_free_override_frame.empty() &&
+      rclcpp::Time(projection_grid.header.stamp).nanoseconds() > 0)
+    {
+      try {
+        override_from_projection = tf_buffer_.lookupTransform(
+          fusion_params_.terrain_free_override_frame, projection_grid.header.frame_id,
+          rclcpp::Time(projection_grid.header.stamp), rclcpp::Duration::from_seconds(0.0));
+        // Static TFs may report stamp zero; lookup has already evaluated the
+        // requested time, so record that query time for the fusion contract.
+        override_from_projection.header.stamp = projection_grid.header.stamp;
+        override_transform = &override_from_projection;
+      } catch (const tf2::TransformException & exception) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Terrain rectangle disabled: strict projection-time TF unavailable: %s",
+          exception.what());
+      }
+    }
     GroundProjectionFusionResult fusion;
     if (!GroundProjectionFusion::fuse(
         projection_grid, *traversability, *slope, *static_map,
-        static_from_projection, fusion_params_, fusion))
+        static_from_projection, current_fusion_params, fusion, override_transform))
     {
       publishUnavailable("ROGMap terrain fusion failed");
       return;

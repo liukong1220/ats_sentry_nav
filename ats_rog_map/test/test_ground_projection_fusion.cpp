@@ -324,12 +324,99 @@ TEST(GroundProjectionFusion, TerrainHardCellDoesNotOverrideStaticFreeInsideCorri
   ats_rog_map::planning::GroundProjectionFusionParams params;
   params.planning_resolution = 1.0;
   params.terrain_free_override_rects = {1.0, 1.0, 4.0, 2.0};
+  params.terrain_free_override_frame = "odom";
+  const auto override_tf = identityTransform();
   ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
-    rog, terrain, slope, static_map, identityTransform(), params, result));
+    rog, terrain, slope, static_map, identityTransform(), params, result, &override_tf));
   EXPECT_EQ(result.planning_grid.data[5], 0);
   EXPECT_EQ(result.planning_grid.data[6], 100);
   EXPECT_EQ(result.planning_grid.data[7], 100);
   EXPECT_EQ(result.planning_grid.data[10], 100);
+}
+
+TEST(GroundProjectionFusion, MissingRectangleTransformKeepsTerrainAndGridAvailable)
+{
+  const auto rog = makeGrid(0);
+  const auto terrain = makeGrid(100);
+  const auto slope = makeGrid(0);
+  const auto prior = makeGrid(0);
+  ats_rog_map::planning::GroundProjectionFusionParams params;
+  params.planning_resolution = 1.0;
+  params.terrain_free_override_rects = {0.0, 0.0, 4.0, 4.0};
+  ats_rog_map::planning::GroundProjectionFusionResult result;
+  ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+    rog, terrain, slope, prior, identityTransform(), params, result));
+  EXPECT_EQ(result.planning_grid.data, std::vector<int8_t>(16, 100));
+}
+
+TEST(GroundProjectionFusion, RectanglePriorUsesIndependentFrameAndMappingDiagnosticGate)
+{
+  auto rog = makeGrid(0);
+  rog.header.stamp.sec = 10;
+  const auto terrain = makeGrid(100);
+  const auto slope = makeGrid(100);
+  const auto prior = makeGrid(0);  // Also models the no-static-map odom fallback.
+  for (const double yaw : {0.0, 0.7, -1.2}) {
+    auto transform = identityTransform();
+    transform.header.frame_id = "map";
+    transform.header.stamp = rog.header.stamp;
+    transform.transform.translation.x = 3.37;
+    transform.transform.translation.y = 9.03;
+    transform.transform.rotation.z = std::sin(yaw / 2);
+    transform.transform.rotation.w = std::cos(yaw / 2);
+    const double x = 3.37 + std::cos(yaw) * 1.5 - std::sin(yaw) * 1.5;
+    const double y = 9.03 + std::sin(yaw) * 1.5 + std::cos(yaw) * 1.5;
+    ats_rog_map::planning::GroundProjectionFusionParams params;
+    params.planning_resolution = 1.0;
+    params.output_in_projection_frame = true;
+    params.terrain_free_override_rects = {x - 0.1, y - 0.1, x + 0.1, y + 0.1};
+    for (const bool mapping : {false, true}) {
+      for (const bool has_static : {false, true}) {
+        for (const bool diagnostic : {false, true}) {
+          params.mapping_mode = mapping;
+          params.has_static_map = has_static;
+          params.diagnostic_allow_terrain_free_override = diagnostic;
+          ats_rog_map::planning::GroundProjectionFusionResult result;
+          ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+            rog, terrain, slope, prior, identityTransform(), params, result, &transform));
+          const bool enabled = (!(mapping || !has_static) || diagnostic);
+          for (std::size_t i = 0; i < 16; ++i) {
+            EXPECT_EQ(result.planning_grid.data[i], enabled && i == 5 ? 0 : 100);
+          }
+        }
+      }
+    }
+    // The legacy untransformed comparison must not clear the old odom location.
+    params.mapping_mode = true;
+    params.diagnostic_allow_terrain_free_override = true;
+    params.terrain_free_override_rects = {1.4, 1.4, 1.6, 1.6};
+    ats_rog_map::planning::GroundProjectionFusionResult result;
+    ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+      rog, terrain, slope, prior, identityTransform(), params, result, &transform));
+    EXPECT_EQ(result.planning_grid.data[5], 100);
+  }
+}
+
+TEST(GroundProjectionFusion, RectangleRejectsWrongFrameAndWrongQueryTime)
+{
+  auto rog = makeGrid(0);
+  rog.header.stamp.sec = 10;
+  const auto terrain = makeGrid(100);
+  const auto slope = makeGrid(0);
+  const auto prior = makeGrid(0);
+  ats_rog_map::planning::GroundProjectionFusionParams params;
+  params.planning_resolution = 1.0;
+  params.terrain_free_override_rects = {0.0, 0.0, 4.0, 4.0};
+  for (const int invalid : {0, 1, 2}) {
+    auto transform = identityTransform();
+    transform.header.frame_id = invalid == 0 ? "wrong" : "map";
+    transform.child_frame_id = invalid == 1 ? "wrong" : "odom";
+    transform.header.stamp.sec = invalid == 2 ? 9 : 10;
+    ats_rog_map::planning::GroundProjectionFusionResult result;
+    ASSERT_TRUE(ats_rog_map::planning::GroundProjectionFusion::fuse(
+      rog, terrain, slope, prior, identityTransform(), params, result, &transform));
+    EXPECT_EQ(result.planning_grid.data, std::vector<int8_t>(16, 100));
+  }
 }
 
 TEST(GroundProjectionFusion, EmptyCorridorRectsKeepLegacyTerrainBehaviour)

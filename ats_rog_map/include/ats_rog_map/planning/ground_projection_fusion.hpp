@@ -98,8 +98,13 @@ struct GroundProjectionFusionParams
   bool use_static_map_obstacles{true};
   // Keep the legacy static-map geometry unless production selects the local odom window.
   bool output_in_projection_frame{false};
-  // 平铺 [xmin, ymin, xmax, ymax]*N，静态图坐标系。矩形内静态图明确 free 的格，terrain 与坡度
-  // 的硬障碍不再生效（隧道走廊被 0.2 m terrain 栅格膨胀成假墙）。静态占据、ROG 占据不受影响。
+  // 场地先验；建图或缺静态图时默认禁用，诊断 A/B 必须显式授权。
+  bool mapping_mode{false};
+  bool has_static_map{true};
+  bool diagnostic_allow_terrain_free_override{false};
+  std::string terrain_free_override_frame{"map"};
+  // 平铺 [xmin, ymin, xmax, ymax]*N，在独立声明的 frame 中判定。
+  // 仅抑制 terrain/slope，静态占据和 ROG 占据始终优先。
   std::vector<double> terrain_free_override_rects;
 };
 
@@ -161,7 +166,8 @@ public:
     const nav_msgs::msg::OccupancyGrid & static_map,
     const geometry_msgs::msg::TransformStamped & static_from_projection,
     const GroundProjectionFusionParams & params,
-    GroundProjectionFusionResult & result);
+    GroundProjectionFusionResult & result,
+    const geometry_msgs::msg::TransformStamped * override_from_projection = nullptr);
   static std::size_t clearUnknownCircle(
     GroundProjectionFusionResult & result, double world_x, double world_y, double radius);
   static std::size_t clearUnknownFootprint(
