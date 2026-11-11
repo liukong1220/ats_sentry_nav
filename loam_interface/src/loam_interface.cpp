@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "pcl_ros/transforms.hpp"
+#include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace loam_interface
@@ -117,6 +118,8 @@ void LoamInterfaceNode::identifiedOdometryCallback(
       retired_instances_.insert(instance_id_);
     }
     instance_id_ = msg->instance_id;
+    // A restarted Point-LIO has a new state world and a new first state.
+    base_frame_to_lidar_initialized_ = false;
     std::lock_guard<std::mutex> lock(odom_buffer_mutex_);
     odom_buffer_.clear();
   }
@@ -146,8 +149,21 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
       const tf2::Transform tf_odom_to_base_frame(
         tf2::Quaternion::getIdentity(), tf2::Vector3(0.0, 0.0, base_frame_height_));
-      tf_odom_to_state_world_ =
+      const tf2::Transform tf_odom_to_world =
         tf_odom_to_base_frame * tf_base_frame_to_lidar * tf_state_to_lidar_.inverse();
+      // The first published state need not be the state world origin: Point-LIO's
+      // first update can already move it. Anchor odom at the ground below the base
+      // of this state; only position and yaw are removed, roll/pitch stay gravity's.
+      tf2::Transform tf_world_to_first_state;
+      tf2::fromMsg(msg->pose.pose, tf_world_to_first_state);
+      const auto first_base = tf_odom_to_world * tf_world_to_first_state * tf_state_to_lidar_ *
+        tf_base_frame_to_lidar.inverse();
+      double roll, pitch, yaw;
+      tf2::Matrix3x3(first_base.getRotation()).getRPY(roll, pitch, yaw);
+      tf2::Quaternion unyaw;
+      unyaw.setRPY(0.0, 0.0, -yaw);
+      const tf2::Transform anchor(unyaw, tf2::quatRotate(unyaw, -first_base.getOrigin()));
+      tf_odom_to_state_world_ = tf_odom_to_base_frame * anchor * tf_odom_to_world;
       base_frame_to_lidar_initialized_ = true;
     } catch (tf2::TransformException & ex) {
       RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s Retrying...", ex.what());
