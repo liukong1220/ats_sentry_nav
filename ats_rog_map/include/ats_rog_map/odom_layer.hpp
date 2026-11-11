@@ -122,6 +122,8 @@ public:
 
   // Mark a cell as visible without asserting either a hit or a ray clear.
   bool observeVisible(int x, int y, double stamp);
+  // Losing support revokes free, never occupied evidence. No ray-clear claim.
+  bool invalidateFree(int x, int y, double stamp);
 
   // A ray clear is authoritative only when the cell was visible to the ray.
   // It never turns an out-of-view cell into free space.

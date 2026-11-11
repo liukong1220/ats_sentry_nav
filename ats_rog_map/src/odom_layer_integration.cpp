@@ -196,7 +196,7 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         if (!layer.validCell(x, y)) {return;}
         if (r == c.cloud_resolution) {clear_cloud(k);}
         const auto i = layer.index(x, y);
-        if (!(flags[i] & 2U)) {
+         if (!(flags[i] & 16U)) {
           if (!(flags[i] & 1U)) {
             flags[i] |= 1U;
             if (const auto ground = columns.ground(x, y)) {ground_cache[i] = *ground;}
@@ -206,12 +206,24 @@ OdomLayerFrameStats integrateOdomLayerFrame(
             actual[2] <= ground + gc.robot_height + gc.top_margin)
           {
             columns.observeRayCell(x, y);
+            flags[i] |= 16U;
             touch(i);
           }
         }
         const Point center{(k[0] + 0.5) * r, (k[1] + 0.5) * r, (k[2] + 0.5) * r};
         if (!mask.clearOnce(k)) {return;}
-        columns.clearVoxel(center, actual[2]);
+         if (columns.clearVoxel(center, actual)) {
+           for (int dy = -1; dy <= 1; ++dy) {
+             for (int dx = -1; dx <= 1; ++dx) {
+               if (layer.validCell(x + dx, y + dy)) {
+                 const auto neighbour = layer.index(x + dx, y + dy);
+                 flags[neighbour] &= static_cast<unsigned char>(~1U);
+                 ground_cache[neighbour] = std::numeric_limits<double>::quiet_NaN();
+                 touch(neighbour);
+               }
+             }
+           }
+         }
         };
       ray(sensor, p, r, clear_column);
       if (r != c.cloud_resolution) {
@@ -233,7 +245,15 @@ OdomLayerFrameStats integrateOdomLayerFrame(
       continue;
     }
     const auto i = layer.index(x, y);
+    flags[i] |= 16U;
     touch(i);
+    // A new support sample can change the fit/bounds in adjacent columns even
+    // when no endpoint lands there this frame. Revoke their stale free too.
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        if (layer.validCell(x + dx, y + dy)) {touch(layer.index(x + dx, y + dy));}
+      }
+    }
     const auto ground = columns.ground(x, y);
     if (ground && p[2] > *ground + gc.surface_max) {flags[i] |= 4U;}
     layer.observePoint(p, stamp, frame_dt);
@@ -241,14 +261,22 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   for (const auto i : touched) {
     const int x = static_cast<int>(i % c.width), y = static_cast<int>(i / c.width);
     const auto state = columns.state(x, y);
+    if (!(flags[i] & 16U)) {
+      if (state != ColumnState::kFree) {layer.invalidateFree(x, y, stamp);}
+      continue;
+    }
     if (state == ColumnState::kOccupied) {
       if (flags[i] & 4U) {layer.observeHit(x, y, stamp, frame_dt);}
-      else {layer.observeVisible(x, y, stamp);}
+      else {
+        layer.invalidateFree(x, y, stamp);
+        layer.observeVisible(x, y, stamp);
+      }
     }
     else if (state == ColumnState::kFree) {
       stats.ray_cleared_cells += layer.observeFree(x, y, stamp, frame_dt) ? 1U : 0U;
       ++stats.non_obstacle;
     }
+    else {layer.invalidateFree(x, y, stamp);}
   }
   stats.ray_voxels = mask.visited();
   layer.tick(stamp);

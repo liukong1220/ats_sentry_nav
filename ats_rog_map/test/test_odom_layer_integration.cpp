@@ -48,6 +48,57 @@ TEST(OdomLayerIntegration, RayRemovesMovedObjectButDoesNotClearOccludedWall)
   EXPECT_EQ(layer.cell(60, 2)->last_visible_time, 3.0);
 }
 
+TEST(OdomLayerIntegration, UnsupportedNewReturnRevokesOldFreeButNotOccupied)
+{
+  const auto c = config();
+  ats_rog_map::OdomLayerStore layer(c);
+  ats_rog_map::GroundColumnGrid columns(c.width, c.height, c.resolution, 0, 0, {});
+  layer.observeFree(20, 2, 1.0, 1.0);
+  layer.observeHit(40, 2, 1.0, 1.0);
+  // Deliberately no connected floor. New uncertain columns must not retain
+  // a previous free decision, nor erase occupied evidence.
+  ats_rog_map::integrateOdomLayerFrame(layer, columns,
+    {{2.05, 0.25, 0.25}, {4.05, 0.25, 0.25}},
+    {0.05, 0.25, 0.4}, {0.05, 0.25, 0.0}, 2.0, 1.0);
+  EXPECT_EQ(layer.cell(20, 2)->state, ats_rog_map::OdomCellState::kUnknown);
+  EXPECT_EQ(layer.cell(40, 2)->state, ats_rog_map::OdomCellState::kOccupied);
+}
+
+TEST(OdomLayerIntegration, SupportRecheckDoesNotManufactureNeighborObservations)
+{
+  const auto c = config();
+  ats_rog_map::OdomLayerStore layer(c);
+  ats_rog_map::GroundColumnGrid columns(c.width, c.height, c.resolution, 0, 0, {});
+  layer.observeFree(20, 2, 1.0, 1.0);
+  layer.observeHit(22, 2, 1.0, 1.0);
+  ats_rog_map::integrateOdomLayerFrame(layer, columns, {{2.15, 0.25, 0.25}},
+    {2.15, 0.25, 0.4}, {0.05, 0.25, 0.0}, 2.0, 1.0);
+  EXPECT_EQ(layer.cell(20, 2)->state, ats_rog_map::OdomCellState::kUnknown);
+  EXPECT_EQ(layer.cell(22, 2)->state, ats_rog_map::OdomCellState::kOccupied);
+  EXPECT_DOUBLE_EQ(layer.cell(22, 2)->last_visible_time, 1.0);
+  EXPECT_DOUBLE_EQ(layer.cell(22, 2)->hit_time_accum, 1.0);
+  EXPECT_EQ(layer.cell(21, 1)->state, ats_rog_map::OdomCellState::kUnknown);
+}
+
+TEST(OdomLayerIntegration, LowCeilingOnSlopeCannotEnterGlobalLayerAsFree)
+{
+  const auto c = config();
+  ats_rog_map::GroundColumnConfig gc;
+  gc.robot_height = 0.242;
+  gc.top_margin = 0.005;
+  ats_rog_map::OdomLayerStore layer(c);
+  ats_rog_map::GroundColumnGrid columns(c.width, c.height, c.resolution, 0, 0, gc);
+  std::vector<Point> points;
+  for (const double x : {0.01, 0.11, 0.21}) {
+    for (const double y : {0.01, 0.11, 0.21}) {points.push_back({x, y, 0.3 * x});}
+  }
+  points.push_back({0.19, 0.15, 0.3 * 0.19 + 0.239});
+  ats_rog_map::integrateOdomLayerFrame(layer, columns, points,
+    {0.01, 0.01, 0.4}, {0.01, 0.01, 0.003}, 1.0, 1.0);
+  EXPECT_EQ(columns.state(1, 1), ats_rog_map::ColumnState::kOccupied);
+  EXPECT_EQ(layer.cell(1, 1)->state, ats_rog_map::OdomCellState::kOccupied);
+}
+
 TEST(OdomLayerIntegration, SameFrameHitsWinAndRepeatedRaysDoNotPromote)
 {
   const auto c = config();

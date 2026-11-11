@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
-from ats_navigation_interfaces.msg import LocalizationStatus
+from ats_navigation_interfaces.msg import LocalizationStatus, PlanningMapStatus
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 import rclpy
@@ -56,8 +56,9 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         status_pub = node.create_publisher(LocalizationStatus, "/localization/status", qos)
         cloud_pub = node.create_publisher(PointCloud2, "/registered_scan", 10)
         odom_pub = node.create_publisher(Odometry, "/localization", 10)
-        ready = []
+        ready, statuses = [], []
         node.create_subscription(Bool, "/rog_map_adapter/ready", lambda m: ready.append(m.data), qos)
+        node.create_subscription(PlanningMapStatus, "/rog_map_adapter/status", statuses.append, qos)
 
         def projection_ends():
             with open(logs[0].name, encoding="utf-8", errors="replace") as text:
@@ -97,7 +98,9 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         boundary = node.get_clock().now().to_msg()
         ready.clear()
         drive(20, 2, 0.8, cloud_stamp=old_stamp)
-        assert ready and not any(ready), "queued old cloud revived reset map"
+        # The untagged Bool may still deliver a ready=True published for epoch 1.
+        reset = [s for s in statuses if s.localization_epoch == 2]
+        assert reset and not any(s.ready for s in reset), "queued old cloud revived reset map"
         # The publisher asked the map for the new identity and got a not-ready
         # projection: the reset map has no new-epoch evidence yet.
         new_epoch = [e for e in projection_ends()
@@ -106,9 +109,14 @@ def test_epoch_reset_blocks_queued_clouds_and_mapping_ready_requires_identity():
         assert new_epoch[0]["ready"] == "0"
         drive(20, 2, 1.2)
         assert ready[-1]
-        ready.clear()
+        # The adapter can react only after a latched status arrives; one status
+        # period plus delivery is far below 0.1 s.
+        reaction = node.get_clock().now().nanoseconds + 100_000_000
         drive(20, 2, 0.6, latched=True)
-        assert ready and not any(ready), "concurrent source latch allowed planning"
+        latched = [s for s in statuses
+                   if s.header.stamp.sec * 1_000_000_000 + s.header.stamp.nanosec >= reaction]
+        assert latched and not any(s.ready for s in latched), \
+            "concurrent source latch allowed planning"
     finally:
         for process in processes:
             if process.poll() is None:

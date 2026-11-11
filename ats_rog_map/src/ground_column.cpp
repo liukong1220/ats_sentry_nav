@@ -84,7 +84,18 @@ void GroundColumnGrid::observe(
     const int x = static_cast<int>(std::floor((p[0] - origin_x_) / resolution_));
     const int y = static_cast<int>(std::floor((p[1] - origin_y_) / resolution_));
     if (!valid(x, y)) {++out_of_range_; continue;}
-    columns_[index(x, y)][static_cast<int>(std::floor(p[2] / config_.voxel_resolution))] = p[2];
+    auto & column = columns_[index(x, y)];
+    const int bin = static_cast<int>(std::floor(p[2] / config_.voxel_resolution));
+    const auto inserted = column.emplace(bin, VoxelReturns{p, p, {p[0], p[1], p[0], p[1]}});
+    if (!inserted.second) {
+      auto & evidence = inserted.first->second;
+      if (p[2] < evidence.low[2]) {evidence.low = p;}
+      if (p[2] > evidence.high[2]) {evidence.high = p;}
+      evidence.xy_bounds[0] = std::min(evidence.xy_bounds[0], p[0]);
+      evidence.xy_bounds[1] = std::min(evidence.xy_bounds[1], p[1]);
+      evidence.xy_bounds[2] = std::max(evidence.xy_bounds[2], p[0]);
+      evidence.xy_bounds[3] = std::max(evidence.xy_bounds[3], p[1]);
+    }
   }
   std::queue<std::pair<int, int>> queue;
   // Existing connected ground is stable in odom; map->odom corrections do not
@@ -95,13 +106,24 @@ void GroundColumnGrid::observe(
       if (columns_[i].empty()) {continue;}
       const double distance = std::hypot(origin_x_ + (x + 0.5) * resolution_ - robot_ground[0],
         origin_y_ + (y + 0.5) * resolution_ - robot_ground[1]);
-      const double z = columns_[i].begin()->second;
+      const auto & candidate = columns_[i].begin()->second;
       // Slope is checked between connected neighbors below. A distance-based
       // seed tolerance would let a nearby hanging plate invent its own floor.
       if (ground_[i] || (distance <= config_.ground_seed_radius &&
-        std::abs(z - robot_ground[2]) <= 0.05))
+        std::abs(candidate.low[2] - robot_ground[2]) <= 0.05))
       {
-        if (!ground_[i]) {ground_[i] = z;}
+        if (!ground_[i]) {ground_[i] = candidate;}
+        else {
+          // Do not turn downward jitter into extra headroom. Keep the observed
+          // support interval until ray contradiction or an epoch reset.
+          auto & support = *ground_[i];
+          if (candidate.low[2] < support.low[2]) {support.low = candidate.low;}
+          if (candidate.high[2] > support.high[2]) {support.high = candidate.high;}
+          for (int a = 0; a < 2; ++a) {
+            support.xy_bounds[a] = std::min(support.xy_bounds[a], candidate.xy_bounds[a]);
+            support.xy_bounds[a + 2] = std::max(support.xy_bounds[a + 2], candidate.xy_bounds[a + 2]);
+          }
+        }
         queue.emplace(x, y);
       }
     }
@@ -109,15 +131,18 @@ void GroundColumnGrid::observe(
   while (!queue.empty()) {
     const auto [x, y] = queue.front();
     queue.pop();
-    const double z = *ground_[index(x, y)];
+    const auto & support = ground_[index(x, y)]->low;
     for (int dy = -1; dy <= 1; ++dy) {
       for (int dx = -1; dx <= 1; ++dx) {
         if ((dx == 0 && dy == 0) || !valid(x + dx, y + dy)) {continue;}
         const auto i = index(x + dx, y + dy);
         if (ground_[i] || columns_[i].empty()) {continue;}
-        const double candidate = columns_[i].begin()->second;
-        if (std::abs(candidate - z) <= config_.max_ground_slope *
-          resolution_ * std::hypot(dx, dy) + 1e-6)
+        const auto & candidate = columns_[i].begin()->second;
+        // Connectivity is surface identity, not a headroom bound: two returns a
+        // few mm apart across a cell edge must not split on LIO noise.
+        if (std::abs(candidate.low[2] - support[2]) <= config_.max_ground_slope * std::max(
+            resolution_ * std::hypot(dx, dy),
+            std::hypot(candidate.low[0] - support[0], candidate.low[1] - support[1])) + 1e-6)
         {ground_[i] = candidate; queue.emplace(x + dx, y + dy);}
       }
     }
@@ -127,42 +152,164 @@ void GroundColumnGrid::observe(
 std::optional<double> GroundColumnGrid::ground(int x, int y) const
 {
   if (!valid(x, y)) {return std::nullopt;}
-  auto result = ground_[index(x, y)];
-  // A wall may have no floor return in its own column. Use the lowest
-  // connected surface in its 3x3 neighborhood, as specified in appendix A.1.
+  const auto bounds = supportBounds(x, y, origin_x_ + (x + 0.5) * resolution_,
+    origin_y_ + (y + 0.5) * resolution_);
+  if (!bounds) {return std::nullopt;}
+  return (*bounds)[0];
+}
+
+std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
+  int x, int y, double query_x, double query_y) const
+{
+  std::vector<VoxelReturns> supports;
+  double lower = -std::numeric_limits<double>::infinity();
+  double upper = std::numeric_limits<double>::infinity();
   for (int dy = -1; dy <= 1; ++dy) {
     for (int dx = -1; dx <= 1; ++dx) {
       if (!valid(x + dx, y + dy)) {continue;}
-      const auto z = ground_[index(x + dx, y + dy)];
-      if (z && (!result || *z < *result)) {result = z;}
+      const auto & p = ground_[index(x + dx, y + dy)];
+      if (!p) {continue;}
+      supports.push_back(*p);
+      lower = std::max(lower, p->low[2] - config_.max_ground_slope *
+        std::hypot(query_x - p->low[0], query_y - p->low[1]));
+      upper = std::min(upper, p->high[2] + config_.max_ground_slope *
+        std::hypot(query_x - p->high[0], query_y - p->high[1]));
     }
   }
-  return result;
+  if (supports.empty()) {return std::nullopt;}
+  // Fit only observed connected supports, not arbitrary low points or a
+  // diagnostic/interpolated floor. Reject steps, rank deficiency and extrapolation.
+  if (supports.size() >= 6) {
+    Point mean{};
+    for (const auto & support : supports) {
+      for (int a = 0; a < 3; ++a) {mean[a] += support.low[a] / supports.size();}
+    }
+    double xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
+    std::vector<double> angles;
+    for (const auto & support : supports) {
+      const auto & p = support.low;
+      const double u = p[0] - mean[0], v = p[1] - mean[1], w = p[2] - mean[2];
+      xx += u * u; xy += u * v; yy += v * v; xz += u * w; yz += v * w;
+      angles.push_back(std::atan2(p[1] - query_y, p[0] - query_x));
+    }
+    const double determinant = xx * yy - xy * xy;
+    if (determinant > 1e-8 * (xx + yy) * (xx + yy)) {
+      const double a = (xz * yy - yz * xy) / determinant;
+      const double b = (yz * xx - xz * xy) / determinant;
+      double residual = 0;
+      for (const auto & support : supports) {
+        // Enclose the whole measured support interval, not only a historical
+        // minimum or the two z-extreme points on a sloping surface.
+        for (const double px : {support.xy_bounds[0], support.xy_bounds[2]}) {
+          for (const double py : {support.xy_bounds[1], support.xy_bounds[3]}) {
+            const double fitted = mean[2] + a * (px - mean[0]) + b * (py - mean[1]);
+            residual = std::max({residual, std::abs(support.low[2] - fitted),
+              std::abs(support.high[2] - fitted)});
+          }
+        }
+      }
+      std::sort(angles.begin(), angles.end());
+      constexpr double pi = 3.14159265358979323846;
+      double gap = angles.front() + 2 * pi - angles.back();
+      for (std::size_t i = 1; i < angles.size(); ++i) {
+        gap = std::max(gap, angles[i] - angles[i - 1]);
+      }
+      if (std::hypot(a, b) <= config_.max_ground_slope && residual <= config_.support_noise &&
+        gap <= pi + 1e-9)
+      {
+        const double z = mean[2] + a * (query_x - mean[0]) + b * (query_y - mean[1]);
+        return std::array<double, 2>{z - residual, z + residual};
+      }
+    }
+  }
+  // No valid planar support: retain the full Lipschitz uncertainty. An
+  // inconsistent neighbourhood is unknown, never repaired by selecting a minimum.
+  // Returns a few mm apart carry measurement noise beyond the slope bound.
+  // Up to support_noise the interval spans both ends; beyond it is unknown.
+  if (lower > upper + config_.support_noise + 1e-9) {return std::nullopt;}
+  return std::array<double, 2>{std::min(lower, upper), std::max(lower, upper)};
 }
 
 ColumnState GroundColumnGrid::state(int x, int y) const
 {
   if (!valid(x, y)) {return ColumnState::kUnknown;}
+  const auto observed = std::max(static_cast<int>(columns_[index(x, y)].size()),
+    ray_observed_[index(x, y)] ? 1 : 0);
+  if (observed < config_.min_observed) {return ColumnState::kUnknown;}
   std::vector<double> heights;
-  for (const auto & bin : columns_[index(x, y)]) {heights.push_back(bin.second);}
+  bool ceiling = false;
+  const double clearance = config_.robot_height + config_.top_margin;
+  for (const auto & bin : columns_[index(x, y)]) {
+    // z extrema alone lose a low-clearance point on a slope. Enclose ALL
+    // measured XY, including returns between the two stored z extrema.
+    double lower = std::numeric_limits<double>::infinity();
+    double upper = -std::numeric_limits<double>::infinity();
+    for (const double qx : {bin.second.xy_bounds[0], bin.second.xy_bounds[2]}) {
+      for (const double qy : {bin.second.xy_bounds[1], bin.second.xy_bounds[3]}) {
+        const auto bounds = supportBounds(x, y, qx, qy);
+        if (!bounds) {return ColumnState::kUnknown;}
+        lower = std::min(lower, (*bounds)[0]);
+        upper = std::max(upper, (*bounds)[1]);
+      }
+    }
+    // Include interior extrema of the slope-bound cones when no plane exists.
+    const double diameter = std::hypot(bin.second.xy_bounds[2] - bin.second.xy_bounds[0],
+      bin.second.xy_bounds[3] - bin.second.xy_bounds[1]);
+    // supportBounds is Lipschitz; corners alone need not enclose its interior.
+    // The centre query plus the rectangle radius supplies an independent bound.
+    const auto centre = supportBounds(x, y,
+      (bin.second.xy_bounds[0] + bin.second.xy_bounds[2]) * 0.5,
+      (bin.second.xy_bounds[1] + bin.second.xy_bounds[3]) * 0.5);
+    if (!centre) {return ColumnState::kUnknown;}
+    lower = std::min(lower, (*centre)[0] - config_.max_ground_slope * diameter * 0.5);
+    upper = std::max(upper, (*centre)[1] + config_.max_ground_slope * diameter * 0.5);
+    if (bin.second.high[2] - lower > config_.surface_max + 1e-9) {
+      if (bin.second.low[2] - upper < clearance - 1e-9) {return ColumnState::kOccupied;}
+      ceiling = true;
+    }
+    // Without its own connected floor, a return below the neighbourhood
+    // support is an unexplained lower surface (a drop), not floor.
+    if (!ground_[index(x, y)] && bin.second.low[2] < lower - config_.surface_max - 1e-9) {
+      return ColumnState::kUnknown;
+    }
+    for (const auto & p : {bin.second.low, bin.second.high}) {
+      heights.push_back(p[2] - upper);
+    }
+  }
+  // Neighbouring floor evidence can identify a wall, but cannot establish
+  // traversable support under a hanging plate. A column with only floor-band
+  // returns, or none, keeps the neighbourhood support of appendix A.1: sparse
+  // downsampled LIO endpoints leave most open-floor columns without their own.
+  if (!ground_[index(x, y)]) {
+    if (ceiling || !supportBounds(x, y, origin_x_ + (x + 0.5) * resolution_,
+        origin_y_ + (y + 0.5) * resolution_))
+    {return ColumnState::kUnknown;}
+  }
   return classifyGroundColumn(heights,
-    std::max(static_cast<int>(heights.size()), ray_observed_[index(x, y)] ? 1 : 0),
-    ground(x, y), config_);
+    observed, 0.0, config_);
 }
 
-void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point)
+bool GroundColumnGrid::clearVoxel(const std::array<double, 3> & point)
 {
-  clearVoxel(point, -std::numeric_limits<double>::infinity());
+  return clearVoxel(point, -std::numeric_limits<double>::infinity());
 }
 
-void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point, double ray_z)
+bool GroundColumnGrid::clearVoxel(const std::array<double, 3> & point, double ray_z)
 {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  return clearVoxel(point, Point{nan, nan, ray_z});
+}
+
+bool GroundColumnGrid::clearVoxel(
+  const std::array<double, 3> & point, const std::array<double, 3> & ray)
+{
+  const double ray_z = ray[2];
   const int x = static_cast<int>(std::floor((point[0] - origin_x_) / resolution_));
   const int y = static_cast<int>(std::floor((point[1] - origin_y_) / resolution_));
-  if (!valid(x, y)) {return;}
+  if (!valid(x, y)) {return false;}
   auto & column = columns_[index(x, y)];
   const auto found = column.find(static_cast<int>(std::floor(point[2] / config_.voxel_resolution)));
-  if (found == column.end()) {return;}
+  if (found == column.end()) {return false;}
   // A ray passing above a stored ground-surface return does not contradict it: a
   // grazing ray inside the same voxel would otherwise erase a horizontal surface
   // (a platform edge) and leave the column empty and ray-observed, i.e. falsely
@@ -170,14 +317,25 @@ void GroundColumnGrid::clearVoxel(const std::array<double, 3> & point, double ra
   // The protection is for the column's own ground. A return above ground +
   // surface_max is an obstacle, and the few rays that reach a low face voxel pass
   // just above it, so an obstacle voxel is cleared by any ray that crosses it.
-  if (std::isfinite(ray_z) && ray_z > found->second + 1e-9) {
+  // On a slope the stored return and the ray sample have different XY: the
+  // surface under the ray can be as low as low.z - slope * d, not low.z.
+  const auto & low = found->second.low;
+  const double d = std::isfinite(ray[0]) && std::isfinite(ray[1]) ?
+    std::hypot(ray[0] - low[0], ray[1] - low[1]) : 0.0;
+  if (std::isfinite(ray_z) && ray_z > low[2] - config_.max_ground_slope * d + 1e-9) {
     // The column's own connected ground, not the 3x3 minimum: beside a step the
     // minimum belongs to the lower neighbour and would make the upper surface
     // look like an obstacle. Without own ground the voxel stays protected.
     const auto & floor = ground_[index(x, y)];
-    if (!floor || found->second <= *floor + config_.surface_max + 1e-9) {return;}
+    if (!floor || found->second.low[2] <= floor->high[2] + config_.surface_max + 1e-9) {return false;}
   }
+  auto & floor = ground_[index(x, y)];
+  const bool removed_support = floor &&
+    (static_cast<int>(std::floor(floor->low[2] / config_.voxel_resolution)) == found->first ||
+    static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) == found->first);
+  if (removed_support) {floor.reset();}
   column.erase(found);
+  return removed_support;
 }
 
 void GroundColumnGrid::observeRayCell(int x, int y)

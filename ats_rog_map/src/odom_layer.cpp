@@ -93,6 +93,17 @@ bool OdomLayerStore::observeVisible(const int x, const int y, const double stamp
   return true;
 }
 
+bool OdomLayerStore::invalidateFree(const int x, const int y, const double stamp)
+{
+  auto * value = cell(x, y);
+  if (value == nullptr || !std::isfinite(stamp) || stamp < value->last_visible_time ||
+    value->state != OdomCellState::kFree)
+  {return false;}
+  value->state = OdomCellState::kUnknown;
+  value->last_visible_time = stamp;
+  return true;
+}
+
 bool OdomLayerStore::observePoint(
   const std::array<double, 3> & point, const double stamp, const double observed_dt)
 {

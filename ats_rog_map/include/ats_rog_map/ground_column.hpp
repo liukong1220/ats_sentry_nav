@@ -27,6 +27,8 @@ struct GroundColumnConfig
   double top_margin{0.05};
   double max_ground_slope{0.6};
   double ground_seed_radius{0.65};
+  // Plane-fit residual limit and tolerated support inconsistency (m).
+  double support_noise{0.005};
 };
 
 // All comparisons use the local connected ground, never the robot's plane.
@@ -47,14 +49,26 @@ public:
   ColumnState state(int x, int y) const;
   std::optional<double> ground(int x, int y) const;
   void clear();
-  void clearVoxel(const std::array<double, 3> & point);
-  // Clears the voxel only when the ray crossing it is not above the stored return.
-  void clearVoxel(const std::array<double, 3> & point, double ray_z);
+  // Return true only when a connected support was actually removed.
+  bool clearVoxel(const std::array<double, 3> & point);
+  bool clearVoxel(const std::array<double, 3> & point, double ray_z);
+  // ray is the sample where the ray crosses the voxel; its XY bounds the slope.
+  bool clearVoxel(const std::array<double, 3> & point, const std::array<double, 3> & ray);
   void observeRayCell(int x, int y);
   std::size_t outOfRange() const {return out_of_range_;}
   const GroundColumnConfig & config() const {return config_;}
 
 private:
+  using Point = std::array<double, 3>;
+  struct VoxelReturns
+  {
+    Point low;
+    Point high;
+    std::array<double, 4> xy_bounds;  // min x/y, max x/y of every retained return
+  };
+  // Bounds at the query XY, never a neighbouring column's unshifted height.
+  std::optional<std::array<double, 2>> supportBounds(int x, int y,
+    double query_x, double query_y) const;
   bool valid(int x, int y) const;
   std::size_t index(int x, int y) const;
   int width_;
@@ -63,8 +77,8 @@ private:
   double origin_x_;
   double origin_y_;
   GroundColumnConfig config_;
-  std::vector<std::map<int, double>> columns_;
-  std::vector<std::optional<double>> ground_;
+  std::vector<std::map<int, VoxelReturns>> columns_;
+  std::vector<std::optional<VoxelReturns>> ground_;
   std::vector<bool> ray_observed_;
   std::size_t out_of_range_{0};
 };
