@@ -546,7 +546,8 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
  *          失败不覆盖原有安全状态，调用方负责进入 fail-stop。
  */
 bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
-                                   bool keep_control_state) {
+                                   bool keep_control_state,
+                                   std::optional<CommandOrder> command) {
   if (require_localization_status_ && !localization_tracking_.load()) {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -596,9 +597,16 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     const bool missing_stamp =
         message.header.stamp.sec == 0 && message.header.stamp.nanosec == 0;
+    // 序号在停车 STOP 之后的 EXECUTE 由 Goal Manager 在停车之后提交，其 reference 戳可与
+    // 停车戳落在同一仿真时钟格（domain 213）。其它来源的停车没有序号可比，相等仍拒绝。
+    const bool ordered_after_stop = command && last_stop_command_ &&
+      command->incarnation == last_stop_command_->incarnation &&
+      command->sequence > last_stop_command_->sequence;
+    const rclcpp::Time reference_stamp(message.header.stamp);
     if (last_stop_stamp_.nanoseconds() > 0 &&
         (missing_stamp ||
-         rclcpp::Time(message.header.stamp) <= last_stop_stamp_)) {
+         reference_stamp < last_stop_stamp_ ||
+         (reference_stamp == last_stop_stamp_ && !ordered_after_stop))) {
       RCLCPP_WARN(
           get_logger(),
           "【参考丢弃】轨迹时间早于最近一次急停，拒绝旧轨迹。");
@@ -800,10 +808,16 @@ void AtsSwerveMpcNode::onExecutionCommand(
         static_cast<unsigned long long>(message->goal_id),
         static_cast<unsigned long long>(message->map_generation),
         static_cast<unsigned long long>(message->map_publication_sequence));
-    engageFailStop();
+    std::optional<CommandOrder> stop_command;
+    if (message->mode == ats_navigation_interfaces::msg::ExecutionCommand::MODE_STOP) {
+      stop_command = CommandOrder{message->manager_incarnation, message->command_sequence};
+    }
+    engageFailStop(true, stop_command);
     return;
   }
-  if (install_reference && !installPath(message->reference, keep_control_state)) {
+  if (install_reference &&
+      !installPath(message->reference, keep_control_state,
+                   CommandOrder{message->manager_incarnation, message->command_sequence})) {
     RCLCPP_ERROR(
         get_logger(),
         "【执行授权拒绝】TRACE execution_command rejected=reference_install incarnation=%llu sequence=%llu "
@@ -1845,7 +1859,8 @@ void AtsSwerveMpcNode::reportSolverDiagnostics(const Se2MpcResult &result) {
  * @details 首次进入时清空 reference、controller warm state 和 frame/deadline；每次调用都通过
  *          同一 command publisher 重发零速度，防止下游保持最后一条非零 Twist。
  */
-void AtsSwerveMpcNode::engageFailStop(bool record_stop_stamp) {
+void AtsSwerveMpcNode::engageFailStop(
+    bool record_stop_stamp, std::optional<CommandOrder> stop_command) {
   const bool was_engaged = fail_stop_engaged_.exchange(true);
   if (!was_engaged) {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
@@ -1854,6 +1869,7 @@ void AtsSwerveMpcNode::engageFailStop(bool record_stop_stamp) {
     trajectory_deadline_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     if (record_stop_stamp) {
       last_stop_stamp_ = now();
+      last_stop_command_ = stop_command;
     }
     controller_->reset();
   }

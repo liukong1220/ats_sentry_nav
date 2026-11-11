@@ -47,6 +47,12 @@ public:
       const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
 private:
+  /** @brief ExecutionCommand 在 Goal Manager 单一发布序列中的位置。 */
+  struct CommandOrder {
+    std::uint64_t incarnation{0};
+    std::uint64_t sequence{0};
+  };
+
   /** @brief 接收里程计并维护供控制 timer 读取的最新状态、时间与跳变证据。 */
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr message);
   /** @brief 兼容 legacy Path；ExecutionCommand 启用时该入口不得重新授权运动。 */
@@ -76,16 +82,24 @@ private:
    * @param record_stop_stamp 为 false 时不更新 last_stop_stamp_（只用于同一定位 epoch 内
    *        地图 generation 被更新的 REFERENCE_READY 取代：旧 reference 已由 generation 相等
    *        门拒绝，不需要时间戳门；否则紧随其后的替换 EXECUTE 会被误判为"早于急停"）。
+   * @param stop_command 本次停车由 ExecutionCommand STOP 触发时为其 (incarnation, sequence)，
+   *        与停车戳一起记录；其它来源为空。
    */
-  void engageFailStop(bool record_stop_stamp = true);
+  void engageFailStop(
+    bool record_stop_stamp = true,
+    std::optional<CommandOrder> stop_command = std::nullopt);
   /**
    * @brief 解析并安装 reference，建立 frame、deadline 和控制器 reset 契约。
    * @param keep_control_state 仅同一 goal、同一定位 epoch、同一 planner generation 内的
    *        换轨为 true：保留 last_control_ 与 iLQR warm start（下一拍 solve 照常左移一格），
    *        避免 max_a*dt 增量限幅把换轨第一拍压到约 0.1 m/s。默认 false：清零，与首次安装、
    *        急停后恢复、legacy Path 的既有行为一致。
+   * @param command 携带该 reference 的 EXECUTE 序号。最近一次停车由同一 incarnation 中序号更小
+   *        的 STOP 触发时，reference 戳等于停车戳也可安装（仿真时钟同一格）；严格更早仍拒绝。
    */
-  bool installPath(const nav_msgs::msg::Path & message, bool keep_control_state = false);
+  bool installPath(
+    const nav_msgs::msg::Path & message, bool keep_control_state = false,
+    std::optional<CommandOrder> command = std::nullopt);
   /** @brief 在 trajectory mutex 内判断换代宽限是否仍在进行（有 active 命令且未急停）。 */
   bool supersedeGraceActiveLocked(std::chrono::steady_clock::time_point now) const;
   /** @brief 在 trajectory mutex 内校验 active 命令：本 generation 有效，或处于换代宽限。 */
@@ -199,6 +213,7 @@ private:
   std::string trajectory_frame_;
   rclcpp::Time trajectory_deadline_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_stop_stamp_{0, 0, RCL_ROS_TIME};
+  std::optional<CommandOrder> last_stop_command_;
   Control last_control_ = Control::Zero();
   EmergencyStopWatchdog emergency_stop_watchdog_;
   bool emergency_stop_watchdog_enabled_ = true;

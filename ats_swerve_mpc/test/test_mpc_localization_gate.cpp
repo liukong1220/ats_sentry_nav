@@ -23,6 +23,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rosgraph_msgs/msg/clock.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
@@ -1508,6 +1509,157 @@ TEST_F(MpcRotationCompensationWiringTest, PredictedPathStartsAtPhaseCompensatedY
     matched = matched || std::abs(first_yaw - expected) < 1e-6;
   }
   EXPECT_TRUE(matched) << "first predicted yaw " << first_yaw;
+}
+
+// 仿真时钟按 5 ms 跳变（domain 213）：MPC 处理 STOP 时记下的停车戳与 Goal Manager 随后提交的
+// reference 戳可以落在同一时钟格。冻结 MPC 的仿真时钟，逐位复现这一相等。
+class MpcFrozenClockTest : public MpcLocalizationGateTest
+{
+protected:
+  std::vector<rclcpp::Parameter> extraParameters() const override
+  {
+    return {rclcpp::Parameter("use_sim_time", true)};
+  }
+
+  void SetUp() override
+  {
+    MpcLocalizationGateTest::SetUp();
+    clock_pub_ = driver_->create_publisher<rosgraph_msgs::msg::Clock>(
+      "/clock", rclcpp::ClockQoS());
+    ASSERT_TRUE(spinUntil(
+      [this]() {return clock_pub_->get_subscription_count() >= 1;}, 2s));
+  }
+
+  void TearDown() override
+  {
+    clock_pub_.reset();
+    MpcLocalizationGateTest::TearDown();
+  }
+
+  rclcpp::Time setClock(std::int64_t nanoseconds)
+  {
+    const rclcpp::Time stamp(nanoseconds, RCL_ROS_TIME);
+    rosgraph_msgs::msg::Clock message;
+    message.clock = stamp;
+    EXPECT_TRUE(spinUntil([this, &message, &stamp]() {
+      clock_pub_->publish(message);
+      return mpc_->now() == stamp;
+    }, 1s));
+    return stamp;
+  }
+
+  void publishStopAt(const rclcpp::Time & stamp)
+  {
+    ExecutionCommand command;
+    command.header.stamp = stamp;
+    command.header.frame_id = "odom";
+    command.mode = ExecutionCommand::MODE_STOP;
+    command.manager_incarnation = manager_incarnation_;
+    command.command_sequence = ++execution_sequence_;
+    command.goal_id = 1;
+    command.localization_epoch = 1;
+    command.failure_reason = ExecutionCommand::FAILURE_RUNTIME_UNSAFE;
+    execution_pub_->publish(command);
+  }
+
+  void publishExecutionAt(
+    const rclcpp::Time & stamp, const rclcpp::Time & reference_start,
+    std::uint64_t map_generation = 1)
+  {
+    ExecutionCommand command;
+    command.header.stamp = stamp;
+    command.header.frame_id = "odom";
+    command.mode = ExecutionCommand::MODE_EXECUTE;
+    command.manager_incarnation = manager_incarnation_;
+    command.command_sequence = ++execution_sequence_;
+    command.goal_id = 1;
+    command.localization_epoch = 1;
+    command.map_generation = map_generation;
+    command.map_publication_sequence = 1;
+    command.failure_reason = ExecutionCommand::FAILURE_NONE;
+    command.yaw_authority =
+      ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED;
+    command.requires_gimbal_lock = false;
+    command.gimbal_request_sequence = gimbal_request_sequence_;
+    command.gimbal_feedback_sequence =
+      gimbal_sequence_ > 0 ? gimbal_sequence_ - 1 : 0;
+    command.reference.header.stamp = reference_start;
+    command.reference.header.frame_id = "odom";
+    for (int index = 0; index <= 20; ++index) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header.frame_id = "odom";
+      pose.header.stamp = reference_start + rclcpp::Duration::from_seconds(0.1 * index);
+      pose.pose.position.x = 0.05 * index;
+      pose.pose.orientation.w = 1.0;
+      command.reference.poses.push_back(pose);
+    }
+    execution_pub_->publish(command);
+  }
+
+  bool movesOn(
+    const rclcpp::Time & stamp, const rclcpp::Time & reference_start,
+    std::uint64_t map_generation, std::chrono::steady_clock::duration timeout)
+  {
+    return spinUntil([&]() {
+      if (command_norm_.load() > 0.02) {
+        return true;
+      }
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      publishExecutionAt(stamp, reference_start, map_generation);
+      return false;
+    }, timeout);
+  }
+
+  bool stops()
+  {
+    return spinUntil([this]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      return command_norm_.load() < 1e-6;
+    }, 300ms);
+  }
+
+  // 返回开始运动之后推进到的新时钟格，后续停车与 reference 都落在这一格。
+  rclcpp::Time startMoving()
+  {
+    const rclcpp::Time t0 = setClock(100'000'000'000);
+    publishStopAt(t0);
+    EXPECT_TRUE(movesOn(t0, t0, 1, 2s));
+    return setClock(101'000'000'000);
+  }
+
+  rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr clock_pub_;
+};
+
+TEST_F(MpcFrozenClockTest, ReferenceStampedAtSequencedStopTimeIsInstalled) {
+  const rclcpp::Time stop_time = startMoving();
+  publishStopAt(stop_time);
+  ASSERT_TRUE(stops());
+  EXPECT_TRUE(movesOn(stop_time, stop_time, 1, 1s));
+}
+
+TEST_F(MpcFrozenClockTest, ReferenceStampedBeforeSequencedStopIsStillRejected) {
+  const rclcpp::Time stop_time = startMoving();
+  publishStopAt(stop_time);
+  ASSERT_TRUE(stops());
+  const rclcpp::Time earlier = stop_time - rclcpp::Duration(5ms);
+  EXPECT_FALSE(movesOn(stop_time, earlier, 1, 500ms));
+  EXPECT_TRUE(movesOn(stop_time, stop_time, 1, 1s));
+}
+
+// 规划失败这类不在 ExecutionCommand 序列里的停车，没有序号可证明 reference 晚于停车，
+// 戳相等仍拒绝；之后同一时钟格内到达的 STOP 不能改写这次停车的来源。
+TEST_F(MpcFrozenClockTest, ReferenceStampedAtUnsequencedStopTimeIsRejected) {
+  const rclcpp::Time stop_time = startMoving();
+  publishPlannerStatus(1, 2, PlannerStatus::STATE_FAILED,
+    PlannerStatus::FAILURE_RUNTIME_UNSAFE);
+  ASSERT_TRUE(stops());
+  publishStopAt(stop_time);
+  publishPlannerStatus(1, 3);
+  EXPECT_FALSE(movesOn(stop_time, stop_time, 3, 500ms));
+  const rclcpp::Time next_tick = setClock(101'005'000'000);
+  EXPECT_TRUE(movesOn(next_tick, next_tick, 3, 1s));
 }
 
 TEST(AtsSwerveMpcNodeConstruction, RejectsOversizedHorizonBeforeControllerCreation) {
