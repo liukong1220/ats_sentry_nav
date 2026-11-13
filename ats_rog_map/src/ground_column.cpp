@@ -243,6 +243,17 @@ std::optional<GroundColumnGrid::SupportPlane> GroundColumnGrid::fitSupportPlane(
   return SupportPlane{CeilingPlane{mean[0], mean[1], mean[2], a, b, residual}, std::move(hull)};
 }
 
+bool GroundColumnGrid::hasOverhead(int x, int y) const
+{
+  const auto & support = ground_[index(x, y)];
+  if (!support) {return false;}
+  const double surface = support->high[2] + config_.surface_max + 1e-9;
+  const auto & bins = columns_[index(x, y)];
+  return std::any_of(bins.begin(), bins.end(), [surface](const auto & bin) {
+      return bin.second.low[2] > surface;
+    });
+}
+
 std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   int x, int y, double query_x, double query_y, double * plane_z) const
 {
@@ -267,10 +278,32 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   // diagnostic/interpolated floor. Reject steps, rank deficiency and extrapolation.
   auto cached = support_planes_.find(index(x, y));
   if (cached == support_planes_.end()) {
-    cached = support_planes_.emplace(index(x, y), fitSupportPlane(supports)).first;
+    std::vector<SupportPlane> fits;
+    if (auto fit = fitSupportPlane(supports)) {fits.push_back(std::move(*fit));}
+    else if (hasOverhead(x, y)) {
+      // Two adjacent rows/columns retain this column and exclude only the
+      // opposite outer row. Every fit still needs six observed connected columns.
+      for (int side = 0; side < 4; ++side) {
+        std::vector<const VoxelReturns *> local;
+        for (int dy = -1; dy <= 1; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if ((side == 0 && dx == -1) || (side == 1 && dx == 1) ||
+              (side == 2 && dy == -1) || (side == 3 && dy == 1) ||
+              !valid(x + dx, y + dy)) {continue;}
+            const auto & floor = ground_[index(x + dx, y + dy)];
+            if (floor) {local.push_back(&*floor);}
+          }
+        }
+        if (auto fit = fitSupportPlane(local)) {fits.push_back(std::move(*fit));}
+      }
+    }
+    cached = support_planes_.emplace(index(x, y), std::move(fits)).first;
   }
-  if (cached->second) {
-    const auto & fit = *cached->second;
+  bool have_fit = false;
+  double fit_lower = std::numeric_limits<double>::infinity();
+  double fit_upper = -std::numeric_limits<double>::infinity();
+  double fit_estimate = -std::numeric_limits<double>::infinity();
+  for (const auto & fit : cached->second) {
     bool enclosed = true;
     for (std::size_t i = 0; i < fit.hull.size(); ++i) {
       const auto & a = fit.hull[i];
@@ -281,9 +314,15 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
     }
     if (enclosed) {
       const double z = fit.plane.at(query_x, query_y);
-      if (plane_z) {*plane_z = z;}
-      return std::array<double, 2>{z - fit.plane.tol, z + fit.plane.tol};
+      have_fit = true;
+      fit_lower = std::min(fit_lower, z - fit.plane.tol);
+      fit_upper = std::max(fit_upper, z + fit.plane.tol);
+      fit_estimate = std::max(fit_estimate, z);
     }
+  }
+  if (have_fit) {
+    if (plane_z) {*plane_z = fit_estimate;}
+    return std::array<double, 2>{fit_lower, fit_upper};
   }
   // No valid planar support: retain the full Lipschitz uncertainty. An
   // inconsistent neighbourhood is unknown, never repaired by selecting a minimum.
@@ -294,7 +333,7 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
 }
 
 std::optional<GroundColumnGrid::SupportInterval> GroundColumnGrid::voxelSupportInterval(
-  int x, int y, const VoxelReturns & evidence) const
+  int x, int y, const ReturnExtent & evidence) const
 {
   // z extrema alone lose a low-clearance point on a slope. Enclose ALL
   // measured XY, including returns between the two stored z extrema.
@@ -325,7 +364,35 @@ std::optional<GroundColumnGrid::SupportInterval> GroundColumnGrid::voxelSupportI
   if (!centre) {return std::nullopt;}
   // One fitted plane is linear: its extrema over the rectangle are at the
   // corners, so the slope-cone allowance only applies without a plane.
-  if (all_planar && std::isfinite(centre_plane)) {
+  // The corner bound is valid only for a plane defined over this WHOLE
+  // extent. Per-query model switches must not create a fictitious linear patch.
+  bool extent_planar = false;
+  double extent_estimate = -std::numeric_limits<double>::infinity();
+  const auto models = support_planes_.find(index(x, y));
+  if (all_planar && std::isfinite(centre_plane) && models != support_planes_.end()) {
+    for (const auto & fit : models->second) {
+      bool enclosed = true;
+      double height = -std::numeric_limits<double>::infinity();
+      for (const double qx : {evidence.xy_bounds[0], evidence.xy_bounds[2]}) {
+        for (const double qy : {evidence.xy_bounds[1], evidence.xy_bounds[3]}) {
+          for (std::size_t i = 0; i < fit.hull.size(); ++i) {
+            const auto & a = fit.hull[i];
+            const auto & b = fit.hull[(i + 1) % fit.hull.size()];
+            if ((b[0] - a[0]) * (qy - a[1]) - (b[1] - a[1]) * (qx - a[0]) < -1e-12) {
+              enclosed = false;
+            }
+          }
+          height = std::max(height, fit.plane.at(qx, qy));
+        }
+      }
+      if (enclosed) {
+        extent_planar = true;
+        extent_estimate = std::max(extent_estimate, height);
+      }
+    }
+  }
+  if (extent_planar) {
+    estimate = extent_estimate;
     // A well-posed trimmed fit over the connected supports gives the floor height
     // without the per-voxel extrema scatter; the corners still bound the voxel XY.
     if (evidence.high[2] - lower > config_.surface_max + 1e-9) {
@@ -502,7 +569,7 @@ double GroundColumnGrid::snapToPlane(
 }
 
 std::optional<double> GroundColumnGrid::boardClearance(
-  int x, int y, const VoxelReturns & evidence, const std::optional<CeilingPlane> & ceiling) const
+  int x, int y, const ReturnExtent & evidence, const std::optional<CeilingPlane> & ceiling) const
 {
   if (!ceiling) {return std::nullopt;}
   const double band = config_.ceiling_plane_band;
@@ -530,17 +597,29 @@ std::optional<ColumnHeadroom> GroundColumnGrid::ceilingHeadroom(int x, int y) co
   std::optional<CeilingPlane> plane;
   bool plane_done = false;
   for (const auto & bin : columns_[index(x, y)]) {
-    const auto interval = voxelSupportInterval(x, y, bin.second);
-    if (!interval || bin.second.high[2] - interval->lower <= config_.surface_max + 1e-9) {continue;}
-    if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
-    const double low = snapToPlane(plane, bin.second.low, config_.ceiling_plane_band);
-    double headroom = low - interval->estimate;
-    if (const auto board = boardClearance(x, y, bin.second, plane)) {
-      headroom = std::max(headroom, *board);
-    }
-    if (!result || headroom < result->headroom) {
-      result = ColumnHeadroom{low, interval->lower, interval->upper,
-        low - headroom, headroom};
+    const auto whole_interval = voxelSupportInterval(x, y, bin.second);
+    if (!whole_interval) {continue;}
+    std::vector<const ReturnExtent *> ranges;
+    if (hasOverhead(x, y) &&
+      bin.second.high[2] - whole_interval->lower > config_.surface_max + 1e-9 &&
+      bin.second.patches.size() > 1) {
+      for (const auto & patch : bin.second.patches) {ranges.push_back(&patch.second);}
+    } else {ranges.push_back(&bin.second);}
+    for (const auto * range : ranges) {
+      const auto & evidence = *range;
+      const auto interval = range == &bin.second ? whole_interval :
+        voxelSupportInterval(x, y, evidence);
+      if (!interval || evidence.high[2] - interval->lower <= config_.surface_max + 1e-9) {continue;}
+      if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
+      const double low = snapToPlane(plane, evidence.low, config_.ceiling_plane_band);
+      double headroom = low - interval->estimate;
+      if (const auto board = boardClearance(x, y, evidence, plane)) {
+        headroom = std::max(headroom, *board);
+      }
+      if (!result || headroom < result->headroom) {
+        result = ColumnHeadroom{low, interval->lower, interval->upper,
+          low - headroom, headroom};
+      }
     }
   }
   return result;
@@ -558,33 +637,45 @@ ColumnState GroundColumnGrid::state(int x, int y) const
   bool plane_done = false;
   const double clearance = config_.robot_height + config_.top_margin;
   for (const auto & bin : columns_[index(x, y)]) {
-    const auto interval = voxelSupportInterval(x, y, bin.second);
-    if (!interval) {return ColumnState::kUnknown;}
-    const double lower = interval->lower;
-    const double support = interval->estimate;
-    double low_z = bin.second.low[2];
-    double high_z = bin.second.high[2];
-    if (bin.second.high[2] - lower > config_.surface_max + 1e-9) {
-      if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
-      low_z = snapToPlane(plane, bin.second.low, config_.ceiling_plane_band);
-      high_z = snapToPlane(plane, bin.second.high, config_.ceiling_plane_band);
-      double headroom = low_z - support;
-      if (const auto board = boardClearance(x, y, bin.second, plane)) {
-        headroom = std::max(headroom, *board);
-        // The board is one surface: the heights below describe it at this clearance.
-        low_z = support + headroom;
-        high_z = std::max(high_z, low_z);
+    const auto whole_interval = voxelSupportInterval(x, y, bin.second);
+    if (!whole_interval) {return ColumnState::kUnknown;}
+    std::vector<const ReturnExtent *> ranges;
+    if (hasOverhead(x, y) &&
+      bin.second.high[2] - whole_interval->lower > config_.surface_max + 1e-9 &&
+      bin.second.patches.size() > 1) {
+      for (const auto & patch : bin.second.patches) {ranges.push_back(&patch.second);}
+    } else {ranges.push_back(&bin.second);}
+    for (const auto * range : ranges) {
+      const auto & evidence = *range;
+      const auto interval = range == &bin.second ? whole_interval :
+        voxelSupportInterval(x, y, evidence);
+      if (!interval) {return ColumnState::kUnknown;}
+      const double lower = interval->lower;
+      const double support = interval->estimate;
+      double low_z = evidence.low[2];
+      double high_z = evidence.high[2];
+      if (evidence.high[2] - lower > config_.surface_max + 1e-9) {
+        if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
+        low_z = snapToPlane(plane, evidence.low, config_.ceiling_plane_band);
+        high_z = snapToPlane(plane, evidence.high, config_.ceiling_plane_band);
+        double headroom = low_z - support;
+        if (const auto board = boardClearance(x, y, evidence, plane)) {
+          headroom = std::max(headroom, *board);
+          // The board is one surface: the heights below describe it at this clearance.
+          low_z = support + headroom;
+          high_z = std::max(high_z, low_z);
+        }
+        if (headroom < clearance - 1e-9) {return ColumnState::kOccupied;}
+        ceiling = true;
       }
-      if (headroom < clearance - 1e-9) {return ColumnState::kOccupied;}
-      ceiling = true;
+      // Without its own connected floor, a return below the neighbourhood
+      // support is an unexplained lower surface (a drop), not floor.
+      if (!ground_[index(x, y)] && evidence.low[2] < lower - config_.surface_max - 1e-9) {
+        return ColumnState::kUnknown;
+      }
+      heights.push_back(low_z - support);
+      heights.push_back(high_z - support);
     }
-    // Without its own connected floor, a return below the neighbourhood
-    // support is an unexplained lower surface (a drop), not floor.
-    if (!ground_[index(x, y)] && bin.second.low[2] < lower - config_.surface_max - 1e-9) {
-      return ColumnState::kUnknown;
-    }
-    heights.push_back(low_z - support);
-    heights.push_back(high_z - support);
   }
   // Neighbouring floor evidence can identify a wall, but cannot establish
   // traversable support under a hanging plate. A column with only floor-band
@@ -645,6 +736,8 @@ bool GroundColumnGrid::clearVoxel(
     static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) == found->first);
   if (removed_support) {floor.reset();}
   column.erase(found);
+  // Removing the last overhead return disables the local board-support model.
+  support_planes_.erase(index(x, y));
   if (removed_support) {
     // A support contributes only to its 3 x 3 neighbourhood. Clearing an
     // obstacle does not change a floor fit; retain unrelated fits during rays.

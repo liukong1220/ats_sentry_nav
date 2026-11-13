@@ -858,3 +858,75 @@ TEST(GroundColumn, BroadFloorPlaneCannotDiscardRaisedSupportUnderALowBoard)
     EXPECT_EQ(grid.state(6, 6), ColumnState::kOccupied) << broad_board;
   }
 }
+
+TEST(GroundColumn, LocalFloorBelowTheBoardSurvivesANeighbouringFold)
+{
+  for (const double ceiling_z : {0.249, 0.239}) {
+    for (const double own_floor_z : {0.0, 0.04}) {
+      ats_rog_map::GroundColumnConfig config;
+      config.robot_height = 0.242;
+      config.top_margin = 0.007;
+      config.ceiling_plane_enabled = false;
+      config.floor_plane_enabled = false;
+      ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+      std::vector<std::array<double, 3>> points;
+      for (int y = 3; y <= 9; ++y) {
+        for (int x = 3; x <= 9; ++x) {
+          const double floor_z = (x == 6 && y == 7) ? 0.08 :
+            ((x == 6 && y == 6) ? own_floor_z : 0.0);
+          for (int py = 0; py < 4; ++py) {
+            for (int px = 0; px < 4; ++px) {
+              const double qx = (x + 0.125 + px * 0.25) * 0.1;
+              const double qy = (y + 0.125 + py * 0.25) * 0.1;
+              points.push_back({qx, qy, floor_z});
+              if (x == 6 && y == 6) {points.push_back({qx, qy, ceiling_z});}
+            }
+          }
+        }
+      }
+      grid.observe(points, {0.55, 0.55, 0.0});
+      if (own_floor_z > 0.0) {
+        // A raised surface may invalidate the connected support model. Both
+        // occupied and unknown block it; it must never become traversable.
+        EXPECT_NE(grid.state(6, 6), ats_rog_map::ColumnState::kFree);
+      } else {
+        EXPECT_EQ(grid.state(6, 6), ceiling_z == 0.249 ?
+          ats_rog_map::ColumnState::kFree : ats_rog_map::ColumnState::kOccupied)
+          << "roof=" << ceiling_z;
+      }
+    }
+  }
+}
+
+TEST(GroundColumn, RemovingTheBoardRestoresTheOriginalFloorModel)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  config.ceiling_plane_enabled = false;
+  config.floor_plane_enabled = false;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int y = 3; y <= 9; ++y) {
+    for (int x = 3; x <= 9; ++x) {
+      for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+          points.push_back({(x + 0.125 + px * 0.25) * 0.1,
+            (y + 0.125 + py * 0.25) * 0.1, (x == 6 && y == 7) ? 0.08 : 0.0});
+        }
+      }
+    }
+  }
+  grid.observe(points, {0.55, 0.55, 0.0});
+  const auto no_board = grid.ground(6, 6);
+  ASSERT_TRUE(no_board);
+  grid.observe({{0.65, 0.65, 0.249}}, {0.55, 0.55, 0.0});
+  ASSERT_TRUE(grid.ground(6, 6));
+  EXPECT_GT(std::abs(*grid.ground(6, 6) - *no_board), 0.01);
+  // This query populates the local-fit cache. Removing an overhead voxel must
+  // invalidate it even though the connected ground itself has not changed.
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kFree);
+  grid.clearVoxel({0.65, 0.65, 0.249}, 0.24);
+  ASSERT_TRUE(grid.ground(6, 6));
+  EXPECT_NEAR(*grid.ground(6, 6), *no_board, 1e-12);
+}

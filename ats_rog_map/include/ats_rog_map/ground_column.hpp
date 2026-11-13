@@ -147,9 +147,10 @@ private:
   // Clearance of a voxel whose stored extremes both lie on the ceiling plane:
   // min over the voxel XY corners of (ceiling plane - floor plane), same XY for both.
   std::optional<double> boardClearance(
-    int x, int y, const VoxelReturns & evidence, const std::optional<CeilingPlane> & ceiling) const;
+    int x, int y, const ReturnExtent & evidence, const std::optional<CeilingPlane> & ceiling) const;
   std::optional<SupportInterval> voxelSupportInterval(int x, int y,
-    const VoxelReturns & evidence) const;
+    const ReturnExtent & evidence) const;
+  bool hasOverhead(int x, int y) const;
   bool valid(int x, int y) const;
   std::size_t index(int x, int y) const;
   int width_;
@@ -163,7 +164,7 @@ private:
   std::vector<bool> ray_observed_;
   // GroundColumnGrid is owned by the serialized odom-layer integration. These
   // fits are valid only until observe(), clearVoxel() or clear() changes evidence.
-  mutable std::unordered_map<std::size_t, std::optional<SupportPlane>> support_planes_;
+  mutable std::unordered_map<std::size_t, std::vector<SupportPlane>> support_planes_;
   std::size_t out_of_range_{0};
 };
 }  // namespace ats_rog_map
