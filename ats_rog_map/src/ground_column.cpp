@@ -143,7 +143,21 @@ void GroundColumnGrid::observe(
         else {
           // Do not turn downward jitter into extra headroom. Keep the observed
           // support interval until ray contradiction or an epoch reset.
-          extendReturns(*ground_[i], candidate);
+          // A column may contain the deck and a disconnected lower surface.
+          // Preserve the already connected support identity; a later lowest bin
+          // cannot stretch that floor through a drop. Ray contradiction still
+          // removes the original support before a new one can be connected.
+          for (const auto & bin : columns_[i]) {
+            const auto & observed = bin.second;
+            const auto & support = ground_[i]->low;
+            if (observed.low[2] >= support[2] - config_.max_ground_slope *
+              std::hypot(observed.low[0] - support[0], observed.low[1] - support[1]) -
+              config_.support_noise - 1e-9)
+            {
+              extendReturns(*ground_[i], observed);
+              break;
+            }
+          }
         }
         queue.emplace(x, y);
       }
@@ -668,9 +682,9 @@ ColumnState GroundColumnGrid::state(int x, int y) const
         if (headroom < clearance - 1e-9) {return ColumnState::kOccupied;}
         ceiling = true;
       }
-      // Without its own connected floor, a return below the neighbourhood
-      // support is an unexplained lower surface (a drop), not floor.
-      if (!ground_[index(x, y)] && evidence.low[2] < lower - config_.surface_max - 1e-9) {
+      // A lower disconnected return is an unexplained drop in this column.
+      // It cannot become support or poison neighbours through the floor fit.
+      if (evidence.low[2] < lower - config_.surface_max - 1e-9) {
         return ColumnState::kUnknown;
       }
       heights.push_back(low_z - support);

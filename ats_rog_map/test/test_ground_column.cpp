@@ -930,3 +930,37 @@ TEST(GroundColumn, RemovingTheBoardRestoresTheOriginalFloorModel)
   ASSERT_TRUE(grid.ground(6, 6));
   EXPECT_NEAR(*grid.ground(6, 6), *no_board, 1e-12);
 }
+
+TEST(GroundColumn, DisconnectedLowerReturnsCannotStretchTheConnectedFloor)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int y = 3; y <= 9; ++y) {
+    for (int x = 3; x <= 9; ++x) {
+      for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+          points.push_back({(x + 0.125 + px * 0.25) * 0.1,
+            (y + 0.125 + py * 0.25) * 0.1, 0.0});
+        }
+      }
+    }
+  }
+  grid.observe(points, {0.55, 0.55, 0.0});
+  ASSERT_EQ(grid.state(5, 6), ColumnState::kFree);
+  ASSERT_EQ(grid.state(6, 6), ColumnState::kFree);
+  grid.observe({{0.65, 0.65, -0.29}}, {0.55, 0.55, 0.0});
+  // A drop stays blocked locally, but does not replace the adjacent measured
+  // planar support with an impossible 29 cm tall "ground" interval.
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kUnknown);
+  EXPECT_EQ(grid.state(5, 6), ColumnState::kFree);
+  ASSERT_TRUE(grid.ground(5, 6));
+  EXPECT_NEAR(*grid.ground(5, 6), 0.0, 1e-9);
+  ASSERT_TRUE(grid.clearVoxel({0.65, 0.65, 0.025}, -0.05));
+  grid.observe({{0.65, 0.65, -0.29}}, {0.55, 0.55, 0.0});
+  // Once the actual upper support is contradicted, the disconnected lower
+  // surface cannot inherit its identity or revive a traversable column.
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kUnknown);
+}
