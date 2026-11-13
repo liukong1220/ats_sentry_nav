@@ -809,3 +809,27 @@ TEST(GroundColumn, SupportFitIsInvalidatedByNewHigherFloorAndRayRemoval)
     EXPECT_NE(grid.state(5, 5), ColumnState::kFree);
   }
 }
+
+TEST(GroundColumn, BroadFloorPlaneCannotDiscardRaisedSupportUnderALowBoard)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  for (const bool broad_board : {false, true}) {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> points;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        const double x = -0.6 + (ix + 0.5) * 0.1;
+        const double y = -0.6 + (iy + 0.5) * 0.1;
+        points.push_back({x, y, ix == 6 && iy == 6 ? 0.04 : 0.0});
+        if (broad_board || (ix == 6 && iy == 6)) {points.push_back({x, y, 0.28});}
+      }
+    }
+    grid.observe(points, {0.0, 0.0, 0.0});
+    // The 4 cm step is connected support. A fit to the surrounding flat ground
+    // must not erase its identity: actual local clearance is only 0.240 m.
+    ASSERT_TRUE(grid.ground(6, 6));
+    EXPECT_EQ(grid.state(6, 6), ColumnState::kOccupied) << broad_board;
+  }
+}

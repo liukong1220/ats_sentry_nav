@@ -467,7 +467,24 @@ std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::floorPlane(int x
       if (support->high[2] > support->low[2]) {points.push_back(support->high);}
     }
   }
-  return robustPlane(points, config_.floor_plane_band, config_.max_ground_slope);
+  const auto plane = robustPlane(points, config_.floor_plane_band, config_.max_ground_slope);
+  const auto & own_support = ground_[index(x, y)];
+  if (!plane || !own_support) {return std::nullopt;}
+  // A broad fit can reject a real local step as an outlier. It may refine this
+  // column's headroom only if its OWN connected support remains on that plane.
+  // Validate every retained XY patch, not only the two whole-column extrema.
+  for (const auto & entry : own_support->patches) {
+    const auto & patch = entry.second;
+    for (const double px : {patch.xy_bounds[0], patch.xy_bounds[2]}) {
+      for (const double py : {patch.xy_bounds[1], patch.xy_bounds[3]}) {
+        const double fitted = plane->at(px, py);
+        if (std::max(std::abs(patch.low[2] - fitted), std::abs(patch.high[2] - fitted)) >
+          plane->tol + 1e-9)
+        {return std::nullopt;}
+      }
+    }
+  }
+  return plane;
 }
 
 double GroundColumnGrid::snapToPlane(
