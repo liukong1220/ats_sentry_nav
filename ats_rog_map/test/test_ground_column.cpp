@@ -964,3 +964,77 @@ TEST(GroundColumn, DisconnectedLowerReturnsCannotStretchTheConnectedFloor)
   // surface cannot inherit its identity or revive a traversable column.
   EXPECT_EQ(grid.state(6, 6), ColumnState::kUnknown);
 }
+
+TEST(GroundColumn, LowerSideScatterDoesNotLowerTheSupportingUpperSurface)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  config.ceiling_plane_enabled = false;
+  config.floor_plane_enabled = false;
+  for (const double clearance : {0.249, 0.239}) {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+    std::vector<std::array<double, 3>> points;
+    for (int y = 3; y <= 9; ++y) {
+      for (int x = 3; x <= 9; ++x) {
+        for (int py = 0; py < 4; ++py) {
+          for (int px = 0; px < 4; ++px) {
+            const double qx = (x + 0.125 + px * 0.25) * 0.1;
+            const double qy = (y + 0.125 + py * 0.25) * 0.1;
+            points.push_back({qx, qy, -0.095});
+            points.push_back({qx, qy, -0.06});
+          }
+        }
+      }
+    }
+    points.push_back({0.65, 0.65, -0.06 + clearance});
+    grid.observe(points, {0.55, 0.55, -0.06});
+    EXPECT_EQ(grid.state(6, 6), clearance == 0.249 ? ColumnState::kFree : ColumnState::kOccupied);
+  }
+}
+
+TEST(GroundColumn, HigherSupportInANewVoxelCannotHideBelowTheSurfaceBand)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  config.ceiling_plane_enabled = false;
+  config.floor_plane_enabled = false;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> floor;
+  for (int y = 3; y <= 9; ++y) {
+    for (int x = 3; x <= 9; ++x) {
+      for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+          floor.push_back({(x + 0.125 + px * 0.25) * 0.1,
+            (y + 0.125 + py * 0.25) * 0.1, -0.06});
+        }
+      }
+    }
+  }
+  grid.observe(floor, {0.55, 0.55, -0.06});
+  grid.observe({{0.65, 0.65, 0.189}}, {0.55, 0.55, -0.06});
+  ASSERT_EQ(grid.state(6, 6), ColumnState::kFree);
+  for (auto & point : floor) {point[2] = -0.02;}
+  grid.observe(floor, {0.55, 0.55, -0.06});
+  // The 4 cm higher support occupies another 5 cm z voxel. It still reduces
+  // physical headroom, even though surface_max itself permits this small step.
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kOccupied);
+}
+
+TEST(GroundColumn, ClearingAnyRetainedSupportVoxelRevokesItsIdentity)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  config.ceiling_plane_enabled = false;
+  config.floor_plane_enabled = false;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+  grid.observe({{0.65, 0.65, -0.06}, {0.65, 0.65, -0.02},
+    {0.65, 0.65, 0.02}}, {0.65, 0.65, -0.06});
+  ASSERT_TRUE(grid.ground(6, 6));
+  // All three bins belong to the measured support band. Clearing the middle
+  // bin must revoke the cached identity, even though neither extremum changed.
+  EXPECT_TRUE(grid.clearVoxel({0.65, 0.65, -0.02}, -0.03));
+  EXPECT_FALSE(grid.ground(6, 6));
+}

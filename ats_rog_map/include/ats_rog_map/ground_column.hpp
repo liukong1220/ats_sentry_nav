@@ -31,8 +31,8 @@ struct GroundColumnConfig
   double ground_seed_radius{0.65};
   // Plane-fit residual limit and tolerated support inconsistency (m).
   double support_noise{0.005};
-  // A plane enclosing every support measurement within this residual is accepted
-  // as the local floor (interval = plane +- residual). Steps and walls exceed it.
+  // A plane enclosing the highest retained support in every XY patch within this
+  // residual is accepted as the floor; lower scatter cannot increase headroom.
   double plane_residual_max{0.02};
   // Overhead plane semantics: non-floor returns of one flat board are fitted as a
   // plane; returns inside +-ceiling_plane_band are the board surface and are judged
@@ -59,7 +59,7 @@ struct ColumnHeadroom
   double support_lower;
   double support_upper;
   // Support height used for the gate: the fitted plane when one encloses every
-  // connected support within plane_residual_max, otherwise support_upper.
+  // connected upper support within plane_residual_max, otherwise support_upper.
   double support_estimate;
   double headroom;  // ceiling_low - support_estimate, the quantity gated by the robot height
 };

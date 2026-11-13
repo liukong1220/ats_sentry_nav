@@ -124,6 +124,21 @@ void GroundColumnGrid::observe(
     const auto inserted = column.emplace(bin, observed);
     if (!inserted.second) {extendReturns(inserted.first->second, observed);}
   }
+  // Preserve the connected identity while retaining every higher return in its
+  // fixed surface band, including another Z voxel. A disconnected lower surface
+  // must not replace it, and the band cannot climb while the bins are merged.
+  const auto merge_support_band = [&](std::size_t i) {
+      const auto anchor = ground_[i]->low;
+      const double top = anchor[2] + config_.surface_max;
+      for (const auto & bin : columns_[i]) {
+        const auto & observed = bin.second;
+        if (observed.high[2] > top + 1e-9) {continue;}
+        if (observed.low[2] < anchor[2] - config_.max_ground_slope *
+          std::hypot(observed.low[0] - anchor[0], observed.low[1] - anchor[1]) -
+          config_.support_noise - 1e-9) {continue;}
+        extendReturns(*ground_[i], observed);
+      }
+    };
   std::queue<std::pair<int, int>> queue;
   // Existing connected ground is stable in odom; map->odom corrections do not
   // move it. Nearby returns seed only across the bounded supporting slope.
@@ -140,25 +155,7 @@ void GroundColumnGrid::observe(
         std::abs(candidate.low[2] - robot_ground[2]) <= 0.05))
       {
         if (!ground_[i]) {ground_[i] = candidate;}
-        else {
-          // Do not turn downward jitter into extra headroom. Keep the observed
-          // support interval until ray contradiction or an epoch reset.
-          // A column may contain the deck and a disconnected lower surface.
-          // Preserve the already connected support identity; a later lowest bin
-          // cannot stretch that floor through a drop. Ray contradiction still
-          // removes the original support before a new one can be connected.
-          for (const auto & bin : columns_[i]) {
-            const auto & observed = bin.second;
-            const auto & support = ground_[i]->low;
-            if (observed.low[2] >= support[2] - config_.max_ground_slope *
-              std::hypot(observed.low[0] - support[0], observed.low[1] - support[1]) -
-              config_.support_noise - 1e-9)
-            {
-              extendReturns(*ground_[i], observed);
-              break;
-            }
-          }
-        }
+        merge_support_band(i);
         queue.emplace(x, y);
       }
     }
@@ -180,7 +177,7 @@ void GroundColumnGrid::observe(
         if (std::abs(candidate.low[2] - support[2]) <= config_.max_ground_slope *
             std::hypot(candidate.low[0] - support[0], candidate.low[1] - support[1]) +
             config_.support_noise + 1e-6)
-        {ground_[i] = candidate; queue.emplace(x + dx, y + dy);}
+        {ground_[i] = candidate; merge_support_band(i); queue.emplace(x + dx, y + dy);}
       }
     }
   }
@@ -223,12 +220,12 @@ std::optional<GroundColumnGrid::SupportPlane> GroundColumnGrid::fitSupportPlane(
   if (std::hypot(a, b) > config_.max_ground_slope) {return std::nullopt;}
   double residual = 0;
   for (const auto * patch : patches) {
-    // Each small Cartesian box encloses ALL retained returns at its XY.
+    // Fit the highest retained supporting surface in each XY patch. Lower
+    // scatter cannot create headroom; higher support remains in every fit.
     for (const double px : {patch->xy_bounds[0], patch->xy_bounds[2]}) {
       for (const double py : {patch->xy_bounds[1], patch->xy_bounds[3]}) {
         const double fitted = mean[2] + a * (px - mean[0]) + b * (py - mean[1]);
-        residual = std::max({residual, std::abs(patch->low[2] - fitted),
-          std::abs(patch->high[2] - fitted)});
+        residual = std::max(residual, std::abs(patch->high[2] - fitted));
       }
     }
   }
@@ -746,8 +743,8 @@ bool GroundColumnGrid::clearVoxel(
   }
   auto & floor = ground_[index(x, y)];
   const bool removed_support = floor &&
-    (static_cast<int>(std::floor(floor->low[2] / config_.voxel_resolution)) == found->first ||
-    static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) == found->first);
+    static_cast<int>(std::floor(floor->low[2] / config_.voxel_resolution)) <= found->first &&
+    static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) >= found->first;
   if (removed_support) {floor.reset();}
   column.erase(found);
   // Removing the last overhead return disables the local board-support model.
