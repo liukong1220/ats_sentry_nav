@@ -1095,13 +1095,15 @@ private:
       // candidate needs a complete footprint recheck on the latest immutable
       // snapshot. Wait for the coherent latest status/snapshot pair first.
       if (active_goal_ && candidate_reference_ && planner_ready_status_ &&
+          sameStamp(candidate_reference_->header.stamp,
+                    planner_ready_status_->reference_stamp) &&
           planner_ready_status_->goal_id == active_goal_->id &&
           planner_ready_status_->localization_epoch == active_goal_->localization_epoch &&
           planner_ready_status_->plan_request_sequence ==
             active_goal_->expected_plan_request_sequence &&
           (planner_ready_status_->map_publication_sequence == 0U ||
            (map_status_publication_sequence_ != 0U &&
-            planner_ready_status_->map_publication_sequence <
+             planner_ready_status_->map_publication_sequence <=
               map_status_publication_sequence_ &&
             (!require_planning_snapshot_ || planningSnapshotUsableLocked(
               map_status_publication_sequence_, active_goal_->localization_epoch)) &&
@@ -1967,19 +1969,55 @@ private:
 
   bool candidateReferenceMapUsableLocked() const {
     if (!planner_ready_status_ || !candidate_reference_ ||
+      planner_ready_status_->gate_collision_count != 0U ||
       planner_ready_status_->map_publication_sequence == 0U ||
       planner_ready_status_->map_publication_sequence > map_status_publication_sequence_)
     {
       return false;
     }
-    if (planner_ready_status_->map_publication_sequence == map_status_publication_sequence_) {
-      return !require_planning_snapshot_ || planningSnapshotUsableLocked(
-        map_status_publication_sequence_, planner_ready_status_->localization_epoch);
+    if (!require_planning_snapshot_) {
+      return planner_ready_status_->map_publication_sequence == map_status_publication_sequence_;
     }
-    return require_planning_snapshot_ && planningSnapshotUsableLocked(
-      map_status_publication_sequence_, planner_ready_status_->localization_epoch) &&
-      planningSnapshotReferenceSafe(
-      *planning_snapshot_, *candidate_reference_, planning_snapshot_safety_params_);
+    if (!planningSnapshotUsableLocked(
+        map_status_publication_sequence_, planner_ready_status_->localization_epoch)) {
+      return false;
+    }
+    // Identity is not a safety certificate, including for an equal publication:
+    // experimental MINCO contact-escape candidates may contain collisions. The
+    // execution authority always checks the complete reference independently.
+    nav_msgs::msg::Path validation_path = *candidate_reference_;
+    const std::string & frame = planning_snapshot_->header.frame_id;
+    if (validation_path.header.frame_id != frame) {
+      if (validation_path.header.frame_id.empty()) {
+        return false;
+      }
+      try {
+        // One coherent latest transform for the whole path; never transform
+        // future reference timestamps individually or block under mutex_. The
+        // enclosing epoch/lease gates reject obsolete localization contracts.
+        const auto transform = tf_buffer_->lookupTransform(
+          frame, validation_path.header.frame_id, tf2::TimePointZero);
+        const auto stamp = rclcpp::Time(transform.header.stamp);
+        const double age = (now() - stamp).seconds();
+        if (stamp.nanoseconds() > 0 && (age > map_transform_timeout_sec_ || age < -0.2)) {
+          return false;
+        }
+        for (auto & pose : validation_path.poses) {
+          if (!pose.header.frame_id.empty() &&
+            pose.header.frame_id != validation_path.header.frame_id) {
+            return false;
+          }
+          geometry_msgs::msg::PoseStamped transformed;
+          tf2::doTransform(pose, transformed, transform);
+          pose = std::move(transformed);
+        }
+        validation_path.header.frame_id = frame;
+      } catch (const tf2::TransformException &) {
+        return false;
+      }
+    }
+    return planningSnapshotReferenceSafe(
+      *planning_snapshot_, validation_path, planning_snapshot_safety_params_);
   }
 
   bool recoverySnapshotReadyLocked(const ActiveGoal & goal) const {
