@@ -281,15 +281,15 @@ class TestRelocalizationStartupShutdown(unittest.TestCase):
                     deadline = time.monotonic() + 10.0
                     while time.monotonic() < deadline:
                         output = log_path.read_text()
-                        if "scan input gate:" in output:
+                        if "【重定位输入门】" in output:
                             break
                         self.assertIsNone(process.poll(), output)
                         time.sleep(0.05)
                     else:
                         self.fail("Map startup incorrectly depends on extrinsic TF: " + output)
-                    self.assertIn("GICP coarse-fine ready:", output)
-                    self.assertIn(f"Loaded global map: frame='prior_map_{token}' points=64", output)
-                    self.assertIn(f"expected_frame='registered_odom_{token}'", output)
+                    self.assertIn("【GICP重定位就绪】", output)
+                    self.assertIn(f"【重定位地图加载】坐标系='prior_map_{token}' points=64", output)
+                    self.assertIn(f"期望坐标系='registered_odom_{token}'", output)
                     process.send_signal(signal.SIGINT)
                     self.assertEqual(
                         process.wait(timeout=5.0), 0,

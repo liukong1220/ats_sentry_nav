@@ -1728,14 +1728,10 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
   }
 
   // 确认与接受都必须锚定同一扫描时刻的 odom 位姿；拿不到就不能推进确认状态。
-  auto odom_to_robot_base = getOdomToRobotBase(scan_time);
-  if (!odom_to_robot_base) {
-    // Exact-stamp zero-wait lookups often miss under Gazebo TF jitter; fall back
-    // to the latest pose rather than wiping an open confirmation episode.
-    if (auto robot_base_to_odom = getCurrentRobotBaseToOdom()) {
-      odom_to_robot_base = robot_base_to_odom->inverse();
-    }
-  }
+  // Never relabel a latest pose as scan_time: fusion composes the observation
+  // with odometry at that stamp, so a fallback would inject robot motion into
+  // map->odom. A TF miss preserves an open episode without advancing it.
+  const auto odom_to_robot_base = getOdomToRobotBase(scan_time);
 
   if (!odom_to_robot_base) {
     RCLCPP_WARN_THROTTLE(

@@ -263,12 +263,17 @@ protected:
   }
 
   void drainCapturedResult(
-    std::int64_t stamp_ns, bool ok, std::uint64_t generation, bool seed_stage_ran = false)
+    std::int64_t stamp_ns, bool ok, std::uint64_t generation, bool seed_stage_ran = false,
+    bool confirmation_recheck = true)
   {
     node_->last_scan_time_ = rclcpp::Time(stamp_ns + 500000000LL, RCL_ROS_TIME);
     node_->has_received_scan_ = true;
     node_->async_result_ = SmallGicpRelocalizationNode::MultiGuessOutcome{};
     node_->async_result_.generation = generation;
+    // Emulate the worker selected for this episode, not a late lattice result
+    // (which is intentionally discarded while confirmation owns the path).
+    node_->async_result_.confirmation_recheck =
+      confirmation_recheck && node_->pending_confirmation_.has_value();
     node_->async_result_.seed_stage_ran = seed_stage_ran;
     node_->async_result_.best.ok = ok;
     node_->async_result_.best.registration_error = 0.01;
@@ -287,6 +292,7 @@ protected:
   bool accepted() const { return node_->has_accepted_alignment_; }
   double previousResultX() const { return node_->previous_result_t_.translation().x(); }
   bool latticeAllowed() const { return node_->preferMultiGuess(); }
+  void setAutoLattice(bool enabled) { node_->auto_multi_guess_on_lost_ = enabled; }
   std::uint64_t sequence() const { return node_->observation_sequence_; }
   std::uint64_t staleResults() const { return node_->stale_async_result_count_; }
   std::optional<std::chrono::steady_clock::time_point> episodeStart() const
@@ -300,6 +306,20 @@ protected:
   }
   void runRegistrationTimer() { node_->performRegistration(); }
   void removeOdometry() { node_->robot_base_frame_ = "unavailable_robot_body"; }
+  void installDynamicOdometry(std::int64_t stamp_ns, double x)
+  {
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "odom";
+    transform.child_frame_id = "robot_body";
+    transform.header.stamp = rclcpp::Time(stamp_ns, RCL_ROS_TIME);
+    transform.transform.translation.x = x;
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(node_->tf_buffer_->setTransform(transform, "scan_time_test", false));
+  }
+  bool hasOdometryAt(std::int64_t stamp_ns) const
+  {
+    return node_->getOdomToRobotBase(rclcpp::Time(stamp_ns, RCL_ROS_TIME)).has_value();
+  }
   void setColdStartPrior(double max_xy_m, double max_yaw_rad)
   {
     node_->cold_start_prior_max_xy_m_ = max_xy_m;
@@ -516,6 +536,61 @@ TEST_F(SmallGicpRelocalizationFrameTest, AsyncObservationsKeepCapturedScanStampO
   expectPublication(1600000000LL, Observation::STATUS_NO_ODOM);
 }
 
+TEST_F(SmallGicpRelocalizationFrameTest, LatestOdometryCannotReplaceMissingScanTimePose)
+{
+  createConfirmationNode(1, false);
+  observePublications();
+  installDynamicOdometry(2000000000LL, 0.7);
+  ASSERT_FALSE(hasOdometryAt(1000000000LL));
+  ASSERT_TRUE(hasOdometryAt(0));  // Latest exists, but belongs to another scan time.
+  attempt(1000000000LL, 0.1);
+  expectPublication(1000000000LL, Observation::STATUS_NO_ODOM);
+  EXPECT_FALSE(accepted());
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_DOUBLE_EQ(previousResultX(), 0.0);
+
+  // Exact-time recovery remains available without a reset or a relaxed gate.
+  installDynamicOdometry(1000000000LL, 0.2);
+  ASSERT_TRUE(hasOdometryAt(1000000000LL));
+  attempt(1000000000LL, 0.1);
+  expectPublication(1000000000LL, Observation::STATUS_ACCEPTED);
+  EXPECT_TRUE(accepted());
+  EXPECT_DOUBLE_EQ(previousResultX(), 0.1);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, MissingScanTimeOdometryCannotOpenConfirmation)
+{
+  createConfirmationNode(2, false);
+  observePublications();
+  installDynamicOdometry(1000000000LL, 0.2);
+  ASSERT_FALSE(hasOdometryAt(1200000000LL));  // Future extrapolation also fails closed.
+  attempt(1200000000LL);
+  expectPublication(1200000000LL, Observation::STATUS_NO_ODOM);
+  EXPECT_EQ(pendingCount(), 0);
+  EXPECT_FALSE(episodeStart());
+  EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, MissingScanTimePosePreservesButCannotAdvanceEpisode)
+{
+  createConfirmationNode(2, false);
+  observePublications();
+  installDynamicOdometry(1000000000LL, 0.0);
+  attempt(1000000000LL);
+  expectPublication(1000000000LL, Observation::STATUS_PENDING_CONFIRMATION);
+  const auto started = episodeStart();
+  ASSERT_EQ(pendingCount(), 1);
+  attempt(1200000000LL);
+  expectPublication(1200000000LL, Observation::STATUS_NO_ODOM);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_EQ(episodeStart(), started);
+  EXPECT_FALSE(accepted());
+  installDynamicOdometry(1200000000LL, 0.1);
+  attempt(1200000000LL);
+  expectPublication(1200000000LL, Observation::STATUS_ACCEPTED);
+  EXPECT_TRUE(accepted());
+}
+
 TEST_F(SmallGicpRelocalizationFrameTest, ThirdConfirmationCannotCountSecondScanTwice)
 {
   createConfirmationNode();
@@ -538,6 +613,9 @@ TEST_F(SmallGicpRelocalizationFrameTest, ThirdConfirmationCannotCountSecondScanT
 TEST_F(SmallGicpRelocalizationFrameTest, ConfirmationRetainsFirstGeometryAndEpisodeDeadline)
 {
   createConfirmationNode();
+  // This case exercises seeded confirmation, not cold auto-lattice recovery.
+  // Cold lattice mismatches are tested separately and must not adopt an anchor.
+  setAutoLattice(false);
   attempt(1000000000LL);
   const auto started = episodeStart();
   attempt(1200000000LL, 0.10);
@@ -760,14 +838,40 @@ TEST_F(SmallGicpRelocalizationFrameTest, TimerTimeoutFencesLateWorkerBeforeObser
   EXPECT_FALSE(accepted());
 }
 
-TEST_F(SmallGicpRelocalizationFrameTest, MissingOdometryAndFailedInitialPoseClearPendingEpisode)
+TEST_F(SmallGicpRelocalizationFrameTest, PendingDiscardsLateLatticeButAdmitsConfirmationRecheck)
+{
+  createConfirmationNode(2);
+  attempt(1000000000LL);
+  const auto started = episodeStart();
+  const auto old_sequence = sequence();
+  const auto before = generation();
+  drainCapturedResult(1200000000LL, true, before, false, false);
+  EXPECT_EQ(sequence(), old_sequence);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_EQ(episodeStart(), started);
+  EXPECT_EQ(generation(), before);
+  EXPECT_FALSE(accepted());
+  observePublications();
+  drainCapturedResult(1400000000LL, true, before);
+  expectPublication(1400000000LL, Observation::STATUS_ACCEPTED);
+  EXPECT_TRUE(accepted());
+  EXPECT_EQ(pendingCount(), 0);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, MissingOdometryPreservesButFailedInitialPoseClearsEpisode)
 {
   createConfirmationNode();
   attempt(1000000000LL);
+  const auto started = episodeStart();
+  const auto before = generation();
   removeOdometry();
+  observePublications();
   attempt(1200000000LL);
-  EXPECT_EQ(pendingCount(), 0);
-  EXPECT_FALSE(episodeStart());
+  expectPublication(1200000000LL, Observation::STATUS_NO_ODOM);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_EQ(episodeStart(), started);
+  EXPECT_EQ(generation(), before);
+  EXPECT_FALSE(accepted());
   resetInitialPose(true);
   attempt(1400000000LL);
   EXPECT_EQ(pendingCount(), 1);
@@ -780,6 +884,9 @@ TEST_F(SmallGicpRelocalizationFrameTest, MissingOdometryAndFailedInitialPoseClea
 TEST_F(SmallGicpRelocalizationFrameTest, RecoveryAndEpochBoundariesFenceWorkersWithoutResetLoops)
 {
   createConfirmationNode();
+  // Recovery after a trusted alignment has different reset semantics from an
+  // open cold-start episode (covered by PreAcceptPendingSurvives* above).
+  setAcceptedAlignment(true);
   receiveStatus(1000000000LL, Status::STATE_BOOTSTRAP, 0);
   attempt(1000000000LL);
   auto before = generation();
@@ -809,7 +916,7 @@ TEST_F(SmallGicpRelocalizationFrameTest, RecoveryAndEpochBoundariesFenceWorkersW
   before = generation();
   receiveStatus(1800000000LL, Status::STATE_RELOCALIZING, 0);
   EXPECT_EQ(generation(), before);
-  EXPECT_FALSE(latticeAllowed());
+  EXPECT_TRUE(latticeAllowed());  // Pending owns the path even without LOST origin.
   receiveStatus(1900000000LL, Status::STATE_CONFIRMED, 1);
   EXPECT_GT(generation(), before);
   EXPECT_EQ(pendingCount(), 0);
