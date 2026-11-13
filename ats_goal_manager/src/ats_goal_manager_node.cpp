@@ -6,11 +6,12 @@
 #include "ats_goal_manager/planner_failure_policy.hpp"
 #include "ats_goal_manager/planning_snapshot_safety.hpp"
 #include "ats_goal_manager/terminal_motion_window.hpp"
+#include "ats_goal_manager/stop_reference_barrier.hpp"
 
 #include <array>
 #include <algorithm>
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -299,6 +300,8 @@ private:
     emergency_stop_heartbeat_period_sec_ = std::max(
         0.02,
         declare_parameter<double>("emergency_stop_heartbeat_period_sec", 0.1));
+    stop_to_reference_guard_sec_ = StopReferenceBarrier::boundedGuardSeconds(
+      declare_parameter<double>("stop_to_reference_guard_sec", 0.01));
     execution_command_stamp_backdate_sec_ = std::clamp(
       declare_parameter<double>("execution_command_stamp_backdate_sec", 0.02),
       0.0, 0.25);
@@ -1206,6 +1209,14 @@ private:
         "commit_gimbal_ack_missing");
       return;
     }
+    // MPC records the STOP using its own /clock callback. A newly committed
+    // reference stamped in the same callback can therefore look older at the
+    // consumer even though it was produced after the STOP. Do not weaken the
+    // MPC stale-reference gate; wait one bounded window before final commit.
+    const rclcpp::Time commit_stamp = now();
+    if (!reference_commit_barrier_.permits(commit_stamp.nanoseconds())) {
+      return;
+    }
     if (replacing) {
       if (!lifecycle_.referenceReplaced(active_goal_->id, true)) {
         return;
@@ -1228,7 +1239,7 @@ private:
         static_cast<unsigned long long>(map_status_publication_sequence_),
         committed.header.frame_id.c_str());
     }
-    rebasePathTimestamps(committed, now());
+    rebasePathTimestamps(committed, commit_stamp);
     ExecutionCommand command;
     command.header = committed.header;
     command.mode = ExecutionCommand::MODE_EXECUTE;
@@ -2166,6 +2177,7 @@ private:
   }
 
   void publishEmergencyStop(bool stop) {
+    const rclcpp::Time transition_stamp = now();
     std_msgs::msg::Bool message;
     message.data = stop;
     emergency_stop_pub_->publish(message);
@@ -2179,6 +2191,10 @@ private:
       if (transition) {
         reason = stop ? (stop_reason_.empty() ? std::string("unattributed") : stop_reason_) :
           std::string("released");
+        if (stop) {
+          reference_commit_barrier_.recordStop(
+            transition_stamp.nanoseconds(), stop_to_reference_guard_sec_);
+        }
       }
       if (!stop || transition) {
         stop_reason_.clear();
@@ -2187,7 +2203,7 @@ private:
     if (transition) {
       RCLCPP_WARN(
         get_logger(), "P2 emergency-stop transition value=%d stamp_ns=%lld reason=%s",
-        stop ? 1 : 0, static_cast<long long>(now().nanoseconds()), reason.c_str());
+        stop ? 1 : 0, static_cast<long long>(transition_stamp.nanoseconds()), reason.c_str());
     }
   }
 
@@ -2275,6 +2291,7 @@ private:
   double map_ready_timeout_sec_{3.0};
   double localization_status_timeout_sec_{1.0};
   double emergency_stop_heartbeat_period_sec_{0.1};
+  double stop_to_reference_guard_sec_{0.01};
   double map_wait_timeout_sec_{5.0};
   double default_goal_timeout_sec_{120.0};
   double execution_command_stamp_backdate_sec_{0.02};
@@ -2317,6 +2334,7 @@ private:
   bool fail_stop_{true};
   bool replan_without_stop_enabled_{false};
   std::optional<bool> last_emergency_stop_published_;
+  StopReferenceBarrier reference_commit_barrier_;
   std::string stop_reason_;
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
   std::optional<std::chrono::steady_clock::time_point> last_map_status_signal_;

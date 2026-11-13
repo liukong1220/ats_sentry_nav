@@ -58,6 +58,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_terminal_motion_window test/test_terminal_motion_window.cpp)
   target_include_directories(test_terminal_motion_window PRIVATE include)
 
+  ament_add_gtest(test_stop_reference_barrier test/test_stop_reference_barrier.cpp)
+  target_include_directories(test_stop_reference_barrier PRIVATE include)
+
   ament_add_gtest(test_planning_snapshot_safety test/test_planning_snapshot_safety.cpp)
   target_include_directories(test_planning_snapshot_safety PRIVATE include)
   ament_target_dependencies(test_planning_snapshot_safety ats_navigation_interfaces geometry_msgs nav_msgs)
@@ -71,6 +74,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_goal_manager_mapping test/test_goal_manager_mapping.py TIMEOUT 40)
   ament_add_pytest_test(test_goal_manager_retarget test/test_goal_manager_retarget.py TIMEOUT 40)
   ament_add_pytest_test(test_goal_manager_fast_maps test/test_goal_manager_fast_maps.py TIMEOUT 40)
+  ament_add_pytest_test(test_goal_manager_stop_barrier test/test_goal_manager_stop_barrier.py TIMEOUT 40)
 endif()
 
 ament_package()
