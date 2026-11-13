@@ -112,6 +112,93 @@ TEST(TrajectoryTracker, UsesYawToAdvanceAnInPlaceTerminalRotation)
   EXPECT_NEAR(projection.time, 12.5, 1e-9);
 }
 
+TEST(TrajectoryTracker, MillimetrePositionErrorDoesNotPinTerminalYawToTheApproach)
+{
+  auto trajectory = straightTrajectory();
+  trajectory[1].state << 1.0, 0.0, 0.0;
+  trajectory[2].state << 1.0, 0.0, M_PI_2;
+  trajectory[3].state << 1.0, 0.0, M_PI;
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.terminal_position_tolerance = 0.01;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  ats_swerve_mpc::State state;
+  state << 0.992, 0.0, 0.75 * M_PI;
+  const auto projection = tracker.project(state);
+  ASSERT_TRUE(projection.valid);
+  EXPECT_EQ(projection.segment_index, 2U);
+  EXPECT_NEAR(projection.time, 12.5, 1e-9);
+  EXPECT_NEAR(projection.cross_track_error, 0.008, 1e-9);
+  tracker.resetProgress();
+  state << 0.98, 0.0, 0.75 * M_PI;
+  EXPECT_EQ(tracker.project(state).segment_index, 0U);
+}
+
+TEST(TrajectoryTracker, TerminalYawReversalCannotRevisitAnEarlierEqualYaw)
+{
+  auto trajectory = straightTrajectory();
+  trajectory[1].state << 1.0, 0.0, 0.0;
+  trajectory[2].state << 1.0, 0.0, 1.0;
+  trajectory[3].state << 1.0, 0.0, -1.0;
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.terminal_position_tolerance = 0.01;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  ats_swerve_mpc::State state;
+  state << 0.992, 0.0, 1.0;
+  EXPECT_NEAR(tracker.project(state).time, 12.0, 1e-9);
+  state(2) = 0.5;
+  EXPECT_NEAR(tracker.project(state).time, 12.25, 1e-9);
+  state(2) = -0.5;
+  EXPECT_NEAR(tracker.project(state).time, 12.75, 1e-9);
+}
+
+TEST(TrajectoryTracker, DenseApproachWithinPositionToleranceCanAdvanceTerminalYaw)
+{
+  std::vector<ats_swerve_mpc::TimedState> trajectory(13);
+  for (std::size_t i = 0; i <= 10; ++i) {
+    trajectory[i].time = 10.0 + 0.1 * i;
+    trajectory[i].state << 0.98 + 0.002 * i, 0.0, 0.0;
+  }
+  trajectory[11].time = 12.0;
+  trajectory[11].state << 1.0, 0.0, M_PI_2;
+  trajectory[12].time = 13.0;
+  trajectory[12].state << 1.0, 0.0, M_PI;
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.terminal_position_tolerance = 0.01;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  ats_swerve_mpc::State state;
+  state << 0.992, 0.0, 0.75 * M_PI;
+  const auto projection = tracker.project(state);
+  ASSERT_TRUE(projection.valid);
+  EXPECT_EQ(projection.segment_index, 11U);
+  EXPECT_NEAR(projection.time, 12.5, 1e-9);
+}
+
+TEST(TrajectoryTracker, PassingNearGoalDoesNotSkipRemainingTranslation)
+{
+  std::vector<ats_swerve_mpc::TimedState> trajectory(5);
+  trajectory[0].state << 0.0, 0.0, 0.0;
+  trajectory[1].state << 1.0, 0.0, 0.0;
+  trajectory[2].state << 1.0, 1.0, 0.0;
+  trajectory[3].state << 1.0, 0.0, 0.0;
+  trajectory[4].state << 1.0, 0.0, 1.0;
+  for (std::size_t i = 0; i < trajectory.size(); ++i) {
+    trajectory[i].time = 10.0 + i;
+  }
+  ats_swerve_mpc::TrajectoryTrackerConfig config;
+  config.terminal_position_tolerance = 0.01;
+  ats_swerve_mpc::TrajectoryTracker tracker(config);
+  tracker.setTrajectory(trajectory);
+  ats_swerve_mpc::State state;
+  state << 0.992, 0.0, 0.5;
+  const auto projection = tracker.project(state);
+  ASSERT_TRUE(projection.valid);
+  EXPECT_EQ(projection.segment_index, 0U);
+  EXPECT_NEAR(projection.time, 10.992, 1e-9);
+}
+
 TEST(TrajectoryTracker, ConvertsWorldReferenceVelocityToBodyFrameAtNinetyDegrees)
 {
   std::vector<ats_swerve_mpc::TimedState> trajectory(2);

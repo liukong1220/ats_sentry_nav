@@ -40,6 +40,7 @@ void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
     std::max(config_.cross_track_slowdown_start + 1e-6, config_.cross_track_slowdown_end);
   config_.min_progress_scale = std::clamp(config_.min_progress_scale, 0.0, 1.0);
   config_.command_latency_compensation = std::max(0.0, config_.command_latency_compensation);
+  config_.terminal_position_tolerance = std::max(0.0, config_.terminal_position_tolerance);
 }
 
 //通过移动语义高效接管路径点，然后重置进，丢弃旧投影信息。
@@ -90,6 +91,45 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
     return projection;
   }
 
+  // Once the approach reaches the existing goal-position disk, centimetre-scale
+  // XY tracking error must not pin yaw to a slightly closer approach segment.
+  // Only the contiguous stationary suffix is eligible; a loop passing the goal
+  // earlier in the path must not skip its remaining translation.
+  if (use_yaw && config_.terminal_position_tolerance > 0.0 &&
+      (position - trajectory_.back().state.head<2>()).norm() <=
+        config_.terminal_position_tolerance) {
+    std::size_t terminal_begin = trajectory_.size() - 1;
+    while (terminal_begin > 0 &&
+           (trajectory_[terminal_begin - 1].state.head<2>() -
+            trajectory_.back().state.head<2>()).squaredNorm() <= 1e-12) {
+      --terminal_begin;
+    }
+    double remaining_translation = 0.0;
+    if (projection.segment_index < terminal_begin) {
+      const auto & first = trajectory_[projection.segment_index];
+      const auto & second = trajectory_[projection.segment_index + 1];
+      const double ratio = std::clamp(
+        (projection.time - first.time) / std::max(1e-9, second.time - first.time),
+        0.0, 1.0);
+      remaining_translation =
+        (1.0 - ratio) * (second.state.head<2>() - first.state.head<2>()).norm();
+      for (std::size_t i = projection.segment_index + 1;
+           i < terminal_begin && remaining_translation <= config_.terminal_position_tolerance;
+           ++i) {
+        remaining_translation +=
+          (trajectory_[i + 1].state.head<2>() - trajectory_[i].state.head<2>()).norm();
+      }
+    }
+    if (terminal_begin + 1 < trajectory_.size() &&
+        remaining_translation <= config_.terminal_position_tolerance) {
+      const auto terminal = nearestProjection(
+        position, yaw, true, has_progress_, terminal_begin);
+      if (terminal.valid) {
+        projection = terminal;
+      }
+    }
+  }
+
   if (has_progress_) {
     // 进度只能单调前进且受前向窗口限制，避免定位噪声跳回旧路径或跳到远端路径段。
     projection.time = std::max(last_progress_time_, projection.time);
@@ -104,7 +144,8 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
 
 //在给定位置和航向的情况下，沿轨迹寻找最近投影点的实现函数
 TrajectoryProjection TrajectoryTracker::nearestProjection(
-  const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress) const
+  const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress,
+  std::optional<std::size_t> terminal_begin) const
 {
   TrajectoryProjection best;
   if (trajectory_.size() < 2 || !position.allFinite()) {
@@ -112,7 +153,8 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
   }
 
   const double minimum_time = restrict_progress
-                                ? last_progress_time_ - config_.backward_search_window
+                                ? last_progress_time_ -
+                                  (terminal_begin ? 0.0 : config_.backward_search_window)
                                 : -std::numeric_limits<double>::infinity();
   const double maximum_time = restrict_progress
                                 ? last_progress_time_ + config_.forward_search_window
@@ -120,7 +162,7 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
   double best_distance_squared = std::numeric_limits<double>::infinity();
   double best_yaw_error = std::numeric_limits<double>::infinity();
 
-  for (std::size_t i = 0; i + 1 < trajectory_.size(); ++i) {
+  for (std::size_t i = terminal_begin.value_or(0); i + 1 < trajectory_.size(); ++i) {
     const TimedState & first = trajectory_[i];
     const TimedState & second = trajectory_[i + 1];
     if (second.time < minimum_time || first.time > maximum_time) {

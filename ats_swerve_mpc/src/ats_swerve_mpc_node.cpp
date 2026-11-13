@@ -426,6 +426,7 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
 /** @brief 加载路径投影、横向偏差降速和时延补偿参数。 */
 TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
   TrajectoryTrackerConfig config;
+  config.terminal_position_tolerance = goal_position_tolerance_;
   config.backward_search_window = declare_parameter<double>(
       "projection_backward_window", config.backward_search_window);
   config.forward_search_window = declare_parameter<double>(

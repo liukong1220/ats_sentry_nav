@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "ats_swerve_mpc/se2_mpc_controller.hpp"
@@ -34,6 +35,8 @@ struct TrajectoryTrackerConfig
   double cross_track_slowdown_end = 0.60;
   double min_progress_scale = 0.25;
   double command_latency_compensation = 0.01;
+  // Set by the node from its existing goal position tolerance. Zero disables.
+  double terminal_position_tolerance = 0.0;
 };
 
 class TrajectoryTracker
@@ -108,7 +111,8 @@ private:
     const Eigen::Vector2d & position, double yaw, bool use_yaw);
   /** @brief 在受限时间窗内寻找最近线段，必要时禁止倒退以保证控制进度单调。 */
   TrajectoryProjection nearestProjection(
-    const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress) const;
+    const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress,
+    std::optional<std::size_t> terminal_begin = std::nullopt) const;
   /** @brief 在相邻时间点间插值位置/yaw，并由离散差分生成 body-frame 控制参考。 */
   bool sampleReference(double time, Se2Reference & reference) const;
   /** @brief 统一 trajectory yaw 插值的最短角归一化。 */
