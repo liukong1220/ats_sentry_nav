@@ -1052,6 +1052,17 @@ private:
   // 参考轨迹在 planning_frame(odom)下,current_pose_ 在 goal_frame(map)下;只比
   // current_pose_ 会恒判不一致而退回直线距离(domain 87 红点目标绕行时直线距离
   // 增大,转弯途中被误判停滞急停)。按参考的坐标系挑同系位姿。
+  PlanProgressWatchdog::Clock::time_point progressMotionTime() {
+    using Clock = PlanProgressWatchdog::Clock;
+    if (!get_clock()->ros_time_is_active()) {
+      return Clock::now();
+    }
+    // This synthetic time_point is used ONLY for motion progress. Map leases,
+    // missing-plan/contact budgets and health checks retain their steady clock.
+    return Clock::time_point(std::chrono::duration_cast<Clock::duration>(
+      std::chrono::nanoseconds(now().nanoseconds())));
+  }
+
   double progressDistanceLocked(double straight_distance) {
     if (!progress_along_reference_ || !active_execution_command_ || !has_current_pose_) {
       return straight_distance;
@@ -1290,7 +1301,8 @@ private:
         progress_identity,
         progressDistanceLocked(
           std::hypot(active_goal_->target.pose.position.x - current_pose_.pose.position.x,
-                     active_goal_->target.pose.position.y - current_pose_.pose.position.y)));
+                     active_goal_->target.pose.position.y - current_pose_.pose.position.y)),
+        progressMotionTime());
     }
     RCLCPP_INFO(
       get_logger(),
@@ -1534,7 +1546,7 @@ private:
             // 目标圈内没有"推进"可言，但也不是停滞：刷新停滞计时。看门狗只在圈外被调用，
             // 不刷新的话，车停在圈内、定位抖动让距离短暂越过圈沿时，会拿陈旧计时当场判停滞，
             // 一次抖动耗掉一次重规划预算(e5 d124)。
-            progress_watchdog_.holdProgress(active_goal_->id);
+            progress_watchdog_.holdProgress(active_goal_->id, progressMotionTime());
           }
           if (require_planning_snapshot_ && !pose_converged && !in_progress_hold) {
             PlanningSnapshotSafetyResult snapshot_safety;
@@ -1604,6 +1616,7 @@ private:
               // a stalled timer every publication.
               gate.identity.source_generation = planning_snapshot_->source_generation;
             }
+            gate.motion_time = progressMotionTime();
             const PlanProgressDecision decision = progress_watchdog_.evaluate(gate);
             if (progress_watchdog_.contactHoldActive()) {
               RCLCPP_WARN_THROTTLE(

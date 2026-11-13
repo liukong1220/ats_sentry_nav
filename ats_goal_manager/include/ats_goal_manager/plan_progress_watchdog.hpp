@@ -90,6 +90,9 @@ struct PlanProgressGate
   bool footprint_safe{false};
   bool has_current_reference{false};
   double distance_to_goal_m{0.0};
+  // Only physical progress/replan intervals use this optional motion clock.
+  // Safety, contact and missing-plan deadlines always use evaluate()'s steady now.
+  std::optional<std::chrono::steady_clock::time_point> motion_time;
   // 当前位姿对足迹检查的接触深度：足迹每边内缩多少才能完整通过(0 = 本来就通过)。
   // NaN = 未计算；+inf = 机器人格被占或内缩到搜索上界仍不通过。只用于有界放行与日志。
   double footprint_contact_depth_m{std::numeric_limits<double>::quiet_NaN()};
@@ -192,6 +195,7 @@ public:
   PlanProgressDecision evaluate(
     const PlanProgressGate & gate, Clock::time_point now = Clock::now())
   {
+    const auto motion_now = gate.motion_time.value_or(now);
     if (!gate.goal_active || gate.cancel_or_preempt ||
       gate.identity.goal_id == 0 || gate.identity.goal_id != goal_id_)
     {
@@ -266,28 +270,34 @@ public:
     // 参考在且急停已解除:这一拍确实可执行,预算清零。
     no_executable_plan_since_.reset();
     if (!active_identity_ || !sameGoalAndReference(*active_identity_, gate.identity)) {
-      observeReference(gate.identity, gate.distance_to_goal_m, now);
+      observeReference(gate.identity, gate.distance_to_goal_m, motion_now);
       return PlanProgressDecision::kNone;
     }
     if (!last_progress_distance_m_ || !last_progress_time_) {
-      observeReference(gate.identity, gate.distance_to_goal_m, now);
+      observeReference(gate.identity, gate.distance_to_goal_m, motion_now);
       return PlanProgressDecision::kNone;
     }
 
     const double distance = std::max(0.0, gate.distance_to_goal_m);
-    if (*last_progress_distance_m_ - distance >= params_.progress_min_delta_m) {
+    if (motion_now < *last_progress_time_) {
+      // A simulation reset rebases motion timing, not safety timing or retry count.
+      last_progress_time_ = motion_now;
       last_progress_distance_m_ = distance;
-      last_progress_time_ = now;
+      last_replan_time_.reset();
       return PlanProgressDecision::kNone;
     }
-    if (now < *last_progress_time_ ||
-      std::chrono::duration<double>(now - *last_progress_time_).count() <
+    if (*last_progress_distance_m_ - distance >= params_.progress_min_delta_m) {
+      last_progress_distance_m_ = distance;
+      last_progress_time_ = motion_now;
+      return PlanProgressDecision::kNone;
+    }
+    if (std::chrono::duration<double>(motion_now - *last_progress_time_).count() <
         params_.replan_stall_timeout_sec)
     {
       return PlanProgressDecision::kNone;
     }
-    if (last_replan_time_ && now >= *last_replan_time_ &&
-      std::chrono::duration<double>(now - *last_replan_time_).count() <
+    if (last_replan_time_ && motion_now >= *last_replan_time_ &&
+      std::chrono::duration<double>(motion_now - *last_replan_time_).count() <
         params_.replan_min_interval_sec)
     {
       return PlanProgressDecision::kNone;
@@ -296,8 +306,8 @@ public:
       return PlanProgressDecision::kExhausted;
     }
     ++consecutive_replans_;
-    last_replan_time_ = now;
-    last_progress_time_ = now;
+    last_replan_time_ = motion_now;
+    last_progress_time_ = motion_now;
     last_progress_distance_m_ = distance;
     return PlanProgressDecision::kReplan;
   }

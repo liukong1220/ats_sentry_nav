@@ -827,3 +827,57 @@ TEST(PlanProgressWatchdog, HoldProgressIgnoresForeignGoalsAndUnobservedGoals)
 }
 
 }  // namespace
+
+TEST(PlanProgressWatchdog, MotionClockDoesNotSpendStallBudgetWhileSimulationIsFrozen)
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.replan_stall_timeout_sec = 4.0;
+  params.replan_min_interval_sec = 2.0;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto wall = Clock::time_point{};
+  auto gate = healthyGate(1.0);
+  gate.motion_time = wall + std::chrono::seconds(10);
+  EXPECT_EQ(watchdog.evaluate(gate, wall), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(100)), Decision::kNone);
+  gate.motion_time = wall + std::chrono::seconds(13);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(130)), Decision::kNone);
+  gate.motion_time = wall + std::chrono::seconds(14);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(140)), Decision::kReplan);
+}
+
+TEST(PlanProgressWatchdog, FrozenMotionClockDoesNotFreezeSafetyOrMissingReferenceBudget)
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.no_executable_plan_timeout_sec = 1.0;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto wall = Clock::time_point{};
+  auto gate = healthyGate(1.0);
+  gate.motion_time = wall;
+  gate.has_current_reference = false;
+  EXPECT_EQ(watchdog.evaluate(gate, wall), Decision::kNone);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(1)), Decision::kNoExecutablePlan);
+  gate.map_fresh = false;
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(2)), Decision::kUnsafe);
+}
+
+TEST(PlanProgressWatchdog, BackwardMotionClockRebasesStallWindowWithoutResettingReplanBudget)
+{
+  ats_goal_manager::PlanProgressWatchdogParams params;
+  params.replan_stall_timeout_sec = 1.0;
+  params.replan_min_interval_sec = 0.0;
+  params.max_consecutive_replans = 1;
+  Watchdog watchdog(params);
+  watchdog.resetGoal(7);
+  const auto wall = Clock::time_point{};
+  auto gate = healthyGate(1.0);
+  gate.motion_time = wall + std::chrono::seconds(10);
+  EXPECT_EQ(watchdog.evaluate(gate, wall), Decision::kNone);
+  gate.motion_time = wall + std::chrono::seconds(11);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(1)), Decision::kReplan);
+  gate.motion_time = wall;
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(2)), Decision::kNone);
+  gate.motion_time = wall + std::chrono::seconds(1);
+  EXPECT_EQ(watchdog.evaluate(gate, wall + std::chrono::seconds(3)), Decision::kExhausted);
+}
