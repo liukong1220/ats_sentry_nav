@@ -242,21 +242,35 @@ std::int8_t OdomLayerStore::sampleFootprint(
 {
   if (!std::isfinite(min_x) || !std::isfinite(min_y) || !std::isfinite(max_x) ||
     !std::isfinite(max_y) || max_x <= min_x || max_y <= min_y) {return -1;}
-  const int first_x = std::max(0, static_cast<int>(std::floor((min_x - config_.origin_x) / config_.resolution)));
-  const int first_y = std::max(0, static_cast<int>(std::floor((min_y - config_.origin_y) / config_.resolution)));
-  const int last_x = std::min(static_cast<int>(config_.width) - 1,
-    static_cast<int>(std::ceil((max_x - config_.origin_x) / config_.resolution - 1e-8)) - 1);
-  const int last_y = std::min(static_cast<int>(config_.height) - 1,
-    static_cast<int>(std::ceil((max_y - config_.origin_y) / config_.resolution - 1e-8)) - 1);
-  bool free = false;
+  const auto lattice = [&](double coordinate, double origin) {
+      const double value = (coordinate - origin) / config_.resolution;
+      if (!std::isfinite(value)) {return value;}
+      const double boundary = std::round(value);
+      // Only absorb arithmetic roundoff when expressing the same grid edge in
+      // world coordinates and back. A fixed geometric epsilon on the upper
+      // edge would discard real positive-area overlap with an occupied cell.
+      const double roundoff = 8 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(coordinate / config_.resolution) +
+        std::abs(origin / config_.resolution));
+      return std::abs(value - boundary) <= roundoff ? boundary : value;
+    };
+  const double x0 = lattice(min_x, config_.origin_x), x1 = lattice(max_x, config_.origin_x);
+  const double y0 = lattice(min_y, config_.origin_y), y1 = lattice(max_y, config_.origin_y);
+  // Clamp in floating point before converting, including very distant queries.
+  const int first_x = static_cast<int>(std::floor(std::clamp(x0, 0.0, double(config_.width))));
+  const int first_y = static_cast<int>(std::floor(std::clamp(y0, 0.0, double(config_.height))));
+  const int last_x = static_cast<int>(std::ceil(std::clamp(x1, 0.0, double(config_.width)))) - 1;
+  const int last_y = static_cast<int>(std::ceil(std::clamp(y1, 0.0, double(config_.height)))) - 1;
+  if (first_x > last_x || first_y > last_y) {return -1;}
+  bool all_free = x0 >= 0.0 && y0 >= 0.0 && x1 <= config_.width && y1 <= config_.height;
   for (int y = first_y; y <= last_y; ++y) {
     for (int x = first_x; x <= last_x; ++x) {
       const auto state = cell(x, y)->state;
       if (state == OdomCellState::kOccupied) {return 100;}
-      free = free || state == OdomCellState::kFree;
+      all_free = all_free && state == OdomCellState::kFree;
     }
   }
-  return free ? 0 : -1;
+  return all_free ? 0 : -1;
 }
 
 bool OdomLayerStore::observeRayClear(

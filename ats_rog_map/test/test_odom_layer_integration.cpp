@@ -145,6 +145,58 @@ TEST(OdomLayerWindow, GlobalEvidenceSurvivesWindowMovementAndConservativeAggrega
   EXPECT_EQ(layer.sampleFootprint(-2.0, 1.0, -1.0, 2.0), -1);
 }
 
+TEST(OdomLayerWindow, AlignedGlobalCellDoesNotBorrowFreeOrOccupiedFromItsNeighbour)
+{
+  auto c = config();
+  c.origin_x = -8.0; c.origin_y = -15.0; c.width = 400; c.height = 300;
+  ats_rog_map::OdomLayerStore layer(c);
+  const auto sample = [&](int x, int y) {
+      return layer.sampleFootprint(c.origin_x + x * c.resolution,
+        c.origin_y + y * c.resolution, c.origin_x + (x + 1) * c.resolution,
+        c.origin_y + (y + 1) * c.resolution);
+    };
+  // d73: (min_y - origin_y)/resolution = 80.99999999999999.
+  layer.observeFree(133, 80, 1.0, 0.1);
+  layer.observeFree(142, 80, 1.0, 0.1);
+  EXPECT_EQ(sample(133, 81), -1);
+  EXPECT_EQ(sample(142, 81), -1);
+  layer.observeHit(132, 85, 1.0, 0.1);
+  layer.observeFree(132, 86, 1.0, 0.1);
+  EXPECT_EQ(sample(132, 86), 0);
+  EXPECT_EQ(sample(132, 85), 100);
+}
+
+TEST(OdomLayerWindow, GenuineSubNanometreOverlapRetainsOccupiedEvidence)
+{
+  auto c = config();
+  c.origin_x = -8.0; c.origin_y = -15.0; c.width = 400; c.height = 300;
+  ats_rog_map::OdomLayerStore layer(c);
+  const double x = c.origin_x + 133 * c.resolution;
+  const double y = c.origin_y + 81 * c.resolution;
+  layer.observeHit(133, 81, 1.0, 0.1);
+  layer.observeFree(133, 80, 1.0, 0.1);
+  layer.observeFree(133, 82, 1.0, 0.1);
+  // The former fixed 1e-8-cell upper-edge epsilon dropped this positive area.
+  EXPECT_EQ(layer.sampleFootprint(x, y - c.resolution, x + c.resolution, y + 1e-10), 100);
+  EXPECT_EQ(layer.sampleFootprint(x, y + c.resolution - 1e-10,
+    x + c.resolution, y + 2 * c.resolution), 100);
+  EXPECT_EQ(layer.sampleFootprint(x, y - c.resolution, x + c.resolution, y), 0);
+}
+
+TEST(OdomLayerWindow, PartialFreeDoesNotFillUnobservedOrOutsideArea)
+{
+  auto c = config();
+  ats_rog_map::OdomLayerStore layer(c);
+  layer.observeFree(0, 0, 1.0, 0.1);
+  EXPECT_EQ(layer.sampleFootprint(0, 0, .2, .1), -1);
+  EXPECT_EQ(layer.sampleFootprint(-.01, 0, .1, .1), -1);
+  layer.observeFree(1, 0, 1.0, 0.1);
+  EXPECT_EQ(layer.sampleFootprint(0, 0, .2, .1), 0);
+  layer.observeHit(1, 0, 2.0, 0.1);
+  EXPECT_EQ(layer.sampleFootprint(-.01, 0, .2, .1), 100);
+  EXPECT_EQ(layer.sampleFootprint(-1e100, -1e100, 1e100, 1e100), 100);
+}
+
 TEST(OdomLayerIntegration, PassingRayDoesNotCountAsAnObstacleHit)
 {
   const auto c = config();
