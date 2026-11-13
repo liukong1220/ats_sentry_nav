@@ -274,6 +274,16 @@ public:
       "odom_layer.top_margin", column_config.top_margin);
     column_config.max_ground_slope = declare_parameter<double>(
       "odom_layer.max_ground_slope", column_config.max_ground_slope);
+    column_config.plane_residual_max = declare_parameter<double>(
+      "odom_layer.plane_residual_max", column_config.plane_residual_max);
+    column_config.ceiling_plane_enabled = declare_parameter<bool>(
+      "odom_layer.ceiling_plane_enabled", column_config.ceiling_plane_enabled);
+    column_config.ceiling_plane_band = declare_parameter<double>(
+      "odom_layer.ceiling_plane_band", column_config.ceiling_plane_band);
+    column_config.floor_plane_enabled = declare_parameter<bool>(
+      "odom_layer.floor_plane_enabled", column_config.floor_plane_enabled);
+    column_config.floor_plane_band = declare_parameter<double>(
+      "odom_layer.floor_plane_band", column_config.floor_plane_band);
     ground_columns_ = std::make_unique<GroundColumnGrid>(
       layer_config.width, layer_config.height, layer_config.resolution,
       layer_config.origin_x, layer_config.origin_y, column_config);

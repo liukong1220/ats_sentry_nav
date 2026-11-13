@@ -3,6 +3,7 @@
 #include "ats_rog_map/ground_column.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <queue>
 #include <stdexcept>
@@ -159,8 +160,9 @@ std::optional<double> GroundColumnGrid::ground(int x, int y) const
 }
 
 std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
-  int x, int y, double query_x, double query_y) const
+  int x, int y, double query_x, double query_y, double * plane_z) const
 {
+  if (plane_z) {*plane_z = std::numeric_limits<double>::quiet_NaN();}
   std::vector<VoxelReturns> supports;
   double lower = -std::numeric_limits<double>::infinity();
   double upper = std::numeric_limits<double>::infinity();
@@ -182,12 +184,15 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   if (supports.size() >= 6) {
     Point mean{};
     for (const auto & support : supports) {
-      for (int a = 0; a < 3; ++a) {mean[a] += support.low[a] / supports.size();}
+      for (int a = 0; a < 3; ++a) {mean[a] += support.high[a] / supports.size();}
     }
     double xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
     std::vector<double> angles;
     for (const auto & support : supports) {
-      const auto & p = support.low;
+      // The plane follows the highest measured support return: a later lower
+      // return must not turn into extra headroom (appendix A.1), so the gate
+      // never sits below a floor height that was actually measured.
+      const auto & p = support.high;
       const double u = p[0] - mean[0], v = p[1] - mean[1], w = p[2] - mean[2];
       xx += u * u; xy += u * v; yy += v * v; xz += u * w; yz += v * w;
       angles.push_back(std::atan2(p[1] - query_y, p[0] - query_x));
@@ -214,10 +219,11 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
       for (std::size_t i = 1; i < angles.size(); ++i) {
         gap = std::max(gap, angles[i] - angles[i - 1]);
       }
-      if (std::hypot(a, b) <= config_.max_ground_slope && residual <= config_.support_noise &&
+      if (std::hypot(a, b) <= config_.max_ground_slope && residual <= config_.plane_residual_max &&
         gap <= pi + 1e-9)
       {
         const double z = mean[2] + a * (query_x - mean[0]) + b * (query_y - mean[1]);
+        if (plane_z) {*plane_z = z;}
         return std::array<double, 2>{z - residual, z + residual};
       }
     }
@@ -230,6 +236,242 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   return std::array<double, 2>{std::min(lower, upper), std::max(lower, upper)};
 }
 
+std::optional<GroundColumnGrid::SupportInterval> GroundColumnGrid::voxelSupportInterval(
+  int x, int y, const VoxelReturns & evidence) const
+{
+  // z extrema alone lose a low-clearance point on a slope. Enclose ALL
+  // measured XY, including returns between the two stored z extrema.
+  double lower = std::numeric_limits<double>::infinity();
+  double upper = -std::numeric_limits<double>::infinity();
+  double estimate = -std::numeric_limits<double>::infinity();
+  bool all_planar = true;
+  for (const double qx : {evidence.xy_bounds[0], evidence.xy_bounds[2]}) {
+    for (const double qy : {evidence.xy_bounds[1], evidence.xy_bounds[3]}) {
+      double plane_z = 0.0;
+      const auto bounds = supportBounds(x, y, qx, qy, &plane_z);
+      if (!bounds) {return std::nullopt;}
+      all_planar = all_planar && std::isfinite(plane_z);
+      if (std::isfinite(plane_z)) {estimate = std::max(estimate, plane_z);}
+      lower = std::min(lower, (*bounds)[0]);
+      upper = std::max(upper, (*bounds)[1]);
+    }
+  }
+  // Include interior extrema of the slope-bound cones when no plane exists.
+  const double diameter = std::hypot(evidence.xy_bounds[2] - evidence.xy_bounds[0],
+    evidence.xy_bounds[3] - evidence.xy_bounds[1]);
+  // supportBounds is Lipschitz; corners alone need not enclose its interior.
+  // The centre query plus the rectangle radius supplies an independent bound.
+  double centre_plane = 0.0;
+  const auto centre = supportBounds(x, y,
+    (evidence.xy_bounds[0] + evidence.xy_bounds[2]) * 0.5,
+    (evidence.xy_bounds[1] + evidence.xy_bounds[3]) * 0.5, &centre_plane);
+  if (!centre) {return std::nullopt;}
+  // One fitted plane is linear: its extrema over the rectangle are at the
+  // corners, so the slope-cone allowance only applies without a plane.
+  if (all_planar && std::isfinite(centre_plane)) {
+    // A well-posed trimmed fit over the connected supports gives the floor height
+    // without the per-voxel extrema scatter; the corners still bound the voxel XY.
+    if (evidence.high[2] - lower > config_.surface_max + 1e-9) {
+     if (const auto floor = floorPlane(x, y)) {
+      double fitted = -std::numeric_limits<double>::infinity();
+      for (const double qx : {evidence.xy_bounds[0], evidence.xy_bounds[2]}) {
+        for (const double qy : {evidence.xy_bounds[1], evidence.xy_bounds[3]}) {
+          fitted = std::max(fitted, floor->at(qx, qy));
+        }
+      }
+      estimate = std::min(estimate, fitted);
+     }
+    }
+    return SupportInterval{lower, upper, estimate};
+  }
+  lower = std::min(lower, (*centre)[0] - config_.max_ground_slope * diameter * 0.5);
+  upper = std::max(upper, (*centre)[1] + config_.max_ground_slope * diameter * 0.5);
+  return SupportInterval{lower, upper, upper};
+}
+
+std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::ceilingPlane(int x, int y) const
+{
+  if (!config_.ceiling_plane_enabled) {return std::nullopt;}
+  const double clearance = config_.robot_height + config_.top_margin;
+  std::vector<Point> points;
+  for (int dy = -config_.ceiling_plane_radius; dy <= config_.ceiling_plane_radius; ++dy) {
+    for (int dx = -config_.ceiling_plane_radius; dx <= config_.ceiling_plane_radius; ++dx) {
+      if (!valid(x + dx, y + dy)) {continue;}
+      for (const auto & bin : columns_[index(x + dx, y + dy)]) {
+        const auto support = supportBounds(x + dx, y + dy, bin.second.low[0], bin.second.low[1]);
+        if (!support) {continue;}
+        const double height = bin.second.low[2] - (*support)[1];
+        // Non-floor returns that could be a ceiling for this robot, not a far roof.
+        if (height <= config_.surface_max + 1e-9 || height > clearance + 0.30) {continue;}
+        points.push_back(bin.second.low);
+        if (bin.second.high[2] > bin.second.low[2]) {points.push_back(bin.second.high);}
+      }
+    }
+  }
+  return robustPlane(points, config_.ceiling_plane_band, config_.ceiling_plane_max_slope);
+}
+
+std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::robustPlane(
+  const std::vector<Point> & points, double band, double max_slope) const
+{
+  if (static_cast<int>(points.size()) < config_.ceiling_plane_min_points) {return std::nullopt;}
+  Point mean{};
+  for (const auto & p : points) {for (int a = 0; a < 3; ++a) {mean[a] += p[a] / points.size();}}
+  // Deterministic RANSAC start: mis-identified support or a wall edge among the
+  // points would tilt a plain least-squares plane and collapse the trimmed set.
+  std::vector<bool> inlier(points.size(), false);
+  {
+    std::uint32_t state = 2463534242u;
+    const auto next = [&state]() {state ^= state << 13; state ^= state >> 17; state ^= state << 5; return state;};
+    std::size_t best = 0;
+    const std::size_t n = points.size();
+    for (int trial = 0; trial < 96; ++trial) {
+      const std::size_t i0 = next() % n, i1 = next() % n, i2 = next() % n;
+      if (i0 == i1 || i1 == i2 || i0 == i2) {continue;}
+      const auto & p0 = points[i0]; const auto & p1 = points[i1]; const auto & p2 = points[i2];
+      const double ux = p1[0] - p0[0], uy = p1[1] - p0[1], uz = p1[2] - p0[2];
+      const double vx = p2[0] - p0[0], vy = p2[1] - p0[1], vz = p2[2] - p0[2];
+      const double det = ux * vy - uy * vx;
+      if (std::abs(det) < 1e-4) {continue;}
+      const double ga = (uz * vy - uy * vz) / det;
+      const double gb = (ux * vz - uz * vx) / det;
+      if (std::hypot(ga, gb) > max_slope) {continue;}
+      std::size_t votes = 0;
+      for (const auto & p : points) {
+        if (std::abs(p[2] - (p0[2] + ga * (p[0] - p0[0]) + gb * (p[1] - p0[1]))) <= band) {++votes;}
+      }
+      if (votes > best) {
+        best = votes;
+        for (std::size_t i = 0; i < n; ++i) {
+          inlier[i] = std::abs(points[i][2] - (p0[2] + ga * (points[i][0] - p0[0]) +
+            gb * (points[i][1] - p0[1]))) <= band;
+        }
+      }
+    }
+    if (static_cast<int>(best) < config_.ceiling_plane_min_points) {return std::nullopt;}
+  }
+  double a = 0.0, b = 0.0, c = mean[2], sigma = 0.0;
+  std::size_t count = points.size();
+  for (int iteration = 0; iteration < 10; ++iteration) {
+    Point m{};
+    count = 0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      if (!inlier[i]) {continue;}
+      ++count;
+      for (int k = 0; k < 3; ++k) {m[k] += points[i][k];}
+    }
+    if (static_cast<int>(count) < config_.ceiling_plane_min_points) {return std::nullopt;}
+    for (int k = 0; k < 3; ++k) {m[k] /= count;}
+    double xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      if (!inlier[i]) {continue;}
+      const double u = points[i][0] - m[0], v = points[i][1] - m[1], w = points[i][2] - m[2];
+      xx += u * u; xy += u * v; yy += v * v; xz += u * w; yz += v * w;
+    }
+    const double determinant = xx * yy - xy * xy;
+    if (determinant <= 1e-8 * (xx + yy) * (xx + yy)) {return std::nullopt;}
+    a = (xz * yy - yz * xy) / determinant;
+    b = (yz * xx - xz * xy) / determinant;
+    c = m[2]; mean = m;
+    double sum = 0.0;
+    std::vector<double> residual(points.size());
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      residual[i] = points[i][2] - (c + a * (points[i][0] - m[0]) + b * (points[i][1] - m[1]));
+      if (inlier[i]) {sum += residual[i] * residual[i];}
+    }
+    sigma = std::sqrt(sum / count);
+    const double limit = std::min(band, std::max(2.5 * sigma, 0.004));
+    bool changed = false;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const bool keep = std::abs(residual[i]) <= limit;
+      if (keep != inlier[i]) {inlier[i] = keep; changed = true;}
+    }
+    if (!changed) {break;}
+  }
+  if (static_cast<int>(count) < config_.ceiling_plane_min_points ||
+    count < config_.ceiling_plane_min_inlier_ratio * points.size() ||
+    sigma > config_.ceiling_plane_max_sigma || std::hypot(a, b) > max_slope)
+  {return std::nullopt;}
+  double lo_x = 1e9, hi_x = -1e9, lo_y = 1e9, hi_y = -1e9;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    if (!inlier[i]) {continue;}
+    lo_x = std::min(lo_x, points[i][0]); hi_x = std::max(hi_x, points[i][0]);
+    lo_y = std::min(lo_y, points[i][1]); hi_y = std::max(hi_y, points[i][1]);
+  }
+  if (hi_x - lo_x < config_.ceiling_plane_min_extent ||
+    hi_y - lo_y < config_.ceiling_plane_min_extent) {return std::nullopt;}
+  return CeilingPlane{mean[0], mean[1], c, a, b, std::min(band, std::max(2.5 * sigma, 0.004))};
+}
+
+std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::floorPlane(int x, int y) const
+{
+  if (!config_.floor_plane_enabled) {return std::nullopt;}
+  std::vector<Point> points;
+  for (int dy = -config_.ceiling_plane_radius; dy <= config_.ceiling_plane_radius; ++dy) {
+    for (int dx = -config_.ceiling_plane_radius; dx <= config_.ceiling_plane_radius; ++dx) {
+      if (!valid(x + dx, y + dy)) {continue;}
+      const auto & support = ground_[index(x + dx, y + dy)];
+      if (!support) {continue;}
+      points.push_back(support->low);
+      if (support->high[2] > support->low[2]) {points.push_back(support->high);}
+    }
+  }
+  return robustPlane(points, config_.floor_plane_band, config_.max_ground_slope);
+}
+
+double GroundColumnGrid::snapToPlane(
+  const std::optional<CeilingPlane> & plane, const std::array<double, 3> & p, double band)
+{
+  if (!plane) {return p[2];}
+  const double z = plane->at(p[0], p[1]);
+  return std::abs(p[2] - z) <= std::min(band, plane->tol) + 1e-9 ? z : p[2];
+}
+
+std::optional<double> GroundColumnGrid::boardClearance(
+  int x, int y, const VoxelReturns & evidence, const std::optional<CeilingPlane> & ceiling) const
+{
+  if (!ceiling) {return std::nullopt;}
+  const double band = config_.ceiling_plane_band;
+  const auto on_board = [&](const Point & p) {
+      return std::abs(p[2] - ceiling->at(p[0], p[1])) <= std::min(band, ceiling->tol) + 1e-9;
+    };
+  // Both stored z extrema must be the board; anything between them is no lower
+  // than the lower extremum, so it is board or higher.
+  if (!on_board(evidence.low) || !on_board(evidence.high)) {return std::nullopt;}
+  const auto floor = floorPlane(x, y);
+  if (!floor) {return std::nullopt;}
+  double worst = std::numeric_limits<double>::infinity();
+  for (const double qx : {evidence.xy_bounds[0], evidence.xy_bounds[2]}) {
+    for (const double qy : {evidence.xy_bounds[1], evidence.xy_bounds[3]}) {
+      worst = std::min(worst, ceiling->at(qx, qy) - floor->at(qx, qy));
+    }
+  }
+  return worst;
+}
+
+std::optional<ColumnHeadroom> GroundColumnGrid::ceilingHeadroom(int x, int y) const
+{
+  if (!valid(x, y)) {return std::nullopt;}
+  std::optional<ColumnHeadroom> result;
+  std::optional<CeilingPlane> plane;
+  bool plane_done = false;
+  for (const auto & bin : columns_[index(x, y)]) {
+    const auto interval = voxelSupportInterval(x, y, bin.second);
+    if (!interval || bin.second.high[2] - interval->lower <= config_.surface_max + 1e-9) {continue;}
+    if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
+    const double low = snapToPlane(plane, bin.second.low, config_.ceiling_plane_band);
+    double headroom = low - interval->estimate;
+    if (const auto board = boardClearance(x, y, bin.second, plane)) {
+      headroom = std::max(headroom, *board);
+    }
+    if (!result || headroom < result->headroom) {
+      result = ColumnHeadroom{low, interval->lower, interval->upper,
+        low - headroom, headroom};
+    }
+  }
+  return result;
+}
+
 ColumnState GroundColumnGrid::state(int x, int y) const
 {
   if (!valid(x, y)) {return ColumnState::kUnknown;}
@@ -238,33 +480,28 @@ ColumnState GroundColumnGrid::state(int x, int y) const
   if (observed < config_.min_observed) {return ColumnState::kUnknown;}
   std::vector<double> heights;
   bool ceiling = false;
+  std::optional<CeilingPlane> plane;
+  bool plane_done = false;
   const double clearance = config_.robot_height + config_.top_margin;
   for (const auto & bin : columns_[index(x, y)]) {
-    // z extrema alone lose a low-clearance point on a slope. Enclose ALL
-    // measured XY, including returns between the two stored z extrema.
-    double lower = std::numeric_limits<double>::infinity();
-    double upper = -std::numeric_limits<double>::infinity();
-    for (const double qx : {bin.second.xy_bounds[0], bin.second.xy_bounds[2]}) {
-      for (const double qy : {bin.second.xy_bounds[1], bin.second.xy_bounds[3]}) {
-        const auto bounds = supportBounds(x, y, qx, qy);
-        if (!bounds) {return ColumnState::kUnknown;}
-        lower = std::min(lower, (*bounds)[0]);
-        upper = std::max(upper, (*bounds)[1]);
-      }
-    }
-    // Include interior extrema of the slope-bound cones when no plane exists.
-    const double diameter = std::hypot(bin.second.xy_bounds[2] - bin.second.xy_bounds[0],
-      bin.second.xy_bounds[3] - bin.second.xy_bounds[1]);
-    // supportBounds is Lipschitz; corners alone need not enclose its interior.
-    // The centre query plus the rectangle radius supplies an independent bound.
-    const auto centre = supportBounds(x, y,
-      (bin.second.xy_bounds[0] + bin.second.xy_bounds[2]) * 0.5,
-      (bin.second.xy_bounds[1] + bin.second.xy_bounds[3]) * 0.5);
-    if (!centre) {return ColumnState::kUnknown;}
-    lower = std::min(lower, (*centre)[0] - config_.max_ground_slope * diameter * 0.5);
-    upper = std::max(upper, (*centre)[1] + config_.max_ground_slope * diameter * 0.5);
+    const auto interval = voxelSupportInterval(x, y, bin.second);
+    if (!interval) {return ColumnState::kUnknown;}
+    const double lower = interval->lower;
+    const double support = interval->estimate;
+    double low_z = bin.second.low[2];
+    double high_z = bin.second.high[2];
     if (bin.second.high[2] - lower > config_.surface_max + 1e-9) {
-      if (bin.second.low[2] - upper < clearance - 1e-9) {return ColumnState::kOccupied;}
+      if (!plane_done) {plane = ceilingPlane(x, y); plane_done = true;}
+      low_z = snapToPlane(plane, bin.second.low, config_.ceiling_plane_band);
+      high_z = snapToPlane(plane, bin.second.high, config_.ceiling_plane_band);
+      double headroom = low_z - support;
+      if (const auto board = boardClearance(x, y, bin.second, plane)) {
+        headroom = std::max(headroom, *board);
+        // The board is one surface: the heights below describe it at this clearance.
+        low_z = support + headroom;
+        high_z = std::max(high_z, low_z);
+      }
+      if (headroom < clearance - 1e-9) {return ColumnState::kOccupied;}
       ceiling = true;
     }
     // Without its own connected floor, a return below the neighbourhood
@@ -272,9 +509,8 @@ ColumnState GroundColumnGrid::state(int x, int y) const
     if (!ground_[index(x, y)] && bin.second.low[2] < lower - config_.surface_max - 1e-9) {
       return ColumnState::kUnknown;
     }
-    for (const auto & p : {bin.second.low, bin.second.high}) {
-      heights.push_back(p[2] - upper);
-    }
+    heights.push_back(low_z - support);
+    heights.push_back(high_z - support);
   }
   // Neighbouring floor evidence can identify a wall, but cannot establish
   // traversable support under a hanging plate. A column with only floor-band

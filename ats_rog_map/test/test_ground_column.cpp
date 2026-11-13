@@ -461,3 +461,272 @@ TEST(GroundColumn, LaterLowFloorReturnCannotErasePreviouslyMeasuredSupportHeight
     EXPECT_NE(grid.state(5, 5), ColumnState::kFree);
   }
 }
+
+TEST(GroundColumn, ColumnsWithoutEndpointOrRayStayUnknownDespitePlanarNeighbors)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+  std::vector<std::array<double, 3>> floor;
+  // A planar tilted floor with a 3 x 3 hole of columns that never had an endpoint.
+  for (int ix = 0; ix < 12; ++ix) {
+    for (int iy = 0; iy < 12; ++iy) {
+      if (ix >= 4 && ix <= 6 && iy >= 4 && iy <= 6) {continue;}
+      const double x = -0.6 + (ix + 0.5) * 0.1;
+      const double y = -0.6 + (iy + 0.5) * 0.1;
+      floor.push_back({x, y, 0.1 * x});
+    }
+  }
+  grid.observe(floor, {0.0, 0.0, 0.0});
+  for (int ix = 4; ix <= 6; ++ix) {
+    for (int iy = 4; iy <= 6; ++iy) {
+      // Neighbour fit must not manufacture free for a never-observed column.
+      EXPECT_EQ(grid.state(ix, iy), ColumnState::kUnknown);
+    }
+  }
+  EXPECT_EQ(grid.state(2, 2), ColumnState::kFree);
+  // Only an explicit ray observation may turn such a column free.
+  grid.observeRayCell(4, 5);
+  EXPECT_EQ(grid.state(4, 5), ColumnState::kFree);
+  EXPECT_EQ(grid.state(4, 6), ColumnState::kUnknown);
+  // The hole's centre has no connected support within its neighbourhood at all.
+  grid.observeRayCell(5, 5);
+  EXPECT_EQ(grid.state(5, 5), ColumnState::kUnknown);
+}
+
+TEST(GroundColumn, ElevatedSupportCandidateNeverMakesAHangingReturnFreeFloor)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  for (const double lift : {0.04, 0.12, 0.28}) {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> floor;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        if (ix == 5 && iy == 5) {continue;}
+        floor.push_back({-0.6 + (ix + 0.5) * 0.1, -0.6 + (iy + 0.5) * 0.1, 0.0});
+      }
+    }
+    // The centre column holds only a return lift above the true floor (a hanging
+    // underside seen from outside) and a plate 0.30 m above that return.
+    floor.push_back({-0.05 + 0.1 * 0.5, -0.05 + 0.1 * 0.5, lift});
+    floor.push_back({-0.05 + 0.1 * 0.5, -0.05 + 0.1 * 0.5, lift + 0.30});
+    grid.observe(floor, {0.0, 0.0, 0.0});
+    // Whatever the support identity, a column whose lowest return is above the
+    // measured floor and whose headroom to the true floor is unproven is not free.
+    const auto state = grid.state(5, 5);
+    const auto ground = grid.ground(5, 5);
+    if (lift > 0.06 + 1e-9) {
+      EXPECT_NE(state, ColumnState::kFree) << "lift " << lift;
+    }
+    if (ground) {
+      // The reported support is never above the elevated candidate.
+      EXPECT_LE(*ground, lift + 1e-9);
+    }
+  }
+}
+
+TEST(GroundColumn, PlanarSupportIntervalDoesNotWidenByTheSlopeConeOverTheCeilingVoxel)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // A plane is linear, so its extrema over the ceiling voxel sit at the corners:
+  // headroom 0.250 clears the 0.247 gate and 0.238 does not, with no allowance
+  // for slope between measured planes that were fitted exactly.
+  for (const auto & [ceiling, expected] : {
+      std::pair<double, ColumnState>{0.250, ColumnState::kFree},
+      std::pair<double, ColumnState>{0.238, ColumnState::kOccupied}})
+  {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> points;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        points.push_back({-0.6 + (ix + 0.5) * 0.1, -0.6 + (iy + 0.5) * 0.1, 0.0});
+      }
+    }
+    // Ceiling returns spread over the whole centre cell (x in [-0.1, 0]).
+    points.push_back({-0.095, -0.05, ceiling});
+    points.push_back({-0.005, -0.05, ceiling});
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(5, 5), expected) << "ceiling " << ceiling;
+  }
+}
+
+TEST(GroundColumn, JitteredFloorGatesOnTheFittedPlaneNotItsResidualBand)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // Floor returns scatter +-0.012 m around a plane. The gate compares the lowest
+  // ceiling return with the fitted plane height, so a 0.250 m headroom clears the
+  // 0.247 m gate and 0.240 m does not; the +-0.012 m band decides only that a
+  // plane exists. The previous upper-bound rule rejected 0.250 m.
+  for (const auto & [ceiling, expected] : {
+      std::pair<double, ColumnState>{0.262, ColumnState::kFree},
+      std::pair<double, ColumnState>{0.252, ColumnState::kFree},
+      std::pair<double, ColumnState>{0.240, ColumnState::kOccupied},
+      std::pair<double, ColumnState>{0.230, ColumnState::kOccupied}})
+  {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> points;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        const double jitter = ((ix + 2 * iy) % 3 - 1) * 0.012;
+        points.push_back({-0.6 + (ix + 0.5) * 0.1, -0.6 + (iy + 0.5) * 0.1, jitter});
+      }
+    }
+    points.push_back({-0.05, -0.05, ceiling});
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(5, 5), expected) << "ceiling " << ceiling;
+    const auto headroom = grid.ceilingHeadroom(5, 5);
+    ASSERT_TRUE(headroom.has_value());
+    EXPECT_NEAR(headroom->headroom, ceiling - headroom->support_estimate, 1e-9);
+    EXPECT_LE(headroom->support_estimate, headroom->support_upper + 1e-12);
+  }
+}
+
+TEST(GroundColumn, ScatterBeyondPlaneResidualKeepsTheConservativeUpperBound)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // Scatter of +-0.03 m exceeds plane_residual_max, so no plane is trusted. The
+  // gate then uses the slope-bound upper bound (tightest Lipschitz bound over the
+  // measured highs), which equals the support interval's upper end; the fitted
+  // height is never substituted. Here the nearest return is -0.03 m.
+  for (const auto & [ceiling, expected] : {
+      std::pair<double, ColumnState>{0.230, ColumnState::kFree},
+      std::pair<double, ColumnState>{0.210, ColumnState::kOccupied}})
+  {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> points;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        const double jitter = ((ix + 2 * iy) % 3 - 1) * 0.03;
+        points.push_back({-0.6 + (ix + 0.5) * 0.1, -0.6 + (iy + 0.5) * 0.1, jitter});
+      }
+    }
+    points.push_back({-0.05, -0.05, ceiling});
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(5, 5), expected) << "ceiling " << ceiling;
+    const auto headroom = grid.ceilingHeadroom(5, 5);
+    ASSERT_TRUE(headroom.has_value());
+    EXPECT_DOUBLE_EQ(headroom->support_estimate, headroom->support_upper);
+  }
+}
+
+TEST(GroundColumn, StepBeyondPlaneResidualNeverBecomesAFloorPlane)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // A 0.06 m step across the neighbourhood must not be fitted away: the low side
+  // keeps its own interval, so a 0.26 m ceiling over it stays occupied.
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+  std::vector<std::array<double, 3>> points;
+  for (int ix = 0; ix < 12; ++ix) {
+    for (int iy = 0; iy < 12; ++iy) {
+      points.push_back({-0.6 + (ix + 0.5) * 0.1, -0.6 + (iy + 0.5) * 0.1, ix >= 6 ? 0.06 : 0.0});
+    }
+  }
+  points.push_back({-0.05, -0.05, 0.26});
+  grid.observe(points, {0.0, 0.0, 0.0});
+  EXPECT_NE(grid.state(5, 5), ColumnState::kFree);
+}
+
+namespace
+{
+// Flat floor plus a flat board of nominal height `board` whose returns scatter
+// +-0.006 m, on a 12 x 12 grid of 0.1 m columns around the origin.
+std::vector<std::array<double, 3>> boardScene(double board, bool full_board = true)
+{
+  std::vector<std::array<double, 3>> points;
+  for (int ix = 0; ix < 12; ++ix) {
+    for (int iy = 0; iy < 12; ++iy) {
+      const double cx = -0.6 + (ix + 0.5) * 0.1, cy = -0.6 + (iy + 0.5) * 0.1;
+      points.push_back({cx, cy, ((ix * 3 + iy) % 3 - 1) * 0.002});
+      if (!full_board && !(ix == 5 && iy == 5)) {continue;}
+      points.push_back({cx - 0.02, cy, board + ((ix * 7 + iy * 3) % 5 - 2) * 0.003});
+      points.push_back({cx + 0.02, cy + 0.02, board + ((ix * 5 + iy * 11) % 5 - 2) * 0.003});
+    }
+  }
+  return points;
+}
+}  // namespace
+
+TEST(GroundColumn, BoardPlaneClearsTheGateWhereTheLowestNoisyReturnWouldNot)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  GroundColumnConfig legacy = config;
+  legacy.ceiling_plane_enabled = false;
+  legacy.floor_plane_enabled = false;
+  // Nominal 0.252 m board, lowest noisy return about 0.246 m: below the 0.247 m gate.
+  for (const auto & [board, expected, legacy_expected] : {
+      std::tuple<double, ColumnState, ColumnState>{0.252, ColumnState::kFree, ColumnState::kOccupied},
+      std::tuple<double, ColumnState, ColumnState>{0.240, ColumnState::kOccupied, ColumnState::kOccupied}})
+  {
+    ats_rog_map::GroundColumnGrid with_plane(12, 12, 0.1, -0.6, -0.6, config);
+    ats_rog_map::GroundColumnGrid without(12, 12, 0.1, -0.6, -0.6, legacy);
+    with_plane.observe(boardScene(board), {0.0, 0.0, 0.0});
+    without.observe(boardScene(board), {0.0, 0.0, 0.0});
+    EXPECT_EQ(with_plane.state(5, 5), expected) << "board " << board;
+    EXPECT_EQ(without.state(5, 5), legacy_expected) << "board " << board;
+  }
+}
+
+TEST(GroundColumn, ReturnBelowTheBoardBandStaysAnObstacle)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // A board 0.30 m up is free, but a protrusion hanging below it, in the same
+  // column, is a real obstacle and must not be averaged into the board.
+  for (const double hanging : {0.20, 0.228}) {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    auto points = boardScene(0.30);
+    points.push_back({-0.05, -0.05, hanging});
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(5, 5), ColumnState::kOccupied) << "hanging " << hanging;
+  }
+  ats_rog_map::GroundColumnGrid clean(12, 12, 0.1, -0.6, -0.6, config);
+  clean.observe(boardScene(0.30), {0.0, 0.0, 0.0});
+  EXPECT_EQ(clean.state(5, 5), ColumnState::kFree);
+}
+
+TEST(GroundColumn, SmallCeilingPatchIsNotTreatedAsABoard)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // Only one column has ceiling returns: too few points and too small an extent
+  // for a plane, so the lowest return decides (0.246 m < 0.247 m gate).
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+  grid.observe(boardScene(0.252, false), {0.0, 0.0, 0.0});
+  EXPECT_NE(grid.state(5, 5), ColumnState::kFree);
+}
+
+TEST(GroundColumn, TiltedBoardUsesItsOwnHeightPerColumn)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.005;
+  // The board descends along x (slope -0.05 from 0.30 at x = 0): the plane is
+  // read at each column's own XY.
+  for (const auto & [shift, expected] : {
+      std::pair<double, ColumnState>{0.0, ColumnState::kFree},
+      std::pair<double, ColumnState>{-0.06, ColumnState::kOccupied}})
+  {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    auto points = boardScene(0.30);
+    for (auto & p : points) {
+      if (p[2] > 0.1) {p[2] += -0.05 * p[0] + shift;}
+    }
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(8, 5), expected) << "shift " << shift;  // x 0.25: board 0.2875 or 0.2275
+  }
+}
