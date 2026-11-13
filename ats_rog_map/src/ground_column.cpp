@@ -139,11 +139,13 @@ void GroundColumnGrid::observe(
         const auto i = index(x + dx, y + dy);
         if (ground_[i] || columns_[i].empty()) {continue;}
         const auto & candidate = columns_[i].begin()->second;
-        // Connectivity is surface identity, not a headroom bound: two returns a
-        // few mm apart across a cell edge must not split on LIO noise.
-        if (std::abs(candidate.low[2] - support[2]) <= config_.max_ground_slope * std::max(
-            resolution_ * std::hypot(dx, dy),
-            std::hypot(candidate.low[0] - support[0], candidate.low[1] - support[1])) + 1e-6)
+        // Surface identity follows measured XY, not cell-centre spacing: the
+        // latter can turn a near-vertical cell-edge step into a supporting ramp
+        // and propagate false ground beyond the real floor's neighbourhood.
+        // Keep the explicit measurement-noise allowance for adjacent returns.
+        if (std::abs(candidate.low[2] - support[2]) <= config_.max_ground_slope *
+            std::hypot(candidate.low[0] - support[0], candidate.low[1] - support[1]) +
+            config_.support_noise + 1e-6)
         {ground_[i] = candidate; queue.emplace(x + dx, y + dy);}
       }
     }

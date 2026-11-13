@@ -412,6 +412,28 @@ TEST(GroundColumn, NearbyFloorReturnsAcrossCellBoundaryStayConnected)
   EXPECT_EQ(torn.state(6, 5), ColumnState::kUnknown);
 }
 
+TEST(GroundColumn, CellCentreDistanceCannotConnectAStepAndSeedTheFarPlate)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  ats_rog_map::GroundColumnGrid grid(12, 4, 0.1, 0.0, 0.0, config);
+  // The 6 cm rise occurs across 2 mm at a cell boundary, not over the 10 cm
+  // centre spacing. Treating it as a ramp seeds the whole elevated surface:
+  // far from the real floor its false support then passes all local bounds.
+  std::vector<std::array<double, 3>> points{{0.099, 0.15, 0.0}};
+  for (int x = 1; x < 10; ++x) {
+    points.push_back({x * 0.1 + 0.001, 0.15, 0.06});
+    points.push_back({x * 0.1 + 0.001, 0.15, 0.36});
+  }
+  // Only the real ground can seed. The raised returns are outside the seed's
+  // height tolerance even before they are outside its spatial radius.
+  grid.observe(points, {0.05, 0.15, -0.048});
+  EXPECT_EQ(grid.state(0, 1), ColumnState::kFree);
+  EXPECT_EQ(grid.state(8, 1), ColumnState::kUnknown);
+  EXPECT_FALSE(grid.ground(8, 1).has_value());
+}
+
 TEST(GroundColumn, ReturnsBelowNeighborSupportWithoutOwnFloorStayUnknown)
 {
   GroundColumnConfig config;
