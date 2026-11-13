@@ -499,8 +499,8 @@ TEST(GroundColumn, ElevatedSupportCandidateNeverMakesAHangingReturnFreeFloor)
 {
   GroundColumnConfig config;
   config.robot_height = 0.242;
-  config.top_margin = 0.005;
-  for (const double lift : {0.04, 0.12, 0.28}) {
+  config.top_margin = 0.007;
+  for (const double lift : {0.04, 0.098, 0.12, 0.278, 0.28}) {
     ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
     std::vector<std::array<double, 3>> floor;
     for (int ix = 0; ix < 12; ++ix) {
@@ -511,8 +511,10 @@ TEST(GroundColumn, ElevatedSupportCandidateNeverMakesAHangingReturnFreeFloor)
     }
     // The centre column holds only a return lift above the true floor (a hanging
     // underside seen from outside) and a plate 0.30 m above that return.
-    floor.push_back({-0.05 + 0.1 * 0.5, -0.05 + 0.1 * 0.5, lift});
-    floor.push_back({-0.05 + 0.1 * 0.5, -0.05 + 0.1 * 0.5, lift + 0.30});
+    // Centre of the omitted (5, 5) cell; (0, 0) belongs to (6, 6) and would
+    // leave the asserted column unobserved, making this regression vacuous.
+    floor.push_back({-0.05, -0.05, lift});
+    floor.push_back({-0.05, -0.05, lift + 0.30});
     grid.observe(floor, {0.0, 0.0, 0.0});
     // Whatever the support identity, a column whose lowest return is above the
     // measured floor and whose headroom to the true floor is unproven is not free.
