@@ -181,3 +181,40 @@ TEST(TrajectoryTracker, TerminalSpeedAveragesTheLastWindow)
   passing.setTrajectory(cruise);
   EXPECT_NEAR(passing.terminalSpeed(), 1.2, 1e-9);
 }
+
+TEST(TrajectoryTracker, TerminalStopWindowIsIndependentOfTimeOrigin)
+{
+  for (const double start : {0.0, 10.0, 1800000000.123456}) {
+    SCOPED_TRACE(start);
+    std::vector<ats_swerve_mpc::TimedState> path;
+    for (int i = 0; i <= 30; ++i) {
+      ats_swerve_mpc::TimedState point;
+      point.time = start + 0.1 * i;
+      point.state << 0.15 * i, 0.0, 0.0;
+      path.push_back(point);
+    }
+    auto stop = path.back();
+    stop.time += 0.1;
+    path.push_back(stop);
+    ats_swerve_mpc::TrajectoryTracker tracker;
+    tracker.setTrajectory(path);
+    EXPECT_DOUBLE_EQ(tracker.terminalSpeed(), 0.0);
+  }
+}
+
+TEST(TrajectoryTracker, TerminalSpeedInterpolatesWindowBoundary)
+{
+  // The last 0.375 s starts inside the first segment. Including that entire
+  // segment would incorrectly report 0.625 m/s instead of 0.5 m/s.
+  std::vector<ats_swerve_mpc::TimedState> path(3);
+  path[0].time = 10.0;
+  path[0].state << 0.0, 0.0, 0.0;
+  path[1].time = 10.1;
+  path[1].state << 0.15, 0.20, 0.0;
+  path[2].time = 10.4;
+  path[2].state << 0.15, 0.20, 0.0;
+  ats_swerve_mpc::TrajectoryTracker tracker;
+  tracker.setTrajectory(path);
+  EXPECT_NEAR(tracker.terminalSpeed(0.375), 0.5, 1e-12);
+  EXPECT_NEAR(tracker.terminalSpeed(1.0), 0.625, 1e-12);
+}

@@ -3,6 +3,7 @@
 #ifndef ATS_SWERVE_MPC__TRAJECTORY_TRACKER_HPP_
 #define ATS_SWERVE_MPC__TRAJECTORY_TRACKER_HPP_
 
+#include <algorithm>
 #include <cstddef>
 #include <vector>
 
@@ -69,13 +70,23 @@ public:
       return 0.0;
     }
     const auto & last = trajectory_.back();
+    // Compare timestamps against a timestamp boundary, not a rounded duration
+    // against window. Otherwise 13.1 - 13.0 < 0.1 can pull a cruising segment
+    // into a fully stopped tail and disable the terminal approach speed cap.
+    const double begin = std::max(trajectory_.front().time, last.time - window);
     std::size_t index = trajectory_.size() - 2;
-    while (index > 0 && last.time - trajectory_[index].time < window) {
+    while (index > 0 && trajectory_[index].time > begin) {
       --index;
     }
     const auto & earlier = trajectory_[index];
-    const double dt = last.time - earlier.time;
-    return dt > 1e-6 ? (last.state.head<2>() - earlier.state.head<2>()).norm() / dt : 0.0;
+    const auto & next = trajectory_[index + 1];
+    const double segment_dt = next.time - earlier.time;
+    const double ratio = segment_dt > 0.0 ?
+      std::clamp((begin - earlier.time) / segment_dt, 0.0, 1.0) : 0.0;
+    const Eigen::Vector2d position = earlier.state.head<2>() +
+      ratio * (next.state.head<2>() - earlier.state.head<2>());
+    const double dt = last.time - begin;
+    return dt > 1e-6 ? (last.state.head<2>() - position).norm() / dt : 0.0;
   }
   /** @brief 返回横向偏差降速允许的下限，供 deadline 保守放大。 */
   double minimumProgressScale() const { return config_.min_progress_scale; }
