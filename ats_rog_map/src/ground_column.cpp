@@ -13,7 +13,8 @@ namespace ats_rog_map
 {
 ColumnState classifyGroundColumn(
   const std::vector<double> & occupied_z, const int observed_count,
-  const std::optional<double> ground_z, const GroundColumnConfig & config)
+  const std::optional<double> ground_z, const GroundColumnConfig & config,
+  const std::optional<std::size_t> occupied_voxel_count)
 {
   if (observed_count < config.min_observed || !ground_z || !std::isfinite(*ground_z) ||
     !std::all_of(occupied_z.begin(), occupied_z.end(), [](double z) {return std::isfinite(z);}))
@@ -24,9 +25,14 @@ ColumnState classifyGroundColumn(
   std::vector<double> heights = occupied_z;
   std::sort(heights.begin(), heights.end());
   heights.erase(std::unique(heights.begin(), heights.end()), heights.end());
+  // Grid callers retain both height extrema for every occupied voxel. They
+  // are clearance evidence, not two independent occupied voxels. Counting
+  // extrema twice can turn a floor/board gap into a dense wall.
+  const auto voxel_count = occupied_voxel_count.value_or(heights.size());
+  if (voxel_count == 0) {return ColumnState::kUnknown;}
   const double span = heights.back() - heights.front();
   const double ratio = span > 1e-9 ? std::clamp(
-    (heights.size() - 1) * config.voxel_resolution / span, 0.0, 1.0) : 1.0;
+    (voxel_count - 1) * config.voxel_resolution / span, 0.0, 1.0) : 1.0;
   // Surface thickness is relative to z_g. A thin low box is not a floor.
   if (heights.back() <= *ground_z + config.surface_max + 1e-9) {
     return ColumnState::kFree;
@@ -590,7 +596,7 @@ ColumnState GroundColumnGrid::state(int x, int y) const
     {return ColumnState::kUnknown;}
   }
   return classifyGroundColumn(heights,
-    observed, 0.0, config_);
+    observed, 0.0, config_, columns_[index(x, y)].size());
 }
 
 bool GroundColumnGrid::clearVoxel(const std::array<double, 3> & point)

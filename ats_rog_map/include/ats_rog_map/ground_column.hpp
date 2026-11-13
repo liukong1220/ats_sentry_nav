@@ -67,7 +67,8 @@ struct ColumnHeadroom
 // All comparisons use the local connected ground, never the robot's plane.
 ColumnState classifyGroundColumn(
   const std::vector<double> & occupied_z, int observed_count,
-  std::optional<double> ground_z, const GroundColumnConfig & config);
+  std::optional<double> ground_z, const GroundColumnConfig & config,
+  std::optional<std::size_t> occupied_voxel_count = std::nullopt);
 
 // Fixed odom array of column evidence. Ground is the lowest surface connected
 // to the robot's known supporting surface, with bounded slope. A floating

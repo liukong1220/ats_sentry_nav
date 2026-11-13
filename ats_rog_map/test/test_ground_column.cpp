@@ -60,6 +60,31 @@ TEST(GroundColumn, DenseWallCannotBecomeOverheadFree)
     6, 0.0, config), ColumnState::kOccupied);
 }
 
+TEST(GroundColumn, VoxelExtremaDoNotDoubleTheOverheadDensity)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  config.ceiling_plane_enabled = false;
+  config.floor_plane_enabled = false;
+  ats_rog_map::GroundColumnGrid grid(10, 10, 0.1, 0.0, 0.0, config);
+  std::vector<std::array<double, 3>> points;
+  for (int x = 0; x < 10; ++x) {
+    for (int y = 0; y < 10; ++y) {
+      // Three actual voxel bins: floor, lower board edge, upper board edge.
+      // Six extrema must not become six occupied voxels in the density test.
+      for (double z : {0.001, 0.005, 0.264, 0.274, 0.301, 0.304}) {
+        points.push_back({(x + 0.5) * 0.1, (y + 0.5) * 0.1, z});
+      }
+    }
+  }
+  grid.observe(points, {0.45, 0.45, 0.001});
+  EXPECT_EQ(grid.state(4, 4), ColumnState::kFree);
+  // An occupied body-height return still takes effect immediately.
+  grid.observe({{0.45, 0.45, 0.235}}, {0.45, 0.45, 0.001});
+  EXPECT_EQ(grid.state(4, 4), ColumnState::kOccupied);
+}
+
 TEST(GroundColumn, ConnectedGroundFollowsRampButDoesNotClimbFloatingPlate)
 {
   GroundColumnConfig config;
