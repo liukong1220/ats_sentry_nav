@@ -225,12 +225,12 @@ private:
   bool force_body_yaw_follow_ = false;
   SpinPolicy spin_policy_;
   SpinYawParams spin_yaw_params_;
-  std::atomic<bool> spin_continuing_{false};
   /// Preferred graph-search clearance (circumscribed all-yaw footprint radius).
   double preferred_search_clearance_ = 0.0;
   /// Lowest clearance the graduated ladder may fall back to (inscribed half-width).
   double search_clearance_floor_ = 0.0;
   bool clearance_relaxation_enabled_ = true;
+  double clearance_detour_ratio_ = 0.0;
   /// 终点净空放宽档。目标格的净空是各向同性代理量,而目标是"一个已知 yaw 的位姿",
   /// 后者有精确的矩形判定。目标位姿已过足迹门禁时,再用 inscribed+量化余量的代理量
   /// 否决它就是用更粗的判据推翻更细的判据(domain 187 目标 9:目标格净空约 0.26 m,

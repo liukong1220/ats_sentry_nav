@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "minco_planner/trajectory/spin_yaw.hpp"
+#include "minco_planner/trajectory/replan_start.hpp"
 
 namespace minco_planner
 {
@@ -43,6 +44,25 @@ TEST(SpinYaw, OpenReferenceAdvancesByRateTimesDt)
     EXPECT_NEAR(trajectory.points[i].yaw, expected, 1e-9);
     EXPECT_NEAR(trajectory.points[i].yaw_rate, 3.0, 1e-12);
   }
+}
+
+TEST(SpinYaw, MidRampReplacementKeepsRateAndContinuesAccelerating)
+{
+  auto first = line(81, 0.1, 1.0);
+  SpinYawParams params;
+  params.angular_accel = 1.5;
+  ASSERT_TRUE(applySpinYaw(first, params));
+  MeasuredStart measured;
+  measured.x = 1.0;
+  const auto start = selectReplanStart(&first, 4, 4, 1.0, measured, ReplanStartParams{});
+  ASSERT_EQ(start.source, ReplanStartSource::kCommitted);
+  auto replacement = line(81, 0.1, 1.0);
+  replacement.points.front().yaw = start.yaw;
+  params.initial_rate = start.yaw_rate;
+  ASSERT_TRUE(applySpinYaw(replacement, params));
+  EXPECT_NEAR(replacement.points.front().yaw_rate, start.yaw_rate, 1e-12);
+  EXPECT_GT(replacement.points.front().yaw_rate, 1.5);
+  EXPECT_NEAR(replacement.points[10].yaw_rate, 3.0, 1e-12);
 }
 
 TEST(SpinYaw, YawIsWrappedAndStaysContinuousModuloTwoPi)

@@ -74,6 +74,8 @@ struct ReplanStart
   double vy = 0.0;
   double ax = 0.0;
   double ay = 0.0;
+  // 只继承同 epoch 受守护参考取点处的角速；实测回退/急停后为零。
+  double yaw_rate = 0.0;
   // 已提交轨迹时间轴（ReferencePoint::t）上的取点时刻 t_ref，以及车的推进时刻 progress [s]。
   // 没有走到轨迹那一步时为 NaN。
   double t_ref = std::numeric_limits<double>::quiet_NaN();
@@ -184,6 +186,10 @@ inline ReplanStart selectReplanStart(
   }
   result.t_ref = std::min(result.progress + std::max(0.0, params.plan_lead_sec), t_back);
   const ReferencePoint ahead = interpolateReferencePoint(*committed, result.t_ref);
+  if (!std::isfinite(ahead.yaw_rate)) {
+    result.reason = ReplanStartReason::kInvalidInput;
+    return result;
+  }
   result.source = ReplanStartSource::kCommitted;
   result.reason = ReplanStartReason::kCommitted;
   result.x = ahead.x;
@@ -193,6 +199,7 @@ inline ReplanStart selectReplanStart(
   result.vy = ahead.vy;
   result.ax = ahead.ax;
   result.ay = ahead.ay;
+  result.yaw_rate = ahead.yaw_rate;
   result.start_delay_sec = result.t_ref - result.progress;
   return result;
 }

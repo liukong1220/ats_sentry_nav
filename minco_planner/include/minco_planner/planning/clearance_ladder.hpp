@@ -38,6 +38,36 @@ inline double footprintConsistentClearanceFloor(
   return std::min(consistent, std::max(0.0, preferred));
 }
 
+/// 首选净空路径相对直线距离是否值得再用下限档搜一次。
+///
+/// 首选档(全 yaw 外接半径)比窄通道半宽还大时,图搜索在这一档绕远路也能成功,
+/// 梯子因此永远不会降档,车会放弃几米长的隧道去绕十几米(RMUL 隧道净宽 0.80 m,
+/// 首选 0.436 m 大于半宽 0.40 m)。只有首选路径明显长于直线距离时才付出第二次搜索的代价。
+/// ratio <= 0 关闭,与旧行为一致。
+inline bool shouldProbeRelaxedClearance(
+  double preferred_length, double straight_distance, double detour_ratio)
+{
+  if (!(detour_ratio > 0.0) || !std::isfinite(preferred_length) ||
+    !std::isfinite(straight_distance) || !(straight_distance > 0.0))
+  {
+    return false;
+  }
+  return preferred_length > detour_ratio * straight_distance;
+}
+
+/// 下限档找到的路径是否应取代首选档路径:只在它明显更短时取代。
+/// 取代后安全性仍由矩形足迹门禁与局部修复裁定,这里不放宽任何安全判据。
+inline bool shouldTakeRelaxedRoute(
+  double preferred_length, double relaxed_length, double detour_ratio)
+{
+  if (!(detour_ratio > 0.0) || !std::isfinite(preferred_length) ||
+    !std::isfinite(relaxed_length) || !(relaxed_length > 0.0))
+  {
+    return false;
+  }
+  return preferred_length > detour_ratio * relaxed_length;
+}
+
 }  // namespace minco_planner
 
 #endif  // MINCO_PLANNER__PLANNING__CLEARANCE_LADDER_HPP_

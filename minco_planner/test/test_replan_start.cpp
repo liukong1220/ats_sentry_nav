@@ -194,3 +194,26 @@ TEST(ReplanStart, InterpolatesYawAlongShortestArc)
   const auto middle = minco_planner::interpolateReferencePoint(trajectory, 0.5);
   EXPECT_NEAR(std::abs(middle.yaw), M_PI, 1e-6);
 }
+
+TEST(ReplanStart, InheritsAngularRateAtProgressPlusLeadNotFirstPoint)
+{
+  auto trajectory = makeAlongX(1.0, 0.0, 4.0);
+  for (auto & point : trajectory.points) {
+    point.yaw_rate = std::min(3.0, 1.5 * point.t);
+  }
+  const auto start = minco_planner::selectReplanStart(
+    &trajectory, kEpoch, kEpoch, 1.0, carAt(trajectory, 1.0), defaultParams());
+  ASSERT_EQ(start.source, ReplanStartSource::kCommitted);
+  EXPECT_NEAR(start.yaw_rate, 1.725, 1e-9);
+  EXPECT_DOUBLE_EQ(trajectory.points.front().yaw_rate, 0.0);
+
+  const auto changed_epoch = minco_planner::selectReplanStart(
+    &trajectory, kEpoch, kEpoch + 1, 1.0, carAt(trajectory, 1.0), defaultParams());
+  EXPECT_DOUBLE_EQ(changed_epoch.yaw_rate, 0.0);
+  const auto stopped = minco_planner::selectReplanStart(
+    nullptr, kEpoch, kEpoch, 1.0, carAt(trajectory, 1.0), defaultParams());
+  EXPECT_DOUBLE_EQ(stopped.yaw_rate, 0.0);
+  const auto deviated = minco_planner::selectReplanStart(
+    &trajectory, kEpoch, kEpoch, 1.0, carAt(trajectory, 1.0, 1.0), defaultParams());
+  EXPECT_DOUBLE_EQ(deviated.yaw_rate, 0.0);
+}

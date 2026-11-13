@@ -70,3 +70,24 @@ TEST(ClearanceLadder, NegativeInscribedRadiusIsClampedNotPropagated)
   const double floor = minco_planner::footprintConsistentClearanceFloor(-1.0, 0.10, kPreferred);
   EXPECT_NEAR(floor, 0.10 * M_SQRT1_2, 1e-12);
 }
+
+TEST(ClearanceLadder, DetourProbeTriggersOnlyForLongRoutes)
+{
+  // RMUL 隧道:直线 3.4 m,首选档绕行 12 m。
+  EXPECT_TRUE(minco_planner::shouldProbeRelaxedClearance(12.0, 3.4, 1.5));
+  EXPECT_FALSE(minco_planner::shouldProbeRelaxedClearance(4.0, 3.4, 1.5));
+  // ratio <= 0 与旧行为一致:从不额外搜索。
+  EXPECT_FALSE(minco_planner::shouldProbeRelaxedClearance(12.0, 3.4, 0.0));
+  EXPECT_FALSE(minco_planner::shouldProbeRelaxedClearance(12.0, 0.0, 1.5));
+  EXPECT_FALSE(minco_planner::shouldProbeRelaxedClearance(
+      std::numeric_limits<double>::infinity(), 3.4, 1.5));
+}
+
+TEST(ClearanceLadder, RelaxedRouteReplacesOnlyAClearlyShorterOne)
+{
+  EXPECT_TRUE(minco_planner::shouldTakeRelaxedRoute(12.0, 3.6, 1.5));
+  // 只短一点不值得换:保留净空更大的首选路径。
+  EXPECT_FALSE(minco_planner::shouldTakeRelaxedRoute(4.0, 3.6, 1.5));
+  EXPECT_FALSE(minco_planner::shouldTakeRelaxedRoute(12.0, 3.6, 0.0));
+  EXPECT_FALSE(minco_planner::shouldTakeRelaxedRoute(12.0, 0.0, 1.5));
+}
