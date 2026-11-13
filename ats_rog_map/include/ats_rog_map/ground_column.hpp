@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace ats_rog_map
@@ -93,12 +95,20 @@ public:
 
 private:
   using Point = std::array<double, 3>;
-  struct VoxelReturns
+  struct ReturnExtent
   {
     Point low;
     Point high;
     std::array<double, 4> xy_bounds;  // min x/y, max x/y of every retained return
   };
+  struct VoxelReturns : ReturnExtent
+  {
+    // At most 4 x 4 XY patches per column. Each patch encloses every return;
+    // keep the height/XY association instead of one whole-cell Cartesian box.
+    std::vector<std::pair<int, ReturnExtent>> patches;
+  };
+  static void extendExtent(ReturnExtent & target, const ReturnExtent & source);
+  static void extendReturns(VoxelReturns & target, const VoxelReturns & source);
   // Bounds at the query XY, never a neighbouring column's unshifted height.
   // plane_z (optional) receives the fitted plane height at the query, or NaN
   // when no valid plane produced the bounds.
@@ -118,6 +128,13 @@ private:
     double tol{0.0};  // inlier limit of the fit: only returns this close are the board
     double at(double x, double y) const {return c + a * (x - x0) + b * (y - y0);}
   };
+  struct SupportPlane
+  {
+    CeilingPlane plane;
+    std::vector<std::array<double, 2>> hull;
+  };
+  std::optional<SupportPlane> fitSupportPlane(
+    const std::vector<const VoxelReturns *> & supports) const;
   std::optional<CeilingPlane> ceilingPlane(int x, int y) const;
   std::optional<CeilingPlane> floorPlane(int x, int y) const;
   std::optional<CeilingPlane> robustPlane(
@@ -143,6 +160,9 @@ private:
   std::vector<std::map<int, VoxelReturns>> columns_;
   std::vector<std::optional<VoxelReturns>> ground_;
   std::vector<bool> ray_observed_;
+  // GroundColumnGrid is owned by the serialized odom-layer integration. These
+  // fits are valid only until observe(), clearVoxel() or clear() changes evidence.
+  mutable std::unordered_map<std::size_t, std::optional<SupportPlane>> support_planes_;
   std::size_t out_of_range_{0};
 };
 }  // namespace ats_rog_map

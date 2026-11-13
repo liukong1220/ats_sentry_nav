@@ -76,10 +76,32 @@ bool GroundColumnGrid::valid(int x, int y) const
 std::size_t GroundColumnGrid::index(int x, int y) const
 {return static_cast<std::size_t>(y) * width_ + x;}
 
+void GroundColumnGrid::extendExtent(ReturnExtent & target, const ReturnExtent & source)
+{
+  if (source.low[2] < target.low[2]) {target.low = source.low;}
+  if (source.high[2] > target.high[2]) {target.high = source.high;}
+  for (int a = 0; a < 2; ++a) {
+    target.xy_bounds[a] = std::min(target.xy_bounds[a], source.xy_bounds[a]);
+    target.xy_bounds[a + 2] = std::max(target.xy_bounds[a + 2], source.xy_bounds[a + 2]);
+  }
+}
+
+void GroundColumnGrid::extendReturns(VoxelReturns & target, const VoxelReturns & source)
+{
+  extendExtent(target, source);
+  for (const auto & patch : source.patches) {
+    const auto found = std::find_if(target.patches.begin(), target.patches.end(),
+      [&](const auto & entry) {return entry.first == patch.first;});
+    if (found == target.patches.end()) {target.patches.push_back(patch);}
+    else {extendExtent(found->second, patch.second);}
+  }
+}
+
 void GroundColumnGrid::observe(
   const std::vector<std::array<double, 3>> & points,
   const std::array<double, 3> & robot_ground)
 {
+  support_planes_.clear();
   for (const auto & p : points) {
     if (!std::all_of(p.begin(), p.end(), [](double v) {return std::isfinite(v);})) {continue;}
     const int x = static_cast<int>(std::floor((p[0] - origin_x_) / resolution_));
@@ -87,16 +109,14 @@ void GroundColumnGrid::observe(
     if (!valid(x, y)) {++out_of_range_; continue;}
     auto & column = columns_[index(x, y)];
     const int bin = static_cast<int>(std::floor(p[2] / config_.voxel_resolution));
-    const auto inserted = column.emplace(bin, VoxelReturns{p, p, {p[0], p[1], p[0], p[1]}});
-    if (!inserted.second) {
-      auto & evidence = inserted.first->second;
-      if (p[2] < evidence.low[2]) {evidence.low = p;}
-      if (p[2] > evidence.high[2]) {evidence.high = p;}
-      evidence.xy_bounds[0] = std::min(evidence.xy_bounds[0], p[0]);
-      evidence.xy_bounds[1] = std::min(evidence.xy_bounds[1], p[1]);
-      evidence.xy_bounds[2] = std::max(evidence.xy_bounds[2], p[0]);
-      evidence.xy_bounds[3] = std::max(evidence.xy_bounds[3], p[1]);
-    }
+    const int px = std::clamp(static_cast<int>(
+      4 * ((p[0] - origin_x_) / resolution_ - x)), 0, 3);
+    const int py = std::clamp(static_cast<int>(
+      4 * ((p[1] - origin_y_) / resolution_ - y)), 0, 3);
+    const ReturnExtent extent{p, p, {p[0], p[1], p[0], p[1]}};
+    const VoxelReturns observed{extent, {{py * 4 + px, extent}}};
+    const auto inserted = column.emplace(bin, observed);
+    if (!inserted.second) {extendReturns(inserted.first->second, observed);}
   }
   std::queue<std::pair<int, int>> queue;
   // Existing connected ground is stable in odom; map->odom corrections do not
@@ -117,13 +137,7 @@ void GroundColumnGrid::observe(
         else {
           // Do not turn downward jitter into extra headroom. Keep the observed
           // support interval until ray contradiction or an epoch reset.
-          auto & support = *ground_[i];
-          if (candidate.low[2] < support.low[2]) {support.low = candidate.low;}
-          if (candidate.high[2] > support.high[2]) {support.high = candidate.high;}
-          for (int a = 0; a < 2; ++a) {
-            support.xy_bounds[a] = std::min(support.xy_bounds[a], candidate.xy_bounds[a]);
-            support.xy_bounds[a + 2] = std::max(support.xy_bounds[a + 2], candidate.xy_bounds[a + 2]);
-          }
+          extendReturns(*ground_[i], candidate);
         }
         queue.emplace(x, y);
       }
@@ -161,11 +175,73 @@ std::optional<double> GroundColumnGrid::ground(int x, int y) const
   return (*bounds)[0];
 }
 
+std::optional<GroundColumnGrid::SupportPlane> GroundColumnGrid::fitSupportPlane(
+  const std::vector<const VoxelReturns *> & supports) const
+{
+  if (supports.size() < 6) {return std::nullopt;}
+  std::vector<const ReturnExtent *> patches;
+  for (const auto * support : supports) {
+    for (const auto & patch : support->patches) {patches.push_back(&patch.second);}
+  }
+  Point mean{};
+  for (const auto * patch : patches) {
+    for (int a = 0; a < 3; ++a) {mean[a] += patch->high[a] / patches.size();}
+  }
+  double xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
+  std::vector<std::array<double, 2>> positions;
+  for (const auto * patch : patches) {
+    // A later lower return never erases the previously measured high surface.
+    const auto & p = patch->high;
+    const double u = p[0] - mean[0], v = p[1] - mean[1], w = p[2] - mean[2];
+    xx += u * u; xy += u * v; yy += v * v; xz += u * w; yz += v * w;
+    positions.push_back({p[0], p[1]});
+  }
+  const double determinant = xx * yy - xy * xy;
+  if (determinant <= 1e-8 * (xx + yy) * (xx + yy)) {return std::nullopt;}
+  const double a = (xz * yy - yz * xy) / determinant;
+  const double b = (yz * xx - xz * xy) / determinant;
+  if (std::hypot(a, b) > config_.max_ground_slope) {return std::nullopt;}
+  double residual = 0;
+  for (const auto * patch : patches) {
+    // Each small Cartesian box encloses ALL retained returns at its XY.
+    for (const double px : {patch->xy_bounds[0], patch->xy_bounds[2]}) {
+      for (const double py : {patch->xy_bounds[1], patch->xy_bounds[3]}) {
+        const double fitted = mean[2] + a * (px - mean[0]) + b * (py - mean[1]);
+        residual = std::max({residual, std::abs(patch->low[2] - fitted),
+          std::abs(patch->high[2] - fitted)});
+      }
+    }
+  }
+  if (residual > config_.plane_residual_max) {return std::nullopt;}
+  std::sort(positions.begin(), positions.end());
+  positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+  const auto cross = [](const auto & o, const auto & p, const auto & q) {
+      return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0]);
+    };
+  std::vector<std::array<double, 2>> hull;
+  for (const auto & p : positions) {
+    while (hull.size() >= 2 && cross(hull[hull.size() - 2], hull.back(), p) <= 0) {
+      hull.pop_back();
+    }
+    hull.push_back(p);
+  }
+  const auto lower_size = hull.size();
+  for (auto it = positions.rbegin() + 1; it != positions.rend(); ++it) {
+    while (hull.size() > lower_size && cross(hull[hull.size() - 2], hull.back(), *it) <= 0) {
+      hull.pop_back();
+    }
+    hull.push_back(*it);
+  }
+  hull.pop_back();
+  if (hull.size() < 3) {return std::nullopt;}
+  return SupportPlane{CeilingPlane{mean[0], mean[1], mean[2], a, b, residual}, std::move(hull)};
+}
+
 std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   int x, int y, double query_x, double query_y, double * plane_z) const
 {
   if (plane_z) {*plane_z = std::numeric_limits<double>::quiet_NaN();}
-  std::vector<VoxelReturns> supports;
+  std::vector<const VoxelReturns *> supports;
   double lower = -std::numeric_limits<double>::infinity();
   double upper = std::numeric_limits<double>::infinity();
   for (int dy = -1; dy <= 1; ++dy) {
@@ -173,7 +249,7 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
       if (!valid(x + dx, y + dy)) {continue;}
       const auto & p = ground_[index(x + dx, y + dy)];
       if (!p) {continue;}
-      supports.push_back(*p);
+      supports.push_back(&*p);
       lower = std::max(lower, p->low[2] - config_.max_ground_slope *
         std::hypot(query_x - p->low[0], query_y - p->low[1]));
       upper = std::min(upper, p->high[2] + config_.max_ground_slope *
@@ -183,51 +259,24 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   if (supports.empty()) {return std::nullopt;}
   // Fit only observed connected supports, not arbitrary low points or a
   // diagnostic/interpolated floor. Reject steps, rank deficiency and extrapolation.
-  if (supports.size() >= 6) {
-    Point mean{};
-    for (const auto & support : supports) {
-      for (int a = 0; a < 3; ++a) {mean[a] += support.high[a] / supports.size();}
+  auto cached = support_planes_.find(index(x, y));
+  if (cached == support_planes_.end()) {
+    cached = support_planes_.emplace(index(x, y), fitSupportPlane(supports)).first;
+  }
+  if (cached->second) {
+    const auto & fit = *cached->second;
+    bool enclosed = true;
+    for (std::size_t i = 0; i < fit.hull.size(); ++i) {
+      const auto & a = fit.hull[i];
+      const auto & b = fit.hull[(i + 1) % fit.hull.size()];
+      const double cross = (b[0] - a[0]) * (query_y - a[1]) -
+        (b[1] - a[1]) * (query_x - a[0]);
+      if (cross < -1e-12) {enclosed = false; break;}
     }
-    double xx = 0, xy = 0, yy = 0, xz = 0, yz = 0;
-    std::vector<double> angles;
-    for (const auto & support : supports) {
-      // The plane follows the highest measured support return: a later lower
-      // return must not turn into extra headroom (appendix A.1), so the gate
-      // never sits below a floor height that was actually measured.
-      const auto & p = support.high;
-      const double u = p[0] - mean[0], v = p[1] - mean[1], w = p[2] - mean[2];
-      xx += u * u; xy += u * v; yy += v * v; xz += u * w; yz += v * w;
-      angles.push_back(std::atan2(p[1] - query_y, p[0] - query_x));
-    }
-    const double determinant = xx * yy - xy * xy;
-    if (determinant > 1e-8 * (xx + yy) * (xx + yy)) {
-      const double a = (xz * yy - yz * xy) / determinant;
-      const double b = (yz * xx - xz * xy) / determinant;
-      double residual = 0;
-      for (const auto & support : supports) {
-        // Enclose the whole measured support interval, not only a historical
-        // minimum or the two z-extreme points on a sloping surface.
-        for (const double px : {support.xy_bounds[0], support.xy_bounds[2]}) {
-          for (const double py : {support.xy_bounds[1], support.xy_bounds[3]}) {
-            const double fitted = mean[2] + a * (px - mean[0]) + b * (py - mean[1]);
-            residual = std::max({residual, std::abs(support.low[2] - fitted),
-              std::abs(support.high[2] - fitted)});
-          }
-        }
-      }
-      std::sort(angles.begin(), angles.end());
-      constexpr double pi = 3.14159265358979323846;
-      double gap = angles.front() + 2 * pi - angles.back();
-      for (std::size_t i = 1; i < angles.size(); ++i) {
-        gap = std::max(gap, angles[i] - angles[i - 1]);
-      }
-      if (std::hypot(a, b) <= config_.max_ground_slope && residual <= config_.plane_residual_max &&
-        gap <= pi + 1e-9)
-      {
-        const double z = mean[2] + a * (query_x - mean[0]) + b * (query_y - mean[1]);
-        if (plane_z) {*plane_z = z;}
-        return std::array<double, 2>{z - residual, z + residual};
-      }
+    if (enclosed) {
+      const double z = fit.plane.at(query_x, query_y);
+      if (plane_z) {*plane_z = z;}
+      return std::array<double, 2>{z - fit.plane.tol, z + fit.plane.tol};
     }
   }
   // No valid planar support: retain the full Lipschitz uncertainty. An
@@ -573,6 +622,15 @@ bool GroundColumnGrid::clearVoxel(
     static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) == found->first);
   if (removed_support) {floor.reset();}
   column.erase(found);
+  if (removed_support) {
+    // A support contributes only to its 3 x 3 neighbourhood. Clearing an
+    // obstacle does not change a floor fit; retain unrelated fits during rays.
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        if (valid(x + dx, y + dy)) {support_planes_.erase(index(x + dx, y + dy));}
+      }
+    }
+  }
   return removed_support;
 }
 
@@ -583,6 +641,7 @@ void GroundColumnGrid::observeRayCell(int x, int y)
 
 void GroundColumnGrid::clear()
 {
+  support_planes_.clear();
   for (auto & c : columns_) {c.clear();}
   std::fill(ground_.begin(), ground_.end(), std::nullopt);
   std::fill(ray_observed_.begin(), ray_observed_.end(), false);

@@ -754,3 +754,58 @@ TEST(GroundColumn, TiltedBoardUsesItsOwnHeightPerColumn)
     EXPECT_EQ(grid.state(8, 5), expected) << "shift " << shift;  // x 0.25: board 0.2875 or 0.2275
   }
 }
+
+TEST(GroundColumn, DenseSlopedSupportKeepsHeightPairedWithMeasuredXY)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  for (const double clearance : {0.249, 0.239}) {
+    ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, -0.6, -0.6, config);
+    std::vector<std::array<double, 3>> points;
+    for (int ix = 0; ix < 12; ++ix) {
+      for (int iy = 0; iy < 12; ++iy) {
+        for (const double dx : {0.01, 0.04, 0.07, 0.09}) {
+          for (const double dy : {0.01, 0.04, 0.07, 0.09}) {
+            const double x = -0.6 + ix * 0.1 + dx;
+            const double y = -0.6 + iy * 0.1 + dy;
+            points.push_back({x, y, 0.3 * x});
+          }
+        }
+      }
+    }
+    // Same plane, more observed XY within each cell: density must not invent
+    // off-plane combinations of the lowest height and highest-X position.
+    points.push_back({0.05, 0.05, 0.3 * 0.05 + clearance});
+    grid.observe(points, {0.0, 0.0, 0.0});
+    EXPECT_EQ(grid.state(6, 6), clearance == 0.249 ?
+      ColumnState::kFree : ColumnState::kOccupied) << clearance;
+  }
+}
+
+TEST(GroundColumn, SupportFitIsInvalidatedByNewHigherFloorAndRayRemoval)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  for (const bool remove_support : {false, true}) {
+    ats_rog_map::GroundColumnGrid grid(10, 10, 0.1, -0.5, -0.5, config);
+    std::vector<std::array<double, 3>> floor;
+    for (const double x : {-0.09, 0.01, 0.11}) {
+      for (const double y : {-0.09, 0.01, 0.11}) {floor.push_back({x, y, 0.0});}
+    }
+    grid.observe(floor, {0.0, 0.0, 0.0});
+    grid.observe({{0.09, 0.05, 0.260}}, {0.0, 0.0, 0.0});
+    ASSERT_EQ(grid.state(5, 5), ColumnState::kFree);
+    if (remove_support) {
+      for (const auto & p : floor) {
+        if (p[0] != 0.01 || p[1] != 0.01) {EXPECT_TRUE(grid.clearVoxel(p, -0.10));}
+      }
+    } else {
+      for (auto & p : floor) {p[2] = 0.02;}
+      grid.observe(floor, {0.0, 0.0, 0.0});
+    }
+    // A formerly valid plane cannot survive changed support evidence.
+    EXPECT_NE(grid.state(5, 5), ColumnState::kFree);
+  }
+}
