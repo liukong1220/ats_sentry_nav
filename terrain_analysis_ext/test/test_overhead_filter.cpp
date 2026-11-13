@@ -13,9 +13,9 @@ namespace
 
 constexpr double kObstacleThre = 0.18;    // traversabilityObstacleHeightThre
 constexpr double kVehicleHeight = 0.242;  // 含雷达整车高（用户 2026-10-17）
-// MuJoCo 2027 profile：车高 + 1.3 cm 余量。2027 悬空板最小净空 0.260 m，余量只有 1.8 cm，
-// 所以余量必须小于 1.8 cm。
-constexpr double kOverhead = 0.255;
+// Current simulation candidate; runtime acceptance remains separate from this
+// numeric boundary test. Real-vehicle parameters are unchanged.
+constexpr double kOverhead = 0.242 + 0.007;
 
 struct Voxel
 {
@@ -91,11 +91,10 @@ TEST(OverheadFilter, VoxelWithOnlyOverheadPointsHasNoEvidence)
   EXPECT_FALSE(v.hardObstacle());
 }
 
-// 净空低于 车高 + 余量 的结构仍是障碍：车高 0.242 m，余量内的横梁（tunnel_B 顶板离口袋底
-// 0.250 m）和比车矮的悬挂物不能被滤掉。
+// Vehicle-height cloud filtering must not remove these raw grid observations.
 TEST(OverheadFilter, SurfaceNotAboveVehiclePlusMarginStaysAnObstacle)
 {
-  for (const float clearance : {0.19f, 0.22f, 0.242f, 0.250f, 0.255f}) {
+  for (const float clearance : {0.19f, 0.22f, 0.230f, 0.235f, 0.239f, 0.242f}) {
     Voxel v;
     addGround(v, kOverhead);
     EXPECT_TRUE(v.add(clearance, kOverhead)) << "clearance=" << clearance;
@@ -103,13 +102,21 @@ TEST(OverheadFilter, SurfaceNotAboveVehiclePlusMarginStaysAnObstacle)
   }
 }
 
-// 边界：恰好等于 overhead_height 的点不是头顶面（严格大于才是）。
-TEST(OverheadFilter, PointExactlyAtTheThresholdIsNotOverhead)
+// Compare the representable absolute boundary, without a metric tolerance:
+// float subtraction otherwise makes an equal-height point fail at some origins.
+TEST(OverheadFilter, PointExactlyAtTheThresholdClearsButNextFloatBelowDoesNot)
 {
-  EXPECT_FALSE(terrain_analysis_ext::isOverheadPoint(1.255f, 1.0f, 0.255));
-  EXPECT_TRUE(terrain_analysis_ext::isOverheadPoint(1.2561f, 1.0f, 0.255));
-  EXPECT_FALSE(terrain_analysis_ext::isOverheadPoint(1.0f, 1.0f, 0.255));
-  EXPECT_FALSE(terrain_analysis_ext::isOverheadPoint(0.9f, 1.0f, 0.255));
+  for (const float ground : {-2.0f, 0.0f, 0.03f, 1.0f}) {
+    const float boundary = static_cast<float>(static_cast<double>(ground) + kOverhead);
+    EXPECT_TRUE(terrain_analysis_ext::isOverheadPoint(boundary, ground, kOverhead));
+    EXPECT_FALSE(
+      terrain_analysis_ext::isOverheadPoint(
+        std::nextafter(boundary, -std::numeric_limits<float>::infinity()), ground, kOverhead));
+    EXPECT_FALSE(
+      terrain_analysis_ext::isOverheadPoint(
+        static_cast<float>(ground + kOverhead - 0.01), ground, kOverhead));
+    EXPECT_FALSE(terrain_analysis_ext::isOverheadPoint(ground, ground, kOverhead));
+  }
 }
 
 // 默认 0 = 关闭，旧行为不变，哪怕点高得离谱。

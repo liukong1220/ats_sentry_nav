@@ -15,13 +15,16 @@ namespace terrain_analysis_ext
 // 硬障碍判据是 max(体素高差, 体素内最大相对高度) >= traversabilityObstacleHeightThre，
 // 对体素内每一个点一视同仁。悬空在车体上方的板（2027 的 ramp_bridge 下表面离地
 // 0.26–0.35 m）因此把下方能通过的路面整片标成硬障碍。overhead_height > 0 时，
-// 相对本体素地面高于该值的点属于头顶面，不进入任何统计。
+// 相对本体素地面达到该值的点属于头顶面，不进入任何统计。
 
-// z 相对地面的高度严格大于 overhead_height 的点是头顶面。overhead_height <= 0 表示关闭。
+// Match the column gate's inclusive boundary in the point cloud's float
+// representation. Rounding the absolute threshold avoids cancellation from
+// float subtraction; no geometric tolerance is added. Nonfinite evidence fails closed.
 inline bool isOverheadPoint(float point_z, float ground_elevation, double overhead_height)
 {
-  return overhead_height > 0.0 &&
-         static_cast<double>(point_z - ground_elevation) > overhead_height;
+  return overhead_height > 0.0 && std::isfinite(overhead_height) &&
+         std::isfinite(point_z) && std::isfinite(ground_elevation) &&
+         point_z >= static_cast<float>(static_cast<double>(ground_elevation) + overhead_height);
 }
 
 // 把一个点并入体素统计。头顶面返回 false 且不改动任何统计。
