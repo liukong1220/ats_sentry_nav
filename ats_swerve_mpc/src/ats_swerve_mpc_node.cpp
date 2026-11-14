@@ -1349,6 +1349,19 @@ void AtsSwerveMpcNode::onControlTimer() {
       reference_terminal_speed <= kTerminalStopSpeed) {
     last_control_ = limitTerminalApproachSpeed(
         last_control_, goal_position_error, terminal_approach_time_constant_);
+    if (goal_position_error <= goal_position_tolerance_) {
+      // Once translation has reached the endpoint, the physical chassis still
+      // needs braking distance for its stationary yaw tail. Waiting until the
+      // yaw tolerance is reached can overshoot a footprint-checked terminal
+      // orientation (d26). Reuse the configured approach time constant and
+      // preserve the existing angular acceleration limit during deceleration.
+      const double deceleration_floor = std::max(
+          0.0, std::abs(snapshot.last_control_before_solve(2)) -
+                   controller_->config().max_awz * controller_->config().dt);
+      const double yaw_rate_limit = std::max(
+          goal_yaw_error / terminal_approach_time_constant_, deceleration_floor);
+      last_control_(2) = std::clamp(last_control_(2), -yaw_rate_limit, yaw_rate_limit);
+    }
   }
   const auto command_publish_start = std::chrono::steady_clock::now();
   publishCommand(last_control_);

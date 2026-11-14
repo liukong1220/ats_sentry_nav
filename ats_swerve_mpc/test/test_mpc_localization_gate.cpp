@@ -1275,6 +1275,57 @@ TEST_F(MpcTerminalApproachTest, PlanarSpeedStaysBelowDistanceOverTimeConstant) {
   }
 }
 
+TEST_F(MpcTerminalApproachTest, StationaryYawBrakesBeforeTheGoalToleranceDisk) {
+  // d26: a safe terminal yaw was overshot while the chassis was still turning.
+  // Hold measured XY at the endpoint and require the actual ROS output to
+  // respect angular error / tau before entering the yaw success tolerance.
+  constexpr double kYaw = -0.3;
+  publishPlannerStatus(1, 7);
+  rclcpp::Time reference_start;
+  const auto heartbeat = [&]() {
+      publishOdometry();
+      publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+      if (command_norm_.load() <= 0.02) {
+        reference_start = driver_->now() + rclcpp::Duration::from_seconds(0.05);
+      }
+      ExecutionCommand command;
+      command.header.stamp = driver_->now();
+      command.header.frame_id = "odom";
+      command.mode = ExecutionCommand::MODE_EXECUTE;
+      command.manager_incarnation = manager_incarnation_;
+      command.command_sequence = ++execution_sequence_;
+      command.goal_id = 1;
+      command.localization_epoch = 1;
+      command.map_generation = 7;
+      command.map_publication_sequence = 1;
+      command.yaw_authority = ExecutionCommand::YAW_AUTHORITY_GIMBAL_COMPENSATED;
+      command.gimbal_request_sequence = gimbal_request_sequence_;
+      command.gimbal_feedback_sequence = gimbal_sequence_ > 0 ? gimbal_sequence_ - 1 : 0;
+      command.reference.header.frame_id = "odom";
+      command.reference.header.stamp = reference_start;
+      for (int i = 0; i <= 10; ++i) {
+        geometry_msgs::msg::PoseStamped pose;
+        pose.header.frame_id = "odom";
+        pose.header.stamp = reference_start + rclcpp::Duration::from_seconds(0.05 * i);
+        const double yaw = kYaw * i / 10.0;
+        pose.pose.orientation.z = std::sin(yaw / 2.0);
+        pose.pose.orientation.w = std::cos(yaw / 2.0);
+        command.reference.poses.push_back(pose);
+      }
+      execution_pub_->publish(command);
+    };
+  ASSERT_TRUE(spinUntil([&]() {
+    heartbeat();
+    return commands_.size() >= 20 && command_norm_.load() > 0.02;
+  }, 3s));
+  double previous = 0.0;
+  for (const auto & command : commands_) {
+    EXPECT_LE(std::abs(command.angular.z), std::abs(kYaw) / kTimeConstant + kTolerance);
+    EXPECT_LE(std::abs(command.angular.z - previous), kAngularStepLimit + kTolerance);
+    previous = command.angular.z;
+  }
+}
+
 // 换代宽限（报告 5.1.9 D）：supersede_grace_sec > 0 时，同一 epoch 内新 generation 的
 // REFERENCE_READY 不立即作废旧命令；宽限内到达的新 generation EXECUTE 沿用 last_control_。
 class MpcSupersedeGraceTest : public MpcReferenceSwitchTest
