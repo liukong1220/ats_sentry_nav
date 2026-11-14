@@ -83,7 +83,8 @@ public:
   ColumnState state(int x, int y) const;
   std::optional<double> ground(int x, int y) const;
   void clear();
-  // Return true only when a connected support was actually removed.
+  // Return true when clearing changes connected support or its usability by
+  // neighbouring columns, which must then re-evaluate cached free evidence.
   bool clearVoxel(const std::array<double, 3> & point);
   bool clearVoxel(const std::array<double, 3> & point, double ray_z);
   // ray is the sample where the ray crosses the voxel; its XY bounds the slope.
@@ -151,6 +152,7 @@ private:
   std::optional<SupportInterval> voxelSupportInterval(int x, int y,
     const ReturnExtent & evidence) const;
   bool hasOverhead(int x, int y) const;
+  bool hasDisconnectedLowerReturn(int x, int y) const;
   bool valid(int x, int y) const;
   std::size_t index(int x, int y) const;
   int width_;

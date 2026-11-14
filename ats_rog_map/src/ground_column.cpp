@@ -269,6 +269,20 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
   int x, int y, double query_x, double query_y, double * plane_z) const
 {
   if (plane_z) {*plane_z = std::numeric_limits<double>::quiet_NaN();}
+  // A neighbouring identity contradicted by a disconnected lower return must
+  // not constrain an independently measured level to which it cannot connect.
+  // Keep the column's own support and all unambiguous neighbours; absent own
+  // support keeps the conservative original neighbourhood.
+  const auto compatible = [&](int nx, int ny) {
+      const auto & own = ground_[index(x, y)];
+      const auto & other = ground_[index(nx, ny)];
+      if (!own || !other || (x == nx && y == ny)) {return true;}
+      const auto & a = own->low;
+      const auto & b = other->low;
+      const bool directly_connected = std::abs(a[2] - b[2]) <= config_.max_ground_slope *
+        std::hypot(a[0] - b[0], a[1] - b[1]) + config_.support_noise + 1e-6;
+      return directly_connected || !hasDisconnectedLowerReturn(nx, ny);
+    };
   std::vector<const VoxelReturns *> supports;
   double lower = -std::numeric_limits<double>::infinity();
   double upper = std::numeric_limits<double>::infinity();
@@ -276,7 +290,7 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
     for (int dx = -1; dx <= 1; ++dx) {
       if (!valid(x + dx, y + dy)) {continue;}
       const auto & p = ground_[index(x + dx, y + dy)];
-      if (!p) {continue;}
+      if (!p || !compatible(x + dx, y + dy)) {continue;}
       supports.push_back(&*p);
       lower = std::max(lower, p->low[2] - config_.max_ground_slope *
         std::hypot(query_x - p->low[0], query_y - p->low[1]));
@@ -302,7 +316,7 @@ std::optional<std::array<double, 2>> GroundColumnGrid::supportBounds(
               (side == 2 && dy == -1) || (side == 3 && dy == 1) ||
               !valid(x + dx, y + dy)) {continue;}
             const auto & floor = ground_[index(x + dx, y + dy)];
-            if (floor) {local.push_back(&*floor);}
+            if (floor && compatible(x + dx, y + dy)) {local.push_back(&*floor);}
           }
         }
         if (auto fit = fitSupportPlane(local)) {fits.push_back(std::move(*fit));}
@@ -636,6 +650,19 @@ std::optional<ColumnHeadroom> GroundColumnGrid::ceilingHeadroom(int x, int y) co
   return result;
 }
 
+bool GroundColumnGrid::hasDisconnectedLowerReturn(int x, int y) const
+{
+  const auto & floor = ground_[index(x, y)];
+  if (!floor) {return false;}
+  const auto & bins = columns_[index(x, y)];
+  if (bins.empty()) {return false;}
+  const auto & low = bins.begin()->second.low;
+  const auto & anchor = floor->low;
+  const double allowance = std::max(config_.surface_max, config_.max_ground_slope *
+    std::hypot(low[0] - anchor[0], low[1] - anchor[1]) + config_.support_noise);
+  return low[2] < anchor[2] - allowance - 1e-9;
+}
+
 ColumnState GroundColumnGrid::state(int x, int y) const
 {
   if (!valid(x, y)) {return ColumnState::kUnknown;}
@@ -697,6 +724,8 @@ ColumnState GroundColumnGrid::state(int x, int y) const
         origin_y_ + (y + 0.5) * resolution_))
     {return ColumnState::kUnknown;}
   }
+  // Contradictory support stays blocked locally; earlier occupied decisions win.
+  if (hasDisconnectedLowerReturn(x, y)) {return ColumnState::kUnknown;}
   return classifyGroundColumn(heights,
     observed, 0.0, config_, columns_[index(x, y)].size());
 }
@@ -719,6 +748,7 @@ bool GroundColumnGrid::clearVoxel(
   const int x = static_cast<int>(std::floor((point[0] - origin_x_) / resolution_));
   const int y = static_cast<int>(std::floor((point[1] - origin_y_) / resolution_));
   if (!valid(x, y)) {return false;}
+  const bool disconnected_before = hasDisconnectedLowerReturn(x, y);
   auto & column = columns_[index(x, y)];
   const auto found = column.find(static_cast<int>(std::floor(point[2] / config_.voxel_resolution)));
   if (found == column.end()) {return false;}
@@ -749,16 +779,19 @@ bool GroundColumnGrid::clearVoxel(
   column.erase(found);
   // Removing the last overhead return disables the local board-support model.
   support_planes_.erase(index(x, y));
-  if (removed_support) {
+  const bool support_changed = removed_support ||
+    disconnected_before != hasDisconnectedLowerReturn(x, y);
+  if (support_changed) {
     // A support contributes only to its 3 x 3 neighbourhood. Clearing an
-    // obstacle does not change a floor fit; retain unrelated fits during rays.
+    // obstacle does not change a floor fit unless it changes support ambiguity.
+    // A newly usable neighbour must invalidate formerly trimmed local fits.
     for (int dy = -1; dy <= 1; ++dy) {
       for (int dx = -1; dx <= 1; ++dx) {
         if (valid(x + dx, y + dy)) {support_planes_.erase(index(x + dx, y + dy));}
       }
     }
   }
-  return removed_support;
+  return support_changed;
 }
 
 void GroundColumnGrid::observeRayCell(int x, int y)

@@ -1038,3 +1038,41 @@ TEST(GroundColumn, ClearingAnyRetainedSupportVoxelRevokesItsIdentity)
   EXPECT_TRUE(grid.clearVoxel({0.65, 0.65, -0.02}, -0.03));
   EXPECT_FALSE(grid.ground(6, 6));
 }
+
+TEST(GroundColumn, IndependentlySeededHigherSurfaceCannotRaiseAdjacentMeasuredFloor)
+{
+  GroundColumnConfig config;
+  config.robot_height = 0.242;
+  config.top_margin = 0.007;
+  ats_rog_map::GroundColumnGrid grid(12, 12, 0.1, 0.0, 0.0, config);
+  // Another connected level was observed first. Its identity must not be moved.
+  grid.observe({{0.51, 0.701, 0.15}, {0.501, 0.711, 0.19}}, {0.51, 0.701, 0.15});
+  std::vector<std::array<double, 3>> floor;
+  for (int y = 4; y <= 8; ++y) {
+    for (int x = 4; x <= 8; ++x) {
+      if (x == 5 && y == 7) {continue;}
+      for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+          floor.push_back({(x + 0.125 + 0.25 * px) * 0.1,
+            (y + 0.125 + 0.25 * py) * 0.1, 0.02});
+        }
+      }
+    }
+  }
+  grid.observe(floor, {0.75, 0.55, 0.02});
+  // The high column also has lower disconnected evidence, as in d30. It stays blocked.
+  grid.observe({{0.55, 0.75, 0.02}}, {0.75, 0.55, 0.02});
+  EXPECT_NE(grid.state(5, 7), ColumnState::kFree);
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kFree);
+  ASSERT_TRUE(grid.ground(6, 6));
+  EXPECT_NEAR(*grid.ground(6, 6), 0.02, 1e-9);
+  // The neighbour becomes usable when its contradictory low return is cleared.
+  // Expire cached fits AND tell integration to re-evaluate adjacent free cells.
+  EXPECT_TRUE(grid.clearVoxel({0.55, 0.75, 0.025}, -0.1));
+  EXPECT_NE(grid.state(6, 6), ColumnState::kFree);
+  grid.observe({{0.55, 0.75, 0.02}}, {0.75, 0.55, 0.02});
+  ASSERT_EQ(grid.state(6, 6), ColumnState::kFree);
+  // Own measured support and the overhead gate remain authoritative.
+  grid.observe({{0.65, 0.65, 0.259}}, {0.75, 0.55, 0.02});
+  EXPECT_EQ(grid.state(6, 6), ColumnState::kOccupied);
+}
