@@ -358,6 +358,14 @@ private:
       std::lock_guard<std::mutex> lock(mutex_);
       // Observe an expired lease before this input can renew its receive time.
       updateHealthLocked();
+      if (!last_odom_receive_time_ && initial_odom_timeout_only_) {
+        // Loading sensors/initializing the frontend may outlive the initial
+        // receive deadline. Its first validated input starts BOOTSTRAP, never
+        // TRACKING. Established-input loss, malformed data and identity changes
+        // still require accepted relocalization evidence to clear LOST.
+        lost_latched_ = false;
+        initial_odom_timeout_only_ = false;
+      }
       if (latest_odom_stamp_ && stamp < *latest_odom_stamp_) {
         recordRejectionLocked("dropped out-of-order odometry", true);
         if (!lost_latched_) {
@@ -600,7 +608,7 @@ private:
     const auto steady_now = std::chrono::steady_clock::now();
     if (!last_odom_receive_time_) {
       if (steadySecondsSince(startup_time_) > odom_timeout_s_) {
-        enterLostLocked("initial odometry input timed out");
+        enterLostLocked("initial odometry input timed out", true);
       } else if (!lost_latched_) {
         status_ = LocalizationStatus::STATE_UNINITIALIZED;
         status_message_ = "waiting for odometry";
@@ -655,8 +663,12 @@ private:
     status_message_ = "tracking";
   }
 
-  void enterLostLocked(const std::string & message)
+  void enterLostLocked(const std::string & message, bool initial_odom_timeout = false)
   {
+    // An initial timeout cannot replace a different latched failure. Repeated
+    // no-input ticks only preserve this marker until the first valid input.
+    initial_odom_timeout_only_ = initial_odom_timeout &&
+      (!lost_latched_ || initial_odom_timeout_only_);
     if (recovery_until_) {
       // Pending-only traffic must not arm another episode after this timeout.
       recovery_episode_closed_ = true;
@@ -804,6 +816,7 @@ private:
   bool recovery_episode_closed_{false};
   // Survives RECOVERING so only LOST-origin recovery receives the wider gate.
   bool lost_latched_{false};
+  bool initial_odom_timeout_only_{false};
   tf2::Transform map_to_odom_{tf2::Transform::getIdentity()};
   bool has_map_to_odom_{false};
   bool has_accepted_observation_{false};
