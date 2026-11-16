@@ -626,6 +626,7 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
   if (!keep_control_state) {
     controller_->reset();
     last_control_.setZero();
+    last_control_update_stamp_.reset();
   }
   // 保留时不调用 reset()：iLQR 的 warm_controls_ 留在原处，下一拍 initializeControls 照常
   // 左移一格并与新 reference 的前馈 0.7/0.3 混合；last_control_ 保持上一拍已发布的指令。
@@ -1220,6 +1221,37 @@ void AtsSwerveMpcNode::onControlTimer() {
     publishZeroCommandForFailure(nullptr);
     return;
   }
+  if (get_clock()->ros_time_is_active()) {
+    const auto update_stamp = now();
+    if (last_control_update_stamp_) {
+      const auto elapsed_ns = (update_stamp - *last_control_update_stamp_).nanoseconds();
+      if (elapsed_ns < 0) {
+        // A backward clock must not keep driving with a held command.
+        const auto previous_update_stamp = *last_control_update_stamp_;
+        engageFailStop();
+        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+        if (last_stop_stamp_ < previous_update_stamp) {
+          last_stop_stamp_ = previous_update_stamp;
+        }
+        // This stop is not authorized by a sequenced Goal Manager STOP.
+        // Keep the pre-rewind reference ineligible even with a newer heartbeat.
+        last_stop_command_.reset();
+        return;
+      }
+      const auto period_ns = static_cast<std::int64_t>(
+        std::llround(1e9 / std::max(1.0, control_rate_hz_)));
+      if (elapsed_ns < period_ns) {
+        // Slow MuJoCo clocks used to advance max_a*dt and the warm horizon on
+        // every wall tick (d117: 5 ms ROS / 50 ms wall with dt=50 ms).
+        // All safety/odometry/expiry checks above still run on every wall
+        // callback. Renew the checked command heartbeat without another
+        // dynamics or terminal-braking step until the ROS period is due.
+        publishCommand(last_control_);
+        return;
+      }
+    }
+    last_control_update_stamp_ = update_stamp;
+  }
   if (goal_position_error <= goal_position_tolerance_ &&
       goal_yaw_error <= goal_yaw_tolerance_) {
     publishTerminalDecelerationCommand();
@@ -1716,6 +1748,7 @@ void AtsSwerveMpcNode::dumpControlTelemetry(
  */
 void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
   last_control_.setZero();
+  last_control_update_stamp_.reset();
   publishCommand(last_control_);
   controller_->reset();
   if (reason_zh != nullptr) {
@@ -1888,6 +1921,7 @@ void AtsSwerveMpcNode::engageFailStop(
     controller_->reset();
   }
   last_control_.setZero();
+  last_control_update_stamp_.reset();
   publishCommand(last_control_);
 }
 

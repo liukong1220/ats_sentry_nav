@@ -200,6 +200,8 @@ private:
   std::optional<std::chrono::steady_clock::time_point>
       previous_control_cycle_start_;
   std::uint64_t control_cycle_sequence_ = 0;
+  // Safety leases keep their wall callback; numerical updates follow ROS time.
+  std::optional<rclcpp::Time> last_control_update_stamp_;
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();

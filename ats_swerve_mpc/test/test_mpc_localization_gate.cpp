@@ -1713,6 +1713,83 @@ TEST_F(MpcFrozenClockTest, ReferenceStampedAtUnsequencedStopTimeIsRejected) {
   EXPECT_TRUE(movesOn(next_tick, next_tick, 3, 1s));
 }
 
+class MpcSlowClockTest : public MpcFrozenClockTest
+{
+protected:
+  std::vector<rclcpp::Parameter> extraParameters() const override
+  {
+    return {
+      rclcpp::Parameter("use_sim_time", true),
+      rclcpp::Parameter("solver_mode", "ilqr"),
+      rclcpp::Parameter("control_rate_hz", 20.0),
+      rclcpp::Parameter("dt", 0.05),
+      rclcpp::Parameter("max_ax", 2.0),
+      rclcpp::Parameter("max_ay", 2.0),
+    };
+  }
+
+  void renewInputs(const rclcpp::Time & stamp)
+  {
+    publishOdometry();
+    publishStatus(LocalizationStatus::STATE_TRACKING, 1);
+    publishExecutionAt(stamp, reference_start_);
+  }
+
+  rclcpp::Time reference_start_{100'000'000'000, RCL_ROS_TIME};
+};
+
+TEST_F(MpcSlowClockTest, SlowRosClockDoesNotRepeatDynamicsStep)
+{
+  const auto start = setClock(reference_start_.nanoseconds());
+  publishStopAt(start);
+  ASSERT_TRUE(movesOn(start, reference_start_, 1, 2s));
+  const double first_command = commands_.back().linear.x;
+  ASSERT_GT(first_command, 0.02);
+  const auto first = commands_.size();
+  // Several wall callbacks pass while less than one model period elapses.
+  const auto early = setClock(start.nanoseconds() + 20'000'000);
+  spinUntil([&]() {renewInputs(early); return false;}, 350ms);
+  ASSERT_GT(commands_.size(), first + 3U);  // command heartbeat must continue
+  for (std::size_t i = first; i < commands_.size(); ++i) {
+    EXPECT_NEAR(commands_[i].linear.x, first_command, 1e-6);
+  }
+  const auto due = setClock(start.nanoseconds() + 50'000'000);
+  EXPECT_TRUE(spinUntil([&]() {
+    renewInputs(due);
+    return commands_.back().linear.x > first_command + 0.02;
+  }, 500ms));
+}
+
+TEST_F(MpcSlowClockTest, FrozenClockStillExpiresSteadyMapLease)
+{
+  const auto start = setClock(reference_start_.nanoseconds());
+  publishStopAt(start);
+  ASSERT_TRUE(movesOn(start, reference_start_, 1, 2s));
+  renew_map_ready_ = false;
+  EXPECT_TRUE(spinUntil([&]() {
+    renewInputs(start);
+    return command_norm_.load() < 1e-6;
+  }, 350ms));
+  // A ready heartbeat and the retired reference cannot restore motion.
+  renew_map_ready_ = true;
+  spinUntil([&]() {renewInputs(start); return false;}, 100ms);
+  EXPECT_LT(command_norm_.load(), 1e-6);
+}
+
+TEST_F(MpcSlowClockTest, BackwardClockCannotRevivePreRewindReference)
+{
+  const auto start = setClock(reference_start_.nanoseconds());
+  publishStopAt(start);
+  ASSERT_TRUE(movesOn(start, reference_start_, 1, 2s));
+  const auto rewound = setClock(start.nanoseconds() - 1'000'000'000);
+  ASSERT_TRUE(spinUntil([&]() {
+    renewInputs(rewound);
+    return command_norm_.load() < 1e-6;
+  }, 350ms));
+  spinUntil([&]() {renewInputs(rewound); return false;}, 150ms);
+  EXPECT_LT(command_norm_.load(), 1e-6);
+}
+
 TEST(AtsSwerveMpcNodeConstruction, RejectsOversizedHorizonBeforeControllerCreation) {
   const bool initialized_before = rclcpp::ok();
   if (!initialized_before) {
