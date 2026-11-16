@@ -31,14 +31,22 @@ ats_swerve_mpc -> /cmd_vel/autonomy_raw -> fake_vel_transform -> /cmd_vel/autono
   -> chassis_vel_transform -> /cmd_vel/autonomy -> cmd_vel_arbiter -> /cmd_vel/selected
 ```
 
-MuJoCo（`ats_mujoco_sim/launch/rmuc_2025_mujoco.launch.py`）始终启动 MPC，不启动
+MuJoCo（2027入口复用`rmuc_2025_mujoco.launch.py`的公共编排）启动MPC，不启动
 `fake_vel_transform`；`cmd_vel_arbiter` 直接订阅 `/cmd_vel/autonomy_raw` 并唯一发布
 `/cmd_vel/selected`，`twist_to_motion_ctrl` 订阅后输出 `/motion_control`：
 
 ```bash
-ros2 launch ats_mujoco_sim rmuc_2025_mujoco.launch.py
+ros2 launch ats_mujoco_sim rmuc_2027_mujoco.launch.py localization_source:=lio
 # 可选：solver_mode:=qp_shadow
 ```
+
+## 当前速度口径与待验收项
+
+2026-11-16正式根profile及独立MPC配置的`max_vx/max_vy/max_wheel_speed`均为`5.0 m/s`、`max_wz=3.0 rad/s`、`max_awz=2.0 rad/s²`，平移加速度`max_ax/max_ay=2.0 m/s²`；`horizon=60`、`dt=0.05 s`。平移叠加自旋时仍受逐轮合成速度约束，轴向上限不意味着对角线或旋转时可以超出轮速预算。
+
+轮半径`0.0425 m`；`motor_max_rpm=1348.1359885`为结合冗余系数1.2反算的暂定等效参数，不是实测电机规格。5 m/s是暂定能力上限，实车8–10 m/s等待测量后再定；MINCO单轮时间缩放仍未启用。
+
+当前终端接近区1 m来自旧低速配置，不能据构建和单测声称5 m/s制动/终点精度通过。直线静止到静止、加减速度2 m/s²时，达到5 m/s至少需12.5 m；当前对称点直线约12.060 m，理想峰值约4.911 m/s。最终记录reference、自主/selected/底盘命令和真值曲线，未触发上限时单列未验证，见[2027方案](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md)。
 
 ## LTV-QP 迁移状态
 
@@ -67,9 +75,10 @@ QP 路径目前仅用于诊断，不能写成实车求解器。急停、定位�
 ## 构建与测试
 
 ```bash
-cd /home/ats/ATS_2026_snetry_test
+# 在当前工作区根目录执行
 source /opt/ros/humble/setup.bash
-colcon build --base-paths src --packages-select ats_swerve_mpc
+MAKEFLAGS=-j1 colcon build --base-paths src --packages-select ats_swerve_mpc \
+  --parallel-workers 1 --cmake-args -DCMAKE_BUILD_TYPE=Release
 cd build/ats_swerve_mpc
 ctest --output-on-failure
 ```
@@ -77,9 +86,4 @@ ctest --output-on-failure
 `FETCHCONTENT_SOURCE_DIR_QDLDL` 在本包 `CMakeLists.txt` 中被强制指向内置 QDLDL。
 不要把它改回空值或 `build/` 下的 git 缓存，否则配置会再次访问 GitHub。
 
-MuJoCo 闭环回归脚本位于工作区根目录：
-
-```bash
-cd /home/ats/ATS_2026_snetry_test
-scripts/test_mujoco_minco_mpc_chain.sh
-```
+MuJoCo最终回归按上述2027方案显式选择场景和起终点；通用runner的旧默认2025与红框不再作为当前最终入口。单测、空场5 m/s执行器诊断与导航闭环分别报告，当前2027套件尚未通过。

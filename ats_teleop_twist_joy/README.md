@@ -3,8 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Build and Test](https://github.com/SMBU-PolarBear-Robotics-Team/ats_teleop_twist_joy/actions/workflows/ci.yml/badge.svg)](https://github.com/SMBU-PolarBear-Robotics-Team/ats_teleop_twist_joy/actions/workflows/ci.yml/badge.svg)
 
-> [!NOTE]
-> This code is currently quite messy, and it is not recommended to develop it again based on this code. The README update is not timely.
+> ATS integration checked on 2026-11-16: navigation goals use the ATS action below. Parameter defaults in this page are constructor fallbacks; deployed values come from the workspace profile.
 
 ## Overview
 
@@ -34,8 +33,14 @@ The message type can be changed to `geometry_msgs/msg/TwistStamped` by the `publ
 
 ### Client
 
-- `nav_to_pose_client_ (nav2_msgs/action/NavigateToPose)`
-  - Action client for sending navigation goals to the `navigate_to_pose` action server. This client is used to send the robot to a specified pose in the map.
+- `nav_to_pose_client_ (ats_navigation_interfaces/action/NavigateToPose)`
+  - Action client for sending navigation goals to the `/ats_navigate_to_pose` action server; it does not call the Nav2 action. This client is used to send the robot to a specified pose in the map.
+
+### ATS profile and speed scope
+
+Current navigation limits are provisionally 5 m/s translation, 3 rad/s yaw and 2 rad/s² yaw acceleration. Manual joystick scales are a separate input: the root profile currently uses normal x/y 2.5 and yaw 3.0, turbo x/y 4.0 and yaw 6.0. These are input gains, not a promise of achieved speed or a separate navigation cap; selected commands still pass through arbitration and downstream actuator limits. This documentation update does not change manual gains or run a robot.
+
+Final navigation acceptance uses the [2027 tunnel and symmetric-point plan](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md); joystick motion does not substitute for an ATS navigation speed result.
 
 ### Parameters
 

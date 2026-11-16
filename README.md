@@ -11,13 +11,13 @@ ROGMap 只做环境表示，不做定位；位姿来自 `/localization`。
 
 | 包 | 职责 |
 | :--- | :--- |
-| `livox_ros_driver2` | Livox 雷达驱动，SDK 随包放在 `Livox-SDK2/`。 |
+| `livox_ros_driver2` | Livox雷达驱动；SDK2由CMake查找，安装方法见根README，不能由源码拉取推导依赖已安装。 |
 | `point_lio` | 雷达惯性里程计，输出 `cloud_registered` 与 `aft_mapped_to_init`。 |
 | `loam_interface` | 把 Point-LIO 输出整理成 `/registered_scan` 与 `/lidar_odometry`。 |
 | `sensor_scan_generation` | 由 `/lidar_odometry` 和 `/registered_scan` 生成 `/odometry`、`/sensor_scan` 与相关 TF。 |
-| `small_gicp_relocalization` | `small_gicp_relocalization_node` 用先验 PCD 做 GICP 重定位；`localization_fusion_node` 融合出 `/localization`、`/localization/status` 和 `map -> odom`。small_gicp 头文件放在包内 `include/small_gicp`，不需要另装。 |
+| `small_gicp_relocalization` | GICP发布重定位观测，`localization_fusion_node`拥有`/localization`、`/localization/status`与`map -> odom`；small_gicp头文件须由构建环境提供，见根README依赖说明。 |
 | `terrain_analysis` / `terrain_analysis_ext` | 地形分析。`terrain_analysis_ext` 输出 `/traversability_grid` 等栅格，供 adapter 融合；`terrain_analysis` 默认不启动。 |
-| `ats_rog_map` | ROG-Map 封装：概率占据、膨胀、三维 ESDF。同一进程 `ats_rog_map_node` 里还运行规划地图所有者（节点名 `ats_rog_map_adapter`）：进程内调用地面投影，融合 terrain 栅格和静态图，发布 `/rc_esdf/planning_grid` 与 `/rog_map_adapter/*`。 |
+| `ats_rog_map` | ROG-Map概率占据、膨胀、三维ESDF；同一进程内的`ats_rog_map_adapter`融合数值投影、terrain和静态层，唯一发布`/rog_map_adapter/planning_snapshot`；`/rog_map_adapter/viz/*`只作可视化，正式graph没有`/rc_esdf/*`。 |
 | `ats_rog_map_interfaces` | 显式保存地图服务的 schema（`SaveOdomMap.srv`）。 |
 | `ats_rc_esdf` | 二维 signed distance、gradient、unknown 与静态图融合的算法库，被 `ats_rog_map` 和 `minco_planner` 依赖，没有自己的节点。 |
 | `ats_goal_manager` | `/ats_navigate_to_pose` action server、目标状态机、候选参考的提交复核、急停与 `ExecutionCommand` 执行授权。 |
@@ -74,7 +74,7 @@ Livox 雷达 + IMU            /livox/lidar, /livox/imu
 ## 构建
 
 ```bash
-cd /home/ats/ATS_2026_snetry_test
+# 在当前工作区根目录执行
 source /opt/ros/humble/setup.bash
 rosdep install --from-paths src --ignore-src -r -y     # 首次
 MAKEFLAGS=-j4 colcon build --base-paths src --parallel-workers 1 \
@@ -88,7 +88,7 @@ source install/setup.bash
 - 整仓构建用根仓的 `./build.sh`（按机器内存与核数自动算并发，已带 Release）。单包用 `--packages-select <pkg>`。
 - 与别人正在使用的 `build/`、`install/` 并行验证时，加 `--build-base`、`--install-base` 指向独立目录，不要在共享目录里构建。
 - `sentry_chassis_vel_transform` 在独立仓库：`vcs import --skip-existing src < src/ats_sentry_nav/dependencies.repos`。
-- 依赖：Ubuntu 22.04、ROS 2 Humble、Eigen3、PCL、yaml-cpp、glog、OpenMP、libunwind；Livox SDK 与 small_gicp 已在源码树内。
+- 依赖：Ubuntu 22.04、ROS 2 Humble、Eigen3、PCL、yaml-cpp、glog、OpenMP、libunwind以及Livox SDK2、small_gicp；依赖来源和发现路径以CMake与根README为准，不假定源码树已包含完整依赖。
 
 ## 启动入口与常用参数
 
@@ -146,10 +146,7 @@ ros2 action send_goal --feedback /ats_navigate_to_pose \
 `ROS_DOMAIN_ID`（默认 `88`）、`TEST_PROFILE`（`default`、`single`、`rectangle`、`south_corridor`、`red_box`、`red_box_2027`、`tunnel_2027`，默认 `single`）、
 `SCENE`（默认 `rmuc_2025`）、`USE_RVIZ`（默认 `false`）、`USE_MUJOCO_VIEWER`。
 
-```bash
-cd /home/ats/ATS_2026_snetry_test
-ROS_DOMAIN_ID=88 TEST_PROFILE=single USE_RVIZ=false scripts/test_mujoco_minco_mpc_chain.sh
-```
+当前最终入口见[2027隧道与对称点速度方案](../../docs/nav_acceptance/20261116_2027_final_test_plan.md)：先真实B往返，再南坡和六隧道；速度使用`SCENE=rmuc_2027 TEST_PROFILE=single`，显式起点`(13.40,2.00,0.550,0)`、目标`map (14.60,14.00)`及`GOAL_TOLERANCE=0.08`。运行前核验新domain、WLAN和同源2027资产，LIO模式显式`LIDAR_DOWNSAMPLE=0`、`lidar_threads:=0`。旧默认2025/红框是兼容菜单，不作为当前最终验收。
 
 手动启动与场景细节见 [src/sim/ats_mujoco_sim/README.md](../sim/ats_mujoco_sim/README.md)，
 RViz 与窗口的使用规则见根仓 `AGENTS.md` 7.1。Gazebo 入口见 [src/sim/gazebo_simulator/README.md](../sim/gazebo_simulator/README.md)。
@@ -205,7 +202,7 @@ RViz 配置是 `rviz_cfg/point_lio_replay.rviz`。这个 launch 不被任何实�
 | `livox_ros_driver2`、`point_lio`、`loam_interface`、`sensor_scan_generation` | 雷达与 IMU topic、frame、里程计输出。 |
 | `small_gicp_relocalization`、`localization_fusion` | 重定位、融合、状态与 timeout。 |
 | `terrain_analysis`、`terrain_analysis_ext` | 地形与可通行栅格。 |
-| `ats_rog_map`、`ats_rog_map_adapter` | 地图尺寸、分辨率、概率、膨胀、投影请求 deadline、栅格 topic、ready/lease。 |
+| `ats_rog_map`、`ats_rog_map_adapter` | 地图尺寸、分辨率、概率、膨胀、进程内投影deadline、数值快照topic、ready/lease。 |
 | `minco_planner` | JPS、MINCO、yaw、足迹、修复、输入输出 topic。 |
 | `ats_goal_manager` | action、goal/planning frame、heartbeat、提交复核、执行授权。 |
 | `ats_swerve_mpc` | SE2 模型、horizon、权重、约束、watchdog、输出 topic。 |
@@ -214,10 +211,24 @@ RViz 配置是 `rviz_cfg/point_lio_replay.rviz`。这个 launch 不被任何实�
 
 接口 schema 以 `.msg`、`.srv`、`.action` 为准；行为树 XML、航点 CSV、地图图像和 PCD 是结构化资产，不放进参数 YAML。
 
+2026-11-16三套profile合并后的公共口径：
+
+| 项目 | 当前值 |
+| --- | --- |
+| 车体长×宽 / 每边余量 | `0.581×0.571 m` / `0.02 m` |
+| ROG车高门 / terrain头顶门 | `0.242+0.007=0.249 m` / `0.249 m` |
+| JPS配置 / 隧道yaw与spin | `jps_safe_distance=0.36` / 均启用；首选搜索净空仍按全yaw半径约0.435592 m抬高 |
+| MINCO参考与最大速度 | `5 m/s`；起点速度保护随正的`max_velocity`，不再固定截到2 m/s |
+| MPC与出口 | `max_vx/max_vy/max_wheel_speed=5 m/s`；平面出口按矢量限幅5 m/s |
+| yaw / 角加速度 / 预测窗口 | `3 rad/s` / `2 rad/s²` / `60×0.05=3 s` |
+| 单轮时间缩放 | `wheel_speed_time_scaling_limit`未启用；不能为恢复旧表而打开 |
+
+5 m/s是待实测的暂定上限，逐轮合成、制动、净空和曲率仍约束实际速度；8–10 m/s未配置。`motor_max_rpm=1348.1359885`是为当前轮速预算反算的暂定等效值，不能写成已测电机规格。MuJoCo MID360为仿真时间10 Hz、LIO IMU 200 Hz，点数和CPU预算见[仿真README](../sim/ats_mujoco_sim/README.md)。
+
 ## 测试与验证
 
 ```bash
-cd /home/ats/ATS_2026_snetry_test
+# 在当前工作区根目录执行
 MAKEFLAGS=-j4 colcon build --base-paths src --packages-select <pkg> --parallel-workers 1 \
   --cmake-args -DCMAKE_BUILD_TYPE=Release
 colcon test --base-paths src --packages-select <pkg>
@@ -237,6 +248,7 @@ ros2 launch <pkg> <file> --show-args
 - 足迹门禁是离散采样（逐点与扫掠），连续 swept footprint 属于后续阶段，不是连续体证明。
 - 实车动力学、制动与 HIL 尚未验证；MuJoCo 的参数和结果不能当作 ATS 实测。
 - 分阶段状态与验收记录见根仓 `AGENTS.md` 与 `docs/`。
+- 11月16日空场d108只验证传感器和执行器，d103/d107导航在有效身份化odom前失败；当前真实隧道、对称点导航速度和2027独立故障矩阵仍未通过。旧局部`tunnel_B`或红框记录不替代当前套件。
 
 ## 目录结构
 

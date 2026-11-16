@@ -2,7 +2,7 @@
 
 ATS 四舵轮哨兵的规划节点。它在 `/rog_map_adapter/planning_snapshot`（占据与带符号距离同一快照）上生成
 带时间戳、带独立 yaw 的参考轨迹，经矩形足迹门禁后作为候选交给 `ats_goal_manager` 复核
-提交，再由 `ats_swerve_mpc` 跟踪。车辆足迹默认 `0.58 x 0.58 m`，安全余量 `0.05 m`。
+提交，再由`ats_swerve_mpc`跟踪。当前三套部署profile车体长×宽`0.581 x 0.571 m`、每边余量`0.02 m`；源码构造器回退值不作为部署配置。
 
 ```text
 ats_goal_manager --PlannerGoal--> minco_planner
@@ -34,7 +34,7 @@ reference 和急停由 Goal Manager 发布。速度链细节见仓库根 README�
 
 - 默认 JPS（`search_algorithm: jps`），`astar` 切换为 A*；`astar_fallback` 让 JPS 失败时回退 A*。
 - 首选净空取 `jps_safe_distance` 与全 yaw 外接半径 `hypot(L/2 + m, W/2 + m)` 的较大者，
-  默认足迹下为 `0.481 m`。
+  当前profile足迹下约为`0.435592 m`；YAML中的`jps_safe_distance=0.36`是配置值，不等于首选搜索实际净空。
 - `clearance_relaxation_enabled` 开启时，首选档无路再退到下限档。未配置
   `search_clearance_floor`（`< 0`）时，下限为内切半宽 `min(L, W)/2 + m` 加当次栅格的半格对角线。
 - `endpoint_clearance_relaxation_enabled` 只在目标位姿已通过足迹准入时生效，允许目标格净空
@@ -107,222 +107,54 @@ reference 和急停由 Goal Manager 发布。速度链细节见仓库根 README�
 窗口重复做足迹检查。`retain_safe_reference_on_snapshot_change` 开启时，地图快照变化后若剩余参考
 仍安全则保留，而不是作废重规划。
 
-## 参数
+## 当前部署参数
 
-默认值取自代码（`declare_parameter` 及对应参数结构体）。部署值以 profile 为准：实机为根仓
-`src/ats_sentry_bringup/params/node_params.yaml` 的 `minco_planner` 段，MuJoCo 为
-`src/sim/ats_mujoco_sim/config/rmuc_2025_navigation.yaml`。
+2026-11-16有效值按实际launch合并：实机为根`src/ats_sentry_bringup/params/node_params.yaml`；MuJoCo先叠加`rmuc_2025_navigation.yaml`，2027再叠加`rmuc_2027_navigation.yaml`与launch内联覆盖。旧文档的大表混用代码回退值和部署值，现仅列当前行为所需参数；其余声明和默认值直接核对`src/nodes/minco_planner_node.cpp`及对应参数结构体。
 
-### 话题与坐标系
+| 参数/契约 | 当前有效值与边界 |
+| --- | --- |
+| `footprint_length/width` / `footprint_safety_margin` | `0.581/0.571 m` / `0.02 m`，三套一致 |
+| `jps_safe_distance` | `0.36 m`；首选按全yaw半径约0.435592 m抬高，净空梯子和最终定向足迹门继续生效 |
+| `reference_speed` / `max_velocity` | 均`5.0 m/s`，暂定上限，受曲率、制动、净空与执行器限制 |
+| 起点速度保护 | 正的`max_velocity`同步到内部`initial_state_max_speed`，不再固定截断到2 m/s |
+| `max_acceleration` / `max_lateral_acceleration` | `2.5 / 1.5 m/s²`；MPC平移加速度为2.0 m/s²，尚需完整高速度可执行性验证 |
+| `yaw_mode` / `yaw_rate_limit` / `yaw_acceleration_limit` | `clearance_aware` / `3.0 rad/s` / `2.0 rad/s²` |
+| `yaw_tunnel_enabled` / `spin_enabled` | 均`true`；安全开阔段请求自旋，隧道/执行约束优先 |
+| `yaw_tangent_symmetry_order` | 矩形足迹用2阶，不沿用旧正方形4阶说明 |
+| `wheel_speed_time_scaling_limit` | 三套未启用，不恢复旧1.45 m/s单轮时间缩放 |
+| `planner_manages_emergency_stop` | 正式链为`false`，Goal Manager拥有已提交reference与急停 |
+| `publish_unsafe_trajectory` | `false`，失败不发布unsafe reference |
+| `local_repair_enabled` | 根实车profile为`false`，MuJoCo覆盖`true`；属于尚未统一的能力项 |
+| ROG / terrain车高门 | 均0.249 m，H2净空、M路线、H3实车仍未验收 |
 
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `grid_topic` | `traversability_grid` | 规划栅格输入（RELIABLE + TRANSIENT_LOCAL） |
-| `goal_topic` | `goal_pose` | 直接 `PoseStamped` 目标；空字符串不订阅 |
-| `goal_request_topic` | `""` | Goal Manager 的 `PlannerGoal` 请求；空字符串不订阅 |
-| `planner_status_topic` | `""` | `PlannerStatus` 输出；空字符串不发布 |
-| `raw_path_topic` | `minco/raw_path` | 图搜索原始路径 |
-| `reference_path_topic` | `minco/reference_path` | 仅 `planner_manages_emergency_stop: true` 时由本节点发布 |
-| `candidate_reference_path_topic` | `""` | 交给 Goal Manager 复核的候选 reference |
-| `preprocessed_guide_topic` | `/minco/preprocessed_guide` | 预处理后引导线（诊断） |
-| `esdf_refined_guide_topic` | `/minco/esdf_refined_guide` | ESDF 修正后引导线（诊断） |
-| `debug_marker_topic` | `minco/debug_markers` | RViz MarkerArray；空字符串不发布 |
-| `map_ready_topic` | `""` | 地图 ready 心跳；空字符串视为地图始终 ready |
-| `emergency_stop_topic` | `/planner/emergency_stop` | 仅 `planner_manages_emergency_stop: true` 时发布 |
-| `global_frame` | `map` | 目标 `frame_id` 为空且栅格无 frame 时的缺省全局 frame |
-| `robot_frame` | `base_link` | 起点 TF 查询 frame |
+前述planYaw算法支持局部时间缩放，不表示当前已打开该功能。单轮5 m/s限制由MPC和底盘执行链继续拥有，平移叠加自旋不能越过轮速预算。ROG高度门属于地图侧，不由本规划器重复膨胀。
 
-### 运行期安全与所有权
+## 正式话题与坐标系
 
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `planner_manages_emergency_stop` | `true` | `true` 时本节点直接发布 reference 与急停；正式运行链设为 `false` |
-| `publish_unsafe_trajectory` | `false` | 是否发布未通过足迹门禁的轨迹 |
-| `map_ready_timeout_sec` | `3.0` | ready 心跳超时（下限 0.1） |
-| `emergency_stop_heartbeat_period_sec` | `0.1` | 急停心跳与 ready watchdog 周期（下限 0.02） |
-| `runtime_safety_recheck_hz` | `10.0` | 已提交 reference 的运行期复检频率（下限 0.1） |
-| `runtime_safety_horizon_sec` | `1.0` | 运行期复检的前向时间窗 |
-| `retain_safe_reference_on_snapshot_change` | `false` | 快照变化时保留仍安全的已提交参考 |
-| `retain_reference_horizon_sec` | `0.0` | 保留判定的时间窗；`<= 0` 检查完整剩余段 |
-| `body_yaw_follow_clearance` | `0.55` | 轨迹任一点足迹净空不大于该值时 yaw authority 取 BODY_YAW_FOLLOW |
-| `force_body_yaw_follow` | `false` | 强制 BODY_YAW_FOLLOW |
-| `commit_max_length_ratio` | `0.0` | 名义提交的轨迹长度/起终点弦长上限；`<= 0` 关闭 |
-| `commit_max_lateral_deviation_m` | `0.0` | 名义提交相对起终点弦的最大横偏；`<= 0` 关闭 |
+| 接口 | 当前作用 |
+| --- | --- |
+| `/rog_map_adapter/planning_snapshot` | 数值规划快照，包含occupancy、signed distance、梯度、来源generation、publication sequence与localization epoch |
+| `/ats_goal_manager/planner_goal` | Goal Manager的`PlannerGoal`请求；正式链不直接订阅Nav2的`/plan` |
+| `/minco/planning_status`、`/minco/reference_path_candidate` | 规划状态与候选交给Goal Manager |
+| `/minco/reference_path`、`/planner/execution_command`、`/planner/emergency_stop` | Goal Manager复核、重定时后统一提交；ready恢复不能复活旧reference |
+| `/minco/raw_path`及调试guide | 诊断输出，不作为另一条目标或安全权威 |
 
-### 目标位姿准入
+规划和控制使用`odom`，Goal Manager保存`map`目标并按当前`map->odom`转换。JPS、MINCO clearance、足迹与repair在单次规划中使用同一不可变本地snapshot；不同generation编号不要求相等，端到端绑定仍须专门验证。旧`grid_topic=traversability_grid`或`/rc_esdf/planning_grid`不是正式规划入口。
 
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `goal_pose_admission_enabled` | `true` | 目标足迹不可行时在容差域内另选终点 |
-| `goal_admission_position_tolerance` | `0.08` | 位置容差（m），与 Goal Manager 一致 |
-| `goal_admission_yaw_tolerance` | `0.15` | yaw 容差（rad），与 Goal Manager 一致 |
-| `goal_admission_position_shrink` | `0.75` | 实际使用的位置容差比例 |
-| `goal_admission_yaw_shrink` | `0.60` | 实际使用的 yaw 容差比例 |
-| `goal_admission_extra_margin` | `0.03` | 第一档额外膨胀余量（m） |
-| `goal_admission_position_step` | `0.02` | 位置候选步长（m） |
-| `goal_admission_yaw_samples` | `5` | yaw 候选数（含原始 yaw，下限 1） |
+## 构建与验证
 
-### 图搜索
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `search_algorithm` | `jps` | `jps` 或 `astar` |
-| `astar_fallback` | `true` | JPS 失败时回退 A* |
-| `obstacle_value_threshold` | `50` | 栅格值不小于该值视为占据（搜索、门禁、修复共用） |
-| `unknown_is_obstacle` | `false` | unknown 是否视为占据；实机 profile 设为 `true` |
-| `allow_diagonal` | `true` | 允许对角扩展 |
-| `jps_max_expanded_nodes` | `-1` | 扩展节点上限；`<= 0` 不限制 |
-| `jps_safe_distance` | `0.0` | 首选搜索净空；低于全 yaw 外接半径时自动抬高并告警 |
-| `clearance_relaxation_enabled` | `true` | 首选档无路时退到下限档 |
-| `endpoint_clearance_relaxation_enabled` | `true` | 目标位姿已过准入时放宽目标格净空 |
-| `search_clearance_floor` | `-1.0` | 下限档净空；`< 0` 自动取内切半宽 + 半格对角线 |
-
-### 路径预处理
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `path_duplicate_epsilon` | `1e-6` | 重复点判定距离（m） |
-| `path_collinear_lateral_tolerance` | `0.025` | 共线合并的横向容差（m） |
-| `path_short_segment_length` | `0.05` | 短段长度阈值（m） |
-| `path_corner_angle_threshold_rad` | `0.20` | 拐角判定角度（rad） |
-| `path_footprint_aware_shortcut_enabled` | `true` | 足迹感知 shortcut |
-| `path_fillet_radius` | `0.0` | 内角 fillet 半径（m）；`0` 保留尖角 |
-| `path_fillet_arc_samples` | `1` | 每个 fillet 弧的采样点数 |
-
-### 引导平滑与 ESDF 修正
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `guide_control_point_spacing` | `0.0` | 引导加密间距（m）；`0` 不加密 |
-| `guide_smoothing_iterations` | `0` | 弹性带平滑迭代数；`0` 关闭 |
-| `guide_smoothing_alpha` | `0.5` | 拉直系数 |
-| `guide_smoothing_fidelity` | `0.02` | 拉回原引导的系数 |
-| `guide_smoothing_max_deviation` | `0.50` | 平滑偏离原引导上限（m） |
-| `guide_smoothing_min_clearance` | `0.42` | 平滑后中心净空下限（不低于原净空与该值的较小者） |
-| `esdf_obstacle_optimization_enabled` | `true` | 中心 ESDF 内点修正 |
-| `esdf_obstacle_clearance` | `0.45` | 中心净空目标（trigger/target 为 0 时使用） |
-| `esdf_obstacle_trigger_clearance` | `0.0` | 触发修正的净空 |
-| `esdf_obstacle_target_clearance` | `0.0` | 修正目标净空 |
-| `esdf_obstacle_max_iterations` | `6` | 修正轮数 |
-| `esdf_obstacle_control_point_spacing` | `0.30` | 插入内部控制点的间距（m） |
-| `esdf_obstacle_max_step` | `0.10` | 单轮最大位移（m） |
-| `esdf_obstacle_max_deviation` | `0.50` | 相对引导的最大偏离（m） |
-| `esdf_obstacle_trust_region` | `0.10` | 信赖域（m） |
-| `esdf_obstacle_backtracking_steps` | `4` | 回溯步数 |
-| `esdf_obstacle_smoothing_weight` | `0.25` | 修正量邻点平滑权重 |
-| `esdf_footprint_optimization_enabled` | `true` | 足迹感知候选（带 yaw 参考的第二遍） |
-| `esdf_footprint_clearance` | `0.10` | 足迹采样点净空目标 |
-| `esdf_footprint_trigger_clearance` | `0.0` | 足迹修正触发净空 |
-| `esdf_footprint_target_clearance` | `0.0` | 足迹修正目标净空 |
-| `esdf_footprint_sample_spacing` | `0.10` | 足迹边采样间距（m） |
-
-### MINCO 联合优化与时间缩放
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `reference_speed` | `1.5` | 巡航速度（m/s），用于时间初值；联合优化软速度上限不高于它 |
-| `min_segment_time` | `0.05` | 最小段时长（s） |
-| `sample_spacing` | `0.12` | 输出轨迹采样间距（m，按 `reference_speed` 折算为时间步） |
-| `max_velocity` | `2.0` | 时间缩放速度上限（m/s） |
-| `max_acceleration` | `2.5` | 时间缩放加速度上限（m/s^2） |
-| `max_jerk` | `0.0` | jerk 上限；`<= 0` 不限制 |
-| `max_lateral_acceleration` | `1.5` | 横向加速度上限（m/s^2） |
-| `max_time_scaling_iterations` | `5` | 分段时间缩放轮数 |
-| `time_scaling_factor` | `1.25` | 每轮最小缩放倍数 |
-| `joint_waypoint_spacing` | `1.0` | 联合优化内点间距（m） |
-| `joint_samples_per_piece` | `16` | 每段罚项采样数 |
-| `joint_max_piece_time` | `3.0` | 段时长上限（s） |
-| `joint_energy_weight` | `1.0` | jerk 能量权重 |
-| `joint_time_weight` | `20.0` | 总时间权重 |
-| `joint_obstacle_weight` | `1e6` | 中心/足迹 ESDF 罚权重 |
-| `joint_velocity_weight` | `1e3` | 速度罚权重 |
-| `joint_acceleration_weight` | `1e3` | 加速度罚权重 |
-| `joint_lateral_weight` | `1e3` | 横向加速度罚权重 |
-| `joint_guide_weight` | `1e6` | 无 ESDF 时引导管道罚权重；`<= 0` 关闭 |
-| `joint_guide_max_deviation` | `0.10` | 引导管道半宽（m） |
-| `joint_center_clearance` | `0.42` | 中心 ESDF 净空目标（m），部署时与 `jps_safe_distance` 对齐 |
-| `joint_footprint_clearance` | `0.03` | 足迹采样点净空目标（m），有 yaw 参考时生效 |
-| `joint_footprint_edge_samples` | `1` | 每条足迹边的采样数（1 为边中点） |
-| `joint_g_epsilon` | `1e-5` | L-BFGS 梯度收敛阈值 |
-| `joint_max_iterations` | `200` | L-BFGS 迭代上限 |
-| `joint_time_budget_ms` | `15.0` | 联合优化墙钟预算（ms） |
-
-### yaw 与局部时间缩放
-
-c41d922 新增的 `yaw_tangent_symmetry_order`、`yaw_narrow_gap_bridge_time`、`yaw_acceleration_limit`、
-`wheel_speed_time_scaling_*`、`narrow_turn_*` 默认均保持原行为（关闭）。目前只有 MuJoCo profile
-启用：symmetry order `4`、gap bridge `1.0 s`、yaw 角加速度 `3.0 rad/s^2`、轮速上限 `1.45 m/s`
-（偏置 `0.27 / 0.27 m`、变化率 `2.0 /s`）、窄通道转向限速 `0.8 m/s`（阈值 `0.2 rad/s`）。
-实机 profile 未设置这些参数。
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `yaw_mode` | `goal_heading` | `clearance_aware` / `goal_heading` / `path_tangent` / `hold` |
-| `yaw_rate_limit` | `2.5` | yaw 角速度上限（rad/s），终端原地转向共用 |
-| `yaw_acceleration_limit` | `0.0` | yaw 角加速度上限（rad/s^2）；`<= 0` 关闭 |
-| `narrow_clearance_enter` | `0.55` | 进入窄段的位置净空（m），窄通道转向判据共用 |
-| `narrow_clearance_exit` | `0.70` | 退出窄段的位置净空（m） |
-| `yaw_tangent_symmetry_order` | `2` | 窄段切线对称阶数；`4` 仅正方形足迹有效 |
-| `yaw_narrow_gap_bridge_time` | `0.0` | 窄段间开阔间隙桥接时长（s）；`0` 关闭 |
-| `wheel_speed_time_scaling_limit` | `0.0` | 单轮线速度上限（m/s）；`<= 0` 关闭 |
-| `wheel_speed_time_scaling_offset_x` | `0.0` | 轮心 x 半轴偏置（m），与 MPC `wheel_base_x` 同义 |
-| `wheel_speed_time_scaling_offset_y` | `0.0` | 轮心 y 半轴偏置（m），与 MPC `wheel_base_y` 同义 |
-| `wheel_speed_time_scaling_change_rate` | `1.0` | 缩放系数变化率上限（1/s），两种局部缩放共用 |
-| `narrow_turn_speed_limit` | `0.0` | 窄通道边平移边转向时的平移限速（m/s）；`<= 0` 关闭 |
-| `narrow_turn_yaw_rate_threshold` | `0.2` | 窄通道转向判据的 `|yaw_rate|` 阈值（rad/s） |
-| `terminal_yaw_sample_period` | `0.10` | 终端原地转向采样周期（s） |
-| `terminal_yaw_relocation_enabled` | `true` | 终端 yaw 重定位 |
-| `terminal_yaw_relocation_max_candidates` | `6` | 重定位候选位置数（下限 1） |
-| `terminal_yaw_relocation_window_length` | `1.0` | 允许重定位的末端弧长窗口（m） |
-| `footprint_yaw_refinement_rounds` | `2` | 足迹 yaw 不动点补解轮数；`0` 关闭 |
-
-### 足迹、修复与脱困
-
-| 参数 | 默认值 | 含义 |
-| :--- | :--- | :--- |
-| `footprint_length` | `0.58` | 车体长（m） |
-| `footprint_width` | `0.58` | 车体宽（m） |
-| `footprint_safety_margin` | `0.05` | 每边安全余量（m） |
-| `swept_max_corner_step_cells` | `0.5` | 扫掠检查中最远角点单步位移上限（栅格数） |
-| `local_repair_enabled` | `true` | 局部碰撞修复；实机 profile 设为 `false` |
-| `local_repair_max_iterations` | `2` | 修复轮数 |
-| `local_repair_search_radius` | `0.35` | 引导点位移搜索半径（m）；低于内切半宽时告警且修复无候选 |
-| `escape_from_contact_enabled` | `false` | 脱困前缀（实验，默认 fail-closed） |
-| `escape_from_contact_max_head_offset` | `0.10` | 冲突允许出现的最靠前弧长（m） |
-| `escape_from_contact_max_prefix_length` | `0.40` | 前缀平移上限（m） |
-| `escape_from_contact_max_prefix_yaw_sweep` | `pi/2` | 前缀累计转角上限（rad） |
-| `escape_from_contact_max_prefix_points` | `64` | 前缀点数上限 |
-| `escape_from_contact_max_contact_depth` | `0.0` | 接触深度上限（m）；`0` 不做内缩足迹检查 |
-
-## 构建与测试
-
-在工作区根目录构建，必须限制 `--base-paths src`：
+在当前工作区根目录执行，保留Release和活动源码范围：
 
 ```bash
-cd /home/ats/ATS_2026_snetry_test
 source /opt/ros/humble/setup.bash
-colcon build --base-paths src --packages-select minco_planner
-source install/setup.bash
+MAKEFLAGS=-j1 colcon build --base-paths src --packages-select minco_planner \
+  --parallel-workers 1 --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon test --base-paths src --packages-select minco_planner
+colcon test-result --test-result-base build/minco_planner --verbose
 ```
 
-GTest 通过 `ctest` 在构建目录运行：
+既有copyright、格式等lint失败应按实际结果单列；定向GTest通过不写成全包全绿。独立`minco_planner.launch.py`的默认参数路径仍指向不存在的`config/minco_planner.yaml`，必须显式传入完整参数（例如包内`config/minco_planner_reality.yaml`）。正式bringup会传根参数文件，不依赖该缺省路径。
 
-```bash
-cd /home/ats/ATS_2026_snetry_test/build/minco_planner
-ctest -R '^test_' --output-on-failure
-```
+最终导航按[2027方案](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md)执行真实B往返、南坡、六隧道和默认起点到对称点速度，另跑独立故障矩阵。11月16日空场5 m/s执行器诊断不含规划；d103/d107 LIO导航启动失败，当前完整套件尚未通过，物理接触和实车未验证。本次只同步文档，未新增运行结果。
 
-`ctest -N` 列出 21 个 `test_*` GTest 和 ament lint 测试。其中 copyright、cpplint、clang_format
-为已知历史失败，完整 `ctest` 不是全绿；功能验证以 `test_*` 结果为准。
-
-独立启动：
-
-```bash
-ros2 launch minco_planner minco_planner.launch.py params_file:=<参数 YAML>
-```
-
-launch 的默认 `params_file` 指向 `config/minco_planner.yaml`，该文件已不在源码中，独立启动时
-需显式传入（例如 `config/minco_planner_reality.yaml`）。正式入口由根仓 bringup 传入
-`node_params.yaml`。
-
-MINCO 的许可证与归属见 `THIRD_PARTY_NOTICES.md`。
+MINCO许可证与归属见[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

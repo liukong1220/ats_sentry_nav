@@ -5,7 +5,9 @@
 
 A simple example: Implementing point cloud alignment and localization using [small_gicp](https://github.com/koide3/small_gicp.git)
 
-Given a registered pointcloud (based on the odom frame) and prior pointcloud (mapped using [pointlio](https://github.com/LihanChen2004/Point-LIO) or similar tools), the node will calculate the transformation between the two point clouds and publish the correction from the `map` frame to the `odom` frame.
+In the ATS integration, registration consumes an odom-frame registered cloud and a map-frame prior, then publishes relocalization observations. `localization_fusion` is the sole publisher of `map -> odom` and `/localization/status`; GICP does not publish a competing pose TF. Mapping mode instead matches against a growing map without loading a prior.
+
+The sensor is fixed to the chassis; Point-LIO owns deskewing and odometry. Current MuJoCo MID360 input is 10 Hz in simulation time with a 200 Hz IMU. See the [current report](../../../docs/调研/无先验地图钻洞高速导航优化调研报告.md) and [2027 acceptance plan](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md) for profile values, startup failures and unpassed navigation gates. Upstream build examples below are standalone examples, not the workspace deployment procedure.
 
 ## Dependencies
 
@@ -34,7 +36,7 @@ cd ..
 2. Build
 
     ```zsh
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build --base-paths src --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
     ```
 
 ## Usage
