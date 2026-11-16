@@ -136,19 +136,68 @@ bool FootprintSafetyChecker::sampleFootprintOccupied(
   double & collision_x,
   double & collision_y) const
 {
-  const std::vector<Eigen::Vector2d> samples = makeRectangularFootprintSamples(
-    params_.length, params_.width, params_.safety_margin, grid.info.resolution);
-  const double cos_yaw = std::cos(point.yaw);
-  const double sin_yaw = std::sin(point.yaw);
-
-  for (const auto & sample : samples) {
-    const double wx = point.x + cos_yaw * sample.x() - sin_yaw * sample.y();
-    const double wy = point.y + sin_yaw * sample.x() + cos_yaw * sample.y();
-    GridIndex index;
-    if (!worldToGrid(grid, wx, wy, index) || isOccupied(grid, index)) {
-      collision_x = wx;
-      collision_y = wy;
-      return true;
+  // Match the execution authority: a lattice of points can miss a cell
+  // intersected only by a rotated corner (d115 terminal unknown-cell failure).
+  // Enumerate the grid bounding box and test the separating axes of the
+  // rectangle and each cell. Keep the physical dimensions and margin intact.
+  GridIndex center;
+  if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+    !std::isfinite(point.yaw) || !worldToGrid(grid, point.x, point.y, center))
+  {
+    collision_x = point.x;
+    collision_y = point.y;
+    return true;
+  }
+  const double resolution = grid.info.resolution;
+  const auto & origin = grid.info.origin;
+  const double origin_yaw = std::atan2(
+    2.0 * (origin.orientation.w * origin.orientation.z +
+      origin.orientation.x * origin.orientation.y),
+    1.0 - 2.0 * (origin.orientation.y * origin.orientation.y +
+      origin.orientation.z * origin.orientation.z));
+  const double co = std::cos(origin_yaw);
+  const double so = std::sin(origin_yaw);
+  const double dx = point.x - origin.position.x;
+  const double dy = point.y - origin.position.y;
+  const double cx = (co * dx + so * dy) / resolution;
+  const double cy = (-so * dx + co * dy) / resolution;
+  const double hx = (0.5 * std::max(0.0, params_.length) +
+    std::max(0.0, params_.safety_margin)) / resolution;
+  const double hy = (0.5 * std::max(0.0, params_.width) +
+    std::max(0.0, params_.safety_margin)) / resolution;
+  const double c = std::cos(point.yaw - origin_yaw);
+  const double s = std::sin(point.yaw - origin_yaw);
+  const double ac = std::abs(c);
+  const double as = std::abs(s);
+  const double extent_x = ac * hx + as * hy;
+  const double extent_y = as * hx + ac * hy;
+  if (cx - extent_x < 0.0 || cy - extent_y < 0.0 ||
+    cx + extent_x >= grid.info.width || cy + extent_y >= grid.info.height)
+  {
+    collision_x = point.x;
+    collision_y = point.y;
+    return true;
+  }
+  for (int iy = static_cast<int>(std::floor(cy - extent_y));
+    iy <= static_cast<int>(std::floor(cy + extent_y)); ++iy)
+  {
+    for (int ix = static_cast<int>(std::floor(cx - extent_x));
+      ix <= static_cast<int>(std::floor(cx + extent_x)); ++ix)
+    {
+      const double cell_dx = ix + 0.5 - cx;
+      const double cell_dy = iy + 0.5 - cy;
+      if (std::abs(c * cell_dx + s * cell_dy) > hx + 0.5 * (ac + as) ||
+        std::abs(-s * cell_dx + c * cell_dy) > hy + 0.5 * (ac + as))
+      {
+        continue;
+      }
+      if (isOccupied(grid, GridIndex{ix, iy})) {
+        const double local_x = (ix + 0.5) * resolution;
+        const double local_y = (iy + 0.5) * resolution;
+        collision_x = origin.position.x + co * local_x - so * local_y;
+        collision_y = origin.position.y + so * local_x + co * local_y;
+        return true;
+      }
     }
   }
   return false;

@@ -214,3 +214,40 @@ TEST(FootprintSweptSafety, RechecksRepairOutputWithSweptGeometry)
 }
 
 }  // namespace
+
+// d115: lattice samples missed the unknown cell touched by the terminal corner.
+TEST(FootprintSweptSafety, RejectsIntersectingCellBetweenFootprintSamples)
+{
+  auto grid = makeGrid(0.05, 240, 240, -6.1, -6.0);
+  FootprintSafetyParams params;
+  params.length = 0.581;
+  params.width = 0.571;
+  params.safety_margin = 0.02;
+  params.obstacle_value_threshold = 100;
+  params.unknown_is_obstacle = true;
+  FootprintSafetyChecker checker(params);
+  const auto trajectory = makeTrajectory(
+    2.60882683432365, -2.795761204674886, -0.8794413194149524,
+    2.60882683432365, -2.795761204674886, -0.8794413194149524);
+  EXPECT_TRUE(checker.check(trajectory, grid).safe);
+  setCell(grid, 174, 55, -1);
+  EXPECT_FALSE(checker.check(trajectory, grid).safe);
+  setCell(grid, 174, 55, 100);
+  EXPECT_FALSE(checker.check(trajectory, grid).safe);
+  setCell(grid, 174, 55, 99);
+  EXPECT_TRUE(checker.check(trajectory, grid).safe);
+}
+
+TEST(FootprintSweptSafety, DoesNotTreatRotatedBoundingBoxAsFootprint)
+{
+  auto grid = makeGrid(0.05, 80, 80);
+  FootprintSafetyParams params;
+  params.length = 0.60;
+  params.width = 0.20;
+  params.safety_margin = 0.02;
+  FootprintSafetyChecker checker(params);
+  setCell(grid, 34, 44, 100);
+  const auto trajectory = makeTrajectory(
+    2.0, 2.0, 0.7853981633974483, 2.0, 2.0, 0.7853981633974483);
+  EXPECT_TRUE(checker.check(trajectory, grid).safe);
+}
