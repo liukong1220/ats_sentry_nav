@@ -71,9 +71,8 @@ ats_swerve_mpc:
     # 预测域起点补偿的命令传输延迟（s）。
     command_latency_compensation: 0.01
 
-    # MPC/iLQR 预测步数；实际预测时长约为 horizon * dt = 30 * 0.05 = 1.5 s，
-    # 需覆盖 max_vx=1.5 m/s 下的一次完整制动距离（v^2/(2a)≈0.56 m，约 0.75 s）。
-    horizon: 30
+    # MPC/iLQR 预测时长60*0.05=3 s，覆盖5 m/s在2 m/s²下的2.5 s制动时间。
+    horizon: 60
     # MPC 离散模型步长（s），必须等于控制周期 1/control_rate_hz=1/20=0.05。
     # 此前为 0.1 s（模型时间轴是执行时间轴的 2 倍），一次迭代预测的"一步"实际
     # 只执行了半步，加速度/舵角速率约束被放大 2 倍，实车表现为超调与舵轮抖振。
@@ -99,9 +98,9 @@ ats_swerve_mpc:
     control_delta_weight: [0.70, 0.70, 0.60]
 
     # 车体系前后最大速度（m/s）；实车需按轮速能力重新标定。
-    max_vx: 1.5
+    max_vx: 5.0
     # 车体系横移最大速度（m/s）；这是舵轮全向能力，不应设为零。
-    max_vy: 1.5
+    max_vy: 5.0
     # 最大 yaw 角速度（rad/s）。
     max_wz: 3.0
     # 车体系前后最大加速度（m/s^2）。
@@ -119,11 +118,11 @@ ats_swerve_mpc:
     # 减速比统一定义为电机转速/轮端转速。
     drive_gear_ratio: 1.0
     steer_gear_ratio: 1.0
-    motor_max_rpm: 450.0
+    motor_max_rpm: 1348.1359885
     steer_max_rpm: 120.0
     actuator_redundancy: 1.2
-    # 若显式设置则覆盖物理参数推导值；当前等于 450 rpm / 1.2 的保守轮缘速度。
-    max_wheel_speed: 1.6689711
+    # 显式5 m/s暂定轮速；等效电机转速按1.2冗余反推，待实测标定。
+    max_wheel_speed: 5.0
     # 逐轮速度向量变化上限（m/s^2）；P4 仿真初值，仍需电机电流与实车阶跃标定。
     max_wheel_acceleration: 2.0
     # 逐轮运动中目标舵角变化上限（rad/s）；当前等于 120 rpm / 1.2。

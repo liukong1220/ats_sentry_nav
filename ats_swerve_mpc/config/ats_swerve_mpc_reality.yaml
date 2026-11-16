@@ -61,8 +61,8 @@ ats_swerve_mpc:
     min_reference_progress_scale: 0.10
     command_latency_compensation: 0.01
 
-    # horizon * dt = 30 * 0.05 = 1.5 s，覆盖 max_vx=1.5 m/s 的一次完整制动。
-    horizon: 30
+    # 60*0.05=3 s，覆盖5 m/s在2 m/s²下2.5 s制动时间。
+    horizon: 60
     # 必须等于控制周期 1/control_rate_hz = 0.05 s。
     dt: 0.05
     max_iterations: 6
@@ -77,12 +77,12 @@ ats_swerve_mpc:
     control_delta_weight: [0.7, 0.7, 0.25]
 
     # 可行域：出口级（底盘/变换级）不得比这里更宽松。
-    max_vx: 1.5
-    max_vy: 1.5
+    max_vx: 5.0
+    max_vy: 5.0
     max_wz: 3.0
     max_ax: 2.0
     max_ay: 2.0
-    max_awz: 3.0
+    max_awz: 2.0
     # 底盘中心到前/后轮心的 x 半轴偏置（m），不是完整轮心距。
     wheel_base_x: 0.270
     # 底盘中心到左/右轮心的 y 半轴偏置（m），不是完整轮心距。
@@ -91,10 +91,10 @@ ats_swerve_mpc:
     wheel_radius: 0.0425
     drive_gear_ratio: 1.0
     steer_gear_ratio: 1.0
-    motor_max_rpm: 450.0
+    motor_max_rpm: 1348.1359885
     steer_max_rpm: 120.0
     actuator_redundancy: 1.2
-    max_wheel_speed: 1.6689711
+    max_wheel_speed: 5.0
     # 台架单自由度标定（P6 四.3，下一轮）前仍为仿真初值。
     max_wheel_acceleration: 2.0
     max_steer_rate: 10.4719755

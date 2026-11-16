@@ -615,6 +615,10 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("sample_spacing", optimizer_params.sample_spacing);
   get_parameter("max_velocity", optimizer_params.max_velocity);
   get_parameter("max_acceleration", optimizer_params.max_acceleration);
+  // 起点保护跟随本profile的动力学上限，避免配置5 m/s后仍把换轨首速截成旧2 m/s。
+  if (optimizer_params.max_velocity > 0.0) {
+    optimizer_params.initial_state_max_speed = optimizer_params.max_velocity;
+  }
   get_parameter("max_jerk", optimizer_params.max_jerk);
   get_parameter("max_lateral_acceleration", optimizer_params.max_lateral_acceleration);
   get_parameter("max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);

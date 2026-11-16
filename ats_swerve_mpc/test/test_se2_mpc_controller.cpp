@@ -92,6 +92,29 @@ TEST(Se2MpcController, CommandsTrueLateralMotionWithoutYawCoupling) {
   EXPECT_NEAR(result.states.back()(2), 0.0, 0.05);
 }
 
+TEST(Se2MpcController, FiveMpsProfileDoesNotKeepLegacyPlanarOrWheelCaps) {
+  ats_swerve_mpc::Se2MpcConfig config;
+  config.horizon = 60;
+  config.dt = 0.05;
+  config.max_vx = config.max_vy = config.max_wheel_speed = 5.0;
+  config.max_ax = config.max_ay = config.max_wheel_acceleration = 2.0;
+  for (int axis = 0; axis < 2; ++axis) {
+    ats_swerve_mpc::Control desired = ats_swerve_mpc::Control::Zero();
+    desired(axis) = 5.0;
+    auto previous = desired;
+    previous(axis) = 4.9;
+    ats_swerve_mpc::Se2MpcController controller(config);
+    const auto result = controller.solve(
+      ats_swerve_mpc::State::Zero(), straightReferences(config.horizon, config.dt, desired),
+      previous);
+    ASSERT_TRUE(result.success);
+    ASSERT_FALSE(result.controls.empty());
+    EXPECT_GT(result.controls.front()(axis), 4.9);
+    EXPECT_LE(maxWheelSpeed(result.controls.front(), config.wheel_base_x, config.wheel_base_y),
+      5.0 + 1e-8);
+  }
+}
+
 TEST(Se2MpcController, RespectsVelocityAndAccelerationBounds) {
   ats_swerve_mpc::Se2MpcConfig config;
   config.horizon = 10;

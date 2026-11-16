@@ -236,6 +236,29 @@ TEST(MincoTrajectoryOptimizer, MovingStraightReplanPreservesBoundaryAndClosesJer
   EXPECT_LE(trace.peak_jerk, params.max_jerk + 1e-6);
 }
 
+TEST(MincoTrajectoryOptimizer, FiveMpsProfilePreservesMovingReplanAboveLegacyTwoMps)
+{
+  minco_planner::MincoTrajectoryOptimizerParams params;
+  params.reference_speed = 5.0;
+  params.max_velocity = 5.0;
+  params.initial_state_max_speed = params.max_velocity;
+  params.esdf_obstacle_optimization_enabled = false;
+  auto path = makeObstacleSkimmingPath();
+  path.poses.back().pose.position.x = 30.0;
+  minco_planner::InitialKinematicState initial;
+  initial.valid = true;
+  initial.velocity = Eigen::Vector2d(4.0, 0.0);
+  minco_planner::MincoTrajectoryOptimizer optimizer(params);
+  minco_planner::MincoOptimizationTrace trace;
+  const auto trajectory = optimizer.optimize(
+    path, nullptr, nullptr, &initial, nullptr, nullptr, &trace);
+  ASSERT_TRUE(trajectory.valid()) << trace.failure_reason;
+  EXPECT_NEAR(trajectory.points.front().vx, 4.0, 1e-8);
+  EXPECT_GT(trace.peak_velocity, 2.0);
+  EXPECT_LE(trace.peak_velocity, 5.0 + 1e-6);
+  EXPECT_NEAR(trajectory.points.back().v, 0.0, 1e-8);
+}
+
 TEST(MincoTrajectoryOptimizer, UsesEsdfGradientToIncreaseObstacleClearance)
 {
   minco_planner::MincoTrajectoryOptimizerParams params;
