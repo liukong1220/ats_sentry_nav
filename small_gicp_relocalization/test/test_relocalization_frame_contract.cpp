@@ -328,6 +328,12 @@ protected:
   void setSimRelax(bool enabled) { node_->relax_convergence_for_sim_ = enabled; }
   void clearInitialPoseOverride() { node_->initial_pose_override_time_.reset(); }
   void setAcceptedAlignment(bool accepted) { node_->has_accepted_alignment_ = accepted; }
+  void setRefreshState(double silence_s, std::int64_t accepted_stamp_ns)
+  {
+    node_->has_accepted_alignment_ = true;
+    node_->observation_silence_sec_ = silence_s;
+    node_->last_accepted_observation_scan_time_ = rclcpp::Time(accepted_stamp_ns, RCL_ROS_TIME);
+  }
   bool inForceWindow() const { return node_->inInitialPoseForceWindow(); }
   bool simRelax() const { return node_->simRelaxAllowed(); }
 
@@ -745,6 +751,73 @@ TEST_F(SmallGicpRelocalizationFrameTest, PreAcceptPendingSurvivesBootstrapAndSta
   receiveStatus(1300000000LL, Status::STATE_DEGRADED);
   EXPECT_EQ(pendingCount(), 1);
   EXPECT_FALSE(accepted());
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, AcceptedRefreshPendingSurvivesSameEpochDegraded)
+{
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_TRACKING);
+  attempt(1000000000LL);
+  attempt(1200000000LL);
+  ASSERT_TRUE(accepted());
+  attempt(2000000000LL);
+  ASSERT_EQ(pendingCount(), 1);
+  const auto start = episodeStart();
+  const auto before = generation();
+
+  // d12: the accepted-evidence lease becomes DEGRADED while a new pair is
+  // already being checked. Soft ageing must not discard that pair or its
+  // steady deadline. The next independent scan must still pass confirmation.
+  receiveStatus(2100000000LL, Status::STATE_DEGRADED);
+  EXPECT_EQ(pendingCount(), 1);
+  EXPECT_EQ(episodeStart(), start);
+  EXPECT_EQ(generation(), before);
+  observePublications();
+  attempt(2200000000LL);
+  expectPublication(2200000000LL, Observation::STATUS_ACCEPTED);
+  EXPECT_EQ(pendingCount(), 0);
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, SlowClockRefreshUsesSteadyLeaseAndFreshScanWindow)
+{
+  createWindowNode(1);
+  receiveDenseScan(3000000000LL);
+  receiveDenseScan(3300000000LL);
+  setRefreshState(0.5, 3200000000LL);
+  EXPECT_FALSE(shouldRegister());  // Only 0.1 s of scan time since acceptance.
+  setRefreshState(1.1, 3200000000LL);
+  EXPECT_TRUE(shouldRegister());   // Same steady lease as fusion, new scan.
+  setRefreshState(1.1, 3300000000LL);
+  EXPECT_FALSE(shouldRegister());  // Never revalidate with the accepted scan.
+  clearWindow();
+  receiveDenseScan(3400000000LL);
+  setRefreshState(1.1, 3300000000LL);
+  EXPECT_FALSE(shouldRegister());  // Minimum accumulation span still applies.
+}
+
+TEST_F(SmallGicpRelocalizationFrameTest, AcceptedRefreshPendingStillExpiresOrFences)
+{
+  createConfirmationNode(2);
+  receiveStatus(1000000000LL, Status::STATE_TRACKING);
+  attempt(1000000000LL);
+  attempt(1200000000LL);
+  ASSERT_TRUE(accepted());
+  attempt(2000000000LL);
+  receiveStatus(2100000000LL, Status::STATE_DEGRADED);
+  ageEpisode();
+  observePublications();
+  attempt(2200000000LL);
+  expectPublication(2200000000LL, Observation::STATUS_REJECTED);
+  EXPECT_EQ(pendingCount(), 0);
+
+  attempt(2400000000LL);
+  ASSERT_EQ(pendingCount(), 1);
+  receiveStatus(2500000000LL, Status::STATE_LOST);
+  EXPECT_EQ(pendingCount(), 0);
+  attempt(2600000000LL);
+  ASSERT_EQ(pendingCount(), 1);
+  receiveStatus(2700000000LL, Status::STATE_DEGRADED, 2);
+  EXPECT_EQ(pendingCount(), 0);
 }
 
 TEST_F(SmallGicpRelocalizationFrameTest, SimRelaxCoversPreAcceptOutsideForceWindow)

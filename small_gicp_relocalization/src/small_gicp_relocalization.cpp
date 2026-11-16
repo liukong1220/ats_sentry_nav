@@ -2123,19 +2123,18 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
   last_status_receive_time_ = received_at;
 
   // RELOCALIZING continues pending evidence; CONFIRMED ends that episode once.
-  // BOOTSTRAP/DEGRADED without a prior accept are the normal cold-start fusion
-  // states while confirmation is still open — invalidating on those flaps
-  // aborted every pending episode in Gazebo193 (gated=1 x66, never accept).
+  // Soft DEGRADED also occurs while refreshing an accepted alignment on slow
+  // simulation clocks (d12). Keep the same-epoch pair and its original steady
+  // deadline; LOST, epoch and frontend boundaries still fence that evidence.
   const bool state_changed = previous != localization_state_;
   const bool pre_accept_pending = pending_confirmation_ && !has_accepted_alignment_;
   const bool recovery_boundary = state_changed &&
     ((localization_state_ == LS::STATE_LOST && !pre_accept_pending) ||
      localization_state_ == LS::STATE_UNINITIALIZED ||
      localization_state_ == LS::STATE_CONFIRMED ||
-     (localization_state_ == LS::STATE_DEGRADED && has_accepted_alignment_) ||
+     (localization_state_ == LS::STATE_DEGRADED && !pending_confirmation_) ||
      (previous == LS::STATE_RELOCALIZING && localization_state_ == LS::STATE_TRACKING) ||
-     (!pre_accept_pending &&
-      (localization_state_ == LS::STATE_BOOTSTRAP || localization_state_ == LS::STATE_DEGRADED)));
+     (!pre_accept_pending && localization_state_ == LS::STATE_BOOTSTRAP));
 
   if (localization_state_ == LS::STATE_RELOCALIZING) {
     recovery_from_lost_ = previous == LS::STATE_LOST ||
@@ -2209,11 +2208,22 @@ bool SmallGicpRelocalizationNode::shouldRunRegistration()
   // A stationary chassis still receives new LiDAR measurements. Re-run the
   // complete registration and quality gates before fusion's accepted-observation
   // lease expires; never refresh status from an old scan alone.
-  const std::optional<double> last_accepted_scan_time_s =
-    last_accepted_observation_scan_time_
-      ? std::optional<double>(last_accepted_observation_scan_time_->seconds())
-      : std::nullopt;
+  std::optional<double> last_accepted_scan_time_s;
+  if (last_accepted_observation_scan_time_) {
+    last_accepted_scan_time_s.emplace(last_accepted_observation_scan_time_->seconds());
+  }
+  // Fusion expires accepted evidence on steady time. A 1 s scan-time refresh
+  // can wait ~15 wall seconds on this host before even opening its two-scan
+  // confirmation. Start revalidation when that same steady lease needs it,
+  // while retaining every scan-span, new-stamp and registration quality gate.
+  const bool steady_refresh_due = last_accepted_observation_scan_time_ &&
+    last_scan_time_ > *last_accepted_observation_scan_time_ &&
+    std::isfinite(accepted_observation_refresh_interval_s_) &&
+    accepted_observation_refresh_interval_s_ > 0.0 &&
+    std::isfinite(observation_silence_sec_) &&
+    observation_silence_sec_ >= accepted_observation_refresh_interval_s_;
   if (
+    steady_refresh_due ||
     acceptedObservationRefreshDue(
       last_accepted_scan_time_s, last_scan_time_.seconds(),
       accepted_observation_refresh_interval_s_)) {
