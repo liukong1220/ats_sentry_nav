@@ -1328,10 +1328,10 @@ ReferenceTrajectory MincoPlannerNode::alignedToCurrentTf(
   } catch (const tf2::TransformException & exception) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【TF失败】参考复检无法获取当前 %s -> %s：%s；按提交时坐标检查。",
+      "【TF失败】参考复检无法获取当前 %s -> %s：%s；撤销参考。",
       reference.control_from_grid->header.frame_id.c_str(),
       reference.trajectory.header.frame_id.c_str(), exception.what());
-    return reference.trajectory;
+    return ReferenceTrajectory();
   }
   tf2::Transform committed;
   tf2::Transform current;
@@ -1339,18 +1339,34 @@ ReferenceTrajectory MincoPlannerNode::alignedToCurrentTf(
   tf2::fromMsg(grid_from_control.transform, current);
   // 栅格坐标下的漂移：map->odom 未变时为恒等。
   const tf2::Transform drift = current * committed;
-  if (drift.getOrigin().length() < 1e-6 && std::abs(tf2::getYaw(drift.getRotation())) < 1e-6) {
+  if (drift.getOrigin().length() < 1e-6 &&
+    drift.getRotation().getAngleShortestPath() < 1e-6) {
     return reference.trajectory;
   }
   ReferenceTrajectory aligned = reference.trajectory;
   const double drift_yaw = tf2::getYaw(drift.getRotation());
   const double c = std::cos(drift_yaw);
   const double s = std::sin(drift_yaw);
-  for (auto & point : aligned.points) {
-    const tf2::Vector3 moved = drift * tf2::Vector3(point.x, point.y, 0.0);
+  if (reference.control_reference &&
+    reference.control_reference->poses.size() != aligned.points.size())
+  {
+    return ReferenceTrajectory();
+  }
+  for (std::size_t i = 0; i < aligned.points.size(); ++i) {
+    auto & point = aligned.points[i];
+    tf2::Vector3 moved;
+    if (reference.control_reference) {
+      geometry_msgs::msg::PoseStamped pose;
+      tf2::doTransform(reference.control_reference->poses[i], pose, grid_from_control);
+      moved = tf2::Vector3(pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
+      point.yaw = tf2::getYaw(pose.pose.orientation);
+    } else {
+      // Legacy in-process fixtures have no committed cross-frame path.
+      moved = drift * tf2::Vector3(point.x, point.y, 0.0);
+      point.yaw = std::atan2(std::sin(point.yaw + drift_yaw), std::cos(point.yaw + drift_yaw));
+    }
     point.x = moved.x();
     point.y = moved.y();
-    point.yaw = std::atan2(std::sin(point.yaw + drift_yaw), std::cos(point.yaw + drift_yaw));
     const double vx = point.vx;
     point.vx = c * vx - s * point.vy;
     point.vy = s * vx + c * point.vy;
@@ -1429,6 +1445,28 @@ void MincoPlannerNode::onRuntimeSafetyRecheck()
   const rclcpp::Time reference_stamp(active_reference->trajectory.header.stamp);
   const double elapsed = std::max(0.0, (now() - reference_stamp).seconds());
   const ReferenceTrajectory aligned = alignedToCurrentTf(*active_reference);
+  if (aligned.points.size() < 2) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (!active_safety_reference_ ||
+      active_safety_reference_->goal_id != active_reference->goal_id ||
+      active_safety_reference_->localization_epoch != active_reference->localization_epoch ||
+      active_safety_reference_->plan_request_sequence != active_reference->plan_request_sequence ||
+      active_safety_reference_->map_generation != active_reference->map_generation ||
+      active_safety_reference_->trajectory.header.stamp != active_reference->trajectory.header.stamp)
+    {
+      return;
+    }
+    active_safety_reference_.reset();
+    safety_state_.plan_safe = false;
+    publishEmergencyStop(true);
+    publishPlannerStatusLocked(
+      active_reference->goal_id, active_reference->localization_epoch,
+      active_reference->plan_request_sequence, snapshot->generation,
+      active_reference->map_publication_sequence,
+      ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
+      ats_navigation_interfaces::msg::PlannerStatus::FAILURE_REFERENCE_TF);
+    return;
+  }
   const double progress = referenceProgress(aligned, snapshot->grid, elapsed);
   const double horizon_end = progress + runtime_safety_horizon_sec_;
   const ReferenceTrajectory remaining = remainingReferenceWindow(
@@ -2585,20 +2623,42 @@ bool MincoPlannerNode::transformPathToGlobal(
   try {
     const auto transform = tf_buffer_->lookupTransform(
       global_frame_, source_frame, tf2::TimePointZero, tf2::durationFromSec(0.1));
-    if (used_transform) {
-      *used_transform = transform;
+    const auto body = tf_buffer_->lookupTransform(
+      global_frame_, robot_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+    const double control_height = body.transform.translation.z;
+    tf2::Transform control_from_grid;
+    tf2::fromMsg(transform.transform, control_from_grid);
+    const auto & rotation = control_from_grid.getBasis();
+    if (!std::isfinite(control_height) || !std::isfinite(rotation[2][2]) ||
+      std::abs(rotation[2][2]) < 1e-6)
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), log_throttle_ms_,
+        "【参考转换拒绝】控制平面高度无效或与规划平面投影奇异，保持急停。");
+      return false;
     }
-    output.header = input.header;
-    output.header.frame_id = global_frame_;
-    output.poses.clear();
-    output.poses.reserve(input.poses.size());
+    nav_msgs::msg::Path candidate;
+    candidate.header = input.header;
+    candidate.header.frame_id = global_frame_;
+    candidate.poses.reserve(input.poses.size());
     for (const auto & pose : input.poses) {
+      if (!finitePose(pose.pose)) {return false;}
+      auto lifted = pose;
+      // Preserve validated planning XY while landing on the body's current
+      // control Z plane. Directly transforming grid Z=0 shifts a planar
+      // controller's XY target when map->odom contains roll/pitch.
+      lifted.pose.position.z = (control_height - control_from_grid.getOrigin().z() -
+        rotation[2][0] * pose.pose.position.x - rotation[2][1] * pose.pose.position.y) /
+        rotation[2][2];
       geometry_msgs::msg::PoseStamped transformed;
-      tf2::doTransform(pose, transformed, transform);
+      tf2::doTransform(lifted, transformed, transform);
+      if (!finitePose(transformed.pose)) {return false;}
+      transformed.pose.position.z = control_height;
       transformed.header = pose.header;
       transformed.header.frame_id = global_frame_;
-      output.poses.push_back(std::move(transformed));
+      candidate.poses.push_back(std::move(transformed));
     }
+    output = std::move(candidate);
+    if (used_transform) {*used_transform = transform;}
     return true;
   } catch (const tf2::TransformException & exception) {
     RCLCPP_WARN_THROTTLE(
@@ -2727,7 +2787,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     safety_reference.header.frame_id == snapshot->grid.header.frame_id &&
     safety_state_.mapSnapshotUsable(snapshot->generation) &&
     map_health_epoch == map_health_epoch_ &&
-    snapshot->generation == latest_map_snapshot_->generation;
+    snapshot->generation == latest_map_snapshot_->generation &&
+    (!control_from_grid || reference_path.poses.size() == safety_reference.points.size());
   if (!publish) {
     // 无停车重规划的替换候选过期：正在执行的旧参考仍受运行期复检守护，只在地图
     // 健康且快照可用时保留它；其余情况照旧撤销。
@@ -2764,6 +2825,7 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
   active_reference.map_publication_sequence = map_publication_sequence;
   if (control_from_grid) {
     active_reference.control_from_grid = *control_from_grid;
+    active_reference.control_reference = committed_reference;
   }
   active_safety_reference_ = std::move(active_reference);
   if (planner_manages_emergency_stop_) {

@@ -47,6 +47,8 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "tf2/LinearMath/Transform.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -504,6 +506,135 @@ TEST_F(ReplanStartTest, KeepsMeasuredStartWhenCarIsFarFromCommittedReference)
   EXPECT_NEAR(first.x, car_.x, 0.1);
   EXPECT_NEAR(first.y, car_.y + 1.0, 0.1);
   EXPECT_LE(originAheadSec(), 1e-9);
+}
+
+geometry_msgs::msg::TransformStamped staticTransform(
+  const std::string & parent, const std::string & child, const tf2::Transform & value)
+{
+  geometry_msgs::msg::TransformStamped result;
+  result.header.frame_id = parent;
+  result.child_frame_id = child;
+  result.transform = tf2::toMsg(value);
+  return result;
+}
+
+TEST_F(OnGridBranchTest, TiltedGridReferenceStartsAtTheBodyControlHeight)
+{
+  node_ = std::make_shared<MincoPlannerNode>(makeNodeOptions(true, true));
+  node_->global_frame_ = "odom";
+  node_->robot_frame_ = "body";
+  tf2::Quaternion rotation;
+  rotation.setRPY(0.16, -0.07, 0.3);
+  const tf2::Transform grid_from_control(rotation, tf2::Vector3(13.4, 2.0, 0.24));
+  const tf2::Vector3 actual(0.5, 0.2, 0.18);
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(
+    staticTransform("map", "odom", grid_from_control), "test", true));
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(staticTransform("odom", "body",
+    tf2::Transform(tf2::Quaternion::getIdentity(), actual)), "test", true));
+  const auto grid_start = grid_from_control * actual;
+  nav_msgs::msg::Path input;
+  input.header.frame_id = "map";
+  input.poses = {makePose(grid_start.x(), grid_start.y()),
+    makePose(grid_start.x() + 1.0, grid_start.y() + 2.0)};
+  input.poses[1].header.stamp.sec = 9;
+  input.poses[1].header.stamp.nanosec = 200000000;
+  nav_msgs::msg::Path output;
+  geometry_msgs::msg::TransformStamped used;
+  ASSERT_TRUE(node_->transformPathToGlobal(input, output, &used));
+  ASSERT_EQ(output.poses.size(), input.poses.size());
+  EXPECT_NEAR(output.poses.front().pose.position.x, actual.x(), 1e-10);
+  EXPECT_NEAR(output.poses.front().pose.position.y, actual.y(), 1e-10);
+  for (std::size_t i = 0; i < output.poses.size(); ++i) {
+    const auto & p = output.poses[i].pose.position;
+    EXPECT_NEAR(p.z, actual.z(), 1e-10);
+    const auto recovered = grid_from_control * tf2::Vector3(p.x, p.y, p.z);
+    EXPECT_NEAR(recovered.x(), input.poses[i].pose.position.x, 1e-10);
+    EXPECT_NEAR(recovered.y(), input.poses[i].pose.position.y, 1e-10);
+    EXPECT_EQ(output.poses[i].header.stamp, input.poses[i].header.stamp);
+  }
+  EXPECT_EQ(used.header.frame_id, "odom");
+  EXPECT_EQ(used.child_frame_id, "map");
+}
+
+TEST_F(OnGridBranchTest, CrossFrameProjectionRejectsMissingBodyHeight)
+{
+  node_ = std::make_shared<MincoPlannerNode>(makeNodeOptions(true, true));
+  node_->global_frame_ = "odom";
+  node_->robot_frame_ = "body";
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(staticTransform("map", "odom",
+    tf2::Transform::getIdentity()), "test", true));
+  nav_msgs::msg::Path input, output;
+  input.header.frame_id = "map";
+  input.poses = {makePose(1.0, 1.0), makePose(2.0, 1.0)};
+  EXPECT_FALSE(node_->transformPathToGlobal(input, output));
+}
+
+TEST_F(OnGridBranchTest, CrossFrameProjectionRejectsSingularControlPlane)
+{
+  node_ = std::make_shared<MincoPlannerNode>(makeNodeOptions(true, true));
+  node_->global_frame_ = "odom";
+  node_->robot_frame_ = "body";
+  tf2::Quaternion rotation;
+  rotation.setRPY(0.0, std::acos(-1.0) * 0.5, 0.0);
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(staticTransform("map", "odom",
+    tf2::Transform(rotation, tf2::Vector3(0.0, 0.0, 0.0))), "test", true));
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(staticTransform("odom", "body",
+    tf2::Transform(tf2::Quaternion::getIdentity(), tf2::Vector3(0.0, 0.0, 0.18))),
+    "test", true));
+  nav_msgs::msg::Path input, output;
+  input.header.frame_id = "map";
+  input.poses = {makePose(1.0, 1.0), makePose(2.0, 1.0)};
+  EXPECT_FALSE(node_->transformPathToGlobal(input, output));
+}
+
+TEST_F(OnGridBranchTest, RuntimeRecheckPreservesTheCommittedControlPlane)
+{
+  ASSERT_NO_FATAL_FAILURE(startAndCommit(true, true));
+  node_->global_frame_ = "odom";
+  node_->robot_frame_ = "body";
+  tf2::Quaternion initial_rotation;
+  initial_rotation.setRPY(0.1, -0.06, 0.05);
+  const tf2::Transform initial(initial_rotation, tf2::Vector3(0.12, -0.2, 0.15));
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(
+    staticTransform("map", "odom", initial), "test", true));
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(staticTransform("odom", "body",
+    tf2::Transform(tf2::Quaternion::getIdentity(), tf2::Vector3(1.5, 0.0, 0.18))),
+    "test", true));
+  nav_msgs::msg::Path control_path;
+  geometry_msgs::msg::TransformStamped used;
+  ASSERT_TRUE(node_->transformPathToGlobal(node_->toPath(committed_.trajectory),
+    control_path, &used));
+  ASSERT_TRUE(node_->publishReferenceIfCurrent(node_->latest_map_snapshot_,
+    node_->map_health_epoch_, control_path, committed_.trajectory, kGoalId, 1, 2, 1,
+    PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW, false, {}, &used));
+  tf2::Quaternion corrected_rotation;
+  corrected_rotation.setRPY(-0.05, 0.08, -0.03);
+  const tf2::Transform corrected(corrected_rotation, tf2::Vector3(0.1, -0.15, 0.14));
+  const auto current = staticTransform("map", "odom", corrected);
+  ASSERT_TRUE(node_->tf_buffer_->setTransform(current, "test", true));
+  const auto aligned = node_->alignedToCurrentTf(*node_->active_safety_reference_);
+  ASSERT_EQ(aligned.points.size(), control_path.poses.size());
+  for (std::size_t i = 0; i < aligned.points.size(); ++i) {
+    geometry_msgs::msg::PoseStamped expected;
+    tf2::doTransform(control_path.poses[i], expected, current);
+    EXPECT_NEAR(aligned.points[i].x, expected.pose.position.x, 1e-10);
+    EXPECT_NEAR(aligned.points[i].y, expected.pose.position.y, 1e-10);
+  }
+}
+
+TEST_F(OnGridBranchTest, RuntimeRecheckRevokesReferenceWhenItsTransformIsMissing)
+{
+  ASSERT_NO_FATAL_FAILURE(startAndCommit(true, true));
+  auto & active = *node_->active_safety_reference_;
+  active.control_from_grid = staticTransform("odom", "map", tf2::Transform::getIdentity());
+  active.control_reference = node_->toPath(active.trajectory);
+  active.control_reference->header.frame_id = "odom";
+  node_->onRuntimeSafetyRecheck();
+  EXPECT_FALSE(node_->active_safety_reference_.has_value());
+  EXPECT_FALSE(node_->safety_state_.plan_safe);
+  ASSERT_TRUE(node_->planner_status_state_.latest.has_value());
+  EXPECT_EQ(node_->planner_status_state_.latest->failure_reason,
+    PlannerStatus::FAILURE_REFERENCE_TF);
 }
 
 }  // namespace

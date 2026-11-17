@@ -289,9 +289,12 @@ private:
     // 提交时 控制坐标系(global_frame_) <- 栅格坐标系 的变换。MPC 在控制坐标系里执行，
     // map->odom 修正后车实际走的是 当前(栅格<-控制) * 提交时(控制<-栅格) * trajectory。
     std::optional<geometry_msgs::msg::TransformStamped> control_from_grid;
+    // Exact SE3 path sent to the planar controller. Its Z plane is needed when
+    // expressing execution in a grid whose TF contains roll/pitch.
+    std::optional<nav_msgs::msg::Path> control_reference;
   };
   std::optional<ActiveSafetyReference> active_safety_reference_;
-  // 按当前 TF 把已提交参考重新表达到栅格坐标系；TF 不可用或无需变换时原样返回。
+  // 按当前 TF 重表达已提交控制参考；跨系 TF 不可用时返回无效参考。
   ReferenceTrajectory alignedToCurrentTf(const ActiveSafetyReference & reference);
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
