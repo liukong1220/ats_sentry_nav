@@ -5,8 +5,13 @@ builtin_interfaces/Duration timeout
 uint8 RESULT_SUCCEEDED=0
 uint8 RESULT_CANCELED=1
 uint8 RESULT_PREEMPTED=2
+# The goal uses the node's ROS clock. If another terminal gate fires before
+# this deadline, its result takes precedence; a no-path goal need not return 3.
 uint8 RESULT_TIMEOUT=3
 uint8 RESULT_MAP_UNREADY=4
+# Includes bounded no-executable-plan / suspended-replan wait exhaustion while
+# map source and localization remain healthy (steady clock). See result message
+# and same-goal planner status for the cause; this is distinct from goal timeout.
 uint8 RESULT_PLANNING_FAILED=5
 uint8 RESULT_TF_FAILED=6
 uint8 RESULT_INTERNAL_ERROR=7

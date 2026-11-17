@@ -121,6 +121,21 @@ class TestFastMaps(harness.TestGoalManagerLocalizationEpoch):
             periodic=self.health))
         command = next(c for c in self.execution_commands if c.mode == c.MODE_EXECUTE)
         self.assertEqual(command.map_publication_sequence, 1, "MINCO provenance was relabelled")
+        self.assertEqual(command.validation_map_publication_sequence, 2,
+                         "EXECUTE did not identify the snapshot actually revalidated")
+        self.assertEqual(command.validation_map_source_generation, 2)
+        self.assertEqual(command.validation_from_reference.header.frame_id, self.snapshot_frame)
+        self.assertEqual(command.validation_from_reference.child_frame_id, "odom")
+        expected_yaw = self.map_transform[2] if self.snapshot_frame == "map" else 0.0
+        self.assertAlmostEqual(command.validation_from_reference.transform.rotation.w,
+                               math.cos(expected_yaw / 2))
+        self.assertAlmostEqual(command.validation_from_reference.transform.rotation.z,
+                               math.sin(expected_yaw / 2))
+        expected_xy = self.map_transform[:2] if self.snapshot_frame == "map" else (0.0, 0.0)
+        self.assertAlmostEqual(command.validation_from_reference.transform.translation.x,
+                               expected_xy[0])
+        self.assertAlmostEqual(command.validation_from_reference.transform.translation.y,
+                               expected_xy[1])
         count = len(self.planner_goals)
         self.goal_pub.publish(goal)
         self.assertTrue(self.spin_until(lambda: len(self.planner_goals) > count, periodic=self.health))

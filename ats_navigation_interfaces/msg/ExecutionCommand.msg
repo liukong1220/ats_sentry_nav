@@ -48,3 +48,13 @@ uint64 gimbal_request_sequence
 # Monotonic feedback sequence that Goal Manager validated after that request.
 uint64 gimbal_feedback_sequence
 nav_msgs/Path reference
+# Final whole-reference footprint validation performed by Goal Manager. These
+# fields are separate from the MINCO provenance above: a candidate can be
+# revalidated on a newer immutable snapshot. Zero means no snapshot certificate
+# (legacy profiles / STOP), never an implicit certificate for map_publication_sequence.
+uint64 validation_map_publication_sequence
+uint64 validation_map_source_generation
+# Exact rigid transform used for that validation, including roll/pitch and z.
+# parent = validation snapshot frame; child = reference frame. Same-frame
+# validation carries an explicit identity transform. Heartbeats preserve it.
+geometry_msgs/TransformStamped validation_from_reference

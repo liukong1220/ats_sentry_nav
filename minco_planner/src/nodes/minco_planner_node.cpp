@@ -1768,9 +1768,13 @@ void MincoPlannerNode::planGoal(
   if (!search_result.success) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
-      "【规划失败】%s 失败（failed: %s expanded=%d clearance=%.3f m）",
+      "【规划失败】%s 失败（failed: %s expanded=%d clearance=%.3f m） "
+      "goal=%llu localization_epoch=%llu plan_request_sequence=%llu",
       search_algorithm_.c_str(), search_result.reason.c_str(),
-      search_result.expanded_nodes, used_clearance);
+      search_result.expanded_nodes, used_clearance,
+      static_cast<unsigned long long>(goal_id),
+      static_cast<unsigned long long>(localization_epoch),
+      static_cast<unsigned long long>(plan_request_sequence));
     const std::uint8_t failure_reason =
       classifyGraphSearchFailure(search_result.reason, search_result.expanded_nodes);
     fail(failure_reason, map_snapshot->generation);

@@ -1163,6 +1163,7 @@ private:
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    geometry_msgs::msg::TransformStamped validation_from_reference;
     if (!active_goal_ || active_goal_->cancel_requested ||
         !candidate_reference_ || !planner_ready_status_ || !mapReadyLocked() ||
         !localizationHealthyLocked() ||
@@ -1174,7 +1175,7 @@ private:
         (localization_epoch_ &&
          planner_ready_status_->localization_epoch != *localization_epoch_) ||
         planner_ready_status_->map_publication_sequence == 0U ||
-        !candidateReferenceMapUsableLocked() ||
+        !candidateReferenceMapUsableLocked(&validation_from_reference) ||
         candidate_reference_->poses.size() < 2 ||
         !sameStamp(candidate_reference_->header.stamp,
                    planner_ready_status_->reference_stamp)) {
@@ -1269,6 +1270,13 @@ private:
       (pending_yaw_authority_request_ ? pending_yaw_authority_request_->request_sequence : 0);
     command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
+    if (require_planning_snapshot_) {
+      // The full-path check above and this assignment share mutex_. Preserve
+      // MINCO provenance; bind the actual final validation independently.
+      command.validation_map_publication_sequence = planning_snapshot_->publication_sequence;
+      command.validation_map_source_generation = planning_snapshot_->source_generation;
+      command.validation_from_reference = validation_from_reference;
+    }
     fillCandidateDigest(command.candidate_content_digest,
                         planner_ready_status_->content_digest);
     fail_stop_ = false;
@@ -1309,7 +1317,8 @@ private:
       "P2 reference commit goal=%llu localization_epoch=%llu plan_request_sequence=%llu "
       "source_generation=%llu map_generation=%llu map_publication_sequence=%llu "
       "reference_stamp_ns=%lld poses=%zu published_digest=%s occupancy_digest=%s "
-      "gate_collisions=%u gate_indices=%s grid_topic=%s validation_frame=%s",
+      "gate_collisions=%u gate_indices=%s grid_topic=%s validation_frame=%s "
+      "validated_publication_sequence=%llu validated_source_generation=%llu",
       static_cast<unsigned long long>(command.goal_id),
       static_cast<unsigned long long>(command.localization_epoch),
       static_cast<unsigned long long>(planner_ready_status_->plan_request_sequence),
@@ -1324,7 +1333,9 @@ private:
       planner_ready_status_->gate_collision_count,
       planner_ready_status_->gate_collision_indices.c_str(),
       planner_ready_status_->grid_topic.c_str(),
-      planner_ready_status_->validation_frame.c_str());
+      planner_ready_status_->validation_frame.c_str(),
+      static_cast<unsigned long long>(command.validation_map_publication_sequence),
+      static_cast<unsigned long long>(command.validation_map_source_generation));
     publishEmergencyStop(false);
     publishExecutionCommand(command);
     reference_path_pub_->publish(committed);
@@ -1980,7 +1991,8 @@ private:
       planning_snapshot_timeout_sec_;
   }
 
-  bool candidateReferenceMapUsableLocked() const {
+  bool candidateReferenceMapUsableLocked(
+      geometry_msgs::msg::TransformStamped * used_transform = nullptr) const {
     if (!planner_ready_status_ || !candidate_reference_ ||
       planner_ready_status_->gate_collision_count != 0U ||
       planner_ready_status_->map_publication_sequence == 0U ||
@@ -2000,6 +2012,11 @@ private:
     // execution authority always checks the complete reference independently.
     nav_msgs::msg::Path validation_path = *candidate_reference_;
     const std::string & frame = planning_snapshot_->header.frame_id;
+    geometry_msgs::msg::TransformStamped validation_transform;
+    validation_transform.header.frame_id = frame;
+    validation_transform.header.stamp = now();
+    validation_transform.child_frame_id = validation_path.header.frame_id;
+    validation_transform.transform.rotation.w = 1.0;
     if (validation_path.header.frame_id != frame) {
       if (validation_path.header.frame_id.empty()) {
         return false;
@@ -2010,6 +2027,7 @@ private:
         // enclosing epoch/lease gates reject obsolete localization contracts.
         const auto transform = tf_buffer_->lookupTransform(
           frame, validation_path.header.frame_id, tf2::TimePointZero);
+        validation_transform = transform;
         const auto stamp = rclcpp::Time(transform.header.stamp);
         const double age = (now() - stamp).seconds();
         if (stamp.nanoseconds() > 0 && (age > map_transform_timeout_sec_ || age < -0.2)) {
@@ -2029,8 +2047,12 @@ private:
         return false;
       }
     }
-    return planningSnapshotReferenceSafe(
+    const bool safe = planningSnapshotReferenceSafe(
       *planning_snapshot_, validation_path, planning_snapshot_safety_params_);
+    if (safe && used_transform) {
+      *used_transform = validation_transform;
+    }
+    return safe;
   }
 
   bool recoverySnapshotReadyLocked(const ActiveGoal & goal) const {
