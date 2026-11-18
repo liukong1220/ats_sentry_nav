@@ -907,12 +907,11 @@ private:
     }
     const std::size_t injected_cells = injectDynamicObstacleForTest(fusion.planning_grid);
 
-    ats_rc_esdf::RcTraversabilityEsdfProvider esdf;
-    esdf.updateGrid(
+    planning_esdf_.updateGrid(
       fusion.planning_grid, fusion_params_.terrain_obstacle_value_threshold,
       fusion_params_.unknown_is_obstacle);
     std::vector<double> signed_distance;
-    if (!esdf.copySignedDistanceField(signed_distance)) {
+    if (!planning_esdf_.copySignedDistanceField(signed_distance)) {
       last_blocking_grid_ = fusion.planning_grid;
       publishUnavailable("Fused RC-ESDF construction failed");
       return;
@@ -1237,6 +1236,7 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr slope_grid_;
   nav_msgs::msg::OccupancyGrid last_blocking_grid_;
   RogMapEsdfSnapshot last_numeric_snapshot_;
+  ats_rc_esdf::RcTraversabilityEsdfProvider planning_esdf_;
   // Guards every field below that callbacks and the projection worker share.
   std::recursive_mutex state_mutex_;
   bool request_pending_{false};

@@ -44,22 +44,12 @@ int64_t timeToNanoseconds(const builtin_interfaces::msg::Time & stamp)
     static_cast<int64_t>(stamp.nanosec);
 }
 
-bool hasSeed(const std::vector<uint8_t> & mask)
-{
-  return std::any_of(mask.begin(), mask.end(), [](uint8_t value) { return value != 0; });
-}
-
 void squaredDistanceTransform1d(
-  const std::vector<double> & input, std::vector<double> & output)
+  const std::vector<double> & input, std::vector<double> & output,
+  std::vector<int> & sites, std::vector<double> & boundaries)
 {
   const int size = static_cast<int>(input.size());
   output.assign(input.size(), std::numeric_limits<double>::infinity());
-  if (size == 0) {
-    return;
-  }
-
-  std::vector<int> sites(static_cast<std::size_t>(size), 0);
-  std::vector<double> boundaries(static_cast<std::size_t>(size + 1), 0.0);
   int first_site = 0;
   while (first_site < size && !std::isfinite(input[static_cast<std::size_t>(first_site)])) {
     ++first_site;
@@ -81,9 +71,9 @@ void squaredDistanceTransform1d(
     while (true) {
       const int site = sites[site_count];
       intersection =
-        ((input[static_cast<std::size_t>(query)] + static_cast<double>(query * query)) -
-        (input[static_cast<std::size_t>(site)] + static_cast<double>(site * site))) /
-        static_cast<double>(2 * (query - site));
+        ((input[static_cast<std::size_t>(query)] + static_cast<double>(query) * query) -
+        (input[static_cast<std::size_t>(site)] + static_cast<double>(site) * site)) /
+        (2.0 * (query - site));
       // boundaries[0] 是 -inf，栈底不会被弹出。
       if (intersection > boundaries[site_count]) {
         break;
@@ -107,76 +97,69 @@ void squaredDistanceTransform1d(
   }
 }
 
-void exactEuclideanDistanceTransform(
-  const std::vector<uint8_t> & seed_mask, unsigned int width, unsigned int height,
-  double resolution, std::vector<double> & distance_field)
+}  // namespace
+
+void RcTraversabilityEsdfProvider::ExactDistanceTransform::update(
+  const std::vector<uint8_t> & seed_mask, unsigned int grid_width, unsigned int grid_height,
+  double grid_resolution)
 {
-  const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-  distance_field.assign(count, std::numeric_limits<double>::infinity());
-  if (width == 0 || height == 0 || seed_mask.size() < count || !hasSeed(seed_mask)) {
+  const bool rebuild = width != grid_width || height != grid_height ||
+    resolution != grid_resolution;
+  if (!rebuild && seeds == seed_mask) {
     return;
   }
-
-  std::vector<double> row_pass(count, std::numeric_limits<double>::infinity());
-  std::vector<double> input(std::max(width, height), std::numeric_limits<double>::infinity());
-  std::vector<double> output;
-  for (unsigned int y = 0; y < height; ++y) {
-    for (unsigned int x = 0; x < width; ++x) {
-      input[x] = seed_mask[static_cast<std::size_t>(y) * width + x] == 0 ?
-        std::numeric_limits<double>::infinity() : 0.0;
-    }
-    input.resize(width);
-    squaredDistanceTransform1d(input, output);
-    for (unsigned int x = 0; x < width; ++x) {
-      row_pass[static_cast<std::size_t>(y) * width + x] = output[x];
-    }
-    input.resize(std::max(width, height), std::numeric_limits<double>::infinity());
+  width = grid_width;
+  height = grid_height;
+  resolution = grid_resolution;
+  const double infinity = std::numeric_limits<double>::infinity();
+  if (rebuild) {
+    horizontal_squared.assign(seed_mask.size(), infinity);
+    distance.resize(seed_mask.size());
   }
 
-  for (unsigned int x = 0; x < width; ++x) {
-    for (unsigned int y = 0; y < height; ++y) {
-      input[y] = row_pass[static_cast<std::size_t>(y) * width + x];
+  const auto max_extent = std::max(width, height);
+  std::vector<double> input(width);
+  std::vector<double> output;
+  std::vector<int> sites(max_extent);
+  std::vector<double> boundaries(static_cast<std::size_t>(max_extent) + 1U);
+  std::vector<uint8_t> changed_columns(width, rebuild);
+  // The first pass depends only on seeds in the same row. A change in its
+  // output invalidates the entire affected column in the second pass.
+  for (unsigned int y = 0; y < height; ++y) {
+    const auto offset = static_cast<std::size_t>(y) * width;
+    const auto row = seed_mask.begin() + offset;
+    if (!rebuild && std::equal(row, row + width, seeds.begin() + offset)) {
+      continue;
     }
-    input.resize(height);
-    squaredDistanceTransform1d(input, output);
+    for (unsigned int x = 0; x < width; ++x) {
+      input[x] = row[x] == 0 ? infinity : 0.0;
+    }
+    squaredDistanceTransform1d(input, output, sites, boundaries);
+    for (unsigned int x = 0; x < width; ++x) {
+      auto & previous = horizontal_squared[offset + x];
+      if (previous != output[x]) {
+        previous = output[x];
+        changed_columns[x] = 1U;
+      }
+    }
+  }
+
+  input.resize(height);
+  for (unsigned int x = 0; x < width; ++x) {
+    if (!changed_columns[x]) {
+      continue;
+    }
     for (unsigned int y = 0; y < height; ++y) {
-      distance_field[static_cast<std::size_t>(y) * width + x] =
+      input[y] = horizontal_squared[static_cast<std::size_t>(y) * width + x];
+    }
+    squaredDistanceTransform1d(input, output, sites, boundaries);
+    for (unsigned int y = 0; y < height; ++y) {
+      distance[static_cast<std::size_t>(y) * width + x] =
         std::sqrt(std::max(0.0, output[y])) * resolution;
     }
-    input.resize(std::max(width, height), std::numeric_limits<double>::infinity());
   }
+  seeds = seed_mask;
 }
-
-// 栅格外按阻塞：在四周补一圈阻塞格再做变换，与 A* 的 computeBlockedSquaredDistanceCells
-// 是同一条规则，两处读到的自由格距离逐格相同。
-void blockedDistanceTransformWithBlockedBorder(
-  const std::vector<uint8_t> & obstacle_mask, unsigned int width, unsigned int height,
-  double resolution, std::vector<double> & distance_field)
-{
-  const unsigned int padded_width = width + 2U;
-  const unsigned int padded_height = height + 2U;
-  std::vector<uint8_t> padded(
-    static_cast<std::size_t>(padded_width) * static_cast<std::size_t>(padded_height), 1U);
-  for (unsigned int y = 0; y < height; ++y) {
-    for (unsigned int x = 0; x < width; ++x) {
-      padded[static_cast<std::size_t>(y + 1U) * padded_width + x + 1U] =
-        obstacle_mask[static_cast<std::size_t>(y) * width + x];
-    }
-  }
-  std::vector<double> padded_field;
-  exactEuclideanDistanceTransform(padded, padded_width, padded_height, resolution, padded_field);
-  distance_field.assign(
-    static_cast<std::size_t>(width) * static_cast<std::size_t>(height),
-    std::numeric_limits<double>::infinity());
-  for (unsigned int y = 0; y < height; ++y) {
-    for (unsigned int x = 0; x < width; ++x) {
-      distance_field[static_cast<std::size_t>(y) * width + x] =
-        padded_field[static_cast<std::size_t>(y + 1U) * padded_width + x + 1U];
-    }
-  }
-}
-
-}  // namespace
 
 void RcTraversabilityEsdfProvider::configureRollingWindow(bool enabled, double size_x, double size_y)
 {
@@ -203,8 +186,6 @@ void RcTraversabilityEsdfProvider::updateGrid(
   // This keeps behavior deterministic and avoids stale semantics surviving across updates.
   available_ = false;
   distance_field_.clear();
-  distance_to_obstacle_field_.clear();
-  distance_to_free_field_.clear();
   smoothed_distance_field_.clear();
   slope_field_.clear();
   width_ = traversability_grid.info.width;
@@ -324,8 +305,6 @@ bool RcTraversabilityEsdfProvider::loadSignedDistanceField(
   std::lock_guard<std::mutex> lock(mutex_);
   available_ = false;
   distance_field_.clear();
-  distance_to_obstacle_field_.clear();
-  distance_to_free_field_.clear();
   smoothed_distance_field_.clear();
   slope_field_.clear();
   width_ = grid.info.width;
@@ -345,12 +324,6 @@ bool RcTraversabilityEsdfProvider::loadSignedDistanceField(
     return false;
   }
   distance_field_ = signed_distance;
-  distance_to_obstacle_field_.resize(cell_count);
-  distance_to_free_field_.resize(cell_count);
-  for (std::size_t i = 0; i < cell_count; ++i) {
-    distance_to_obstacle_field_[i] = std::max(0.0, signed_distance[i]);
-    distance_to_free_field_[i] = std::max(0.0, -signed_distance[i]);
-  }
   slope_field_.assign(cell_count, std::numeric_limits<double>::quiet_NaN());
   rebuildSmoothedDistanceField();
   available_ = true;
@@ -669,39 +642,38 @@ void RcTraversabilityEsdfProvider::rebuildSignedDistanceField(
   const std::vector<uint8_t> & obstacle_mask,
   const std::vector<uint8_t> & free_mask)
 {
-  const std::size_t cell_count = static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
-  distance_to_obstacle_field_.assign(cell_count, std::numeric_limits<double>::infinity());
-  distance_to_free_field_.assign(cell_count, std::numeric_limits<double>::infinity());
-  distance_field_.assign(cell_count, std::numeric_limits<double>::quiet_NaN());
+  // A one-cell blocked border keeps clearance consistent with the A* field.
+  const unsigned int padded_width = width_ + 2U;
+  const unsigned int padded_height = height_ + 2U;
+  std::vector<uint8_t> padded(
+    static_cast<std::size_t>(padded_width) * padded_height, 1U);
+  for (unsigned int y = 0; y < height_; ++y) {
+    std::copy_n(obstacle_mask.begin() + static_cast<std::size_t>(y) * width_, width_,
+      padded.begin() + static_cast<std::size_t>(y + 1U) * padded_width + 1U);
+  }
+  blocked_transform_.update(padded, padded_width, padded_height, resolution_);
+  free_transform_.update(free_mask, width_, height_, resolution_);
 
-  // This is an exact separable Euclidean distance transform at cell centres,
-  // not a costmap potential or an 8-neighbour path-distance approximation.
-  blockedDistanceTransformWithBlockedBorder(
-    obstacle_mask, width_, height_, resolution_, distance_to_obstacle_field_);
-  exactEuclideanDistanceTransform(
-    free_mask, width_, height_, resolution_, distance_to_free_field_);
-
-  for (std::size_t i = 0; i < cell_count; ++i) {
-    const double d_occ = distance_to_obstacle_field_[i];
-    const double d_free = distance_to_free_field_[i];
-    const bool have_occ = std::isfinite(d_occ);
-    const bool have_free = std::isfinite(d_free);
-    if (!have_occ && !have_free) {
-      distance_field_[i] = std::numeric_limits<double>::quiet_NaN();
-      continue;
+  distance_field_.resize(obstacle_mask.size());
+  for (unsigned int y = 0; y < height_; ++y) {
+    const auto offset = static_cast<std::size_t>(y) * width_;
+    const auto padded_offset = static_cast<std::size_t>(y + 1U) * padded_width + 1U;
+    for (unsigned int x = 0; x < width_; ++x) {
+      const double d_occ = blocked_transform_.distance[padded_offset + x];
+      const double d_free = free_transform_.distance[offset + x];
+      const bool have_occ = std::isfinite(d_occ);
+      const bool have_free = std::isfinite(d_free);
+      auto & value = distance_field_[offset + x];
+      if (!have_occ && !have_free) {
+        value = std::numeric_limits<double>::quiet_NaN();
+      } else if (!have_free) {
+        value = -d_occ;
+      } else if (!have_occ) {
+        value = d_free;
+      } else {
+        value = d_occ - d_free;
+      }
     }
-    if (!have_free) {
-      distance_field_[i] = -d_occ;
-      continue;
-    }
-    if (!have_occ) {
-      distance_field_[i] = d_free;
-      continue;
-    }
-    // Standard signed-distance construction used by the planner stack:
-    // positive in free space, negative in obstacle space, zero near the boundary.
-    // The optimizer interprets larger values as safer clearance.
-    distance_field_[i] = d_occ - d_free;
   }
 }
 

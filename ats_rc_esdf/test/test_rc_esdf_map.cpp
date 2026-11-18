@@ -178,12 +178,14 @@ TEST(RcTraversabilityEsdfProvider, RandomGridsMatchBruteForce)
   constexpr unsigned int kSeed = 20261105U;
   std::mt19937 rng(kSeed);
   std::uniform_int_distribution<int> box(2, 6);
+  ats_rc_esdf::RcTraversabilityEsdfProvider provider;
   for (int mode = 0; mode < 2; ++mode) {
     for (int trial = 0; trial < 12; ++trial) {
-      const int width = 48;
+      const int width = trial == 11 ? 42 : 48;
       const int height = 36;
       auto grid = makeGrid(width, height);
-      grid.info.resolution = 0.1F;
+      const bool unknown_is_obstacle = trial % 2 == 0;
+      grid.info.resolution = trial == 10 ? 0.05F : 0.1F;
       if (mode == 1) {
         // 类 S3：中间一块已知自由区，其余 unknown。
         grid.data.assign(grid.data.size(), -1);
@@ -205,11 +207,10 @@ TEST(RcTraversabilityEsdfProvider, RandomGridsMatchBruteForce)
           for (int x = x0; x < x0 + bw; ++x) {grid.data[y * width + x] = 100;}
         }
       }
-      ats_rc_esdf::RcTraversabilityEsdfProvider provider;
-      provider.updateGrid(grid, 50, true, 50);
+      provider.updateGrid(grid, 50, unknown_is_obstacle, 50);
       std::vector<double> field;
       ASSERT_TRUE(provider.copySignedDistanceField(field)) << "mode " << mode << " trial " << trial;
-      const auto expected = bruteForceSignedDistance(grid, 50, true);
+      const auto expected = bruteForceSignedDistance(grid, 50, unknown_is_obstacle);
       for (std::size_t i = 0; i < expected.size(); ++i) {
         ASSERT_NEAR(field[i], expected[i], 1e-6)
           << "seed " << kSeed << " mode " << mode << " trial " << trial << " cell " << i;

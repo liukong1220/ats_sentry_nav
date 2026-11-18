@@ -76,6 +76,20 @@ public:
     const std::vector<Eigen::Vector2d> & footprint_samples) const;
 
 private:
+  struct ExactDistanceTransform
+  {
+    void update(
+      const std::vector<uint8_t> & seed_mask,
+      unsigned int width, unsigned int height, double resolution);
+
+    unsigned int width{0};
+    unsigned int height{0};
+    double resolution{0.0};
+    std::vector<uint8_t> seeds;
+    std::vector<double> horizontal_squared;
+    std::vector<double> distance;
+  };
+
   bool worldToGrid(double wx, double wy, double & gx, double & gy) const;
   std::size_t indexOf(unsigned int mx, unsigned int my) const;
   double bilinearDistanceAt(const std::vector<double> & field, double gx, double gy) const;
@@ -99,10 +113,10 @@ private:
     const std::vector<uint8_t> & free_mask);
 
   mutable std::mutex mutex_;
-  // Signed center-point distance and its helper buffers.
+  // Transforms use the seed masks of the current grid in index coordinates.
+  ExactDistanceTransform blocked_transform_;
+  ExactDistanceTransform free_transform_;
   std::vector<double> distance_field_;
-  std::vector<double> distance_to_obstacle_field_;
-  std::vector<double> distance_to_free_field_;
   std::vector<double> smoothed_distance_field_;
   // Physical slope angle in degrees, decoded from traversability_slope_grid.
   std::vector<double> slope_field_;
