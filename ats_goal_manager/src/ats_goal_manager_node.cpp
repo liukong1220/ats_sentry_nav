@@ -248,6 +248,7 @@ private:
     std::optional<geometry_msgs::msg::PoseStamped> committed_planning_target{std::nullopt};
     // 无停车重规划进行中：旧参考继续执行，expected_plan_request_sequence 指向新请求。
     bool replacement_pending{false};
+    double requested_position_tolerance{0.0};
   };
 
   void loadParameters() {
@@ -311,6 +312,9 @@ private:
         0.1, declare_parameter<double>("default_goal_timeout_sec", 120.0));
     goal_position_tolerance_ = std::max(
         0.0, declare_parameter<double>("goal_position_tolerance", 0.08));
+    max_goal_position_tolerance_ = std::max(
+        goal_position_tolerance_, declare_parameter<double>(
+            "max_goal_position_tolerance", goal_position_tolerance_));
     // Hold radius for progress-watchdog suppression. Defaults to the success
     // disk; Gazebo widens this so replan storms stop before the success latch.
     progress_hold_distance_m_ = std::max(
@@ -383,10 +387,12 @@ private:
   rclcpp_action::GoalResponse
   onActionGoal(const rclcpp_action::GoalUUID &,
                std::shared_ptr<const NavigateToPose::Goal> goal) {
-    if (!goal || !finitePose(goal->goal_pose.pose)) {
+    if (!goal || !finitePose(goal->goal_pose.pose) ||
+        !std::isfinite(goal->position_tolerance) || goal->position_tolerance < 0.0 ||
+        goal->position_tolerance > max_goal_position_tolerance_) {
       RCLCPP_WARN(
           get_logger(),
-          "Rejected action goal with non-finite pose or zero quaternion.");
+          "Rejected action goal with invalid pose or out-of-range position tolerance.");
       return rclcpp_action::GoalResponse::REJECT;
     }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -424,7 +430,8 @@ private:
         1e-9 * static_cast<double>(timeout.nanosec);
     startGoal(target, handle,
               requested_timeout > 0.0 ? requested_timeout
-                                      : default_goal_timeout_sec_);
+                                      : default_goal_timeout_sec_,
+              handle->get_goal()->position_tolerance);
   }
 
   void onTopicGoal(const geometry_msgs::msg::PoseStamped::SharedPtr message) {
@@ -440,7 +447,7 @@ private:
 
   void startGoal(const geometry_msgs::msg::PoseStamped &target,
                  const std::shared_ptr<GoalHandleNavigateToPose> &handle,
-                 double timeout_sec) {
+                 double timeout_sec, double position_tolerance = 0.0) {
     std::shared_ptr<GoalHandleNavigateToPose> preempted;
     std::uint64_t id = 0;
     std::uint64_t localization_epoch = 0;
@@ -471,6 +478,7 @@ private:
                                 std::nullopt,
                                 false,
                                 0};
+      active_goal_->requested_position_tolerance = position_tolerance;
       progress_watchdog_.resetGoal(id);
       // Prefer live fusion epoch; when require_localization_status=false the
       // status callback used to skip bookkeeping so this stayed 0 while adapter
@@ -538,6 +546,7 @@ private:
       request.plan_request_sequence = ++active_goal_->next_plan_request_sequence;
       active_goal_->expected_plan_request_sequence = request.plan_request_sequence;
       active_goal_->requested_planning_target = target;
+      request.position_tolerance = active_goal_->requested_position_tolerance;
       request.start_pose = planner_start_in_planning_frame_ ? current_planning_pose_ : current_pose_;
       request.start_pose.header.stamp = current_localization_stamp_;
       request.start_twist.linear.x = current_world_vx_;
@@ -1497,7 +1506,9 @@ private:
               tf2::getYaw(current_planning_pose_.pose.orientation);
           const double yaw_error =
               std::abs(std::atan2(std::sin(yaw_delta), std::cos(yaw_delta)));
-          const bool pose_converged = distance <= goal_position_tolerance_ &&
+          const double position_tolerance = active_goal_->requested_position_tolerance > 0.0 ?
+            active_goal_->requested_position_tolerance : goal_position_tolerance_;
+          const bool pose_converged = distance <= position_tolerance &&
             yaw_error <= goal_yaw_tolerance_;
           bool velocity_converged = false;
           if (terminal_motion_.enabled()) {
@@ -1531,7 +1542,8 @@ private:
           // (progress_hold_distance_m_) are intentionally separate. Watchdog
           // replan storms stop inside the hold disk so tracking can finish
           // closing the last metres; SUCCEEDED still requires the success disk.
-          const bool in_progress_hold = distance <= progress_hold_distance_m_;
+          const bool in_progress_hold = distance <=
+            std::max(progress_hold_distance_m_, position_tolerance);
           if (replan_without_stop_enabled_ && active_execution_command_ && !fail_stop_ &&
             !active_goal_->replacement_pending &&
             active_goal_->committed_planning_target &&
@@ -2369,6 +2381,7 @@ private:
   double default_goal_timeout_sec_{120.0};
   double execution_command_stamp_backdate_sec_{0.02};
   double goal_position_tolerance_{0.08};
+  double max_goal_position_tolerance_{0.08};
   double progress_hold_distance_m_{0.08};
   bool progress_along_reference_{false};
   std::size_t progress_reference_hint_{0};

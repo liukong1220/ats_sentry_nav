@@ -1547,9 +1547,10 @@ void MincoPlannerNode::onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr m
 void MincoPlannerNode::onPlannerGoal(
   const ats_navigation_interfaces::msg::PlannerGoal::SharedPtr msg)
 {
-  if (msg->goal_id == 0 || msg->plan_request_sequence == 0) {
+  if (msg->goal_id == 0 || msg->plan_request_sequence == 0 ||
+    !std::isfinite(msg->position_tolerance) || msg->position_tolerance < 0.0) {
     publishPlannerStatus(
-        0, msg->localization_epoch, msg->plan_request_sequence, 0,
+        msg->goal_id, msg->localization_epoch, msg->plan_request_sequence, 0,
         msg->map_publication_sequence,
         ats_navigation_interfaces::msg::PlannerStatus::STATE_FAILED,
         ats_navigation_interfaces::msg::PlannerStatus::FAILURE_INVALID_GOAL);
@@ -1587,7 +1588,7 @@ void MincoPlannerNode::onPlannerGoal(
     msg->goal_pose, msg->goal_id, msg->localization_epoch,
     msg->plan_request_sequence,
     msg->map_publication_sequence, true, frozen_start,
-    frozen_seed.valid ? &frozen_seed : nullptr);
+    frozen_seed.valid ? &frozen_seed : nullptr, msg->position_tolerance);
 }
 
 void MincoPlannerNode::planGoal(
@@ -1596,7 +1597,7 @@ void MincoPlannerNode::planGoal(
     std::uint64_t map_publication_sequence,
     bool report_status,
     const geometry_msgs::msg::PoseStamped * frozen_start,
-    const InitialKinematicState * initial_state) {
+    const InitialKinematicState * initial_state, double position_tolerance) {
   const auto plan_wall_begin = std::chrono::steady_clock::now();
   const rclcpp::Time plan_begin_time = now();
   bool keep_active_reference = false;
@@ -1764,11 +1765,16 @@ void MincoPlannerNode::planGoal(
   // 终点净空放宽档只有在目标位姿确实过了矩形足迹门禁时才允许启用;准入关闭时
   // 保持 false,行为与今天完全一致。
   bool goal_pose_footprint_verified = false;
-  if (goal_pose_admission_params_.enabled) {
+  auto admission_params = goal_pose_admission_params_;
+  if (position_tolerance > 0.0) {
+    // Per-request copy: a waypoint override must not alter later/final goals.
+    admission_params.position_tolerance_m = position_tolerance;
+  }
+  if (admission_params.enabled) {
     const double commanded_goal_yaw = tf2::getYaw(goal.pose.orientation);
     const GoalPoseAdmissionResult admission = admitGoalPose(
       goal.pose.position.x, goal.pose.position.y, commanded_goal_yaw,
-      planning_grid, footprint_params_, goal_pose_admission_params_);
+      planning_grid, footprint_params_, admission_params);
     if (!admission.feasible) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,

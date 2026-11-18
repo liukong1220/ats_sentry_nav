@@ -75,6 +75,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_goal_manager_retarget test/test_goal_manager_retarget.py TIMEOUT 40)
   ament_add_pytest_test(test_goal_manager_fast_maps test/test_goal_manager_fast_maps.py TIMEOUT 40)
   ament_add_pytest_test(test_goal_manager_stop_barrier test/test_goal_manager_stop_barrier.py TIMEOUT 40)
+  ament_add_pytest_test(test_goal_manager_goal_tolerance test/test_goal_manager_goal_tolerance.py TIMEOUT 40)
 endif()
 
 ament_package()

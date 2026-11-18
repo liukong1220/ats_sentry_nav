@@ -1,6 +1,10 @@
 # 目标必须能够变换到目标管理器的 planning_frame；timeout 小于等于零时使用服务端默认值。
 geometry_msgs/PoseStamped goal_pose
 builtin_interfaces/Duration timeout
+# 0 uses the server's configured convergence/admission defaults. A positive
+# value requests this goal's XY convergence radius, bounded by the server's
+# max_goal_position_tolerance. It never changes footprint/known-free checks.
+float64 position_tolerance
 ---
 uint8 RESULT_SUCCEEDED=0
 uint8 RESULT_CANCELED=1

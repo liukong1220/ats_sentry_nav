@@ -99,7 +99,8 @@ private:
                 std::uint64_t map_publication_sequence,
                 bool report_status,
                 const geometry_msgs::msg::PoseStamped * frozen_start = nullptr,
-                const InitialKinematicState * initial_state = nullptr);
+                const InitialKinematicState * initial_state = nullptr,
+                double position_tolerance = 0.0);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start);
   bool resolveStartPose(

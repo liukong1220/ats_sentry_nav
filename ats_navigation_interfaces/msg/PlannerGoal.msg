@@ -11,6 +11,9 @@ uint64 plan_request_sequence
 # distinct from ROG source and MINCO local snapshot generations.
 uint64 map_publication_sequence
 geometry_msgs/PoseStamped goal_pose
+# Explicit per-goal XY tolerance from the action; 0 preserves planner defaults.
+# Replans of the same goal retain this value. Goal Manager bounds positive values.
+float64 position_tolerance
 # Frozen at dispatch with the same localization epoch as goal_id / map snapshot.
 # start_pose.header.stamp is the localization sample used for this request.
 geometry_msgs/PoseStamped start_pose

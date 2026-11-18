@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -635,6 +636,50 @@ TEST_F(OnGridBranchTest, RuntimeRecheckRevokesReferenceWhenItsTransformIsMissing
   ASSERT_TRUE(node_->planner_status_state_.latest.has_value());
   EXPECT_EQ(node_->planner_status_state_.latest->failure_reason,
     PlannerStatus::FAILURE_REFERENCE_TF);
+}
+
+TEST_F(OnGridBranchTest, RequestedToleranceAdmitsSafeEndpointWithoutChangingLaterDefaults)
+{
+  startAndCommit(true, true);
+  node_->goal_pose_admission_params_.enabled = true;
+  node_->goal_pose_admission_params_.position_tolerance_m = 0.02;
+  node_->goal_pose_admission_params_.position_step_m = 0.005;
+  node_->goal_pose_admission_params_.yaw_tolerance_rad = 0.0;
+  auto grid = makeArena();
+  const auto blocked = static_cast<std::size_t>(33) * grid.info.width + 121;
+  grid.data[blocked] = 100;
+  ASSERT_FALSE(minco_planner::goalPoseFootprintFree(
+    kGoalX, 0.0, 0.0, grid, node_->footprint_params_));
+  node_->onGrid(std::make_shared<Grid>(grid));
+  const auto start = makePose(kStartX, 0.0);
+  node_->planGoal(makePose(kGoalX, 0.0), 2, 1, 1, 2, true, &start, nullptr, 0.08);
+  ASSERT_EQ(node_->planner_status_state_.latest->state, PlannerStatus::STATE_REFERENCE_READY);
+  ASSERT_TRUE(node_->active_safety_reference_);
+  const auto & endpoint = node_->active_safety_reference_->trajectory.points.back();
+  EXPECT_LE(std::hypot(endpoint.x - kGoalX, endpoint.y), 0.06 + 1e-6);
+  EXPECT_TRUE(minco_planner::goalPoseFootprintFree(
+    endpoint.x, endpoint.y, endpoint.yaw, grid, node_->footprint_params_));
+  EXPECT_DOUBLE_EQ(node_->goal_pose_admission_params_.position_tolerance_m, 0.02);
+  EXPECT_EQ(node_->latest_map_snapshot_->grid.data[blocked], 100);
+  node_->planGoal(makePose(kGoalX, 0.0), 3, 1, 1, 2, true, &start, nullptr);
+  EXPECT_EQ(node_->planner_status_state_.latest->state, PlannerStatus::STATE_FAILED);
+  EXPECT_DOUBLE_EQ(node_->goal_pose_admission_params_.position_tolerance_m, 0.02);
+}
+
+TEST_F(OnGridBranchTest, InvalidRequestedToleranceReportsTheSameGoalIdentity)
+{
+  startAndCommit(true, true);
+  for (const double tolerance : {-0.01, std::numeric_limits<double>::quiet_NaN()}) {
+    auto request = std::make_shared<ats_navigation_interfaces::msg::PlannerGoal>();
+    request->goal_id = 99;
+    request->localization_epoch = 1;
+    request->plan_request_sequence = 3;
+    request->position_tolerance = tolerance;
+    node_->onPlannerGoal(request);
+    ASSERT_TRUE(node_->planner_status_state_.latest);
+    EXPECT_EQ(node_->planner_status_state_.latest->goal_id, 99U);
+    EXPECT_EQ(node_->planner_status_state_.latest->failure_reason, PlannerStatus::FAILURE_INVALID_GOAL);
+  }
 }
 
 }  // namespace
