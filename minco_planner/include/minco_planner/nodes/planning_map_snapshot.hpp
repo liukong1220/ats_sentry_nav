@@ -124,6 +124,9 @@ struct PlannerStatusState
 struct PlanningMapSnapshot
 {
   std::uint64_t generation{0};
+  std::uint64_t source_generation{0};
+  std::uint64_t publication_sequence{0};
+  std::uint64_t localization_epoch{0};
   // A local safety identity, not a ROGMap source-generation or adapter
   // publication sequence.  It binds the exact inputs from which RC-ESDF and
   // swept-footprint checks are derived.
@@ -138,6 +141,7 @@ struct PlanningMapSnapshot
   bool hasSameSafetyContent(const PlanningMapSnapshot & other) const
   {
     return !safety_content_digest.empty() &&
+           localization_epoch == other.localization_epoch &&
            safety_content_digest == other.safety_content_digest;
   }
 

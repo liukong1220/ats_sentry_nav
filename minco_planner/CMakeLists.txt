@@ -22,6 +22,8 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/nodes/planning_map_snapshot.cpp
   src/planning/grid_astar.cpp
   src/planning/grid_jps.cpp
+  src/planning/grid_search.cpp
+  src/planning/local_route.cpp
   src/safety/footprint_safety_checker.cpp
   src/safety/local_collision_repair.cpp
   src/safety/goal_pose_admission.cpp
@@ -81,6 +83,8 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_grid_search_clearance test/test_grid_search_clearance.cpp)
   target_link_libraries(test_grid_search_clearance ${PROJECT_NAME})
+  ament_add_gtest(test_local_route test/test_local_route.cpp)
+  target_link_libraries(test_local_route ${PROJECT_NAME})
 
   ament_add_gtest(
     test_minco_trajectory_optimizer

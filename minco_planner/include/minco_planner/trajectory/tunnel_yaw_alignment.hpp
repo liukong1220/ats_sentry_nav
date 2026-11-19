@@ -25,6 +25,8 @@ struct TunnelYawParams
   double yaw_offset = 0.0;
   double pre_align_distance = 0.53;
   double post_release_distance = 0.31;
+  double forward_width_limit = 0.0;
+  double front_extent = 0.0;
 };
 
 struct TunnelSegment
@@ -34,6 +36,7 @@ struct TunnelSegment
   std::vector<double> axis_yaw;
   double width_estimate = 0.0;
   double coherence = 0.0;
+  bool forward_alignment = false;
 };
 
 std::vector<TunnelSegment> detectTunnelSegments(
@@ -41,6 +44,9 @@ std::vector<TunnelSegment> detectTunnelSegments(
   const TunnelYawParams & params);
 
 double tunnelAlignedYaw(double axis_yaw, double yaw_offset, double reference_yaw);
+bool forwardTunnelEntriesAligned(
+  const ReferenceTrajectory & trajectory, const std::vector<TunnelSegment> & tunnels,
+  const TunnelYawParams & params);
 
 }  // namespace minco_planner
 

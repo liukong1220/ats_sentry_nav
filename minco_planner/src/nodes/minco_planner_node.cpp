@@ -149,6 +149,34 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
       grid_topic_, rclcpp::QoS(1).reliable().transient_local(),
       std::bind(&MincoPlannerNode::onGrid, this, std::placeholders::_1), map_options);
   }
+  if (!prior_guide_map_topic_.empty()) {
+    prior_guide_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      prior_guide_map_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr prior) {
+        if (prior_guide_map_ && prior_guide_map_->header.frame_id == prior->header.frame_id &&
+          prior_guide_map_->info.origin == prior->info.origin &&
+          prior_guide_map_->info.resolution == prior->info.resolution &&
+          prior_guide_map_->info.width == prior->info.width &&
+          prior_guide_map_->info.height == prior->info.height &&
+          prior_guide_map_->data == prior->data)
+        {
+          return;
+        }
+        global_route_.reset();
+        prior_guide_map_.reset();
+        prior_blocked_squared_.clear();
+        if (prior->header.frame_id.empty() || !(prior->info.resolution > 0.0) ||
+          !std::isfinite(prior->info.resolution) || prior->data.empty() ||
+          !finitePose(prior->info.origin) || prior->data.size() !=
+          static_cast<std::size_t>(prior->info.width) * prior->info.height)
+        {
+          return;
+        }
+        prior_blocked_squared_ = computeBlockedSquaredDistanceCells(
+          *prior, {obstacle_value_threshold_, unknown_is_obstacle_});
+        prior_guide_map_ = std::move(prior);
+      }, planning_options);
+  }
   if (!goal_topic_.empty()) {
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       goal_topic_, rclcpp::QoS(10),
@@ -253,7 +281,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("global_frame", global_frame_);
   declare_parameter<std::string>("robot_frame", robot_frame_);
   declare_parameter<std::string>("search_algorithm", search_algorithm_);
-  declare_parameter<bool>("astar_fallback", astar_fallback_);
+  declare_parameter<std::string>("prior_guide_map_topic", prior_guide_map_topic_);
+  declare_parameter<bool>("astar_fallback", true);  // Legacy launch/profile compatibility.
   declare_parameter<bool>("publish_unsafe_trajectory", publish_unsafe_trajectory_);
   declare_parameter<bool>(
     "escape_from_contact_enabled", escape_prefix_params_.enabled);
@@ -300,7 +329,7 @@ void MincoPlannerNode::declareAndLoadParams()
     "commit_max_lateral_deviation_m", commit_geometry_limits_.max_lateral_deviation_m);
   declare_parameter<bool>("planner_manages_emergency_stop", planner_manages_emergency_stop_);
 
-  GridAstarParams astar_params;
+  GridSearchParams astar_params;
   declare_parameter<int>("obstacle_value_threshold", astar_params.obstacle_value_threshold);
   declare_parameter<bool>("unknown_is_obstacle", astar_params.unknown_is_obstacle);
   declare_parameter<bool>("allow_diagonal", astar_params.allow_diagonal);
@@ -308,9 +337,8 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>(
     "search_clearance_cost_distance", astar_params.clearance_cost_distance);
   declare_parameter<int>("start_escape_max_steps", astar_params.start_escape_max_steps);
-  GridJpsParams jps_params;
-  declare_parameter<int>("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
-  declare_parameter<double>("jps_safe_distance", jps_params.safe_distance);
+  declare_parameter<int>("jps_max_expanded_nodes", astar_params.max_expanded_nodes);
+  declare_parameter<double>("jps_safe_distance", astar_params.safe_distance);
   declare_parameter<bool>("clearance_relaxation_enabled", clearance_relaxation_enabled_);
   // 首选净空路径超过直线距离该倍数时,再用下限档搜一次并优先明显更短的;<=0 关闭。
   declare_parameter<double>("clearance_detour_ratio", clearance_detour_ratio_);
@@ -536,7 +564,7 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("global_frame", global_frame_);
   get_parameter("robot_frame", robot_frame_);
   get_parameter("search_algorithm", search_algorithm_);
-  get_parameter("astar_fallback", astar_fallback_);
+  get_parameter("prior_guide_map_topic", prior_guide_map_topic_);
   get_parameter("publish_unsafe_trajectory", publish_unsafe_trajectory_);
   get_parameter("escape_from_contact_enabled", escape_prefix_params_.enabled);
   get_parameter("escape_from_contact_max_head_offset", escape_prefix_params_.max_head_offset_m);
@@ -600,16 +628,16 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("search_clearance_cost_distance", astar_params.clearance_cost_distance);
   get_parameter("start_escape_max_steps", astar_params.start_escape_max_steps);
   astar_params.start_escape_max_steps = std::max(0, astar_params.start_escape_max_steps);
-  if (astar_params.clearance_cost_weight > 0.0 && search_algorithm_ == "jps") {
-    // JPS 的跳点剪枝只对均匀代价成立，无法表达离墙代价；开启离墙代价时改用 A*。
+  if (search_algorithm_ != "astar" && search_algorithm_ != "jps" &&
+    search_algorithm_ != "hybrid")
+  {
     RCLCPP_WARN(
-      get_logger(),
-      "【规划参数修正】search_clearance_cost_weight=%.3f 需要加权搜索，search_algorithm 由 jps 改为 astar。",
-      astar_params.clearance_cost_weight);
+      get_logger(), "Unknown search_algorithm '%s'; using astar.", search_algorithm_.c_str());
     search_algorithm_ = "astar";
   }
-  get_parameter("jps_max_expanded_nodes", jps_params.max_expanded_nodes);
-  get_parameter("jps_safe_distance", jps_params.safe_distance);
+  astar_params.jump_enabled = search_algorithm_ != "astar";
+  get_parameter("jps_max_expanded_nodes", astar_params.max_expanded_nodes);
+  get_parameter("jps_safe_distance", astar_params.safe_distance);
   get_parameter("reference_speed", optimizer_params.reference_speed);
   get_parameter("min_segment_time", optimizer_params.min_segment_time);
   get_parameter("sample_spacing", optimizer_params.sample_spacing);
@@ -747,7 +775,6 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("yaw_tunnel_axis_min_coherence", yaw_params.tunnel.min_coherence);
   get_parameter("yaw_tunnel_pre_align_distance", yaw_params.tunnel.pre_align_distance);
   get_parameter("yaw_tunnel_post_release_distance", yaw_params.tunnel.post_release_distance);
-  tunnel_yaw_params_ = yaw_params.tunnel;
   get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   get_parameter("footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
   footprint_yaw_refinement_rounds_ = std::max(0, footprint_yaw_refinement_rounds_);
@@ -778,12 +805,12 @@ void MincoPlannerNode::declareAndLoadParams()
   const double all_yaw_footprint_radius = std::hypot(
     0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_,
     0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_);
-  if (jps_params.safe_distance + 1e-6 < all_yaw_footprint_radius) {
+  if (astar_params.safe_distance + 1e-6 < all_yaw_footprint_radius) {
     RCLCPP_WARN(
       get_logger(),
       "【规划参数修正】图搜索优选净空由 %.3f m 提高到矩形全航向足迹半径 %.3f m。",
-      jps_params.safe_distance, all_yaw_footprint_radius);
-    jps_params.safe_distance = all_yaw_footprint_radius;
+      astar_params.safe_distance, all_yaw_footprint_radius);
+    astar_params.safe_distance = all_yaw_footprint_radius;
   }
   // The all-yaw radius is the circumscribed disc: it demands room to spin in
   // place at every cell. A rectangular body aligned with a corridor only needs
@@ -795,7 +822,7 @@ void MincoPlannerNode::declareAndLoadParams()
   const double inscribed_footprint_radius =
     0.5 * std::max(0.0, std::min(footprint_length_, footprint_width_)) +
     footprint_safety_margin_;
-  preferred_search_clearance_ = jps_params.safe_distance;
+  preferred_search_clearance_ = astar_params.safe_distance;
   get_parameter("clearance_relaxation_enabled", clearance_relaxation_enabled_);
   get_parameter("clearance_detour_ratio", clearance_detour_ratio_);
   get_parameter(
@@ -818,7 +845,6 @@ void MincoPlannerNode::declareAndLoadParams()
     search_clearance_floor_configured_
       ? "显式配置" : "内切半径；每个快照另加栅格量化余量",
     clearance_relaxation_enabled_ ? "开启" : "关闭");
-  astar_params.safe_distance = jps_params.safe_distance;
   astar_params.min_safe_distance = search_clearance_floor_;
   get_parameter("local_repair_enabled", repair_params.enabled);
   get_parameter("local_repair_max_iterations", repair_params.max_iterations);
@@ -850,12 +876,12 @@ void MincoPlannerNode::declareAndLoadParams()
       repair_params.search_radius, repair_params.inscribed_radius_m);
   }
 
-  astar_.setParams(astar_params);
-  static_cast<GridAstarParams &>(jps_params) = astar_params;
-  jps_.setParams(jps_params);
-  // 终点净空放宽档在 const 方法里构造临时搜索器,需要一份参数副本。
-  astar_params_cache_ = astar_params;
-  jps_params_cache_ = jps_params;
+  yaw_params.tunnel.forward_width_limit = std::hypot(
+    footprint_length_ + 2.0 * footprint_safety_margin_,
+    footprint_width_ + 2.0 * footprint_safety_margin_);
+  yaw_params.tunnel.front_extent = 0.5 * footprint_length_ + footprint_safety_margin_;
+  tunnel_yaw_params_ = yaw_params.tunnel;
+  graph_search_.setParams(astar_params);
   optimizer_.setParams(optimizer_params);
   // 4 阶对称（切线 ±pi/2 等价）只对正方形足迹成立；非正方形时 ±pi/2 会把长边横进
   // 通道，这里回退到 2 阶，fail-closed。
@@ -879,7 +905,7 @@ void MincoPlannerNode::declareAndLoadParams()
   collision_repair_.setParams(repair_params);
 }
 
-GridAstarResult MincoPlannerNode::runGraphSearch(
+GridSearchResult MincoPlannerNode::runGraphSearch(
   const nav_msgs::msg::OccupancyGrid & planning_grid,
   const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal,
@@ -905,38 +931,41 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
     ladder.push_back(effective_floor);
   }
 
-  const auto search_at = [&](double clearance) {
-    GridAstarResult attempt;
-    if (search_algorithm_ == "jps") {
-      attempt = jps_.planWithClearance(planning_grid, start, goal, clearance);
-      if (!attempt.success && astar_fallback_) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), log_throttle_ms_,
-          "【规划回退】JPS 失败（jps failed: clearance=%.3f m reason=%s），改用 A*。",
-          clearance, attempt.reason.c_str());
-        attempt = astar_.planWithClearance(
-          planning_grid, start, goal, clearance, blocked_squared);
-      }
-    } else {
-      attempt = astar_.planWithClearance(planning_grid, start, goal, clearance, blocked_squared);
-    }
+  const auto search_at = [&](double clearance, double endpoint_minimum = -1.0) {
+    const auto begin = std::chrono::steady_clock::now();
+    GridSearchOptions options;
+    options.clearance = clearance;
+    options.endpoint_minimum = endpoint_minimum;
+    GridSearchResult attempt = graph_search_.plan(
+      planning_grid, start, goal, blocked_squared, options);
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - begin).count();
+    RCLCPP_INFO(
+      get_logger(),
+      "TRACE graph_search mode=%s requested_clearance=%.3f clearance=%.3f "
+      "expanded=%d wall_ms=%.3f cost=%.9f length=%.3f result='%s'",
+      search_algorithm_.c_str(), clearance, attempt.clearance, attempt.expanded_nodes,
+      wall_ms, attempt.cost, attempt.length, attempt.reason.c_str());
     return attempt;
   };
 
-  GridAstarResult last_result;
+  GridSearchResult last_result;
   for (std::size_t level = 0; level < ladder.size(); ++level) {
     const double clearance = ladder[level];
-    GridAstarResult attempt = search_at(clearance);
+    if (last_result.expanded_nodes > 0 && last_result.clearance <= clearance + 1e-9) {
+      break;  // An endpoint relaxation already searched this effective clearance.
+    }
+    GridSearchResult attempt = search_at(clearance);
     if (attempt.success) {
       // 首选档比窄通道半宽大时,绕远路也能在这一档成功,梯子就永远不降档。
       // 路径相对直线明显绕行时,用下限档再搜一次,明显更短才取代;
       // 安全仍由矩形足迹门禁与局部修复裁定。
-      if (level == 0 && ladder.size() > 1) {
+      if (level == 0 && ladder.size() > 1 && attempt.clearance > ladder[1] + 1e-9) {
         const double straight = std::hypot(
           goal.pose.position.x - start.pose.position.x,
           goal.pose.position.y - start.pose.position.y);
         if (shouldProbeRelaxedClearance(attempt.length, straight, clearance_detour_ratio_)) {
-          GridAstarResult relaxed = search_at(ladder[1]);
+          GridSearchResult relaxed = search_at(ladder[1]);
           if (relaxed.success &&
             shouldTakeRelaxedRoute(attempt.length, relaxed.length, clearance_detour_ratio_))
           {
@@ -945,12 +974,12 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
               "【绕行回退】首选净空 %.3f m 路径 %.2f m（直线 %.2f m）明显绕行，"
               "改用净空 %.3f m 路径 %.2f m；最终仍以航向感知足迹门禁为准。",
               clearance, attempt.length, straight, ladder[1], relaxed.length);
-            used_clearance = ladder[1];
+            used_clearance = relaxed.clearance;
             return relaxed;
           }
         }
       }
-      used_clearance = clearance;
+      used_clearance = attempt.clearance;
       if (clearance + 1e-6 < preferred_search_clearance_) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), log_throttle_ms_,
@@ -970,32 +999,12 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
   // 安全性仍由重解 MINCO 之后的矩形足迹门禁与局部修复裁定,不是靠放宽判据换成功。
   const double relaxed_endpoint_min = gridQuantizationAllowance(planning_grid.info.resolution);
   if (goal_pose_footprint_verified && endpoint_clearance_relaxation_enabled_ &&
+    (last_result.expanded_nodes == 0 || last_result.clearance > effective_floor + 1e-9) &&
     !last_result.success && relaxed_endpoint_min + 1e-6 < effective_floor)
   {
-    GridAstarResult attempt;
-    if (search_algorithm_ == "jps") {
-      GridJpsParams relaxed = jps_params_cache_;
-      relaxed.min_safe_distance = relaxed_endpoint_min;
-      relaxed.relax_endpoint_clearance = true;
-      attempt = GridJps(relaxed).planWithClearance(planning_grid, start, goal, effective_floor);
-      if (!attempt.success && astar_fallback_) {
-        GridAstarParams relaxed_astar = astar_params_cache_;
-        relaxed_astar.min_safe_distance = relaxed_endpoint_min;
-        relaxed_astar.relax_endpoint_clearance = true;
-        attempt =
-          GridAstar(relaxed_astar).planWithClearance(
-          planning_grid, start, goal, effective_floor, blocked_squared);
-      }
-    } else {
-      GridAstarParams relaxed_astar = astar_params_cache_;
-      relaxed_astar.min_safe_distance = relaxed_endpoint_min;
-      relaxed_astar.relax_endpoint_clearance = true;
-      attempt =
-        GridAstar(relaxed_astar).planWithClearance(
-          planning_grid, start, goal, effective_floor, blocked_squared);
-    }
+    GridSearchResult attempt = search_at(effective_floor, relaxed_endpoint_min);
     if (attempt.success) {
-      used_clearance = effective_floor;
+      used_clearance = attempt.clearance;
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), log_throttle_ms_,
         "【终点净空放宽】终点下限从 %.3f m 放宽到 %.3f m 后成功；目标已通过矩形足迹门禁，"
@@ -1008,6 +1017,105 @@ GridAstarResult MincoPlannerNode::runGraphSearch(
 
   used_clearance = ladder.back();
   return last_result;
+}
+
+GridSearchResult MincoPlannerNode::planRoute(
+  const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal, const GoalUuid & goal_uuid,
+  std::uint64_t goal_id, std::uint64_t localization_epoch, bool goal_pose_footprint_verified,
+  double & used_clearance)
+{
+  const auto & grid = snapshot->grid;
+  const auto * squared = snapshot->blocked_squared_cells.get();
+  const bool managed_goal = std::any_of(goal_uuid.begin(), goal_uuid.end(),
+      [](std::uint8_t byte) {return byte != 0;});
+  const bool prior_mode = managed_goal && prior_guide_map_ &&
+    prior_guide_map_->header.frame_id == grid.header.frame_id;
+  GridSearchResult result;
+  if (prior_mode) {
+    const bool same_goal = global_route_ && global_route_->goal_uuid == goal_uuid &&
+      global_route_->goal_id == goal_id && global_route_->localization_epoch == localization_epoch &&
+      global_route_->path->header.frame_id == grid.header.frame_id &&
+      std::hypot(global_route_->goal.position.x - goal.pose.position.x,
+      global_route_->goal.position.y - goal.pose.position.y) <= 0.001 &&
+      std::abs(std::remainder(tf2::getYaw(global_route_->goal.orientation) -
+      tf2::getYaw(goal.pose.orientation), 2.0 * M_PI)) <= 0.001;
+    nav_msgs::msg::Path remaining;
+    double clearance = 0.0;
+    if (same_goal) {
+      remaining = remainingGuide(*global_route_->path, start, replan_start_params_.deviation_max_m);
+      clearance = global_route_->clearance;
+    } else {
+      auto prior = runGraphSearch(
+        *prior_guide_map_, start, goal, goal_pose_footprint_verified, clearance,
+        &prior_blocked_squared_);
+      RCLCPP_INFO(
+        get_logger(), "TRACE global_route source=prior goal=%llu generation=%llu "
+        "publication=%llu source_generation=%llu points=%zu length=%.3f result='%s'",
+        static_cast<unsigned long long>(goal_id), static_cast<unsigned long long>(snapshot->generation),
+        static_cast<unsigned long long>(snapshot->publication_sequence),
+        static_cast<unsigned long long>(snapshot->source_generation),
+        prior.path.poses.size(), prior.length, prior.reason.c_str());
+      remaining = std::move(prior.path);
+    }
+    if (!remaining.poses.empty()) {
+      remaining.header = grid.header;
+      std::optional<geometry_msgs::msg::Point> reference_conflict;
+      {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (reference_conflict_ && reference_conflict_->goal_id == goal_id &&
+          reference_conflict_->localization_epoch == localization_epoch &&
+          reference_conflict_->snapshot_generation == snapshot->generation)
+        {
+          reference_conflict = reference_conflict_->position;
+          reference_conflict_.reset();
+        }
+      }
+      const auto begin = std::chrono::steady_clock::now();
+      const auto * accepted_grid = same_goal ? &global_route_->snapshot->grid : prior_guide_map_.get();
+      auto local = rejoinGlobalRoute(
+        remaining, grid, *squared, clearance, safety_checker_, graph_search_, reference_conflict,
+        accepted_grid);
+      if (local.obstruction) {
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - begin).count();
+        const auto rejoin = local.rejoin.value_or(geometry_msgs::msg::Point());
+        RCLCPP_INFO(
+          get_logger(), "TRACE local_rejoin goal=%llu generation=%llu publication=%llu "
+          "source_generation=%llu cached_publication=%llu cached_source_generation=%llu "
+          "blocked=%zu..%zu expanded=%d wall_ms=%.3f bypass_m=%.3f rejoin=(%.4f,%.4f) result='%s'",
+          static_cast<unsigned long long>(goal_id),
+          static_cast<unsigned long long>(snapshot->generation),
+          static_cast<unsigned long long>(snapshot->publication_sequence),
+          static_cast<unsigned long long>(snapshot->source_generation),
+          static_cast<unsigned long long>(same_goal ? global_route_->snapshot->publication_sequence : 0),
+          static_cast<unsigned long long>(same_goal ? global_route_->snapshot->source_generation : 0),
+          local.obstruction->first, local.obstruction->last, local.route.expanded_nodes,
+          wall_ms, local.bypass_length, rejoin.x, rejoin.y, local.route.reason.c_str());
+      }
+      result = std::move(local.route);
+    }
+  }
+  if (!result.success) {
+    result = runGraphSearch(grid, start, goal, goal_pose_footprint_verified, used_clearance, squared);
+    if (prior_mode) {
+      RCLCPP_INFO(
+        get_logger(), "TRACE global_route source=fused goal=%llu publication=%llu result='%s'",
+        static_cast<unsigned long long>(goal_id),
+        static_cast<unsigned long long>(snapshot->publication_sequence), result.reason.c_str());
+    }
+  }
+  global_route_.reset();
+  if (result.success && prior_mode) {
+    global_route_ = GlobalRoute{
+      goal_uuid, goal_id, localization_epoch, snapshot, goal.pose,
+      std::make_shared<const nav_msgs::msg::Path>(result.path), result.clearance};
+  }
+  if (result.success) {
+    used_clearance = result.clearance;
+  }
+  return result;
 }
 
 void MincoPlannerNode::onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -1088,21 +1196,38 @@ void MincoPlannerNode::ingestMapSnapshot(
   if (retain_safe_reference_on_snapshot_change_) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (active_safety_reference_ && latest_map_snapshot_ && safety_state_.plan_safe &&
+      snapshot->localization_epoch == latest_map_snapshot_->localization_epoch &&
       !snapshot->hasSameSafetyContent(*latest_map_snapshot_))
     {
       retain_candidate = active_safety_reference_;
     }
   }
   std::string retain_reason;
+  geometry_msgs::msg::PoseStamped progress_pose;
+  std::optional<geometry_msgs::msg::Point> reference_conflict;
   // map->odom 在同一定位 epoch 内的连续修正不作废参考，检查按当前 TF 重新表达的参考。
   const ReferenceTrajectory retain_aligned = retain_candidate ?
     alignedToCurrentTf(*retain_candidate) : ReferenceTrajectory();
   const bool retain_verdict = retain_candidate &&
     retain_candidate->trajectory.header.frame_id == snapshot->grid.header.frame_id &&
-    remainingReferenceSafeOn(retain_aligned, snapshot->grid, &retain_reason);
+    remainingReferenceSafeOn(
+      retain_aligned, snapshot->grid, &retain_reason, &progress_pose, &reference_conflict);
+  bool guide_blocked = false;
+  if (replan_advisory_enabled_ && retain_verdict && retain_candidate->guide &&
+    retain_candidate->guide_snapshot)
+  {
+    const auto remaining = remainingGuide(
+      *retain_candidate->guide, progress_pose, replan_start_params_.deviation_max_m);
+    guide_blocked = obstructedGuide(
+      traceGuide(remaining), snapshot->grid, safety_checker_,
+      &retain_candidate->guide_snapshot->grid).has_value();
+    if (guide_blocked) {
+      retain_reason = "global guide footprint conflict";
+    }
+  }
   // 远端冲突、近端安全：继续执行并建议重规划，交给 10 Hz 运行期复检兜底近端。
-  const bool advise_replan = replan_advisory_enabled_ && retain_candidate && !retain_verdict &&
-    runtimeWindowSafeOn(retain_aligned, snapshot->grid);
+  const bool advise_replan = replan_advisory_enabled_ && retain_candidate &&
+    (guide_blocked || (!retain_verdict && runtimeWindowSafeOn(retain_aligned, snapshot->grid)));
   std::optional<ActiveSafetyReference> advised_reference;
   bool retained_reference = false;
   std::uint64_t retained_reference_goal = 0;
@@ -1127,6 +1252,12 @@ void MincoPlannerNode::ingestMapSnapshot(
       retained_generation = latest_map_snapshot_->generation;
       retained_digest = latest_map_snapshot_->safety_content_digest;
     } else {
+      reference_conflict_.reset();
+      if (retain_candidate && reference_conflict) {
+        reference_conflict_ = ReferenceConflict{
+          retain_candidate->goal_id, retain_candidate->localization_epoch,
+          snapshot->generation, *reference_conflict};
+      }
       retained_reference = (retain_verdict || advise_replan) && replaces_existing_snapshot &&
         active_safety_reference_ && safety_state_.plan_safe &&
         safety_state_.mapSnapshotUsable(snapshot->generation) &&
@@ -1140,7 +1271,7 @@ void MincoPlannerNode::ingestMapSnapshot(
       if (retained_reference) {
         active_safety_reference_->map_generation = snapshot->generation;
         retained_reference_goal = active_safety_reference_->goal_id;
-        if (!retain_verdict && (!replan_advised_reference_stamp_ ||
+        if (advise_replan && (!replan_advised_reference_stamp_ ||
           *replan_advised_reference_stamp_ != active_safety_reference_->trajectory.header.stamp))
         {
           replan_advised_reference_stamp_ = active_safety_reference_->trajectory.header.stamp;
@@ -1265,7 +1396,8 @@ void MincoPlannerNode::onMapReadyWatchdog()
 
 bool MincoPlannerNode::remainingReferenceSafeOn(
   const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
-  std::string * reason)
+  std::string * reason, geometry_msgs::msg::PoseStamped * progress_pose,
+  std::optional<geometry_msgs::msg::Point> * conflict)
 {
   if (trajectory.points.size() < 2) {
     if (reason) {
@@ -1292,6 +1424,14 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
     }
     return false;
   }
+  const auto & head = remaining.points.front();
+  if (progress_pose) {
+    progress_pose->header = grid.header;
+    progress_pose->pose.position.x = head.x;
+    progress_pose->pose.position.y = head.y;
+    progress_pose->pose.orientation.z = std::sin(head.yaw * 0.5);
+    progress_pose->pose.orientation.w = std::cos(head.yaw * 0.5);
+  }
   const FootprintSafetyResult safety = safety_checker_.check(remaining, grid);
   if (safety.safe) {
     return true;
@@ -1300,16 +1440,22 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
     evaluateEscapePrefix(remaining.points, safety.collisions, escape_prefix_params_);
   const bool shallow = escapePrefixContactAdmitted(
     remaining, escape, footprint_params_, grid, escape_prefix_params_);
-  if (!shallow && reason) {
-    std::ostringstream text;
+  if (!shallow && !safety.collisions.empty()) {
     const CollisionSample & first = safety.collisions.front();
     const ReferencePoint & center =
       remaining.points[std::min(first.trajectory_index, remaining.points.size() - 1U)];
-    text << "窗口足迹冲突=" << safety.collisions.size() << " 墙钟=" << elapsed << "s 起点=" <<
-      window_start << "s 首冲突序号=" << first.trajectory_index << " 中心=(" << center.x << "," <<
-      center.y << ") 起点位置=(" << remaining.points.front().x << "," <<
-      remaining.points.front().y << ")";
-    *reason = text.str();
+    if (conflict) {
+      auto & position = conflict->emplace();
+      position.x = center.x;
+      position.y = center.y;
+    }
+    if (reason) {
+      std::ostringstream text;
+      text << "窗口足迹冲突=" << safety.collisions.size() << " 墙钟=" << elapsed << "s 起点=" <<
+        window_start << "s 首冲突序号=" << first.trajectory_index << " 中心=(" << center.x << "," <<
+        center.y << ") 起点位置=(" << head.x << "," << head.y << ")";
+      *reason = text.str();
+    }
   }
   return shallow;
 }
@@ -1588,7 +1734,7 @@ void MincoPlannerNode::onPlannerGoal(
     msg->goal_pose, msg->goal_id, msg->localization_epoch,
     msg->plan_request_sequence,
     msg->map_publication_sequence, true, frozen_start,
-    frozen_seed.valid ? &frozen_seed : nullptr, msg->position_tolerance);
+    frozen_seed.valid ? &frozen_seed : nullptr, msg->position_tolerance, msg->goal_uuid);
 }
 
 void MincoPlannerNode::planGoal(
@@ -1597,7 +1743,8 @@ void MincoPlannerNode::planGoal(
     std::uint64_t map_publication_sequence,
     bool report_status,
     const geometry_msgs::msg::PoseStamped * frozen_start,
-    const InitialKinematicState * initial_state, double position_tolerance) {
+    const InitialKinematicState * initial_state, double position_tolerance,
+    const GoalUuid & goal_uuid) {
   const auto plan_wall_begin = std::chrono::steady_clock::now();
   const rclcpp::Time plan_begin_time = now();
   bool keep_active_reference = false;
@@ -1678,7 +1825,10 @@ void MincoPlannerNode::planGoal(
     map_health_epoch = map_health_epoch_;
     map_ready = map_snapshot && safety_state_.mapSnapshotUsable(map_snapshot->generation);
   }
-  if (!map_ready || !map_snapshot) {
+  if (!map_ready || !map_snapshot ||
+    (localization_epoch != 0 && map_snapshot->localization_epoch != 0 &&
+    map_snapshot->localization_epoch != localization_epoch))
+  {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_, "【等待地图】尚未收到可通行栅格，规划保持急停。");
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_MAP_UNREADY, 0);
@@ -1805,10 +1955,9 @@ void MincoPlannerNode::planGoal(
 
   // 起点来自 TF、终点来自 goal_topic，因此此分支不依赖 Smac 的路径几何。
   double used_clearance = preferred_search_clearance_;
-  const GridAstarResult search_result =
-    runGraphSearch(
-    planning_grid, start, goal, goal_pose_footprint_verified, used_clearance,
-    map_snapshot->blocked_squared_cells.get());
+  const GridSearchResult search_result = planRoute(
+    map_snapshot, start, goal, goal_uuid, goal_id, localization_epoch,
+    goal_pose_footprint_verified, used_clearance);
   if (!search_result.success) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
@@ -1833,6 +1982,21 @@ void MincoPlannerNode::planGoal(
   // geometry, ESDF, time-allocation, or dynamic-limit stage.
   if (raw_path_pub_) {
     raw_path_pub_->publish(search_result.path);
+  }
+  if (tunnel_yaw_params_.enabled && clearance_esdf) {
+    auto guide = traceGuide(search_result.path);
+    annotatePositionClearance(guide, *map_snapshot);
+    for (const auto & tunnel : detectTunnelSegments(guide, *clearance_esdf, tunnel_yaw_params_)) {
+      if (tunnel.forward_alignment) {
+        const auto & entry = guide.points[tunnel.begin];
+        RCLCPP_INFO(
+          get_logger(), "TRACE guide_tunnel publication=%llu width_m=%.3f "
+          "entry=(%.3f,%.3f) yaw=%.3f exit=(%.3f,%.3f)",
+          static_cast<unsigned long long>(map_snapshot->publication_sequence),
+          tunnel.width_estimate, entry.x, entry.y, tunnel.axis_yaw.front(),
+          guide.points[tunnel.end].x, guide.points[tunnel.end].y);
+      }
+    }
   }
   MincoOptimizationTrace selected_trace;
   ReferenceTrajectory center_reference = optimizer_.optimize(
@@ -2290,6 +2454,21 @@ void MincoPlannerNode::planGoal(
   // 授权按原规则判定。
   std::uint8_t yaw_authority = selectYawAuthority(
     reference, force_body_yaw_follow_, body_yaw_follow_clearance_);
+  std::vector<TunnelSegment> forward_tunnels;
+  if (tunnel_yaw_params_.enabled && clearance_esdf) {
+    auto center = reference;
+    annotatePositionClearance(center, *map_snapshot);
+    forward_tunnels = detectTunnelSegments(center, *clearance_esdf, tunnel_yaw_params_);
+  }
+  if (!forwardTunnelEntriesAligned(reference, forward_tunnels, tunnel_yaw_params_)) {
+    RCLCPP_WARN(
+      get_logger(), "【洞口对齐拒绝】目标=%llu 快照=%llu，候选进入窄通道前未对向入口。",
+      static_cast<unsigned long long>(goal_id),
+      static_cast<unsigned long long>(map_snapshot->publication_sequence));
+    fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_FOOTPRINT,
+      map_snapshot->generation);
+    return;
+  }
   if (spin_policy_.enabled && !force_body_yaw_follow_) {
     ReferenceTrajectory spun = reference;
     SpinYawParams spin_params = spin_yaw_params_;
@@ -2300,7 +2479,8 @@ void MincoPlannerNode::planGoal(
     if (spin_ok) {
       applyWheelSpeedTimeScaling(spun, wheel_speed_time_scaling_params_);
       annotateClearance(spun, *map_snapshot);
-      spin_ok = spun.valid() && safety_checker_.check(spun, planning_grid).safe;
+      spin_ok = spun.valid() && safety_checker_.check(spun, planning_grid).safe &&
+        forwardTunnelEntriesAligned(spun, forward_tunnels, tunnel_yaw_params_);
     }
     if (spin_ok) {
       reference = std::move(spun);
@@ -2753,6 +2933,7 @@ void MincoPlannerNode::invalidatePlannerStatusLocked(
 }
 
 void MincoPlannerNode::invalidateMapLocked() {
+  reference_conflict_.reset();
   ++map_health_epoch_;
   latest_map_snapshot_.reset();
   active_safety_reference_.reset();
@@ -2829,6 +3010,12 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
   active_reference.plan_request_sequence = plan_request_sequence;
   active_reference.map_generation = snapshot->generation;
   active_reference.map_publication_sequence = map_publication_sequence;
+  if (global_route_ && global_route_->snapshot->generation == snapshot->generation &&
+    global_route_->goal_id == goal_id && global_route_->localization_epoch == localization_epoch)
+  {
+    active_reference.guide = global_route_->path;
+    active_reference.guide_snapshot = global_route_->snapshot;
+  }
   if (control_from_grid) {
     active_reference.control_from_grid = *control_from_grid;
     active_reference.control_reference = committed_reference;

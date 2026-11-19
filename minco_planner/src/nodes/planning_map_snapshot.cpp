@@ -67,6 +67,9 @@ std::shared_ptr<const PlanningMapSnapshot> PlanningMapSnapshot::fromMessage(
   }
   auto snapshot = std::make_shared<PlanningMapSnapshot>();
   snapshot->generation = generation;
+  snapshot->source_generation = message.source_generation;
+  snapshot->publication_sequence = message.publication_sequence;
+  snapshot->localization_epoch = message.localization_epoch;
   snapshot->grid.header.frame_id = message.header.frame_id;
   snapshot->grid.header.stamp = message.source_stamp;
   snapshot->grid.info = message.info;

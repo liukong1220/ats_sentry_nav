@@ -141,6 +141,24 @@ void YawSplinePlanner::applyClearanceAware(
   double previous_t = trajectory.points.front().t;
   double previous_rate = 0.0;
   const double acceleration_limit = std::max(0.0, params_.yaw_acceleration_limit);
+  const double rate_limit = std::max(0.0, params_.yaw_rate_limit);
+  // Start before the front reaches the entry. Allow enough trajectory time for
+  // even a half-turn, including deceleration into the directed tunnel heading.
+  const double alignment_time = std::max(
+    1.875 * M_PI / std::max(1e-3, rate_limit),
+    acceleration_limit > 0.0 ? std::sqrt(5.7735 * M_PI / acceleration_limit) : 0.0);
+  std::vector<double> tunnel_turn_start;
+  if (tunnels) {
+    tunnel_turn_start.reserve(tunnels->size());
+    for (const auto & tunnel : *tunnels) {
+      std::size_t entry = tunnel.begin;
+      const double front_s = trajectory.points[entry].s - params_.tunnel.front_extent;
+      while (entry > 0U && trajectory.points[entry].s > front_s) {
+        --entry;
+      }
+      tunnel_turn_start.push_back(trajectory.points[entry].t - alignment_time);
+    }
+  }
   trajectory.points.front().yaw = previous_yaw;
   trajectory.points.front().yaw_rate = 0.0;
 
@@ -149,23 +167,26 @@ void YawSplinePlanner::applyClearanceAware(
     double desired_yaw = open_area_yaws[i];
     bool tunnel_alignment = false;
     if (tunnels != nullptr) {
-      for (const auto & tunnel : *tunnels) {
+      for (std::size_t j = 0; j < tunnels->size(); ++j) {
+        const auto & tunnel = (*tunnels)[j];
         if (tunnel.axis_yaw.empty()) {
           continue;
         }
         const double begin_s = trajectory.points[tunnel.begin].s - params_.tunnel.pre_align_distance;
         const double end_s = trajectory.points[tunnel.end].s + params_.tunnel.post_release_distance;
-        if (current.s >= begin_s && current.s <= end_s) {
+        const bool prealign = tunnel.forward_alignment && current.t >= tunnel_turn_start[j];
+        if ((current.s >= begin_s || prealign) && current.s <= end_s) {
           const std::size_t local_index =
             std::min(tunnel.axis_yaw.size() - 1, i >= tunnel.begin ? i - tunnel.begin : 0U);
-          desired_yaw = tunnelAlignedYaw(
-            tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
+          desired_yaw = tunnel.forward_alignment ?
+            normalizeAngle(tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset) :
+            tunnelAlignedYaw(tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
           tunnel_alignment = true;
           break;
         }
       }
     }
-    if (minimal_rotation && !narrow_flags[i]) {
+    if (minimal_rotation && !tunnel_alignment && !narrow_flags[i]) {
       if (i == 1 || narrow_flags[i - 1]) {
         // 进入开阔段：找下一段窄通道入口，目标取其切线的对齐朝向；没有则为目标朝向。
         std::size_t run_end = i;
@@ -204,7 +225,6 @@ void YawSplinePlanner::applyClearanceAware(
 
     // 最后按 yaw_rate_limit 裁剪，避免参考轨迹要求舵轮瞬时转向。
     const double dt = std::max(1e-3, current.t - previous_t);
-    const double rate_limit = std::max(0.0, params_.yaw_rate_limit);
     const double desired_delta = shortestAngularDistance(previous_yaw, desired_yaw);
     double rate = std::max(-rate_limit, std::min(rate_limit, desired_delta / dt));
     if (acceleration_limit > 0.0) {

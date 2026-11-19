@@ -149,10 +149,46 @@ std::vector<TunnelSegment> detectTunnelSegments(
         std::atan2(trajectory.points[end].y - trajectory.points[begin].y,
           trajectory.points[end].x - trajectory.points[begin].x));
     }
+    segment.forward_alignment = segment.width_estimate < params.forward_width_limit;
+    if (segment.forward_alignment) {
+      for (std::size_t k = begin; k <= end; ++k) {
+        const auto & previous = trajectory.points[k - 1U];
+        const auto & next = trajectory.points[k + 1U];
+        const double direction = std::atan2(next.y - previous.y, next.x - previous.x);
+        auto & axis = segment.axis_yaw[k - begin];
+        axis = tunnelAlignedYaw(axis, 0.0, direction);
+      }
+    }
     segments.push_back(std::move(segment));
     ++i;
   }
   return segments;
+}
+
+bool forwardTunnelEntriesAligned(
+  const ReferenceTrajectory & trajectory, const std::vector<TunnelSegment> & tunnels,
+  const TunnelYawParams & params)
+{
+  constexpr double kAxisTolerance = 0.20;
+  for (const auto & tunnel : tunnels) {
+    if (!tunnel.forward_alignment || tunnel.axis_yaw.empty()) {
+      continue;
+    }
+    const double entry_s = trajectory.points[tunnel.begin].s - params.front_extent;
+    // Check the last pose before the front reaches the mouth, and all poses in the passage.
+    std::size_t first = tunnel.begin;
+    while (first > 0U && trajectory.points[first].s > entry_s) {
+      --first;
+    }
+    for (std::size_t i = first; i <= tunnel.end; ++i) {
+      const auto local_index = i > tunnel.begin ? i - tunnel.begin : 0U;
+      const double target = tunnel.axis_yaw[local_index] + params.yaw_offset;
+      if (std::abs(normalize(trajectory.points[i].yaw - target)) > kAxisTolerance) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 }  // namespace minco_planner

@@ -167,7 +167,8 @@ protected:
 
   // Builds the node, subscribes a probe to its PlannerStatus topic, then commits a reference
   // exactly like the sandbox CLI: free-space grid -> onGrid -> planGoal.
-  void startAndCommit(bool retain, bool advisory)
+  void startAndCommit(
+    bool retain, bool advisory, const MincoPlannerNode::GoalUuid & goal_uuid = {})
   {
     node_ = std::make_shared<MincoPlannerNode>(makeNodeOptions(retain, advisory));
     probe_ = std::make_shared<rclcpp::Node>("minco_ongrid_probe");
@@ -180,10 +181,16 @@ protected:
       << "probe never matched the planner status publisher";
 
     node_->onGrid(std::make_shared<Grid>(makeArena()));
+    if (goal_uuid.front() != 0) {
+      node_->prior_guide_map_ = std::make_shared<const Grid>(makeArena());
+      const auto & params = node_->safety_checker_.params();
+      node_->prior_blocked_squared_ = minco_planner::computeBlockedSquaredDistanceCells(
+        *node_->prior_guide_map_, {params.obstacle_value_threshold, params.unknown_is_obstacle});
+    }
     const auto start = makePose(kStartX, 0.0);
     node_->planGoal(
       makePose(kGoalX, 0.0), kGoalId, /*localization_epoch=*/1, /*plan_request_sequence=*/1,
-      /*map_publication_sequence=*/1, /*report_status=*/true, &start, nullptr);
+      /*map_publication_sequence=*/1, /*report_status=*/true, &start, nullptr, 0.0, goal_uuid);
 
     ASSERT_TRUE(node_->active_safety_reference_.has_value()) << "free-space plan was not committed";
     ASSERT_TRUE(node_->safety_state_.plan_safe);
@@ -409,6 +416,41 @@ TEST_F(OnGridBranchTest, InvalidatesFailClosedWhenNearSegmentIsUnsafe)
   EXPECT_EQ(
     findStatus(PlannerStatus::STATE_ACCEPTED, PlannerStatus::FAILURE_REPLAN_ADVISED), nullptr)
     << "near-window conflict must never be advised";
+}
+
+TEST_F(OnGridBranchTest, BlockedPriorRouteKeepsTheStopAfterTheFullSearchFails)
+{
+  const MincoPlannerNode::GoalUuid goal_uuid{1};
+  ASSERT_NO_FATAL_FAILURE(startAndCommit(/*retain=*/true, /*advisory=*/true, goal_uuid));
+  ASSERT_TRUE(node_->global_route_);
+  ASSERT_EQ(node_->global_route_->goal_uuid, goal_uuid);
+
+  auto blocked = makeArena();
+  const auto column = static_cast<std::size_t>(2.3 / kResolution);
+  for (std::size_t row = 0; row < blocked.info.height; ++row) {
+    blocked.data[row * blocked.info.width + column] = 100;
+  }
+  ASSERT_TRUE(headSafe(blocked));
+  ASSERT_FALSE(runtimeWindowSafe(blocked));
+  feed(blocked);
+  ASSERT_NO_FATAL_FAILURE(expectInvalidated(2));
+
+  const auto start = makePose(kStartX, 0.0);
+  node_->planGoal(
+    makePose(kGoalX, 0.0), kGoalId, /*localization_epoch=*/1, /*plan_request_sequence=*/2,
+    /*map_publication_sequence=*/2, /*report_status=*/true, &start, nullptr, 0.0, goal_uuid);
+
+  EXPECT_FALSE(node_->global_route_);
+  EXPECT_FALSE(node_->active_safety_reference_);
+  EXPECT_TRUE(node_->safety_state_.emergencyStopRequired());
+  ASSERT_TRUE(spinUntil([this] {
+    return findStatus(PlannerStatus::STATE_FAILED, PlannerStatus::FAILURE_NO_PATH);
+  }));
+  const auto * failure = findStatus(PlannerStatus::STATE_FAILED, PlannerStatus::FAILURE_NO_PATH);
+  EXPECT_EQ(failure->goal_id, kGoalId);
+  EXPECT_EQ(failure->localization_epoch, 1U);
+  EXPECT_EQ(failure->plan_request_sequence, 2U);
+  EXPECT_EQ(failure->map_generation, 2U);
 }
 
 // retention disabled: a harmless map change still invalidates the previous reference.

@@ -3,12 +3,21 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <iostream>
+#include <random>
 
 #include "minco_planner/planning/clearance_ladder.hpp"
 #include "minco_planner/planning/grid_astar.hpp"
 #include "minco_planner/planning/grid_clearance.hpp"
 #include "minco_planner/planning/grid_jps.hpp"
+#include "minco_planner/planning/grid_search.hpp"
+#include "minco_planner/safety/goal_pose_admission.hpp"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace
 {
@@ -592,4 +601,251 @@ TEST(GridAstarClearanceCost, DisabledCostKeepsShortestPathLength)
   ASSERT_TRUE(baseline.success);
   ASSERT_TRUE(disabled.success);
   EXPECT_DOUBLE_EQ(disabled.length, baseline.length);
+}
+
+namespace
+{
+
+double pathCost(
+  const nav_msgs::msg::OccupancyGrid & grid, const nav_msgs::msg::Path & path,
+  const std::vector<double> & blocked_squared, const minco_planner::GridAstarParams & params)
+{
+  const auto index = [&](const geometry_msgs::msg::PoseStamped & pose) {
+      const auto & p = pose.pose.position;
+      return std::make_pair(
+        static_cast<int>(std::floor(p.x / grid.info.resolution)),
+        static_cast<int>(std::floor(p.y / grid.info.resolution)));
+    };
+  double total = 0.0;
+  for (std::size_t i = 1; i < path.poses.size(); ++i) {
+    const auto a = index(path.poses[i - 1]);
+    const auto b = index(path.poses[i]);
+    const int dx = std::abs(a.first - b.first);
+    const int dy = std::abs(a.second - b.second);
+    EXPECT_LE(dx, 1);
+    EXPECT_LE(dy, 1);
+    if (a == b) {
+      continue;
+    }
+    const double distance = std::sqrt(
+      blocked_squared[b.second * grid.info.width + b.first]) * grid.info.resolution;
+    double factor = 1.0;
+    if (distance < params.clearance_cost_distance && params.clearance_cost_weight > 0.0) {
+      const double deficit =
+        (params.clearance_cost_distance - distance) / params.clearance_cost_distance;
+      factor += params.clearance_cost_weight * deficit * deficit;
+    }
+    total += (dx && dy ? params.diagonal_cost : 1.0) * factor;
+  }
+  return total;
+}
+
+void expectSameAstarPath(
+  const minco_planner::GridAstarResult & previous,
+  const minco_planner::GridSearchResult & unified)
+{
+  ASSERT_EQ(previous.success, unified.success);
+  EXPECT_EQ(previous.reason, unified.reason);
+  ASSERT_EQ(previous.path, unified.path);
+  EXPECT_EQ(std::memcmp(&previous.length, &unified.length, sizeof(double)), 0);
+  const auto components = [](const auto & pose) {
+      return std::array<double, 7>{
+        pose.position.x, pose.position.y, pose.position.z, pose.orientation.x,
+        pose.orientation.y, pose.orientation.z, pose.orientation.w};
+    };
+  for (std::size_t i = 0; i < previous.path.poses.size(); ++i) {
+    const auto older = components(previous.path.poses[i].pose);
+    const auto newer = components(unified.path.poses[i].pose);
+    EXPECT_EQ(std::memcmp(older.data(), newer.data(), older.size() * sizeof(double)), 0);
+  }
+  if (previous.success) {
+    EXPECT_EQ(previous.expanded_nodes, unified.expanded_nodes);
+  }
+}
+
+}  // namespace
+
+TEST(UnifiedGridSearch, JumpOffMatchesExistingCorridorsAndEndpointRelaxation)
+{
+  minco_planner::GridSearchParams params;
+  params.jump_enabled = false;
+  params.safe_distance = kCircumscribedRadius;
+  params.min_safe_distance = kInscribedRadius;
+  params.unknown_is_obstacle = true;
+  params.start_escape_max_steps = 8;
+  params.clearance_cost_weight = 4.0;
+  params.clearance_cost_distance = 0.8;
+  minco_planner::GridSearch search(params);
+  minco_planner::GridAstar previous(params);
+  for (const auto & grid : {makeWestCorridorGrid(), makeCorridorGrid(), makeOpenGrid(60, 30)}) {
+    const auto field = minco_planner::computeBlockedSquaredDistanceCells(
+      grid, {params.obstacle_value_threshold, params.unknown_is_obstacle});
+    for (const auto & start : {poseAt(0.15, 1.55), poseAt(1.57, 1.55)}) {
+      for (const auto & goal : {poseAt(5.43, 1.51), poseAt(0.24, 1.55), poseAt(6.1, 1.55)}) {
+        for (const double clearance : {0.0, 0.28, kCircumscribedRadius}) {
+          minco_planner::GridSearchOptions options;
+          options.clearance = clearance;
+          expectSameAstarPath(
+            previous.planWithClearance(grid, start, goal, clearance, &field),
+            search.plan(grid, start, goal, &field, options));
+        }
+      }
+    }
+  }
+}
+
+TEST(UnifiedGridSearch, JumpMatchesWeightedAstarOnTheSameRandomizedGrids)
+{
+  using Clock = std::chrono::steady_clock;
+  std::mt19937 generator(0x20271119);
+  minco_planner::GridSearch search;
+  constexpr int kTrials = 480;
+  int reachable = 0;
+  int escaped_starts = 0;
+  int previous_expanded = 0;
+  int hybrid_expanded = 0;
+  double previous_ms = 0.0;
+  double hybrid_ms = 0.0;
+  double max_cost_difference = 0.0;
+  for (int trial = 0; trial < kTrials; ++trial) {
+    SCOPED_TRACE(trial);
+    const bool full_field = trial % 12 == 0;
+    const int width = full_field ? 280 : 32 + trial % 7;
+    const int height = full_field ? 160 : 22 + trial % 5;
+    auto grid = makeOpenGrid(width, height);
+    const auto set = [&](int x, int y, int value) {grid.data[y * width + x] = value;};
+    for (int i = 0; i < (full_field ? 20 : 6); ++i) {
+      const int x = 6 + generator() % (width - 12);
+      const int y = 2 + generator() % (height - 5);
+      const int value = i % 3 == 0 ? -1 : 100;
+      for (int dy = 0; dy < 3; ++dy) {
+        for (int dx = 0; dx < 3; ++dx) {
+          set(x + dx, y + dy, value);
+        }
+      }
+    }
+    if (trial % 2 == 0 && !full_field) {
+      const int gap = 4 + generator() % (height - 10);
+      for (int y = 0; y < height; ++y) {
+        if (y < gap || y >= gap + (trial % 20 == 0 ? 2 : 7)) {
+          set(width / 2, y, 100);
+        }
+      }
+    }
+    minco_planner::GridSearchParams params;
+    params.safe_distance = trial % 3 == 0 ? 0.21 : 0.0;
+    params.unknown_is_obstacle = trial % 7 != 0;
+    params.start_escape_max_steps = 6;
+    params.clearance_cost_weight = trial % 5 == 0 ? 0.0 : 4.0;
+    params.clearance_cost_distance = full_field ? 1.0 : 0.4;
+    search.setParams(params);
+    const auto field = minco_planner::computeBlockedSquaredDistanceCells(
+      grid, {params.obstacle_value_threshold, params.unknown_is_obstacle});
+    const int start_x = trial % 3 == 0 ? 0 : 3;
+    const auto start = poseAt((start_x + 0.5) * grid.info.resolution,
+        (5.5 + generator() % (height / 2)) * grid.info.resolution);
+    const auto goal = poseAt((width - 4.5) * grid.info.resolution,
+        (4.5 + generator() % (height - 8)) * grid.info.resolution);
+
+    auto begin = Clock::now();
+    const auto previous = minco_planner::GridAstar(params).planWithClearance(
+      grid, start, goal, -1.0, &field);
+    previous_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    begin = Clock::now();
+    const auto hybrid = search.plan(grid, start, goal, &field);
+    hybrid_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    ASSERT_EQ(previous.success, hybrid.success);
+    previous_expanded += previous.expanded_nodes;
+    hybrid_expanded += hybrid.expanded_nodes;
+
+    params.jump_enabled = false;
+    search.setParams(params);
+    expectSameAstarPath(previous, search.plan(grid, start, goal, &field));
+    if (previous.success) {
+      ++reachable;
+      escaped_starts += start_x == 0;
+      const double expected = pathCost(grid, previous.path, field, params);
+      EXPECT_NEAR(pathCost(grid, hybrid.path, field, params), hybrid.cost, 1e-9);
+      EXPECT_NEAR(expected, hybrid.cost, 1e-9);
+      max_cost_difference = std::max(max_cost_difference, std::abs(expected - hybrid.cost));
+    }
+  }
+  EXPECT_GT(reachable, 250);
+  EXPECT_GT(escaped_starts, 50);
+  std::cout << "Unified search Release comparison: grids=" << kTrials << ", reachable=" <<
+    reachable << ", escaped_starts=" << escaped_starts << ", max_cost_delta=" <<
+    max_cost_difference << ", legacy_Astar_expanded=" << previous_expanded <<
+    ", hybrid_expanded=" << hybrid_expanded << ", legacy_Astar_wall_ms=" << previous_ms <<
+    ", hybrid_wall_ms=" << hybrid_ms << '\n';
+}
+
+TEST(UnifiedGridSearch, OutsideGoalReturnsTheClosestKnownFreeStop)
+{
+  auto grid = makeOpenGrid(40, 28);
+  for (std::uint32_t y = 0; y < grid.info.height; ++y) {
+    std::fill_n(grid.data.begin() + y * grid.info.width + 30, 10, -1);
+  }
+  minco_planner::GridSearchParams params;
+  params.unknown_is_obstacle = true;
+  params.safe_distance = 0.31;
+  minco_planner::FootprintSafetyParams footprint;
+  footprint.length = 0.38;
+  footprint.width = 0.36;
+  footprint.safety_margin = 0.02;
+  footprint.unknown_is_obstacle = true;
+  minco_planner::GridSearchOptions options;
+  options.can_stop = [&](const auto & pose) {
+      return minco_planner::goalPoseFootprintFree(
+        pose.pose.position.x, pose.pose.position.y, tf2::getYaw(pose.pose.orientation),
+        grid, footprint);
+    };
+  const auto field = minco_planner::computeBlockedSquaredDistanceCells(grid, {50, true});
+  const auto start = poseAt(0.75, 1.45);
+  const auto outside = poseAt(8.0, 1.45);
+  for (const bool jump : {false, true}) {
+    params.jump_enabled = jump;
+    minco_planner::GridSearch search(params);
+    EXPECT_FALSE(search.plan(grid, start, outside, &field).partial);
+    const auto result = search.plan(grid, start, outside, &field, options);
+    EXPECT_FALSE(result.success);
+    ASSERT_TRUE(result.partial) << result.reason;
+    EXPECT_EQ(result.reason, "partial: goal is outside grid");
+    ASSERT_GT(result.path.poses.size(), 1U);
+    const auto & end = result.path.poses.back();
+    EXPECT_NEAR(end.pose.position.x, 2.65, 1e-6);
+    EXPECT_NEAR(end.pose.position.y, 1.45, 1e-6);
+    EXPECT_TRUE(options.can_stop(end));
+    EXPECT_EQ(result.path.poses.front(), start);
+  }
+}
+
+TEST(UnifiedGridSearch, DisconnectedGoalOnlyReturnsAnAdmittedPartialStop)
+{
+  auto grid = makeOpenGrid(36, 28);
+  for (int y = 0; y < 28; ++y) {
+    block(grid, 20, y);
+  }
+  const auto field = minco_planner::computeBlockedSquaredDistanceCells(grid, {50, true});
+  minco_planner::GridSearchParams params;
+  params.unknown_is_obstacle = true;
+  params.jump_enabled = false;
+  minco_planner::GridSearch search(params);
+  minco_planner::GridSearchOptions options;
+  const auto start = poseAt(0.55, 1.35);
+  const auto goal = poseAt(2.85, 1.35);
+  options.can_stop = [](const auto &) {return false;};
+  const auto rejected = search.plan(grid, start, goal, &field, options);
+  EXPECT_FALSE(rejected.success);
+  EXPECT_FALSE(rejected.partial);
+  EXPECT_TRUE(rejected.path.poses.empty());
+  options.can_stop = [](const auto & pose) {return pose.pose.position.x < 1.7;};
+  const auto partial = search.plan(grid, start, goal, &field, options);
+  ASSERT_TRUE(partial.partial);
+  EXPECT_FALSE(partial.success);
+  EXPECT_EQ(partial.reason, "partial: no path");
+  EXPECT_NEAR(partial.path.poses.back().pose.position.x, 1.65, 1e-6);
+  EXPECT_NEAR(partial.path.poses.back().pose.position.y, 1.35, 1e-6);
+  const auto complete = search.plan(grid, start, poseAt(1.45, 1.35), &field, options);
+  EXPECT_TRUE(complete.success);
+  EXPECT_FALSE(complete.partial);
 }

@@ -287,6 +287,8 @@ public:
     ground_columns_ = std::make_unique<GroundColumnGrid>(
       layer_config.width, layer_config.height, layer_config.resolution,
       layer_config.origin_x, layer_config.origin_y, column_config);
+    projection_follow_measured_ground_ = declare_parameter<bool>(
+      "projection_follow_measured_ground", false);
     base_ground_offset_ = declare_parameter<double>("odom_layer.base_ground_offset", 0.0);
     layer_window_x_ = declare_parameter<double>("odom_layer.window_x", 12.0);
     layer_window_y_ = declare_parameter<double>("odom_layer.window_y", 12.0);
@@ -1404,6 +1406,13 @@ public:
                (point.array() <= (esdf_box_max.array() + tolerance)).all();
       };
     const auto sample_started = std::chrono::steady_clock::now();
+    const bool use_ground = projection_follow_measured_ground_ && !test_reset_to_unknown_active_;
+    std::unique_lock<std::mutex> layer_lock(layer_mutex_, std::defer_lock);
+    if (use_ground) {
+      layer_lock.lock();
+    }
+    const auto & layer_config = odom_layer_->config();
+    const auto & column_config = ground_columns_->config();
     for (std::uint32_t my = 0; my < grid.info.height; ++my) {
       for (std::uint32_t mx = 0; mx < grid.info.width; ++mx) {
         const std::size_t index =
@@ -1414,9 +1423,32 @@ public:
           grid.info.origin.position.y + (static_cast<double>(my) + 0.5) * resolution);
         bool occupied = false;
         bool known_free = false;
+        double cell_z_min = z_min;
+        double cell_z_max = z_max;
+        if (use_ground) {
+          const double x0 = grid.info.origin.position.x + mx * resolution;
+          const double y0 = grid.info.origin.position.y + my * resolution;
+          const int value = odom_layer_->sampleFootprint(x0, y0, x0 + resolution, y0 + resolution);
+          occupied = value == 100;
+          if (value == 0) {
+            const int gx = static_cast<int>(std::floor((x - layer_config.origin_x) /
+              layer_config.resolution));
+            const int gy = static_cast<int>(std::floor((y - layer_config.origin_y) /
+              layer_config.resolution));
+            if (const auto ground = ground_columns_->ground(gx, gy)) {
+              // Observed connected support establishes the swept height band. The
+              // numerical map can still block a column with a new return in that band.
+              cell_z_min = std::max(static_cast<double>(box_min.z()),
+                *ground + column_config.surface_max);
+              cell_z_max = std::min(static_cast<double>(box_max.z()),
+                *ground + column_config.robot_height + column_config.top_margin);
+              known_free = cell_z_max >= cell_z_min;
+            }
+          }
+        }
         double minimum_distance = std::numeric_limits<double>::infinity();
-        for (double z = z_min + 0.5 * z_step; z <= z_max + 1e-6; z += z_step) {
-          const rog_map::Vec3f point(x, y, static_cast<float>(std::min(z, z_max)));
+        for (double z = cell_z_min + 0.5 * z_step; z <= cell_z_max + 1e-6; z += z_step) {
+          const rog_map::Vec3f point(x, y, static_cast<float>(std::min(z, cell_z_max)));
           // Downstream JPS and footprint gates apply their own metric clearance on this snapshot.
           // Project raw probability occupancy here to avoid double-inflating the robot start cell.
           const auto grid_type_started = std::chrono::steady_clock::now();
@@ -1453,6 +1485,9 @@ public:
           }
         }
       }
+    }
+    if (use_ground) {
+      layer_lock.unlock();
     }
     sample_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - sample_started).count();
@@ -1554,6 +1589,7 @@ private:
   std::unique_ptr<RogMapEngine> map_;
   std::unique_ptr<OdomLayerStore> odom_layer_;
   std::unique_ptr<GroundColumnGrid> ground_columns_;
+  bool projection_follow_measured_ground_{false};
   double base_ground_offset_{0.0};
   double layer_window_x_{12.0}, layer_window_y_{12.0};
   double layer_center_x_{0.0}, layer_center_y_{0.0};

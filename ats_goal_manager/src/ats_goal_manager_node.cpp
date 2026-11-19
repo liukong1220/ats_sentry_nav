@@ -547,6 +547,9 @@ private:
       active_goal_->expected_plan_request_sequence = request.plan_request_sequence;
       active_goal_->requested_planning_target = target;
       request.position_tolerance = active_goal_->requested_position_tolerance;
+      if (active_goal_->action_handle) {
+        request.goal_uuid = active_goal_->action_handle->get_goal_id();
+      }
       request.start_pose = planner_start_in_planning_frame_ ? current_planning_pose_ : current_pose_;
       request.start_pose.header.stamp = current_localization_stamp_;
       request.start_twist.linear.x = current_world_vx_;

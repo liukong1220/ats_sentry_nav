@@ -2,6 +2,8 @@
 
 #include "minco_planner/planning/grid_jps.hpp"
 
+// [Dead Code Suggestion] GridSearch owns online graph search. Keep GridJps for legacy tests.
+
 #include <algorithm>
 #include <cmath>
 #include <limits>

@@ -36,7 +36,7 @@ minco_planner:
     obstacle_value_threshold: 50
     unknown_is_obstacle: true
     allow_diagonal: true
-    search_algorithm: jps
+    search_algorithm: hybrid
     astar_fallback: true
     jps_max_expanded_nodes: -1
     jps_safe_distance: 0.36

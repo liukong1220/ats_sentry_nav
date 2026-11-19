@@ -3,6 +3,7 @@
 #ifndef MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 #define MINCO_PLANNER__MINCO_PLANNER_NODE_HPP_
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -22,8 +23,8 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/nodes/planning_map_snapshot.hpp"
-#include "minco_planner/planning/grid_astar.hpp"
-#include "minco_planner/planning/grid_jps.hpp"
+#include "minco_planner/planning/grid_search.hpp"
+#include "minco_planner/planning/local_route.hpp"
 #include "minco_planner/safety/escape_prefix.hpp"
 #include "minco_planner/safety/goal_pose_admission.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"
@@ -65,19 +66,27 @@ public:
   explicit MincoPlannerNode(const rclcpp::NodeOptions & options);
 
 private:
+  using GoalUuid = std::array<std::uint8_t, 16>;
+
   /// Run the graph search across the graduated clearance ladder.
   ///
   /// Returns the first successful attempt and reports the clearance it used;
   /// on total failure it returns the last attempt so the caller can classify it.
   /// \param goal_pose_footprint_verified True only when the goal pose已经通过同一套
   ///   矩形足迹门禁。为真时才允许最后一档把"目标格净空下限"降到栅格量化余量。
-  GridAstarResult runGraphSearch(
+  GridSearchResult runGraphSearch(
     const nav_msgs::msg::OccupancyGrid & planning_grid,
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal,
     bool goal_pose_footprint_verified,
     double & used_clearance,
     const std::vector<double> * blocked_squared = nullptr);
+  GridSearchResult planRoute(
+    const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal, const GoalUuid & goal_uuid,
+    std::uint64_t goal_id, std::uint64_t localization_epoch,
+    bool goal_pose_footprint_verified, double & used_clearance);
   // Offline/sandbox input: builds the local snapshot (and its distance fields) from a grid.
   void onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   // Production input: the map owner's numeric snapshot; no distance transform runs here.
@@ -100,7 +109,7 @@ private:
                 bool report_status,
                 const geometry_msgs::msg::PoseStamped * frozen_start = nullptr,
                 const InitialKinematicState * initial_state = nullptr,
-                double position_tolerance = 0.0);
+                double position_tolerance = 0.0, const GoalUuid & goal_uuid = {});
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start);
   bool resolveStartPose(
@@ -139,7 +148,8 @@ private:
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
-    std::string * reason = nullptr);
+    std::string * reason = nullptr, geometry_msgs::msg::PoseStamped * progress_pose = nullptr,
+    std::optional<geometry_msgs::msg::Point> * conflict = nullptr);
   // 车当前推进位置起 runtime_safety_horizon_sec 内的参考在 grid 上是否安全（与运行期复检同判据）。
   bool runtimeWindowSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid);
@@ -175,6 +185,7 @@ private:
   std::string grid_topic_ = "traversability_grid";
   // Non-empty: subscribe to the numeric planning snapshot and ignore grid_topic.
   std::string planning_snapshot_topic_ = "/rog_map_adapter/planning_snapshot";
+  std::string prior_guide_map_topic_;
   std::string goal_topic_ = "goal_pose";
   std::string goal_request_topic_;
   std::string planner_status_topic_;
@@ -188,8 +199,7 @@ private:
   std::string emergency_stop_topic_ = "/planner/emergency_stop";
   std::string global_frame_ = "map";
   std::string robot_frame_ = "base_link";
-  std::string search_algorithm_ = "jps";
-  bool astar_fallback_ = true;
+  std::string search_algorithm_ = "hybrid";
   bool publish_unsafe_trajectory_ = false;
   EscapePrefixParams escape_prefix_params_{};
   double inscribed_footprint_radius_{0.0};
@@ -237,10 +247,6 @@ private:
   /// 否决它就是用更粗的判据推翻更细的判据(domain 187 目标 9:目标格净空约 0.26 m,
   /// 下限 0.341 m,图搜索直接报 goal occupied,规划器一条路径都产不出来)。
   bool endpoint_clearance_relaxation_enabled_ = true;
-  /// 图搜索参数副本。放宽档要在 const 方法里临时降低 min_safe_distance,
-  /// 不能改成员搜索器的状态,所以需要可复制的参数。
-  GridAstarParams astar_params_cache_{};
-  GridJpsParams jps_params_cache_{};
   /// 终端原地转向重定位。窄通道 yaw 在目标处追加的原地转向没有 footprint 感知,
   /// 目标净空介于内切半宽与全 yaw 外接圆之间时必然扫过不可行 yaw 带,门禁正确
   /// 拒绝后规划器会每周期复现同一条被拒轨迹直到超时。开关关闭即完全保持旧行为。
@@ -251,8 +257,21 @@ private:
   int terminal_yaw_relocation_max_candidates_ = 6;
   TerminalYawRelocationParams terminal_yaw_relocation_params_{};
 
-  GridAstar astar_;
-  GridJps jps_;
+  GridSearch graph_search_;
+  // Only the planning callback group changes the prior layer and route cache.
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr prior_guide_map_;
+  std::vector<double> prior_blocked_squared_;
+  struct GlobalRoute
+  {
+    GoalUuid goal_uuid;
+    std::uint64_t goal_id;
+    std::uint64_t localization_epoch;
+    std::shared_ptr<const PlanningMapSnapshot> snapshot;
+    geometry_msgs::msg::Pose goal;
+    nav_msgs::msg::Path::ConstSharedPtr path;
+    double clearance;
+  };
+  std::optional<GlobalRoute> global_route_;
   MincoTrajectoryOptimizer optimizer_;
   YawSplinePlanner yaw_planner_;
   /// 同一套航向参数，只多一项 narrow_start_hold_length；planYaw 在两版之间按足迹冲突选。
@@ -293,12 +312,23 @@ private:
     // Exact SE3 path sent to the planar controller. Its Z plane is needed when
     // expressing execution in a grid whose TF contains roll/pitch.
     std::optional<nav_msgs::msg::Path> control_reference;
+    nav_msgs::msg::Path::ConstSharedPtr guide;
+    std::shared_ptr<const PlanningMapSnapshot> guide_snapshot;
   };
   std::optional<ActiveSafetyReference> active_safety_reference_;
+  struct ReferenceConflict
+  {
+    std::uint64_t goal_id;
+    std::uint64_t localization_epoch;
+    std::uint64_t snapshot_generation;
+    geometry_msgs::msg::Point position;
+  };
+  std::optional<ReferenceConflict> reference_conflict_;
   // 按当前 TF 重表达已提交控制参考；跨系 TF 不可用时返回无效参考。
   ReferenceTrajectory alignedToCurrentTf(const ActiveSafetyReference & reference);
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr prior_guide_map_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::PlanningMapSnapshot>::SharedPtr
     planning_snapshot_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
