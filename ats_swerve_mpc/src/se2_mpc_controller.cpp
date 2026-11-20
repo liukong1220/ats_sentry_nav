@@ -158,11 +158,11 @@ Se2MpcController::moduleVelocities(const Control &control) const {
  *       实车表现为舵轮被要求瞬间掉头，转向电机堵转或底盘被硬拽。
  */
 bool Se2MpcController::moduleIncrementFeasible(
-    const Control &candidate, const Control &previous) const {
+    const Control &candidate, const Control &previous, double step_dt) const {
   const auto candidate_velocities = moduleVelocities(candidate);
   const auto previous_velocities = moduleVelocities(previous);
-  const double max_speed_delta = config_.max_wheel_acceleration * config_.dt;
-  const double max_steer_delta = config_.max_steer_rate * config_.dt;
+  const double max_speed_delta = config_.max_wheel_acceleration * step_dt;
+  const double max_steer_delta = config_.max_steer_rate * step_dt;
   for (std::size_t index = 0; index < candidate_velocities.size(); ++index) {
     const double candidate_speed = candidate_velocities[index].norm();
     const double previous_speed = previous_velocities[index].norm();
@@ -194,27 +194,29 @@ bool Se2MpcController::moduleIncrementFeasible(
  * @brief 将控制增量限制在车体加速度与四舵轮执行器可达范围内。
  * @param target            期望的车体控制 [vx, vy, wz]。
  * @param previous          上一周期实际下发的车体控制。
+ * @param step_dt           相邻两拍控制量之间的真实时间步长 [s]。
  * @param report            可选输出：车体级/轮级速度限幅是否命中。
  * @param increment_limited 可选输出：是否因模块增量不可达而被线搜索回退。
- * @return 一个 dt 内实车可达的车体控制。
+ * @return 一个 step_dt 内实车可达的车体控制。
  * @note 每步预测与每次线搜索都会调用。先按车体加速度上限裁剪 Δv，再做速度限幅；
  *       若模块级增量仍不可达，则在 previous→limited 线段上做 40 次二分，
  *       取最大可行比例，保证四轮速度向量始终来自同一车体 Twist。
  */
 Control Se2MpcController::clampIncrement(const Control &target,
                                          const Control &previous,
+                                         double step_dt,
                                          SaturationReport *report,
                                          bool *increment_limited) const {
-  const Control max_delta(config_.max_ax * config_.dt,
-                          config_.max_ay * config_.dt,
-                          config_.max_awz * config_.dt);
-  // 同时限制速度幅值和每个 dt 内的增量，近似轮速与舵角执行器的加速度边界。
+  const Control max_delta(config_.max_ax * step_dt,
+                          config_.max_ay * step_dt,
+                          config_.max_awz * step_dt);
+  // 同时限制速度幅值和每个 step_dt 内的增量，近似轮速与舵角执行器的加速度边界。
   Control delta = target - previous;
   for (int axis = 0; axis < 3; ++axis) {
     delta(axis) = std::clamp(delta(axis), -max_delta(axis), max_delta(axis));
   }
   const Control limited = clampControl(previous + delta, report);
-  if (moduleIncrementFeasible(limited, previous)) {
+  if (moduleIncrementFeasible(limited, previous, step_dt)) {
     return limited;
   }
   if (increment_limited != nullptr) {
@@ -227,7 +229,7 @@ Control Se2MpcController::clampIncrement(const Control &target,
   for (int iteration = 0; iteration < 40; ++iteration) {
     const double scale = 0.5 * (feasible_scale + infeasible_scale);
     const Control candidate = previous + scale * (limited - previous);
-    if (moduleIncrementFeasible(candidate, previous)) {
+    if (moduleIncrementFeasible(candidate, previous, step_dt)) {
       feasible_scale = scale;
     } else {
       infeasible_scale = scale;
@@ -292,15 +294,27 @@ double Se2MpcController::cost(const std::vector<State> &states,
  * @details 首步单独记录饱和/增量回退，因为只有它会进入 `/cmd_vel/autonomy_raw`。
  */
 void Se2MpcController::initializeControls(
-    const std::vector<Se2Reference> &references, const Control &last_control) {
+    const std::vector<Se2Reference> &references, const Control &last_control,
+    double first_step_dt) {
   if (!has_warm_start_ ||
       static_cast<int>(warm_controls_.size()) != config_.horizon) {
     warm_controls_.assign(static_cast<std::size_t>(config_.horizon),
                           Control::Zero());
-  } else {
-    // 将上一次控制序列左移一格，减少每个控制周期从零开始求解的时间。
-    std::rotate(warm_controls_.begin(), warm_controls_.begin() + 1,
-                warm_controls_.end());
+  } else if (config_.horizon > 1) {
+    // 按真实经过的控制步长 first_step_dt / config_.dt 连续前移 warm start，
+    // 避免高频控制周期（如 50 Hz）下盲目左移一整个预测步长 dt。
+    const double shift = std::clamp(first_step_dt / config_.dt, 0.0, 1.0);
+    if (shift >= 1.0 - 1e-9) {
+      std::rotate(warm_controls_.begin(), warm_controls_.begin() + 1,
+                  warm_controls_.end());
+      warm_controls_.back() = warm_controls_[warm_controls_.size() - 2];
+    } else if (shift > 1e-9) {
+      for (std::size_t index = 0; index + 1 < warm_controls_.size(); ++index) {
+        warm_controls_[index] =
+            (1.0 - shift) * warm_controls_[index] +
+            shift * warm_controls_[index + 1];
+      }
+    }
   }
   Control previous = last_control;
   for (int step = 0; step < config_.horizon; ++step) {
@@ -309,12 +323,13 @@ void Se2MpcController::initializeControls(
             ? 0.7 * warm_controls_[static_cast<std::size_t>(step)] +
                   0.3 * references[static_cast<std::size_t>(step)].control
             : references[static_cast<std::size_t>(step)].control;
-    // 仅第 0 步是本周期真正下发的控制，记录其限幅命中情况用于饱和诊断。
+    // 仅第 0 步是本周期真正下发的控制，按实际经过步长 first_step_dt 限幅并记录饱和诊断。
     SaturationReport *report = step == 0 ? &first_step_saturation_ : nullptr;
     bool *increment_limited =
         step == 0 ? &first_step_increment_limited_ : nullptr;
+    const double step_dt = step == 0 ? first_step_dt : config_.dt;
     warm_controls_[static_cast<std::size_t>(step)] =
-        clampIncrement(seed, previous, report, increment_limited);
+        clampIncrement(seed, previous, step_dt, report, increment_limited);
     previous = warm_controls_[static_cast<std::size_t>(step)];
   }
   has_warm_start_ = true;
@@ -396,13 +411,17 @@ Se2MpcController::backwardPass(const std::vector<State> &states,
 Se2MpcResult
 Se2MpcController::solve(const State &current_state,
                         const std::vector<Se2Reference> &references,
-                        const Control &last_control) {
+                        const Control &last_control,
+                        double first_step_dt) {
   Se2MpcResult result;
   const auto start_time = std::chrono::steady_clock::now();
   if (config_.horizon <= 0 || config_.dt <= 0.0 ||
       references.size() < static_cast<std::size_t>(config_.horizon + 1)) {
     return result;
   }
+  const double effective_first_step_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : config_.dt;
   first_step_saturation_ = SaturationReport{};
   first_step_increment_limited_ = false;
   // 分阶段归因累加器每周期清零；jacobian/cost 由 const 成员在内部累加。
@@ -418,7 +437,7 @@ Se2MpcController::solve(const State &current_state,
   };
 
   const auto warm_start_start_time = std::chrono::steady_clock::now();
-  initializeControls(references, last_control);
+  initializeControls(references, last_control, effective_first_step_dt);
   const double warm_start_ms = elapsed_ms_since(warm_start_start_time);
   std::vector<Control> controls = warm_controls_;
   const auto initial_rollout_start_time = std::chrono::steady_clock::now();
@@ -465,9 +484,10 @@ Se2MpcController::solve(const State &current_state,
             stateDifference(candidate_states.back(), states[index]);
         const Control update = alpha * backward.feedforward[index] +
                                backward.feedback[index] * error;
-        // 只有第 0 步会被真正下发，其限幅命中情况才有实车诊断意义。
+        // 只有第 0 步会被真正下发，按实际经过步长限幅并记录饱和诊断。
+        const double step_dt = step == 0 ? effective_first_step_dt : config_.dt;
         candidate_controls[index] = clampIncrement(
-            controls[index] + update, previous,
+            controls[index] + update, previous, step_dt,
             step == 0 ? &candidate_saturation : nullptr,
             step == 0 ? &candidate_increment_limited : nullptr);
         candidate_states.push_back(

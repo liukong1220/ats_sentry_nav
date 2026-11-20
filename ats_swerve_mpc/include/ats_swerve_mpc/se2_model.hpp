@@ -31,18 +31,24 @@ public:
   double timeStep() const { return dt_; }
 
   /**
-   * @brief 按车体系 Twist 将世界系位姿推进一个离散周期。
+   * @brief 按车体系 Twist 将世界系位姿推进一个离散周期（SE(2) 解析指数映射积分）。
    * @param state 当前世界系 [x,y,yaw]。
    * @param control 当前车体系 [vx,vy,wz]。
    * @return 推进并将 yaw 归一化到 [-pi,pi] 后的状态。
    */
   State dynamics(const State &state, const Control &control) const;
+  /** @brief 使用显式积分步长 dt 的 SE(2) 解析指数映射离散动力学（对任意 dt 恒定速度零离散误差）。 */
+  static State dynamics(const State &state, const Control &control, double dt);
   /**
    * @brief 计算离散动力学对状态和控制的局部 Jacobian，供 iLQR/LTV-QP 线性化。
    */
   void jacobians(const State &state, const Control &control,
                  Eigen::Matrix3d &state_jacobian,
                  Eigen::Matrix3d &control_jacobian) const;
+  /** @brief 使用显式积分步长 dt 的 SE(2) 指数映射解析 Jacobian（含 sinc 与 wz 对平移耦合）。 */
+  static void jacobians(const State &state, const Control &control, double dt,
+                        Eigen::Matrix3d &state_jacobian,
+                        Eigen::Matrix3d &control_jacobian);
   /** @brief 从同一个初始状态按控制序列生成完整状态 rollout。 */
   std::vector<State> rollout(const State &initial,
                              const std::vector<Control> &controls) const;

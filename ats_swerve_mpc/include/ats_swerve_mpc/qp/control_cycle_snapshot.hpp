@@ -26,6 +26,8 @@ struct ControlCycleSnapshot {
   State current_state = State::Zero();
   std::vector<Se2Reference> references;
   Control last_control_before_solve = Control::Zero();
+  // 本控制周期相对上一控制指令的实际时间步长 [s]，供首步增量约束复用。
+  double first_step_dt = 0.0;
   Se2MpcResult ilqr_result;
 
   // ExecutionCommand 的单调身份字段；它们是审计输入，不是 QP 可以修改的控制权限。

@@ -5,7 +5,7 @@
 # 与 `ats_swerve_mpc.yaml`（MuJoCo 回归，use_sim_time: true）互斥使用。
 #
 # 时序关系（P6 一.3）：
-#   MPC 控制周期 $T_c = 1/20 = 0.05\,\mathrm{s}$；
+#   MPC 控制周期 $T_c = 1/50 = 0.02\,\mathrm{s}$（与预测步长 dt 解耦，首步按实测 step_dt 约束）；
 #   授权/急停租约 $T_{lease} = 0.5\,\mathrm{s}$；
 #   底盘 `cmd_vel_watchdog_timeout_ms = 300\,\mathrm{ms}$，
 #   满足 $T_c < T_{watchdog} \le T_{lease}$，即底盘看门狗严于上层租约，
@@ -34,7 +34,7 @@ ats_swerve_mpc:
     require_localization_status: true
     emergency_stop_timeout: 0.5
     frame_id: odom
-    control_rate_hz: 20.0
+    control_rate_hz: 50.0
     fallback_path_dt: 0.1
     trajectory_timeout: 0.5
     goal_position_tolerance: 0.08
@@ -63,7 +63,7 @@ ats_swerve_mpc:
 
     # 60*0.05=3 s，覆盖5 m/s在2 m/s²下2.5 s制动时间。
     horizon: 60
-    # 必须等于控制周期 1/control_rate_hz = 0.05 s。
+    # 预测时域离散步长（SE(2) 解析指数映射积分），与实时控制频率 control_rate_hz 解耦。
     dt: 0.05
     max_iterations: 6
     regularization: 1.0e-5

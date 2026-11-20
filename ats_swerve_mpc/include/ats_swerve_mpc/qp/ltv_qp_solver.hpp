@@ -206,7 +206,8 @@ public:
       const ZeroSpeedGuardConfig &guard_config,
       const LtvQpSolverSettings &settings,
       const LtvQpCandidateSafety &safety,
-      const LtvQpSolveResult &result);
+      const LtvQpSolveResult &result,
+      double first_step_dt = -1.0);
 
   /** @brief 额外要求重建 rollout 与 primal 身份一致，供 qp_shadow 审计调用。 */
   static LtvQpCandidateAudit validate(
@@ -218,7 +219,8 @@ public:
       const LtvQpSolverSettings &settings,
       const LtvQpCandidateSafety &safety,
       const LtvQpSolveResult &result,
-      const LtvQpPrimalCandidate &candidate);
+      const LtvQpPrimalCandidate &candidate,
+      double first_step_dt = -1.0);
 };
 
 }  // namespace ats_swerve_mpc

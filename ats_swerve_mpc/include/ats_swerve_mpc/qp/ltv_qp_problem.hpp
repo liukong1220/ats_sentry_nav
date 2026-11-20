@@ -138,7 +138,8 @@ public:
       const std::vector<Control> &nominal_controls,
       const std::vector<Se2Reference> &references, const Control &last_control,
       const Se2MpcConfig &config,
-      const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig());
+      const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig(),
+      double first_step_dt = -1.0);
 
   /**
    * @brief 在不改变维度的前提下重填已有的 LTV-QP 数值缓冲。
@@ -150,7 +151,8 @@ public:
       const std::vector<Control> &nominal_controls,
       const std::vector<Se2Reference> &references, const Control &last_control,
       const Se2MpcConfig &config, LtvQpProblem &problem,
-      const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig());
+      const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig(),
+      double first_step_dt = -1.0);
 };
 
 }  // namespace ats_swerve_mpc

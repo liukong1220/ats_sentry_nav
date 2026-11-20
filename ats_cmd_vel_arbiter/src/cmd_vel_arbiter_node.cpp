@@ -48,7 +48,7 @@ public:
     const int auto_timeout_ms = declare_parameter<int>("auto_timeout_ms", 300);
     const int link_timeout_ms = declare_parameter<int>("link_timeout_ms", 300);
     execution_command_timeout_s_ = declare_parameter<double>("execution_command_timeout", 0.5);
-    const double rate_hz = declare_parameter<double>("control_rate_hz", 20.0);
+    const double rate_hz = declare_parameter<double>("control_rate_hz", 50.0);
     const double supersede_grace_sec = std::max(
       0.0, declare_parameter<double>("supersede_grace_sec", 0.0));
 

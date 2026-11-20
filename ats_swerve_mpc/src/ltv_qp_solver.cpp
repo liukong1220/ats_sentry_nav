@@ -272,7 +272,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     const ZeroSpeedGuardConfig &guard_config,
     const LtvQpSolverSettings &settings,
     const LtvQpCandidateSafety &safety,
-    const LtvQpSolveResult &result) {
+    const LtvQpSolveResult &result,
+    double first_step_dt) {
   LtvQpCandidateAudit audit;
   if (!settings.valid()) {
     reject(audit, "invalid_solver_settings");
@@ -412,16 +413,20 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
         audit.actual_hard_constraint_maximum_violation,
         absoluteViolation(candidate(2), config.max_wz));
 
+    const double step_dt =
+        (step == 0 && std::isfinite(first_step_dt) && first_step_dt > 0.0)
+            ? first_step_dt
+            : config.dt;
     const Control body_delta = candidate - previous;
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation,
-        absoluteViolation(body_delta(0), config.max_ax * config.dt));
+        absoluteViolation(body_delta(0), config.max_ax * step_dt));
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation,
-        absoluteViolation(body_delta(1), config.max_ay * config.dt));
+        absoluteViolation(body_delta(1), config.max_ay * step_dt));
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation,
-        absoluteViolation(body_delta(2), config.max_awz * config.dt));
+        absoluteViolation(body_delta(2), config.max_awz * step_dt));
 
     const auto previous_modules = moduleVelocities(previous, config);
     const auto candidate_modules = moduleVelocities(candidate, config);
@@ -436,7 +441,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       audit.actual_hard_constraint_maximum_violation = std::max(
           audit.actual_hard_constraint_maximum_violation,
           upperViolation((candidate_modules[module] - previous_modules[module]).norm(),
-                         config.max_wheel_acceleration * config.dt));
+                         config.max_wheel_acceleration * step_dt));
 
       if (zero_speed_guard.angleConstraintDefined(previous_speed,
                                                   candidate_speed)) {
@@ -447,7 +452,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
             -1.0, 1.0);
         audit.actual_hard_constraint_maximum_violation = std::max(
             audit.actual_hard_constraint_maximum_violation,
-            upperViolation(std::acos(cosine), config.max_steer_rate * config.dt));
+            upperViolation(std::acos(cosine), config.max_steer_rate * step_dt));
       } else {
         ++audit.steering_rate_constraints_skipped_by_zero_speed_guard;
       }
@@ -478,7 +483,8 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     const LtvQpSolverSettings &settings,
     const LtvQpCandidateSafety &safety,
     const LtvQpSolveResult &result,
-    const LtvQpPrimalCandidate &candidate) {
+    const LtvQpPrimalCandidate &candidate,
+    double first_step_dt) {
   LtvQpCandidateAudit audit;
   // 该 overload 会在委托基础 hard-check 前读取 control offset 和 primal segment。
   // 先完整复核公开输入，不能依赖 qp_shadow 当前只传 builder 成功 buffer 的调用约定。
@@ -528,7 +534,7 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     }
   }
   return validate(problem, nominal_controls, last_control, config, guard_config,
-                  settings, safety, result);
+                  settings, safety, result, first_step_dt);
 }
 
 }  // namespace ats_swerve_mpc

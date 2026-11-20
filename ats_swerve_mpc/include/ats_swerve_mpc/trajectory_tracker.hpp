@@ -37,6 +37,8 @@ struct TrajectoryTrackerConfig
   double command_latency_compensation = 0.01;
   // Set by the node from its existing goal position tolerance. Zero disables.
   double terminal_position_tolerance = 0.0;
+  // In-place rotation blocks remain a forward barrier until yaw aligns within this tolerance.
+  double stationary_yaw_tolerance = 0.15;
 };
 
 class TrajectoryTracker
@@ -97,8 +99,8 @@ public:
   double commandLatencyCompensation() const { return config_.command_latency_compensation; }
   /** @brief 仅按二维位置投影，供无可靠 yaw 的调用方使用。 */
   TrajectoryProjection project(const Eigen::Vector2d & position);
-  /** @brief 按完整 SE(2) 状态投影，结合 yaw 抑制路径交叉处跳段。 */
-  TrajectoryProjection project(const State & state);
+  /** @brief 按完整 SE(2) 状态投影，结合 yaw 与当前角速度抑制路径交叉或旋转未刹停时的跳段。 */
+  TrajectoryProjection project(const State & state, double current_wz = 0.0);
   /** @brief 将横向误差转换为 [min_progress_scale,1] 的连续时间缩放。 */
   double progressScale(double cross_track_error) const;
   /** @brief 从投影时刻采样 horizon+1 个状态和车体系速度参考。 */
@@ -108,11 +110,12 @@ public:
 private:
   /** @brief 投影入口的共用实现；按参数决定是否将 yaw 计入距离度量。 */
   TrajectoryProjection projectImpl(
-    const Eigen::Vector2d & position, double yaw, bool use_yaw);
-  /** @brief 在受限时间窗内寻找最近线段，必要时禁止倒退以保证控制进度单调。 */
+    const Eigen::Vector2d & position, double yaw, bool use_yaw, double current_wz = 0.0);
+  /** @brief 在受限时间窗内寻找最近线段，必要时禁止倒退或跨过未完成的原地转向段。 */
   TrajectoryProjection nearestProjection(
     const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress,
-    std::optional<std::size_t> terminal_begin = std::nullopt) const;
+    std::optional<std::size_t> segment_begin = std::nullopt,
+    std::optional<double> max_time_cap = std::nullopt) const;
   /** @brief 在相邻时间点间插值位置/yaw，并由离散差分生成 body-frame 控制参考。 */
   bool sampleReference(double time, Se2Reference & reference) const;
   /** @brief 统一 trajectory yaw 插值的最短角归一化。 */

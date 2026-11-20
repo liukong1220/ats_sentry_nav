@@ -109,8 +109,8 @@ private:
     const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
   /** @brief 发布确定性零速度并复位控制器内部状态，供所有失败/退出路径共用。 */
   void publishZeroCommandForFailure(const char * reason_zh);
-  /** @brief 终点容差圆内把上一拍指令按 max_a*dt 每拍降到零，降到零后走零速出口。 */
-  void publishTerminalDecelerationCommand();
+  /** @brief 终点容差圆内把上一拍指令按 max_a*step_dt 降到零，降到零后走零速出口。 */
+  void publishTerminalDecelerationCommand(double step_dt);
   /** @brief 终点区内把平面速度按 d / tau 等比缩小（保持方向，wz 不变）。 */
   static Control limitTerminalApproachSpeed(
     const Control & command, double goal_distance, double time_constant);
@@ -161,7 +161,7 @@ private:
   std::string localization_status_topic_;
   std::string gimbal_status_topic_;
   std::string frame_id_;
-  double control_rate_hz_ = 20.0;
+  double control_rate_hz_ = 50.0;
   double fallback_path_dt_ = 0.1;
   double trajectory_timeout_ = 0.5;
   double emergency_stop_timeout_ = 0.5;
@@ -200,8 +200,9 @@ private:
   std::optional<std::chrono::steady_clock::time_point>
       previous_control_cycle_start_;
   std::uint64_t control_cycle_sequence_ = 0;
-  // Safety leases keep their wall callback; numerical updates follow ROS time.
+  // Safety leases keep their wall callback; numerical updates follow ROS time (or wall clock when non-sim).
   std::optional<rclcpp::Time> last_control_update_stamp_;
+  std::optional<std::chrono::steady_clock::time_point> last_control_update_steady_;
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();

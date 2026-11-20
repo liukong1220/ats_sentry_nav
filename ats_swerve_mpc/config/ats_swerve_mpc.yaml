@@ -31,8 +31,8 @@ ats_swerve_mpc:
     emergency_stop_timeout: 0.5
     # MPC 接受的状态与轨迹坐标系。
     frame_id: odom
-    # 控制器计算频率（Hz）。
-    control_rate_hz: 20.0
+    # 控制器计算频率（Hz），与预测时域离散步长 dt 解耦；首步按每拍实测 step_dt 积分/限幅。
+    control_rate_hz: 50.0
     # 输入 Path 缺少单点时间戳时，相邻点使用的兜底时间间隔（s）。
     fallback_path_dt: 0.1
     # 轨迹跟踪超时附加宽限（s），用于容忍通信与执行延迟。
@@ -73,9 +73,8 @@ ats_swerve_mpc:
 
     # MPC/iLQR 预测时长60*0.05=3 s，覆盖5 m/s在2 m/s²下的2.5 s制动时间。
     horizon: 60
-    # MPC 离散模型步长（s），必须等于控制周期 1/control_rate_hz=1/20=0.05。
-    # 此前为 0.1 s（模型时间轴是执行时间轴的 2 倍），一次迭代预测的"一步"实际
-    # 只执行了半步，加速度/舵角速率约束被放大 2 倍，实车表现为超调与舵轮抖振。
+    # MPC 预测时域离散步长（s），采用 SE(2) 解析指数映射积分（对恒定车体系速度无离散误差）；
+    # 控制频率与预测步长解耦，首步加速度/舵角速率限幅与 warm-start 前移按每拍实测 step_dt 执行。
     dt: 0.05
     # 每个控制周期允许的 iLQR 最大迭代次数。
     max_iterations: 6

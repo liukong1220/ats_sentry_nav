@@ -41,6 +41,7 @@ void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
   config_.min_progress_scale = std::clamp(config_.min_progress_scale, 0.0, 1.0);
   config_.command_latency_compensation = std::max(0.0, config_.command_latency_compensation);
   config_.terminal_position_tolerance = std::max(0.0, config_.terminal_position_tolerance);
+  config_.stationary_yaw_tolerance = std::max(1e-3, config_.stationary_yaw_tolerance);
 }
 
 //通过移动语义高效接管路径点，然后重置进，丢弃旧投影信息。
@@ -71,24 +72,114 @@ TrajectoryProjection TrajectoryTracker::project(const Eigen::Vector2d & position
 }
 
 //根据给定状态，沿轨迹寻找最近投影点，并返回投影结果，包括投影时间、横向误差和轨迹段索引
-TrajectoryProjection TrajectoryTracker::project(const State & state)
+TrajectoryProjection TrajectoryTracker::project(const State & state, double current_wz)
 {
   if (!state.allFinite()) {
     return {};
   }
-  return projectImpl(state.head<2>(), state(2), true);
+  return projectImpl(state.head<2>(), state(2), true, current_wz);
 }
 
 //根据给定位置和航向，沿轨迹寻找最近投影点，并返回投影结果，包括投影时间、横向误差和轨迹段索引，使得投影点沿轨迹平滑推进，具有抗噪能力
 TrajectoryProjection TrajectoryTracker::projectImpl(
-  const Eigen::Vector2d & position, double yaw, bool use_yaw)
+  const Eigen::Vector2d & position, double yaw, bool use_yaw, double current_wz)
 {
-  TrajectoryProjection projection = nearestProjection(position, yaw, use_yaw, has_progress_);
+  // 查找当前进度之后第一个尚未完成航向对齐的原地转向段 [rot_begin, rot_end]。
+  // 在未转到该段末端航向（stationary_yaw_tolerance 内）之前，投影不得越过 rot_end 跳到
+  // 后续平移段——否则毫米级 XY 抖动会让 MPC 跳过洞口/窄区预对齐旋转，边转边横扫撞墙。
+  std::optional<std::size_t> active_rot_begin;
+  std::optional<std::size_t> active_rot_end;
+  std::optional<double> rotation_time_cap;
+  if (use_yaw && trajectory_.size() >= 2) {
+    const double current_time = has_progress_ ? last_progress_time_ : trajectory_.front().time;
+    const double search_limit =
+      has_progress_ ? current_time + config_.forward_search_window : trajectory_.back().time;
+    constexpr double kStationaryXyEpsSq = 1e-12;
+    constexpr double kMinRotationSpanRad = 0.05;
+    std::size_t idx = 0;
+    while (idx + 1 < trajectory_.size()) {
+      const bool stationary =
+        (trajectory_[idx + 1].state.head<2>() - trajectory_[idx].state.head<2>()).squaredNorm() <=
+        kStationaryXyEpsSq;
+      if (!stationary) {
+        ++idx;
+        continue;
+      }
+      const std::size_t block_begin = idx;
+      double angular_span = 0.0;
+      while (idx + 1 < trajectory_.size() &&
+             (trajectory_[idx + 1].state.head<2>() -
+              trajectory_[block_begin].state.head<2>()).squaredNorm() <= kStationaryXyEpsSq) {
+        angular_span += std::abs(
+          normalizeAngle(trajectory_[idx + 1].state(2) - trajectory_[idx].state(2)));
+        ++idx;
+      }
+      const std::size_t block_end = idx;
+      if (angular_span <= kMinRotationSpanRad) {
+        continue;
+      }
+      if (trajectory_[block_end].time < current_time - 1e-6) {
+        continue;
+      }
+      if (trajectory_[block_begin].time > search_limit + 1e-6) {
+        break;
+      }
+      const double exit_yaw_error =
+        std::abs(normalizeAngle(yaw - trajectory_[block_end].state(2)));
+      const bool intermediate_block = (block_end + 1 < trajectory_.size());
+      const bool still_spinning = intermediate_block && std::isfinite(current_wz) &&
+        std::abs(current_wz) > 0.35;
+      if (exit_yaw_error > config_.stationary_yaw_tolerance || still_spinning) {
+        active_rot_begin = block_begin;
+        active_rot_end = block_end;
+        rotation_time_cap = trajectory_[block_end].time;
+        break;
+      }
+    }
+  }
+
+  TrajectoryProjection projection = nearestProjection(
+    position, yaw, use_yaw, has_progress_, std::nullopt, rotation_time_cap);
   if (!projection.valid && has_progress_) {
-    projection = nearestProjection(position, yaw, use_yaw, false);
+    projection = nearestProjection(
+      position, yaw, use_yaw, false, std::nullopt, rotation_time_cap);
   }
   if (!projection.valid) {
     return projection;
+  }
+
+  // 当已接近中途原地转向段时，直接投影到该原地转向段内按 yaw 推进。
+  // 非末端原地转向（如贴墙侧移掉头或洞口预对齐）要求到达掉头点 3 cm 内才进入旋转，
+  // 防止提前在离掉头点 8 cm 处起转导致角落擦墙；末端转向沿用 terminal_position_tolerance。
+  const bool intermediate_rotation =
+    active_rot_end && (*active_rot_end + 1 < trajectory_.size());
+  const double handoff_tolerance = intermediate_rotation
+    ? std::min(config_.terminal_position_tolerance, 0.03)
+    : config_.terminal_position_tolerance;
+  if (use_yaw && active_rot_begin && active_rot_end && *active_rot_begin > 0 &&
+      handoff_tolerance > 0.0 &&
+      (position - trajectory_[*active_rot_begin].state.head<2>()).norm() <= handoff_tolerance &&
+      projection.segment_index < *active_rot_begin) {
+    const auto & first = trajectory_[projection.segment_index];
+    const auto & second = trajectory_[projection.segment_index + 1];
+    const double ratio = std::clamp(
+      (projection.time - first.time) / std::max(1e-9, second.time - first.time),
+      0.0, 1.0);
+    double remaining_translation =
+      (1.0 - ratio) * (second.state.head<2>() - first.state.head<2>()).norm();
+    for (std::size_t i = projection.segment_index + 1;
+         i < *active_rot_begin && remaining_translation <= handoff_tolerance;
+         ++i) {
+      remaining_translation +=
+        (trajectory_[i + 1].state.head<2>() - trajectory_[i].state.head<2>()).norm();
+    }
+    if (remaining_translation <= handoff_tolerance) {
+      const auto rot_projection = nearestProjection(
+        position, yaw, true, has_progress_, *active_rot_begin, rotation_time_cap);
+      if (rot_projection.valid) {
+        projection = rot_projection;
+      }
+    }
   }
 
   // Once the approach reaches the existing goal-position disk, centimetre-scale
@@ -121,9 +212,10 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
       }
     }
     if (terminal_begin + 1 < trajectory_.size() &&
-        remaining_translation <= config_.terminal_position_tolerance) {
+        remaining_translation <= config_.terminal_position_tolerance &&
+        (!rotation_time_cap || trajectory_[terminal_begin].time <= *rotation_time_cap + 1e-6)) {
       const auto terminal = nearestProjection(
-        position, yaw, true, has_progress_, terminal_begin);
+        position, yaw, true, has_progress_, terminal_begin, rotation_time_cap);
       if (terminal.valid) {
         projection = terminal;
       }
@@ -145,7 +237,8 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
 //在给定位置和航向的情况下，沿轨迹寻找最近投影点的实现函数
 TrajectoryProjection TrajectoryTracker::nearestProjection(
   const Eigen::Vector2d & position, double yaw, bool use_yaw, bool restrict_progress,
-  std::optional<std::size_t> terminal_begin) const
+  std::optional<std::size_t> segment_begin,
+  std::optional<double> max_time_cap) const
 {
   TrajectoryProjection best;
   if (trajectory_.size() < 2 || !position.allFinite()) {
@@ -154,18 +247,26 @@ TrajectoryProjection TrajectoryTracker::nearestProjection(
 
   const double minimum_time = restrict_progress
                                 ? last_progress_time_ -
-                                  (terminal_begin ? 0.0 : config_.backward_search_window)
+                                  (segment_begin ? 0.0 : config_.backward_search_window)
                                 : -std::numeric_limits<double>::infinity();
-  const double maximum_time = restrict_progress
-                                ? last_progress_time_ + config_.forward_search_window
-                                : std::numeric_limits<double>::infinity();
+  double maximum_time = restrict_progress
+                          ? last_progress_time_ + config_.forward_search_window
+                          : std::numeric_limits<double>::infinity();
+  if (max_time_cap) {
+    maximum_time = std::min(maximum_time, *max_time_cap);
+  }
+  if (maximum_time < minimum_time) {
+    maximum_time = minimum_time;
+  }
   double best_distance_squared = std::numeric_limits<double>::infinity();
   double best_yaw_error = std::numeric_limits<double>::infinity();
 
-  for (std::size_t i = terminal_begin.value_or(0); i + 1 < trajectory_.size(); ++i) {
+  for (std::size_t i = segment_begin.value_or(0); i + 1 < trajectory_.size(); ++i) {
     const TimedState & first = trajectory_[i];
     const TimedState & second = trajectory_[i + 1];
-    if (second.time < minimum_time || first.time > maximum_time) {
+    if (second.time < minimum_time || first.time > maximum_time ||
+        (max_time_cap && first.time >= *max_time_cap - 1e-12 &&
+         second.time > *max_time_cap + 1e-12)) {
       continue;
     }
     const Eigen::Vector2d start = first.state.head<2>();

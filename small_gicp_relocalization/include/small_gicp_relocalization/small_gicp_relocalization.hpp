@@ -227,6 +227,7 @@ private:
   double confirmation_translation_tolerance_;
   double confirmation_yaw_tolerance_;
   double registration_interval_s_;
+  double transform_publish_rate_hz_{50.0};
   double max_accumulation_age_s_;
   double min_registration_translation_delta_;
   double min_registration_yaw_delta_;

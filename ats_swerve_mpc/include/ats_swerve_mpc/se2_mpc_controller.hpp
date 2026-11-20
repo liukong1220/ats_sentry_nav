@@ -155,12 +155,15 @@ public:
 
   /**
    * @brief 在当前状态和参考 horizon 上执行一次完整 iLQR 控制周期。
+   * @param first_step_dt 可选：本周期相对上一拍控制量的实际时间步长 [s]；<=0 时回退为 config_.dt。
+   *                      用于将实时控制周期/实测间隔与预测时域步长解耦。
    * @details 该函数保留既有主控制链：先生成/复用控制序列，再做 rollout、
    *          backward pass、线搜索和真实四轮硬约束限幅，返回的首个控制才可发布。
    */
   Se2MpcResult solve(const State &current_state,
                      const std::vector<Se2Reference> &references,
-                     const Control &last_control);
+                     const Control &last_control,
+                     double first_step_dt = -1.0);
   /** @brief 替换动力学和代价配置，并清空与旧配置不兼容的 warm start。 */
   void setConfig(const Se2MpcConfig &config);
   /** @brief 清空控制序列和求解器内部状态，使下一周期回到确定性初始路径。 */
@@ -209,9 +212,11 @@ private:
   /** @brief 将车体 Twist 映射为四个轮心的车体系二维速度向量。 */
   std::array<Eigen::Vector2d, 4> moduleVelocities(const Control &control) const;
   /** @brief 独立检查候选相对上一控制的轮速、轮加速度和有效舵角速率。 */
-  bool moduleIncrementFeasible(const Control &candidate, const Control &previous) const;
+  bool moduleIncrementFeasible(const Control &candidate, const Control &previous,
+                               double step_dt) const;
   /** @brief 在上一控制到目标控制之间二分寻找一个真实可达的增量。 */
   Control clampIncrement(const Control &target, const Control &previous,
+                         double step_dt,
                          SaturationReport *report = nullptr,
                          bool *increment_limited = nullptr) const;
   /** @brief 使用共享模型生成当前 iLQR 名义轨迹。 */
@@ -229,7 +234,8 @@ private:
                               const Control &last_control) const;
   /** @brief 生成有效参考控制 warm start，并逐步投影到真实执行器约束内。 */
   void initializeControls(const std::vector<Se2Reference> &references,
-                          const Control &last_control);
+                          const Control &last_control,
+                          double first_step_dt);
 
   Se2MpcConfig config_;
   // iLQR 名义轨迹与 LTV-QP candidate 非线性复核共用此模型，禁止维护第二套动力学。

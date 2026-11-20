@@ -627,6 +627,7 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
     controller_->reset();
     last_control_.setZero();
     last_control_update_stamp_.reset();
+    last_control_update_steady_.reset();
   }
   // 保留时不调用 reset()：iLQR 的 warm_controls_ 留在原处，下一拍 initializeControls 照常
   // 左移一格并与新 reference 的前馈 0.7/0.3 混合；last_control_ 保持上一拍已发布的指令。
@@ -1202,7 +1203,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     goal = trajectory_tracker_.goal();
     rotation_delay = trajectory_tracker_.commandLatencyCompensation();
     reference_terminal_speed = trajectory_tracker_.terminalSpeed();
-    projection = trajectory_tracker_.project(current);
+    projection = trajectory_tracker_.project(current, last_control_(2));
     references = trajectory_tracker_.buildHorizon(
         projection, controller_->config().horizon, controller_->config().dt);
     trajectory_expired =
@@ -1221,6 +1222,10 @@ void AtsSwerveMpcNode::onControlTimer() {
     publishZeroCommandForFailure(nullptr);
     return;
   }
+  const double nominal_control_period = 1.0 / std::max(1.0, control_rate_hz_);
+  const double max_step_dt = std::max(
+      controller_->config().dt, 2.0 * nominal_control_period);
+  double actual_step_dt = nominal_control_period;
   if (get_clock()->ros_time_is_active()) {
     const auto update_stamp = now();
     if (last_control_update_stamp_) {
@@ -1239,22 +1244,31 @@ void AtsSwerveMpcNode::onControlTimer() {
         return;
       }
       const auto period_ns = static_cast<std::int64_t>(
-        std::llround(1e9 / std::max(1.0, control_rate_hz_)));
+        std::llround(1e9 * nominal_control_period));
       if (elapsed_ns < period_ns) {
-        // Slow MuJoCo clocks used to advance max_a*dt and the warm horizon on
-        // every wall tick (d117: 5 ms ROS / 50 ms wall with dt=50 ms).
-        // All safety/odometry/expiry checks above still run on every wall
-        // callback. Renew the checked command heartbeat without another
-        // dynamics or terminal-braking step until the ROS period is due.
+        // Slow simulation clocks must not advance dynamics/warm-start on every
+        // wall tick. All safety/odometry/expiry checks above still run; renew
+        // the checked command heartbeat until one ROS control period elapses.
         publishCommand(last_control_);
         return;
       }
+      actual_step_dt = std::clamp(
+          static_cast<double>(elapsed_ns) * 1e-9, 1e-3, max_step_dt);
     }
     last_control_update_stamp_ = update_stamp;
+  } else {
+    if (last_control_update_steady_) {
+      const double elapsed_s = std::chrono::duration<double>(
+          cycle_start - *last_control_update_steady_).count();
+      if (std::isfinite(elapsed_s) && elapsed_s > 0.0) {
+        actual_step_dt = std::clamp(elapsed_s, 1e-3, max_step_dt);
+      }
+    }
+    last_control_update_steady_ = cycle_start;
   }
   if (goal_position_error <= goal_position_tolerance_ &&
       goal_yaw_error <= goal_yaw_tolerance_) {
-    publishTerminalDecelerationCommand();
+    publishTerminalDecelerationCommand(actual_step_dt);
     return;
   }
   // 5. 检查参考序列长度
@@ -1283,6 +1297,7 @@ void AtsSwerveMpcNode::onControlTimer() {
       rotationPhaseCompensatedState(current, last_control_(2), rotation_delay);
   snapshot.references = references;
   snapshot.last_control_before_solve = last_control_;
+  snapshot.first_step_dt = actual_step_dt;
   snapshot.reference_fresh = projection.valid && !trajectory_expired &&
                              references.size() >= static_cast<std::size_t>(
                                  controller_->config().horizon + 1);
@@ -1346,7 +1361,8 @@ void AtsSwerveMpcNode::onControlTimer() {
   const auto ilqr_start = std::chrono::steady_clock::now();
   const Se2MpcResult result =
       controller_->solve(snapshot.current_state, snapshot.references,
-                         snapshot.last_control_before_solve);
+                         snapshot.last_control_before_solve,
+                         snapshot.first_step_dt);
   recordTiming(telemetry, ControlCycleTimingStage::kIlqrSolve,
                elapsedMilliseconds(ilqr_start, std::chrono::steady_clock::now()));
   // iLQR 内部拆分：仅为把 solve 的耗时归属到具体阶段，它们是 kIlqrSolve 的
@@ -1389,7 +1405,7 @@ void AtsSwerveMpcNode::onControlTimer() {
       // preserve the existing angular acceleration limit during deceleration.
       const double deceleration_floor = std::max(
           0.0, std::abs(snapshot.last_control_before_solve(2)) -
-                   controller_->config().max_awz * controller_->config().dt);
+                   controller_->config().max_awz * snapshot.first_step_dt);
       const double yaw_rate_limit = std::max(
           goal_yaw_error / terminal_approach_time_constant_, deceleration_floor);
       last_control_(2) = std::clamp(last_control_(2), -yaw_rate_limit, yaw_rate_limit);
@@ -1455,7 +1471,7 @@ void AtsSwerveMpcNode::runQpShadow(
       snapshot.current_state, snapshot.ilqr_result.states,
       snapshot.ilqr_result.controls, snapshot.references,
       snapshot.last_control_before_solve, controller_->config(),
-      qp_problem_buffer_);
+      qp_problem_buffer_, ZeroSpeedGuardConfig(), snapshot.first_step_dt);
   if (problem_built) {
     recordQpProblemMetrics(qp_problem_buffer_, telemetry);
   }
@@ -1521,7 +1537,8 @@ void AtsSwerveMpcNode::runQpShadow(
     audit = LtvQpCandidateValidator::validate(
         problem, snapshot.ilqr_result.controls,
         snapshot.last_control_before_solve, controller_->config(),
-        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result, candidate);
+        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result, candidate,
+        snapshot.first_step_dt);
     recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
                  elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
   } else {
@@ -1529,7 +1546,8 @@ void AtsSwerveMpcNode::runQpShadow(
     audit = LtvQpCandidateValidator::validate(
         problem, snapshot.ilqr_result.controls,
         snapshot.last_control_before_solve, controller_->config(),
-        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result);
+        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result,
+        snapshot.first_step_dt);
     recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
                  elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
   }
@@ -1749,6 +1767,7 @@ void AtsSwerveMpcNode::dumpControlTelemetry(
 void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
   last_control_.setZero();
   last_control_update_stamp_.reset();
+  last_control_update_steady_.reset();
   publishCommand(last_control_);
   controller_->reset();
   if (reason_zh != nullptr) {
@@ -1770,18 +1789,20 @@ Control AtsSwerveMpcNode::limitTerminalApproachSpeed(
 }
 
 /**
- * @brief 终点容差圆内的减速出口：上一拍指令每轴按 max_a*dt 降向零，降到零后才清零。
+ * @brief 终点容差圆内的减速出口：上一拍指令每轴按 max_a*step_dt 降向零，降到零后才清零。
  * @details 报告 5.1.9 B：容差圆内直接发零时指令从约 0.5 m/s 阶跃到 0，底盘带着加速度
  *          限幅与约 0.4 s 滞后滑出 0.15-0.25 m，MPC 再从零起步拉回，形成终点极限环。
- *          这里每拍只减一个增量限幅步长，与 MPC 自身的 max_a*dt 增量约束同一口径；
+ *          这里每拍按实际经过时间步长 step_dt 衰减，与 MPC 自身的增量约束同一物理口径；
  *          车在衰减途中滑出容差圆时，MPC 从这条衰减后的指令接着求解，而不是从零。
  *          warm start 每拍都清掉：衰减期间不求解，旧 warm controls 没有随时间左移。
  *          轨迹过期、急停与其它失败路径不经过这里，仍直接发零。
  */
-void AtsSwerveMpcNode::publishTerminalDecelerationCommand() {
+void AtsSwerveMpcNode::publishTerminalDecelerationCommand(double step_dt) {
   const Se2MpcConfig &config = controller_->config();
-  const Control step(config.max_ax * config.dt, config.max_ay * config.dt,
-                     config.max_awz * config.dt);
+  const double effective_dt =
+      (std::isfinite(step_dt) && step_dt > 0.0) ? step_dt : config.dt;
+  const Control step(config.max_ax * effective_dt, config.max_ay * effective_dt,
+                     config.max_awz * effective_dt);
   Control next = Control::Zero();
   for (int axis = 0; axis < 3; ++axis) {
     const double magnitude = std::max(0.0, std::abs(last_control_(axis)) - step(axis));
@@ -1810,12 +1831,12 @@ void AtsSwerveMpcNode::validateDynamicsParameters(
                  config.dt, config.horizon);
   }
   const double control_period = 1.0 / std::max(1.0, control_rate_hz_);
-  if (std::abs(config.dt - control_period) > 0.2 * control_period) {
+  if (control_period > 1.2 * config.dt) {
     RCLCPP_WARN(
         get_logger(),
-        "【动力学参数不匹配】预测步长 dt=%.4f s 与控制周期 %.4f s（%.1f Hz）"
-        "偏差超过 20%%，预测时间轴与实际执行时间轴错位，跟踪会出现系统性滞后。",
-        config.dt, control_period, control_rate_hz_);
+        "【动力学参数不匹配】控制周期 %.4f s（%.1f Hz）慢于预测步长 dt=%.4f s 超过 20%%，"
+        "建议提高 control_rate_hz 或调大预测步长 dt。",
+        control_period, control_rate_hz_, config.dt);
   }
   if (config.wheel_base_x <= 0.0 || config.wheel_base_y <= 0.0) {
     RCLCPP_ERROR(get_logger(),
@@ -1922,6 +1943,7 @@ void AtsSwerveMpcNode::engageFailStop(
   }
   last_control_.setZero();
   last_control_update_stamp_.reset();
+  last_control_update_steady_.reset();
   publishCommand(last_control_);
 }
 

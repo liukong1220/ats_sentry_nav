@@ -272,10 +272,11 @@ LtvQpProblem LtvQpBuilder::build(
     const State &current_state, const std::vector<State> &nominal_states,
     const std::vector<Control> &nominal_controls,
     const std::vector<Se2Reference> &references, const Control &last_control,
-    const Se2MpcConfig &config, const ZeroSpeedGuardConfig &guard_config) {
+    const Se2MpcConfig &config, const ZeroSpeedGuardConfig &guard_config,
+    double first_step_dt) {
   LtvQpProblem problem = allocate(config.horizon);
   build(current_state, nominal_states, nominal_controls, references, last_control,
-        config, problem, guard_config);
+        config, problem, guard_config, first_step_dt);
   return problem;
 }
 
@@ -290,7 +291,7 @@ bool LtvQpBuilder::build(
     const std::vector<Control> &nominal_controls,
     const std::vector<Se2Reference> &references, const Control &last_control,
     const Se2MpcConfig &config, LtvQpProblem &problem,
-    const ZeroSpeedGuardConfig &guard_config) {
+    const ZeroSpeedGuardConfig &guard_config, double first_step_dt) {
   const auto dimensions = checkedLtvQpDimensions(config.horizon);
   if (!dimensions.valid || !std::isfinite(config.dt) || config.dt <= 0.0) {
     problem.valid = false;
@@ -391,9 +392,13 @@ bool LtvQpBuilder::build(
       problem.inequality_matrix
           .block<3, 3>(inequality_offset, previous_offset) *= -1.0;
     }
-    const Control max_delta(config.max_ax * config.dt,
-                           config.max_ay * config.dt,
-                           config.max_awz * config.dt);
+    const double step_dt =
+        (step == 0 && std::isfinite(first_step_dt) && first_step_dt > 0.0)
+            ? first_step_dt
+            : config.dt;
+    const Control max_delta(config.max_ax * step_dt,
+                           config.max_ay * step_dt,
+                           config.max_awz * step_dt);
     problem.inequality_lower.segment<3>(inequality_offset) =
         -max_delta - nominal_delta;
     problem.inequality_upper.segment<3>(inequality_offset) =

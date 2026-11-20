@@ -138,6 +138,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("confirmation_motion_translation_tolerance", 0.25);
   this->declare_parameter("confirmation_motion_yaw_tolerance", 0.15);
   this->declare_parameter("registration_interval_s", 0.25);
+  this->declare_parameter("transform_publish_rate_hz", 50.0);
   this->declare_parameter("max_accumulation_age_s", 0.30);
   this->declare_parameter("min_registration_translation_delta", 0.10);
   this->declare_parameter("min_registration_yaw_delta", 0.12);
@@ -259,6 +260,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     std::max(0.0, confirmation_motion_translation_tolerance_);
   confirmation_motion_yaw_tolerance_ = std::max(0.0, confirmation_motion_yaw_tolerance_);
   this->get_parameter("registration_interval_s", registration_interval_s_);
+  this->get_parameter("transform_publish_rate_hz", transform_publish_rate_hz_);
+  if (!std::isfinite(transform_publish_rate_hz_) || transform_publish_rate_hz_ <= 0.0) {
+    transform_publish_rate_hz_ = 50.0;
+  }
+  transform_publish_rate_hz_ = std::clamp(transform_publish_rate_hz_, 1.0, 200.0);
   this->get_parameter("max_accumulation_age_s", max_accumulation_age_s_);
   this->get_parameter("min_registration_translation_delta", min_registration_translation_delta_);
   this->get_parameter("min_registration_yaw_delta", min_registration_yaw_delta_);
@@ -470,12 +476,11 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
       "relocalization_observation", rclcpp::QoS(10).reliable());
 
   register_timer_ = this->create_wall_timer(
-    std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::duration<double>(std::max(0.05, registration_interval_s_))),
+    std::chrono::duration<double>(std::max(0.01, registration_interval_s_)),
     std::bind(&SmallGicpRelocalizationNode::performRegistration, this));
 
   transform_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(50),  // 20 Hz
+    std::chrono::duration<double>(1.0 / std::max(1.0, transform_publish_rate_hz_)),
     std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
 
   RCLCPP_INFO(
