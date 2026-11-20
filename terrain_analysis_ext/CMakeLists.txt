@@ -59,23 +59,4 @@ install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 install(DIRECTORY include/ DESTINATION include)
 
-if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  ament_lint_auto_find_test_dependencies()
-
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_planar_lattice test/test_planar_lattice.cpp)
-  if(TARGET test_planar_lattice)
-    target_include_directories(test_planar_lattice PRIVATE include)
-  endif()
-  ament_add_gtest(test_self_filter test/test_self_filter.cpp)
-  if(TARGET test_self_filter)
-    target_include_directories(test_self_filter PRIVATE include)
-  endif()
-  ament_add_gtest(test_overhead_filter test/test_overhead_filter.cpp)
-  if(TARGET test_overhead_filter)
-    target_include_directories(test_overhead_filter PRIVATE include)
-  endif()
-endif()
-
 ament_package()

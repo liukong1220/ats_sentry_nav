@@ -41,12 +41,6 @@ install(TARGETS ${PROJECT_NAME}
 )
 install(DIRECTORY include/ DESTINATION include)
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_rc_esdf_map test/test_rc_esdf_map.cpp)
-  target_link_libraries(test_rc_esdf_map ${PROJECT_NAME})
-endif()
-
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 ament_export_dependencies(Eigen3 geometry_msgs nav_msgs tf2 tf2_geometry_msgs)

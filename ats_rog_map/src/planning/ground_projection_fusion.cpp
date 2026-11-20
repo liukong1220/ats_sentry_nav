@@ -243,94 +243,6 @@ RogMapEsdfSnapshot RogMapEsdfSnapshot::fromResponse(
   return snapshot;
 }
 
-SourceUnknownEvidence evaluateSourceUnknownEvidence(
-  const RogMapEsdfSnapshot & snapshot, const std::uint64_t baseline_generation)
-{
-  SourceUnknownEvidence evidence;
-  evidence.generation = snapshot.generation;
-  const std::size_t cell_count = static_cast<std::size_t>(snapshot.info.width) *
-    static_cast<std::size_t>(snapshot.info.height);
-  evidence.cell_count = cell_count;
-
-  if (!snapshot.ready) {
-    evidence.reason = "ROGMap numeric projection is not ready";
-    return evidence;
-  }
-  if (snapshot.stale) {
-    evidence.reason = "ROGMap numeric projection is stale";
-    return evidence;
-  }
-  if (snapshot.header.frame_id.empty()) {
-    evidence.reason = "ROGMap numeric projection has an empty frame_id";
-    return evidence;
-  }
-  if (snapshot.header.stamp.sec <= 0 && snapshot.header.stamp.nanosec == 0U) {
-    evidence.reason = "ROGMap numeric projection has a non-positive stamp";
-    return evidence;
-  }
-  if (!std::isfinite(snapshot.info.resolution) || snapshot.info.resolution <= 0.0F) {
-    evidence.reason = "ROGMap numeric projection resolution is not finite and positive";
-    return evidence;
-  }
-  if (snapshot.info.width == 0 || snapshot.info.height == 0 || cell_count == 0) {
-    evidence.reason = "ROGMap numeric projection grid is empty";
-    return evidence;
-  }
-  if (snapshot.occupancy.size() != cell_count) {
-    evidence.reason = "ROGMap numeric occupancy length does not equal width * height";
-    return evidence;
-  }
-  if (snapshot.signed_distance.size() != cell_count ||
-    snapshot.gradient_x.size() != cell_count || snapshot.gradient_y.size() != cell_count)
-  {
-    evidence.reason = "ROGMap numeric signed-distance or gradient length does not equal cells";
-    return evidence;
-  }
-  evidence.structurally_valid = true;
-
-  for (std::size_t index = 0; index < cell_count; ++index) {
-    const int value = static_cast<int>(snapshot.occupancy[index]);
-    if (value == -1) {
-      ++evidence.unknown_cells;
-    } else if (value == 0) {
-      ++evidence.free_cells;
-    } else if (value > 0 && value <= 100) {
-      ++evidence.occupied_cells;
-    } else {
-      ++evidence.out_of_range_cells;
-    }
-    if (std::isfinite(snapshot.signed_distance[index]) ||
-      std::isfinite(snapshot.gradient_x[index]) || std::isfinite(snapshot.gradient_y[index]))
-    {
-      ++evidence.finite_numeric_cells;
-    }
-  }
-
-  if (evidence.unknown_cells != cell_count) {
-    evidence.reason = "ROGMap numeric occupancy mixes unknown with free=" +
-      std::to_string(evidence.free_cells) + " occupied=" +
-      std::to_string(evidence.occupied_cells) + " out_of_range=" +
-      std::to_string(evidence.out_of_range_cells) + " unknown=" +
-      std::to_string(evidence.unknown_cells) + " of cells=" + std::to_string(cell_count);
-    return evidence;
-  }
-  if (evidence.finite_numeric_cells != 0) {
-    evidence.reason = "ROGMap numeric signed-distance or gradient is finite in " +
-      std::to_string(evidence.finite_numeric_cells) + " unknown cells";
-    return evidence;
-  }
-  if (snapshot.generation <= baseline_generation) {
-    evidence.reason = "ROGMap source generation " + std::to_string(snapshot.generation) +
-      " did not advance past the pre-fault generation " + std::to_string(baseline_generation);
-    return evidence;
-  }
-
-  evidence.all_unknown = true;
-  evidence.reason = "ROGMap numeric projection is strictly all-unknown across " +
-    std::to_string(cell_count) + " cells at generation " + std::to_string(snapshot.generation);
-  return evidence;
-}
-
 TerrainSpikeFilter::TerrainSpikeFilter(int confirm_frames, int obstacle_threshold)
 : confirm_frames_(std::max(confirm_frames, 1)),
   obstacle_threshold_(std::clamp(obstacle_threshold, 0, 100))
@@ -584,7 +496,7 @@ bool GroundProjectionFusion::fuse(
 
 std::size_t GroundProjectionFusion::clearUnknownFootprint(
   GroundProjectionFusionResult & result, double world_x, double world_y, double yaw,
-  double length, double width, double margin)
+  double length, double width, double margin, int obstacle_threshold)
 {
   if (!validGrid(result.planning_grid) || !std::isfinite(world_x) ||
     !std::isfinite(world_y) || !std::isfinite(yaw) || !std::isfinite(length) ||
@@ -593,6 +505,46 @@ std::size_t GroundProjectionFusion::clearUnknownFootprint(
   std::size_t cleared = 0;
   const double c = std::cos(yaw), s = std::sin(yaw);
   auto & grid = result.planning_grid;
+  const double res = grid.info.resolution;
+  const double origin_x = grid.info.origin.position.x;
+  const double origin_y = grid.info.origin.position.y;
+  tf2::Quaternion origin_rotation;
+  tf2::fromMsg(grid.info.origin.orientation, origin_rotation);
+  const double origin_yaw = tf2::getYaw(origin_rotation);
+  const double cos_o = std::cos(origin_yaw);
+  const double sin_o = std::sin(origin_yaw);
+  const int occ_thr = std::clamp(obstacle_threshold, 1, 100);
+  const auto rayOccludedByObstacle = [&](double target_x, double target_y) -> bool {
+      const double rx = target_x - world_x;
+      const double ry = target_y - world_y;
+      const double dist = std::hypot(rx, ry);
+      if (dist <= 0.5 * res) {
+        return false;
+      }
+      const int steps = std::max(2, static_cast<int>(std::ceil(dist / (0.5 * res))));
+      for (int step = 1; step < steps; ++step) {
+        const double t = static_cast<double>(step) / static_cast<double>(steps);
+        const double sx = world_x + t * rx;
+        const double sy = world_y + t * ry;
+        const double rel_x = sx - origin_x;
+        const double rel_y = sy - origin_y;
+        const double gx = (cos_o * rel_x + sin_o * rel_y) / res;
+        const double gy = (-sin_o * rel_x + cos_o * rel_y) / res;
+        const int ix = static_cast<int>(std::floor(gx));
+        const int iy = static_cast<int>(std::floor(gy));
+        if (ix < 0 || iy < 0 || ix >= static_cast<int>(grid.info.width) ||
+          iy >= static_cast<int>(grid.info.height))
+        {
+          return true;
+        }
+        const std::size_t sidx =
+          static_cast<std::size_t>(iy) * grid.info.width + static_cast<std::size_t>(ix);
+        if (grid.data[sidx] >= occ_thr) {
+          return true;
+        }
+      }
+      return false;
+    };
   for (unsigned int y = 0; y < grid.info.height; ++y) {
     for (unsigned int x = 0; x < grid.info.width; ++x) {
       const auto index = static_cast<std::size_t>(y) * grid.info.width + x;
@@ -602,6 +554,7 @@ std::size_t GroundProjectionFusion::clearUnknownFootprint(
       const double dx = wx - world_x, dy = wy - world_y;
       if (std::abs(c * dx + s * dy) > 0.5 * length + margin + 1e-8 ||
         std::abs(-s * dx + c * dy) > 0.5 * width + margin + 1e-8) {continue;}
+      if (rayOccludedByObstacle(wx, wy)) {continue;}
       grid.data[index] = 0; ++cleared;
     }
   }

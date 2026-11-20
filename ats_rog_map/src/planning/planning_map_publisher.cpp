@@ -24,7 +24,6 @@
 #include "ats_rog_map/planning/ground_projection_fusion.hpp"
 #include "ats_rog_map/planning/planning_map_snapshot.hpp"
 #include "ats_rog_map/planning/planning_map_publisher.hpp"
-#include "ats_rog_map/test_fault_authorization.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
@@ -40,19 +39,6 @@
 
 namespace ats_rog_map::planning
 {
-
-/// @brief Test-only parameters that may not be set without startup authorization.
-const std::vector<std::string> & kGuardedTestParameters()
-{
-  static const std::vector<std::string> names{
-    "test_mask_secondary_evidence",
-    "test_stall_projection",
-    "test_inject_dynamic_obstacle",
-    "test_dynamic_obstacle_x",
-    "test_dynamic_obstacle_y",
-    "test_dynamic_obstacle_radius"};
-  return names;
-}
 
 class PlanningMapPublisher final : public rclcpp::Node
 {
@@ -170,49 +156,16 @@ public:
     robot_unknown_clear_radius_ = std::max(
       0.0, declare_parameter<double>("robot_unknown_clear_radius", 0.0));
     robot_unknown_clear_footprint_ = declare_parameter<bool>("robot_unknown_clear_footprint", false);
-    robot_clear_length_ = declare_parameter<double>("robot_unknown_clear_length", 0.70);
-    robot_clear_width_ = declare_parameter<double>("robot_unknown_clear_width", 0.55);
-    robot_clear_margin_ = declare_parameter<double>("robot_unknown_clear_margin", 0.10);
-    // Startup-only authorization gate for every test fixture below.  It is
-    // latched once here and never re-read, so a live client cannot raise it.
-    // Default false keeps nominal, real-vehicle and default-launch runs clean.
-    test_fault_injection_enabled_ =
-      declare_parameter<bool>("enable_test_fault_injection", false);
-    // Only for an isolated source-unknown fault.  Secondary evidence is
-    // masked before the normal truth table runs; the fused output is never
-    // overwritten after fusion.  Gated by enable_test_fault_injection.
-    declare_parameter<bool>("test_mask_secondary_evidence", false);
-    // Stands in for the former "projection service does not answer" fault: the
-    // projection worker waits before computing until this is cleared, so the
-    // request deadline below fires exactly as it did for a stalled service.
-    declare_parameter<bool>("test_stall_projection", false);
-    // P4 runtime swept-volume injection.  These values are only sampled when
-    // explicitly enabled at runtime and never affect the normal map contract.
-    declare_parameter<bool>("test_inject_dynamic_obstacle", false);
-    declare_parameter<double>("test_dynamic_obstacle_x", 0.0);
-    declare_parameter<double>("test_dynamic_obstacle_y", 0.0);
-    declare_parameter<double>("test_dynamic_obstacle_radius", 0.10);
-    RCLCPP_INFO(
-      get_logger(), "P2 adapter test fault injection gate enable_test_fault_injection=%d",
-      test_fault_injection_enabled_ ? 1 : 0);
-    test_fault_parameter_callback_ = add_on_set_parameters_callback(
-      [this](const std::vector<rclcpp::Parameter> & parameters) {
-        std::vector<std::string> names;
-        names.reserve(parameters.size());
-        for (const auto & parameter : parameters) {
-          names.push_back(parameter.get_name());
-        }
-        const auto verdict = screenTestFaultParameters(
-          test_fault_injection_enabled_, names, kGuardedTestParameters());
-        rcl_interfaces::msg::SetParametersResult result;
-        result.successful = verdict.accepted;
-        result.reason = verdict.reason;
-        if (!verdict.accepted) {
-          RCLCPP_ERROR(get_logger(), "P2 adapter test fault request rejected: %s",
-            verdict.reason.c_str());
-        }
-        return result;
-      });
+    robot_clear_length_ = std::max(
+      0.0, declare_parameter<double>("robot_unknown_clear_length", footprint_length_));
+    robot_clear_width_ = std::max(
+      0.0, declare_parameter<double>("robot_unknown_clear_width", footprint_width_));
+    // 建图模式（robot_unknown_clear_footprint=true）下，ROGMap self_filter_radius(0.45 m)
+    // 与倾斜雷达近场盲区会在车身周围形成未观测未知环带，且图搜索最低净空为内切半径加量化余量；
+    // 默认外扩 0.14 m（仅清理未知格并经视线遮挡检查，不穿透/改写占据墙体）以衔接近场已知空闲地面。
+    robot_clear_margin_ = std::max(
+      0.0, declare_parameter<double>(
+        "robot_unknown_clear_margin", std::max(footprint_safety_margin_, 0.14)));
 
     static_map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       static_map_topic_, rclcpp::QoS(1).reliable().transient_local(),
@@ -501,17 +454,6 @@ private:
         pending_job_.reset();
         worker_busy_ = true;
       }
-      bool stall_logged = false;
-      while (test_fault_injection_enabled_ && !workerStopping() &&
-        get_parameter("test_stall_projection").as_bool())
-      {
-        if (!stall_logged) {
-          RCLCPP_WARN(get_logger(), "P2 adapter test projection stall active request=%llu",
-            static_cast<unsigned long long>(job.epoch));
-          stall_logged = true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      }
       GroundProjection response;
       bool computed = true;
       try {
@@ -571,7 +513,6 @@ private:
         static_cast<unsigned long long>(response.odom_epoch),
         response.odom_layer_included ? 1 : 0, response.occupancy_grid.header.frame_id.c_str(),
         response.occupancy_grid.info.width, response.occupancy_grid.info.height);
-      logNumericProjectionEvidence(response);
       processProjection(response, job.localization_epoch, job.epoch);
       if (mapping_update_pending_) {
         mapping_update_pending_ = false;
@@ -581,24 +522,6 @@ private:
       RCLCPP_ERROR(get_logger(), "ROGMap projection response failed: %s", exception.what());
       publishUnavailable("ROGMap projection response failed");
     }
-  }
-
-  // Test-only replacement for the former numeric service query: with the startup
-  // fault gate open, every raw ROGMap projection is audited by the same strict
-  // all-unknown predicate before any masking or fusion runs.
-  void logNumericProjectionEvidence(const GroundProjection & response)
-  {
-    if (!test_fault_injection_enabled_) {return;}
-    const auto evidence = evaluateSourceUnknownEvidence(
-      RogMapEsdfSnapshot::fromResponse(response), 0U);
-    RCLCPP_INFO(
-      get_logger(),
-      "P2 rog numeric projection structurally_valid=%d all_unknown=%d cells=%zu unknown=%zu "
-      "free=%zu occupied=%zu out_of_range=%zu finite_numeric=%zu generation=%llu reason=%s",
-      evidence.structurally_valid ? 1 : 0, evidence.all_unknown ? 1 : 0, evidence.cell_count,
-      evidence.unknown_cells, evidence.free_cells, evidence.occupied_cells,
-      evidence.out_of_range_cells, evidence.finite_numeric_cells,
-      static_cast<unsigned long long>(response.generation), evidence.reason.c_str());
   }
 
   void processProjection(
@@ -623,14 +546,6 @@ private:
     // Keep every ready=false heartbeat tied to the latest numeric response;
     // unavailable paths must not report an older ROGMap source generation.
     last_rog_generation_ = response.generation;
-    // Baseline for the strict all-unknown predicate: the newest source
-    // generation seen while no fixture was active.  It is frozen while the
-    // fixture runs so recovery cannot be confused with the pre-fault map.
-    if (!(test_fault_injection_enabled_ &&
-      get_parameter("test_mask_secondary_evidence").as_bool()))
-    {
-      pre_fault_rog_generation_ = response.generation;
-    }
     nav_msgs::msg::OccupancyGrid::SharedPtr static_map;
     nav_msgs::msg::OccupancyGrid::SharedPtr traversability;
     nav_msgs::msg::OccupancyGrid::SharedPtr slope;
@@ -682,31 +597,6 @@ private:
     if (!numeric_snapshot.available() || !projectionFresh(projection_grid)) {
       publishUnavailable("ROGMap projection is unavailable or stale");
       return;
-    }
-    // The masking fixture may only run when the startup gate authorized it and
-    // when the ROGMap numeric occupancy is *strictly* all-unknown.  Any mixed
-    // free/occupied/out-of-range response is refused with a named reason so a
-    // partially cleared map can never be reported as a source-unknown fault.
-    const bool mask_secondary_evidence = test_fault_injection_enabled_ &&
-      get_parameter("test_mask_secondary_evidence").as_bool();
-    if (mask_secondary_evidence) {
-      const auto evidence =
-        evaluateSourceUnknownEvidence(numeric_snapshot, pre_fault_rog_generation_);
-      RCLCPP_WARN(
-        get_logger(),
-        "P2 source-unknown evidence structurally_valid=%d all_unknown=%d cells=%zu unknown=%zu "
-        "free=%zu occupied=%zu out_of_range=%zu finite_numeric=%zu generation=%llu "
-        "baseline_generation=%llu reason=%s",
-        evidence.structurally_valid ? 1 : 0, evidence.all_unknown ? 1 : 0, evidence.cell_count,
-        evidence.unknown_cells, evidence.free_cells, evidence.occupied_cells,
-        evidence.out_of_range_cells, evidence.finite_numeric_cells,
-        static_cast<unsigned long long>(evidence.generation),
-        static_cast<unsigned long long>(pre_fault_rog_generation_), evidence.reason.c_str());
-      if (!evidence.all_unknown) {
-        publishUnavailable(
-          ("test source-unknown fixture refused: " + evidence.reason).c_str());
-        return;
-      }
     }
     const bool traversability_fresh = traversability && inputFresh(*traversability);
     const bool slope_fresh = slope && inputFresh(*slope);
@@ -768,20 +658,6 @@ private:
         "(traversal fresh=%d sync=%d; slope fresh=%d sync=%d)",
         traversability_fresh ? 1 : 0, traversability_synchronized ? 1 : 0,
         slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0);
-    }
-    if (mask_secondary_evidence) {
-      const auto unknown_copy = [](const nav_msgs::msg::OccupancyGrid & source) {
-          auto masked = std::make_shared<nav_msgs::msg::OccupancyGrid>(source);
-          std::fill(masked->data.begin(), masked->data.end(), static_cast<std::int8_t>(-1));
-          return masked;
-        };
-      static_map = unknown_copy(*static_map);
-      traversability = unknown_copy(*traversability);
-      slope = unknown_copy(*slope);
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "P2 test fixture masks static/terrain/slope evidence before fusion; "
-        "ROGMap numeric unknown remains the only source evidence");
     }
 
     const auto lookupAtProjectionStamp = [this](
@@ -872,7 +748,7 @@ private:
       try {
         override_from_projection = tf_buffer_.lookupTransform(
           fusion_params_.terrain_free_override_frame, projection_grid.header.frame_id,
-          rclcpp::Time(projection_grid.header.stamp), rclcpp::Duration::from_seconds(0.0));
+          rclcpp::Time(projection_grid.header.stamp), rclcpp::Duration::from_seconds(0.1));
         // Static TFs may report stamp zero; lookup has already evaluated the
         // requested time, so record that query time for the fusion contract.
         override_from_projection.header.stamp = projection_grid.header.stamp;
@@ -898,14 +774,13 @@ private:
       ego_unknown_cleared += GroundProjectionFusion::clearUnknownFootprint(
         fusion, static_from_robot.transform.translation.x, static_from_robot.transform.translation.y,
         tf2::getYaw(static_from_robot.transform.rotation), robot_clear_length_, robot_clear_width_,
-        robot_clear_margin_);
+        robot_clear_margin_, fusion_params_.terrain_obstacle_value_threshold);
     }
     last_blocking_grid_ = fusion.planning_grid;
     if (fusion.known_free_cells == 0) {
       publishUnavailable("ROGMap terrain fusion produced no known-free cells", true);
       return;
     }
-    const std::size_t injected_cells = injectDynamicObstacleForTest(fusion.planning_grid);
 
     planning_esdf_.updateGrid(
       fusion.planning_grid, fusion_params_.terrain_obstacle_value_threshold,
@@ -956,67 +831,10 @@ private:
     publishMapStatus(true, response.generation, "planning snapshot ready");
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu injected=%zu numeric_esdf=%zu",
+      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu numeric_esdf=%zu",
       static_cast<unsigned long long>(response.generation), fusion.known_free_cells,
-      fusion.occupied_cells, fusion.unknown_cells, ego_unknown_cleared, injected_cells,
+      fusion.occupied_cells, fusion.unknown_cells, ego_unknown_cleared,
       numeric_snapshot.signed_distance.size());
-  }
-
-  std::size_t injectDynamicObstacleForTest(nav_msgs::msg::OccupancyGrid & grid)
-  {
-    if (!test_fault_injection_enabled_ ||
-      !get_parameter("test_inject_dynamic_obstacle").as_bool() ||
-      grid.info.resolution <= 0.0 || grid.data.empty())
-    {
-      return 0;
-    }
-    const double world_x = get_parameter("test_dynamic_obstacle_x").as_double();
-    const double world_y = get_parameter("test_dynamic_obstacle_y").as_double();
-    const double radius = std::max(
-      0.0, get_parameter("test_dynamic_obstacle_radius").as_double());
-    const double yaw = std::atan2(
-      2.0 * (grid.info.origin.orientation.w * grid.info.origin.orientation.z +
-        grid.info.origin.orientation.x * grid.info.origin.orientation.y),
-      1.0 - 2.0 * (grid.info.origin.orientation.y * grid.info.origin.orientation.y +
-        grid.info.origin.orientation.z * grid.info.origin.orientation.z));
-    const double dx = world_x - grid.info.origin.position.x;
-    const double dy = world_y - grid.info.origin.position.y;
-    const double grid_x =
-      (std::cos(yaw) * dx + std::sin(yaw) * dy) / grid.info.resolution;
-    const double grid_y =
-      (-std::sin(yaw) * dx + std::cos(yaw) * dy) / grid.info.resolution;
-    const int center_x = static_cast<int>(std::floor(grid_x));
-    const int center_y = static_cast<int>(std::floor(grid_y));
-    const double conservative_radius = radius +
-      0.5 * std::sqrt(2.0) * grid.info.resolution;
-    const int radius_cells = std::max(
-      0, static_cast<int>(std::ceil(conservative_radius / grid.info.resolution)));
-    std::size_t injected = 0;
-    for (int y = center_y - radius_cells; y <= center_y + radius_cells; ++y) {
-      for (int x = center_x - radius_cells; x <= center_x + radius_cells; ++x) {
-        if (x < 0 || y < 0 || x >= static_cast<int>(grid.info.width) ||
-          y >= static_cast<int>(grid.info.height))
-        {
-          continue;
-        }
-        const double cell_dx =
-          (static_cast<double>(x) + 0.5 - grid_x) * grid.info.resolution;
-        const double cell_dy =
-          (static_cast<double>(y) + 0.5 - grid_y) * grid.info.resolution;
-        if (cell_dx * cell_dx + cell_dy * cell_dy >
-          conservative_radius * conservative_radius)
-        {
-          continue;
-        }
-        const std::size_t index = static_cast<std::size_t>(y) * grid.info.width + x;
-        if (grid.data[index] < fusion_params_.terrain_obstacle_value_threshold) {
-          ++injected;
-        }
-        grid.data[index] = static_cast<int8_t>(
-          std::max(fusion_params_.terrain_obstacle_value_threshold, 100));
-      }
-    }
-    return injected;
   }
 
   // 每格一个点，颜色见 distance_viz.hpp：占据黑，外接半径内红，到
@@ -1245,10 +1063,6 @@ private:
   std::uint64_t localization_epoch_{0};
   std::uint64_t last_rog_generation_{0};
   std::uint64_t map_status_sequence_{0};
-  bool test_fault_injection_enabled_{false};
-  std::uint64_t pre_fault_rog_generation_{0};
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
-    test_fault_parameter_callback_;
   std::uint8_t localization_state_{
       ats_navigation_interfaces::msg::LocalizationStatus::STATE_UNINITIALIZED};
   bool has_localization_status_{false};

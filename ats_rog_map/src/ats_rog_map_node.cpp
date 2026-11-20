@@ -25,8 +25,6 @@
 #include "ats_rog_map/point_cloud_input.hpp"
 #include "ats_rog_map/rog_map_core_parameters.hpp"
 #include "ats_rog_map/rog_map_engine.hpp"
-#include "ats_rog_map/test_fault_authorization.hpp"
-#include "ats_rog_map/unknown_projection_audit.hpp"
 #include "ats_rog_map/ground_projection.hpp"
 #include "ats_rog_map/planning/planning_map_publisher.hpp"
 #include "ats_rog_map_interfaces/srv/save_odom_map.hpp"
@@ -213,35 +211,6 @@ public:
     if (planning_grid_owner_ != "rog_map" && planning_grid_owner_ != "rc_esdf") {
       throw std::invalid_argument("planning_grid_owner must be 'rog_map' or 'rc_esdf'");
     }
-    // Startup-only authorization gate.  It is latched once here and never
-    // re-read, so no live client can raise it.  Default false keeps nominal,
-    // real-vehicle and default-launch runs from ever clearing the map.
-    test_fault_injection_enabled_ =
-      declare_parameter<bool>("enable_test_fault_injection", false);
-    // Test-only edge-triggered source fixture.  It never changes default map
-    // semantics and is intentionally distinct from an input-stale fault.
-    declare_parameter<bool>("test_reset_to_unknown", false);
-    RCLCPP_INFO(
-      get_logger(), "P2 ROGMap test fault injection gate enable_test_fault_injection=%d",
-      test_fault_injection_enabled_ ? 1 : 0);
-    test_fault_parameter_callback_ = add_on_set_parameters_callback(
-      [this](const std::vector<rclcpp::Parameter> & parameters) {
-        std::vector<std::string> names;
-        names.reserve(parameters.size());
-        for (const auto & parameter : parameters) {
-          names.push_back(parameter.get_name());
-        }
-        const auto verdict = screenTestFaultParameters(
-          test_fault_injection_enabled_, names, {"test_reset_to_unknown"});
-        rcl_interfaces::msg::SetParametersResult result;
-        result.successful = verdict.accepted;
-        result.reason = verdict.reason;
-        if (!verdict.accepted) {
-          RCLCPP_ERROR(
-            get_logger(), "P2 ROGMap test fault request rejected: %s", verdict.reason.c_str());
-        }
-        return result;
-      });
 
     const auto core_parameters = declareCoreParameters(*this);
     intensity_required_ = core_parameters.intensity_threshold > 0;
@@ -567,39 +536,6 @@ private:
     }
     const auto trace_tf = std::chrono::steady_clock::now();
 
-    // The isolated all-unknown fixture keeps sensor/TF cadence healthy while
-    // withholding every numeric occupancy observation.  It is an explicit
-    // substitute for MuJoCo's zero-return LiDAR fixture; normal profiles can
-    // never enter this branch because the startup authorization gate is false.
-    const bool hold_all_unknown = test_fault_injection_enabled_ &&
-      get_parameter("test_reset_to_unknown").as_bool();
-    if (hold_all_unknown) {
-      std::lock_guard<std::mutex> epoch_lock(epoch_mutex_);
-      if (cloud_revision != odom_epoch_guard_.revision()) {return;}
-      {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        map_->resetToUnknownForTest();
-        last_map_stamp_ = now();
-        has_map_data_ = true;
-        test_reset_to_unknown_active_ = true;
-      }
-      {
-        std::lock_guard<std::mutex> lock(layer_mutex_);
-        odom_layer_->clear();
-        ground_columns_->clear();
-        last_layer_stamp_seconds_ = 0.0;
-        last_layer_source_stamp_ = msg->header.stamp;
-      }
-      {
-        std::lock_guard<std::mutex> lock(input_mutex_);
-        last_map_update_time_ = std::chrono::steady_clock::now();
-      }
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "P2 all-unknown fixture holds numeric occupancy unknown while cloud and TF remain fresh.");
-      return;
-    }
-
     auto decoded = decodePointCloudForRogMap(*msg, intensity_required_);
     if (decoded.status != PointCloudInputStatus::kAccepted) {
       RCLCPP_ERROR_THROTTLE(
@@ -638,9 +574,6 @@ private:
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
       trace_map_locked = std::chrono::steady_clock::now();
-      // Second, independent enforcement point: even if a value slipped in via a
-      // parameter file, an unauthorized fixture stays ineffective here.
-      test_reset_to_unknown_active_ = false;
       map_updated = map_->update(
         cloud, poseFromTransform(map_from_base), poseFromTransform(map_from_sensor));
       if (map_updated) {
@@ -1336,8 +1269,6 @@ public:
     map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
       *map_lock_acquired_at - map_lock_wait_started).count();
     response->generation = map_->generation();
-    const bool publish_unknown_projection_audit = test_fault_injection_enabled_ &&
-      test_reset_to_unknown_active_ && unknown_pub_->get_subscription_count() > 0U;
     const auto esdf_refresh_started = std::chrono::steady_clock::now();
     response->ready = has_map_data_ && map_->ensureCurrentEsdf();
     esdf_refresh_ms = 1000.0 * std::chrono::duration<double>(
@@ -1406,7 +1337,7 @@ public:
                (point.array() <= (esdf_box_max.array() + tolerance)).all();
       };
     const auto sample_started = std::chrono::steady_clock::now();
-    const bool use_ground = projection_follow_measured_ground_ && !test_reset_to_unknown_active_;
+    const bool use_ground = projection_follow_measured_ground_;
     std::unique_lock<std::mutex> layer_lock(layer_mutex_, std::defer_lock);
     if (use_ground) {
       layer_lock.lock();
@@ -1492,14 +1423,6 @@ public:
     sample_ms = 1000.0 * std::chrono::duration<double>(
       std::chrono::steady_clock::now() - sample_started).count();
 
-    // Implicit unknown cells cannot be enumerated through ProbMap::boxSearch().  During the
-    // explicitly authorized reset fixture, publish an audit-only cloud from the authoritative
-    // numerical response after it has proved strictly all-unknown.  It is never a safety input.
-    rog_map::vec_E<rog_map::Vec3f> unknown_projection_audit;
-    if (publish_unknown_projection_audit) {
-      unknown_projection_audit = makeAllUnknownProjectionAudit(grid);
-    }
-
     const auto index_of = [&grid](std::uint32_t x, std::uint32_t y) {
         return static_cast<std::size_t>(y) * static_cast<std::size_t>(grid.info.width) + x;
       };
@@ -1551,10 +1474,6 @@ public:
       response->stale ? "true" : "false");
     log_projection_end();
     lock.unlock();
-    if (!unknown_projection_audit.empty()) {
-      unknown_pub_->publish(
-        makeCloud(unknown_projection_audit, rclcpp::Time(grid.header.stamp, RCL_ROS_TIME)));
-    }
   }
 
 private:
@@ -1578,11 +1497,7 @@ private:
   int debug_qos_depth_{1};
   bool input_qos_reliable_{false};
   bool debug_qos_reliable_{false};
-  bool test_reset_to_unknown_active_{false};
-  bool test_fault_injection_enabled_{false};
   std::string planning_grid_owner_;
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
-    test_fault_parameter_callback_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

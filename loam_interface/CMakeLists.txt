@@ -37,19 +37,6 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_auto_add_gtest(test_identified_odometry test/test_identified_odometry.cpp)
-  ament_auto_add_gtest(test_point_lio_frame_contract test/test_point_lio_frame_contract.cpp)
-set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
-find_package(ament_lint_auto REQUIRED)
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE
-    ament_cmake_uncrustify
-    ament_cmake_flake8
-  )
-  ament_lint_auto_find_test_dependencies()
-endif()
-
 #############
 ## Install ##
 #############

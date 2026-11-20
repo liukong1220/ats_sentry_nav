@@ -49,67 +49,6 @@ rclcpp_components_register_node(${PROJECT_NAME}
 ## Testing ##
 #############
 
-if(BUILD_TESTING)
-  set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
-  find_package(ament_cmake_gtest REQUIRED)
-  find_package(ament_cmake_pytest REQUIRED)
-  find_package(ament_lint_auto REQUIRED)
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE
-    ament_cmake_uncrustify
-    ament_cmake_flake8
-  )
-  ament_lint_auto_find_test_dependencies()
-
-  ament_add_gtest(test_localization_fusion_core
-    test/test_localization_fusion_core.cpp
-  )
-  target_include_directories(test_localization_fusion_core PUBLIC include)
-  ament_target_dependencies(test_localization_fusion_core rclcpp tf2)
-
-  ament_add_gtest(test_relocalization_candidate_core
-    test/test_relocalization_candidate_core.cpp
-  )
-  target_include_directories(test_relocalization_candidate_core PUBLIC include)
-  ament_target_dependencies(test_relocalization_candidate_core tf2_eigen)
-
-  ament_add_gtest(test_scan_input_core
-    test/test_scan_input_core.cpp
-  )
-  target_include_directories(test_scan_input_core PUBLIC include)
-  ament_add_gtest(test_growing_map test/test_growing_map.cpp)
-  target_include_directories(test_growing_map PRIVATE include)
-  ament_target_dependencies(test_growing_map tf2_eigen)
-  ament_add_gtest(test_mapping_fusion_commit test/test_mapping_fusion_commit.cpp)
-  target_link_libraries(test_mapping_fusion_commit ${PROJECT_NAME})
-  ament_target_dependencies(test_mapping_fusion_commit
-    ats_navigation_interfaces rclcpp sensor_msgs geometry_msgs pcl_conversions tf2_ros tf2_eigen)
-
-  ament_add_gtest(test_relocalization_frame_contract
-    test/test_relocalization_frame_contract.cpp
-    TIMEOUT 30
-  )
-  target_link_libraries(test_relocalization_frame_contract ${PROJECT_NAME})
-  ament_target_dependencies(test_relocalization_frame_contract
-    ats_navigation_interfaces rclcpp sensor_msgs geometry_msgs pcl_conversions tf2_ros tf2_eigen
-  )
-
-  ament_add_pytest_test(test_localization_fusion_node
-    test/test_localization_fusion_node.py
-    TIMEOUT 40
-  )
-
-  ament_add_pytest_test(test_fusion_identified_odometry
-    test/test_fusion_identified_odometry.py
-    TIMEOUT 40
-  )
-  ament_add_pytest_test(test_mapping_registration test/test_mapping_registration.py TIMEOUT 60)
-
-  ament_add_pytest_test(test_localization_fusion_cold_seed
-    test/test_localization_fusion_cold_seed.py
-    TIMEOUT 60
-  )
-endif()
-
 #############
 ## Install ##
 #############

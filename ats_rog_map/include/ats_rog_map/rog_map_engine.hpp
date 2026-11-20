@@ -66,14 +66,6 @@ public:
     return true;
   }
 
-  // Test-only fault fixture.  Clear every map representation together so the
-  // numerical ground projection becomes genuinely unknown without resetting
-  // the externally visible source-generation sequence.
-  void resetToUnknownForTest()
-  {
-    resetForOdomEpoch();
-  }
-
   // A frontend process reset has no old_from_new transform. All numeric
   // representations are revoked together, while generation stays monotonic.
   void resetForOdomEpoch()

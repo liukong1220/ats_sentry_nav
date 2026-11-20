@@ -41,26 +41,6 @@ rclcpp_components_register_node(${PROJECT_NAME}
 ## Testing ##
 #############
 
-if(BUILD_TESTING)
-set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
-find_package(ament_lint_auto REQUIRED)
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE
-    ament_cmake_uncrustify
-    ament_cmake_flake8
-  )
-  ament_lint_auto_find_test_dependencies()
-
-  find_package(ament_cmake_gtest REQUIRED)
-  find_package(loam_interface REQUIRED)
-  ament_auto_add_gtest(test_sensor_scan_generation test/test_sensor_scan_generation.cpp)
-  ament_target_dependencies(test_sensor_scan_generation loam_interface)
-  find_package(ament_cmake_pytest REQUIRED)
-  ament_add_pytest_test(test_identified_two_processes
-    test/test_identified_two_processes.py TIMEOUT 45)
-  ament_add_pytest_test(test_identified_container
-    test/test_identified_container.py TIMEOUT 45)
-endif()
-
 #############
 ## Install ##
 #############

@@ -52,7 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("assets_dir", description="Root-owned maps, PCDs, parameters and RViz assets"),
-        DeclareLaunchArgument("world", default_value="rmul"),
+        DeclareLaunchArgument("world", default_value="rmuc_2027"),
         DeclareLaunchArgument(
             "map",
             default_value=[

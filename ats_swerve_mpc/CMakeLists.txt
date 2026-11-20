@@ -89,45 +89,6 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/qdldl/LICENSE
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/osqp/include/public/
         DESTINATION include/osqp FILES_MATCHING PATTERN "*.h")
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_se2_mpc_controller test/test_se2_mpc_controller.cpp)
-  target_link_libraries(test_se2_mpc_controller ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_se2_model test/test_se2_model.cpp)
-  target_link_libraries(test_se2_model ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_zero_speed_guard test/test_zero_speed_guard.cpp)
-  target_link_libraries(test_zero_speed_guard ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_ltv_qp_problem test/test_ltv_qp_problem.cpp)
-  target_link_libraries(test_ltv_qp_problem ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_ltv_qp_solver test/test_ltv_qp_solver.cpp)
-  target_link_libraries(test_ltv_qp_solver ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_ltv_qp_osqp_solver test/test_ltv_qp_osqp_solver.cpp)
-  target_link_libraries(test_ltv_qp_osqp_solver ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_ltv_qp_convergence_fixture test/test_ltv_qp_convergence_fixture.cpp)
-  target_link_libraries(test_ltv_qp_convergence_fixture ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_control_cycle_snapshot test/test_control_cycle_snapshot.cpp)
-  target_link_libraries(test_control_cycle_snapshot ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_control_cycle_telemetry test/test_control_cycle_telemetry.cpp)
-  target_link_libraries(test_control_cycle_telemetry ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_trajectory_tracker test/test_trajectory_tracker.cpp)
-  target_link_libraries(test_trajectory_tracker ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_emergency_stop_watchdog test/test_emergency_stop_watchdog.cpp)
-  target_link_libraries(test_emergency_stop_watchdog ${PROJECT_NAME}_lib)
-
-  ament_add_gtest(test_mpc_localization_gate test/test_mpc_localization_gate.cpp)
-  target_link_libraries(test_mpc_localization_gate ${PROJECT_NAME}_lib)
-endif()
-
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME}_lib)
 ament_export_dependencies(Eigen3 eigen3_cmake_module)

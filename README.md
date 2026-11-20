@@ -142,13 +142,12 @@ ros2 action send_goal --feedback /ats_navigate_to_pose \
 
 ### 仿真：MuJoCo
 
-仿真入口在根仓 `scripts/test_mujoco_minco_mpc_chain.sh`：启动 MuJoCo 与导航栈，发目标并评估，常用环境变量有
-`ROS_DOMAIN_ID`（默认 `88`）、`TEST_PROFILE`（`default`、`single`、`rectangle`、`south_corridor`、`red_box`、`red_box_2027`、`tunnel_2027`，默认 `single`）、
-`SCENE`（默认 `rmuc_2025`）、`USE_RVIZ`（默认 `false`）、`USE_MUJOCO_VIEWER`。
+当前 2027 仿真默认有图模式（`slam:=false`，加载 `rmuc_2027.yaml` / `rmuc_2027.pcd`），通过正式 launch 入口启动并用 `/ats_navigate_to_pose` 或 `scripts/s3_mujoco_acceptance.py` 验证：
 
-当前最终入口见[2027隧道与对称点速度方案](../../docs/nav_acceptance/20261116_2027_final_test_plan.md)：先真实B往返，再南坡和六隧道；速度使用`SCENE=rmuc_2027 TEST_PROFILE=single`，显式起点`(13.40,2.00,0.550,0)`、目标`map (14.60,14.00)`及`GOAL_TOLERANCE=0.08`。运行前核验新domain、WLAN和同源2027资产，LIO模式显式`LIDAR_DOWNSAMPLE=0`、`lidar_threads:=0`。旧默认2025/红框是兼容菜单，不作为当前最终验收。
+- 2027 直接启动：`ros2 launch ats_mujoco_sim rmuc_2027_mujoco.launch.py localization_source:=lio use_identified_odometry:=true`（无先验建图显式加 `slam:=true`）；
+- 2027 路线与隧道验证：`python3 scripts/s3_mujoco_acceptance.py --profile rmuc_2027_tunnels --route tunnel_b_roundtrip --output <独立目录>`（默认加载 `rmuc_2027` 先验；无先验显式加 `--mapless`）。
 
-手动启动与场景细节见 [src/sim/ats_mujoco_sim/README.md](../sim/ats_mujoco_sim/README.md)，
+当前最终入口见[2027 导航验证方案](../../docs/nav_acceptance/20261116_2027_final_test_plan.md)。手动启动与场景细节见 [src/sim/ats_mujoco_sim/README.md](../sim/ats_mujoco_sim/README.md)，
 RViz 与窗口的使用规则见根仓 `AGENTS.md` 7.1。Gazebo 入口见 [src/sim/gazebo_simulator/README.md](../sim/gazebo_simulator/README.md)。
 
 ### 本仓 `ats_nav_bringup/launch`
@@ -220,26 +219,21 @@ RViz 配置是 `rviz_cfg/point_lio_replay.rviz`。这个 launch 不被任何实�
 | JPS配置 / 隧道yaw与spin | `jps_safe_distance=0.36` / 均启用；首选搜索净空仍按全yaw半径约0.435592 m抬高 |
 | MINCO参考与最大速度 | `5 m/s`；起点速度保护随正的`max_velocity`，不再固定截到2 m/s |
 | MPC与出口 | `max_vx/max_vy/max_wheel_speed=5 m/s`；平面出口按矢量限幅5 m/s |
-| yaw / 角加速度 / 预测窗口 | `3 rad/s` / `2 rad/s²` / `60×0.05=3 s` |
+| yaw / 角加速度 / 控制频率与预测窗口 | `3 rad/s` / `2 rad/s²` / 控制 `50 Hz`（按实测 `step_dt` 与预测步长 `60×0.05=3 s` 解耦） |
 | 单轮时间缩放 | `wheel_speed_time_scaling_limit`未启用；不能为恢复旧表而打开 |
 
 5 m/s是待实测的暂定上限，逐轮合成、制动、净空和曲率仍约束实际速度；8–10 m/s未配置。`motor_max_rpm=1348.1359885`是为当前轮速预算反算的暂定等效值，不能写成已测电机规格。MuJoCo MID360为仿真时间10 Hz、LIO IMU 200 Hz，点数和CPU预算见[仿真README](../sim/ats_mujoco_sim/README.md)。
 
-## 测试与验证
+## 构建与验证
 
 ```bash
 # 在当前工作区根目录执行
-MAKEFLAGS=-j4 colcon build --base-paths src --packages-select <pkg> --parallel-workers 1 \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
-colcon test --base-paths src --packages-select <pkg>
-colcon test-result --test-result-base build/<pkg> --verbose
+./build.sh --packages-select <pkg>
 python3 scripts/validate_navigation_config.py          # 正式参数、launch 与 RViz 契约
 ros2 launch <pkg> <file> --show-args
 ```
 
-- 部分包的 ament lint 用例（copyright、cpplint、uncrustify、black、pep257 等）在当前 HEAD 上本来就是红的，
-  功能结论只看对应的 GTest/pytest 用例，不要写成“全包测试通过”。
-- 单元测试通过、topic 存在或 RViz 可见都不代替闭环验收；闭环用 MuJoCo 入口，结果要有终点测量和话题证据。
+- 编译通过、topic 存在或 RViz 可见都不代替闭环验收；闭环通过 `rmuc_2027_mujoco.launch.py` 与 `scripts/s3_mujoco_acceptance.py` 执行，结果须包含独立终点真值、话题唯一所有权与跟踪证据。
 
 ## 已知边界
 

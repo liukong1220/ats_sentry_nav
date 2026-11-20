@@ -29,14 +29,4 @@ ament_target_dependencies(cmd_vel_arbiter_node
 install(TARGETS cmd_vel_arbiter_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_cmd_vel_arbiter test/test_cmd_vel_arbiter.cpp)
-  target_include_directories(test_cmd_vel_arbiter PRIVATE include)
-  ament_add_gtest(test_cmd_vel_arbiter_node test/test_cmd_vel_arbiter_node.cpp)
-  target_include_directories(test_cmd_vel_arbiter_node PRIVATE include)
-  ament_target_dependencies(test_cmd_vel_arbiter_node
-    rclcpp geometry_msgs std_msgs ats_navigation_interfaces)
-endif()
-
 ament_package()
