@@ -147,14 +147,12 @@ reference 和急停由 Goal Manager 发布。速度链细节见仓库根 README�
 
 ```bash
 source /opt/ros/humble/setup.bash
-MAKEFLAGS=-j1 colcon build --base-paths src --packages-select minco_planner \
-  --parallel-workers 1 --cmake-args -DCMAKE_BUILD_TYPE=Release
-colcon test --base-paths src --packages-select minco_planner
-colcon test-result --test-result-base build/minco_planner --verbose
+./build.sh --packages-select minco_planner
+python3 scripts/validate_navigation_config.py
 ```
 
-既有copyright、格式等lint失败应按实际结果单列；定向GTest通过不写成全包全绿。独立`minco_planner.launch.py`的默认参数路径仍指向不存在的`config/minco_planner.yaml`，必须显式传入完整参数（例如包内`config/minco_planner_reality.yaml`）。正式bringup会传根参数文件，不依赖该缺省路径。
+独立`minco_planner.launch.py`的默认参数路径仍指向不存在的`config/minco_planner.yaml`，必须显式传入完整参数（例如包内`config/minco_planner_reality.yaml`）。正式bringup会传根参数文件，不依赖该缺省路径。
 
-最终导航按[2027方案](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md)执行真实B往返、南坡、六隧道和默认起点到对称点速度，另跑独立故障矩阵。11月16日空场5 m/s执行器诊断不含规划；d103/d107 LIO导航启动失败，当前完整套件尚未通过，物理接触和实车未验证。本次只同步文档，未新增运行结果。
+最终导航按[2027方案](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md)通过 `rmuc_2027_mujoco.launch.py` 与 `scripts/s3_mujoco_acceptance.py` 执行真实 B 往返、基地到基地、南坡与六隧道验证。当前已新增贴墙大角度终端转向的 ESDF 侧移掉头、无停车终点修正保持运行参考与 `RELIABLE` 参考轨迹发布契约；物理接触与实车仍待独立验收。
 
 MINCO许可证与归属见[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

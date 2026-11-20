@@ -28,6 +28,8 @@ struct TerminalYawRelocationParams
 {
   /// 与 YawSplinePlannerParams::yaw_rate_limit 同义,原地转向的角速度上界。
   double yaw_rate_limit = 2.5;
+  /// 与 YawSplinePlannerParams::yaw_acceleration_limit 同义,原地转向的角加速度上界 [rad/s^2]。
+  double yaw_acceleration_limit = 2.0;
   /// 与 YawSplinePlannerParams::terminal_yaw_sample_period 同义。
   double sample_period = 0.10;
   /// 终端近域窗口弧长(m)。冲突全部落在末点前这段弧长内时才允许重定位。
@@ -87,6 +89,26 @@ bool relocateTerminalYawRotation(
 std::vector<std::size_t> terminalYawRelocationCandidates(
   const ReferenceTrajectory & trajectory,
   std::size_t max_candidates);
+
+/// 判断轨迹是否包含大角度终端原地转向且该段最小足迹净空偏低（易因厘米级滑移触发冲突）。
+bool hasTightInPlaceTerminalRotation(
+  const ReferenceTrajectory & trajectory,
+  double min_yaw_span_rad,
+  double min_footprint_clearance);
+
+/// 构造全向侧移掉头候选轨迹：保留 [0..anchor_index]，在 anchor 处保持当前航向平滑侧移至
+/// 开阔掉头点 (turn_x, turn_y)，在掉头点原地平滑转到 goal_yaw，再保持 goal_yaw 平滑平移至终点。
+/// 整条轨迹三段之间速度与加速度连续归零，并交由调用方过同一套矩形足迹/扫掠与洞口对齐门禁。
+bool buildSidestepTerminalYawTurnaround(
+  const ReferenceTrajectory & input,
+  double goal_yaw,
+  std::size_t anchor_index,
+  double turn_x,
+  double turn_y,
+  const TerminalYawRelocationParams & params,
+  ReferenceTrajectory * output,
+  double max_sidestep_speed = 0.6,
+  double max_sidestep_accel = 1.2);
 
 }  // namespace minco_planner
 

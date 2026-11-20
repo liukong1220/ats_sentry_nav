@@ -50,8 +50,6 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "minco_planner/debug/planner_debug_visualizer.hpp"
 #include "minco_planner/nodes/planning_map_snapshot.hpp"
-#include "minco_planner/planning/grid_astar.hpp"
-#include "minco_planner/planning/grid_jps.hpp"
 #include "minco_planner/safety/escape_prefix.hpp"
 #include "minco_planner/safety/goal_pose_admission.hpp"
 #include "minco_planner/safety/footprint_safety_checker.hpp"

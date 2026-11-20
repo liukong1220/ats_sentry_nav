@@ -24,6 +24,7 @@ struct SpinYawParams
   double angular_accel = 1.0e3;   // 自旋加速度上限 [rad/s^2]；默认近似瞬时。
   double stop_before_narrow_m = 0.0;   // 非净空点前这么远（弧长）停止自旋并回到规划 yaw。
   double resume_after_narrow_m = 0.0;  // 离开非净空点这么远（弧长）后才重新自旋。
+  double sample_period = 0.10;         // 终点停旋/对齐尾段的采样周期 [s]，与 terminal_yaw_sample_period 一致。
 };
 
 inline double wrapAngle(double angle)
@@ -37,7 +38,10 @@ inline bool appendSpinTerminalGoal(
   ReferenceTrajectory & trajectory, double goal_yaw, double original_end_time,
   const SpinYawParams & params)
 {
-  constexpr double sample_period = 0.05;
+  const double sample_period =
+    (std::isfinite(params.sample_period) && params.sample_period > 0.0)
+      ? std::max(0.01, params.sample_period)
+      : 0.10;
   const auto append_phase = [&](double duration, const auto & evaluate) {
       if (duration <= 1e-12) {
         return true;

@@ -109,7 +109,8 @@ private:
                 bool report_status,
                 const geometry_msgs::msg::PoseStamped * frozen_start = nullptr,
                 const InitialKinematicState * initial_state = nullptr,
-                double position_tolerance = 0.0, const GoalUuid & goal_uuid = {});
+                double position_tolerance = 0.0, const GoalUuid & goal_uuid = {},
+                bool preserve_active_reference = false);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start);
   bool resolveStartPose(
@@ -144,7 +145,8 @@ private:
       bool report_status,
       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry(),
       const geometry_msgs::msg::TransformStamped * control_from_grid = nullptr,
-      double reference_origin_delay_sec = 0.0);
+      double reference_origin_delay_sec = 0.0,
+      bool preserve_active_reference = false);
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,

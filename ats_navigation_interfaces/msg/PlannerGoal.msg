@@ -21,3 +21,8 @@ float64 position_tolerance
 geometry_msgs/PoseStamped start_pose
 # World-frame twist at that localization sample. linear.x/y are map/odom world axes.
 geometry_msgs/Twist start_twist
+# True only when Goal Manager is keeping an active executing reference alive for a
+# non-stop replacement replan (e.g. far-horizon replan advice or continuous endpoint
+# retarget). Planner must retain its runtime safety guard and report failure as
+# STATE_ACCEPTED instead of emergency-stopping the valid executing reference.
+bool preserve_active_reference

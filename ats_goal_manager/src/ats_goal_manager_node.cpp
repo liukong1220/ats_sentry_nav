@@ -161,7 +161,7 @@ public:
     planner_goal_pub_ =
         create_publisher<PlannerGoal>(planner_goal_topic_, rclcpp::QoS(10));
     reference_path_pub_ = create_publisher<nav_msgs::msg::Path>(
-        reference_path_topic_, rclcpp::QoS(1));
+        reference_path_topic_, rclcpp::QoS(10).reliable());
     emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
         emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local());
     execution_command_pub_ = create_publisher<ExecutionCommand>(
@@ -555,6 +555,8 @@ private:
       request.start_twist.linear.x = current_world_vx_;
       request.start_twist.linear.y = current_world_vy_;
       request.start_twist.angular.z = current_world_wz_;
+      request.preserve_active_reference =
+        active_goal_->replacement_pending && active_execution_command_.has_value() && !fail_stop_;
     }
     request.goal_pose = target;
     RCLCPP_INFO(get_logger(),

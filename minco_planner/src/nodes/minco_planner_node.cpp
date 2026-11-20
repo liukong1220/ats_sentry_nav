@@ -204,7 +204,7 @@ MincoPlannerNode::MincoPlannerNode(const rclcpp::NodeOptions & options)
   }
   if (!candidate_reference_path_topic_.empty()) {
     candidate_reference_path_pub_ = create_publisher<nav_msgs::msg::Path>(
-      candidate_reference_path_topic_, rclcpp::QoS(1).reliable());
+      candidate_reference_path_topic_, rclcpp::QoS(10).reliable());
   }
   if (!debug_marker_topic_.empty()) {
     marker_pub_ =
@@ -785,7 +785,9 @@ void MincoPlannerNode::declareAndLoadParams()
   // 重定位必须与 yaw 规划用同一组转向参数,否则两条路径生成的原地转向时长
   // 不一致,MPC 侧会看到两种不同的终端时间预算。
   terminal_yaw_relocation_params_.yaw_rate_limit = yaw_params.yaw_rate_limit;
+  terminal_yaw_relocation_params_.yaw_acceleration_limit = yaw_params.yaw_acceleration_limit;
   terminal_yaw_relocation_params_.sample_period = yaw_params.terminal_yaw_sample_period;
+  spin_yaw_params_.sample_period = yaw_params.terminal_yaw_sample_period;
   get_parameter(
     "terminal_yaw_relocation_window_length",
     terminal_yaw_relocation_params_.terminal_window_length);
@@ -1734,7 +1736,8 @@ void MincoPlannerNode::onPlannerGoal(
     msg->goal_pose, msg->goal_id, msg->localization_epoch,
     msg->plan_request_sequence,
     msg->map_publication_sequence, true, frozen_start,
-    frozen_seed.valid ? &frozen_seed : nullptr, msg->position_tolerance, msg->goal_uuid);
+    frozen_seed.valid ? &frozen_seed : nullptr, msg->position_tolerance, msg->goal_uuid,
+    msg->preserve_active_reference);
 }
 
 void MincoPlannerNode::planGoal(
@@ -1744,7 +1747,7 @@ void MincoPlannerNode::planGoal(
     bool report_status,
     const geometry_msgs::msg::PoseStamped * frozen_start,
     const InitialKinematicState * initial_state, double position_tolerance,
-    const GoalUuid & goal_uuid) {
+    const GoalUuid & goal_uuid, bool preserve_active_reference) {
   const auto plan_wall_begin = std::chrono::steady_clock::now();
   const rclcpp::Time plan_begin_time = now();
   bool keep_active_reference = false;
@@ -1752,13 +1755,17 @@ void MincoPlannerNode::planGoal(
   std::optional<ActiveSafetyReference> committed_for_start;
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
-    // 由【建议重规划】触发的同目标新请求：旧参考仍在执行，保留它的运行期复检守护与
-    // plan_safe，直到新参考提交（publishReferenceIfCurrent 替换）或本次规划失败。
-    keep_active_reference = replan_advised_reference_stamp_ && active_safety_reference_ &&
+    // 由【建议重规划】或目标管理器连续终点修正（preserve_active_reference）触发的同目标
+    // 非停车替换请求：旧参考仍在执行，保留它的运行期复检守护与 plan_safe，直到新参考提交
+    // （publishReferenceIfCurrent 替换）或本次规划以 STATE_ACCEPTED 报告失败。
+    const bool advised_match = replan_advised_reference_stamp_ &&
+      active_safety_reference_ &&
+      active_safety_reference_->trajectory.header.stamp == *replan_advised_reference_stamp_;
+    keep_active_reference = active_safety_reference_ &&
       safety_state_.plan_safe && active_safety_reference_->goal_id == goal_id &&
       active_safety_reference_->localization_epoch == localization_epoch &&
       active_safety_reference_->plan_request_sequence < plan_request_sequence &&
-      active_safety_reference_->trajectory.header.stamp == *replan_advised_reference_stamp_;
+      (preserve_active_reference || advised_match);
     if (keep_active_reference) {
       committed_for_start = active_safety_reference_;
     } else {
@@ -2174,27 +2181,44 @@ void MincoPlannerNode::planGoal(
     }
   }
 
-  // 终端原地转向重定位。冲突全部落在终点原地转向段时,换一个更早的转向位置:
-  // 先在路径上某点把 yaw 拧到 goal_yaw,再保持 goal_yaw 平移进入目标。
-  // 候选族的最晚一个(尾段起点)与现状完全等价,所以这是现状的超集;每个候选都
-  // 要过同一套矩形足迹门禁,不安全就继续走既有拒绝路径。因此既不会放过不安全
-  // 轨迹,也不会比不做更差。目标位姿本身不被修改,只改到达目标的 yaw 时序。
-  // 触发条件用"终端近域窗口"而不是"与末点严格重合的原地转向段":domain 189
-  // 目标 9 的冲突落在最后 6 个采样点,其中前几个仍在以通道切线 yaw 平移,坐标
-  // 与末点差 0.014 m,旧判据因此返回 false,重定位一次都没试过。窗口之外只要
-  // 有一个冲突仍然返回 false,中途不可行照旧交回既有拒绝路径。
-  if (!safety.safe && terminal_yaw_relocation_enabled_ &&
+  // 终端原地转向重定位与全向侧移掉头：
+  // 1) 当冲突全部落在终端近域窗口（含起点即终点的纯原地转向）时，先尝试沿路径提前转向；
+  // 2) 当沿路径候选全被拒，或虽安全但原地大角度转向的足迹净空极薄（< 6 cm，易被厘米级
+  //    轮系滑移推入墙壁）时，利用四舵轮全向能力先保持当前航向侧移到开阔 ESDF 区域掉头，
+  //    再保持目标航向平移至终点。所有候选仍过同一套零冲突矩形足迹、扫掠与洞口对齐门禁。
+  constexpr double kMinComfortableRotationClearanceM = 0.06;
+  const std::size_t relocation_tail_start = terminalCoincidentTailStart(reference);
+  const bool unsafe_terminal_rotation = !safety.safe && (
     collisionsConfinedToTerminalApproach(
-      reference, safety, terminal_yaw_relocation_params_.terminal_window_length))
+      reference, safety, terminal_yaw_relocation_params_.terminal_window_length) ||
+    (relocation_tail_start == 0U && reference.points.size() >= 2U));
+  const bool tight_terminal_rotation = safety.safe &&
+    hasTightInPlaceTerminalRotation(reference, 0.35, kMinComfortableRotationClearanceM);
+  if (terminal_yaw_relocation_enabled_ &&
+    (unsafe_terminal_rotation || tight_terminal_rotation))
   {
-    const std::size_t tail_start = terminalCoincidentTailStart(reference);
+    const auto minClearanceOf = [](const ReferenceTrajectory & traj) {
+      double min_c = std::numeric_limits<double>::infinity();
+      for (const auto & pt : traj.points) {
+        if (std::isfinite(pt.clearance)) {
+          min_c = std::min(min_c, pt.clearance);
+        }
+      }
+      return std::isfinite(min_c) ? min_c : -std::numeric_limits<double>::infinity();
+    };
+
+    const std::size_t tail_start = relocation_tail_start;
     const std::size_t window_start = std::min(
       tail_start,
       terminalApproachWindowStart(
         reference, terminal_yaw_relocation_params_.terminal_window_length));
     const std::size_t original_collisions = safety.collisions.size();
-    const std::vector<std::size_t> candidates = terminalYawRelocationCandidates(
-      reference, static_cast<std::size_t>(terminal_yaw_relocation_max_candidates_));
+    const double original_min_clearance = safety.safe ?
+      minClearanceOf(reference) : -std::numeric_limits<double>::infinity();
+    const std::vector<std::size_t> candidates = tail_start > 0U ?
+      terminalYawRelocationCandidates(
+        reference, static_cast<std::size_t>(terminal_yaw_relocation_max_candidates_)) :
+      std::vector<std::size_t>{};
     std::ostringstream candidate_list;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
       if (i != 0U) {
@@ -2215,11 +2239,46 @@ void MincoPlannerNode::planGoal(
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
       "【终端航向重定位】尝试：tail_start=%zu window_start=%zu candidates=[%s] "
-      "conflict_span=[%zu,%zu] collisions=%zu.",
+      "conflict_span=[%zu,%zu] collisions=%zu tight=%d min_clearance=%.3f.",
       tail_start, window_start, candidate_list.str().c_str(), first_conflict, last_conflict,
-      original_collisions);
+      original_collisions, tight_terminal_rotation ? 1 : 0,
+      std::isfinite(original_min_clearance) ? original_min_clearance : -1.0);
     std::size_t built = 0;
     std::ostringstream rejected;
+    std::optional<ReferenceTrajectory> best_candidate;
+    FootprintSafetyResult best_safety;
+    double best_clearance = original_min_clearance;
+    std::size_t best_rotation_index = 0U;
+    bool best_is_sidestep = false;
+    double best_turn_x = 0.0;
+    double best_turn_y = 0.0;
+
+    auto evaluateCandidate = [&](ReferenceTrajectory & candidate, const std::string & label,
+      FootprintSafetyResult & out_safety, double & out_clearance) -> bool {
+      candidate.header.stamp = now();
+      applyWheelSpeedTimeScaling(candidate, wheel_speed_time_scaling_params_);
+      // 只补净空标注,绝不调用 planYaw:planYaw 会在末点再追加一段原地转向,
+      // 把刚刚移开的问题原样搬回来。
+      annotateClearance(candidate, *map_snapshot);
+      out_safety = safety_checker_.check(candidate, planning_grid);
+      if (!out_safety.safe) {
+        rejected << label << ":footprint;";
+        return false;
+      }
+      if (tunnel_yaw_params_.enabled && clearance_esdf) {
+        auto candidate_center = candidate;
+        annotatePositionClearance(candidate_center, *map_snapshot);
+        const auto candidate_tunnels = detectTunnelSegments(
+          candidate_center, *clearance_esdf, tunnel_yaw_params_);
+        if (!forwardTunnelEntriesAligned(candidate, candidate_tunnels, tunnel_yaw_params_)) {
+          rejected << label << ":tunnel_align;";
+          return false;
+        }
+      }
+      out_clearance = minClearanceOf(candidate);
+      return true;
+    };
+
     for (const std::size_t rotation_index : candidates) {
       ReferenceTrajectory candidate;
       if (!relocateTerminalYawRotation(
@@ -2229,27 +2288,155 @@ void MincoPlannerNode::planGoal(
         continue;
       }
       ++built;
-      candidate.header.stamp = now();
-      // 只补净空标注,绝不调用 planYaw:planYaw 会在末点再追加一段原地转向,
-      // 把刚刚移开的问题原样搬回来。
-      annotateClearance(candidate, *map_snapshot);
-      const FootprintSafetyResult candidate_safety = safety_checker_.check(
-        candidate, planning_grid);
-      if (!candidate_safety.safe) {
-        rejected << rotation_index << ":footprint;";
+      FootprintSafetyResult candidate_safety;
+      double candidate_clearance = -std::numeric_limits<double>::infinity();
+      if (!evaluateCandidate(
+          candidate, std::to_string(rotation_index), candidate_safety, candidate_clearance))
+      {
         continue;
       }
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), log_throttle_ms_,
-        "【终端航向重定位成功】rotation_index=%zu tail_start=%zu "
-        "window_start=%zu candidates=%zu built=%zu cleared_collisions=%zu points=%zu。",
-        rotation_index, tail_start, window_start, candidates.size(), built, original_collisions,
-        candidate.points.size());
-      reference = std::move(candidate);
-      safety = candidate_safety;
-      break;
+      if (!best_candidate || candidate_clearance > best_clearance) {
+        best_candidate = std::move(candidate);
+        best_safety = std::move(candidate_safety);
+        best_clearance = candidate_clearance;
+        best_rotation_index = rotation_index;
+        best_is_sidestep = false;
+      }
+      if (best_clearance >= kMinComfortableRotationClearanceM) {
+        break;
+      }
     }
-    if (!safety.safe) {
+
+    // 沿路径重定位全部失败或净空仍不足 6 cm 时，搜索附近开阔 ESDF 点进行全向侧移掉头。
+    if ((!best_candidate || best_clearance < kMinComfortableRotationClearanceM) &&
+        clearance_esdf && clearance_esdf->available() && !reference.points.empty())
+    {
+      const std::size_t anchor_index =
+        (reference.points[tail_start].s <= 0.60 && reference.points.front().v <= 0.15) ?
+        0U : tail_start;
+      const ReferencePoint & pivot = reference.points[anchor_index];
+      const ReferencePoint & goal_pt = reference.points.back();
+      const double yaw_diff = std::abs(std::atan2(
+        std::sin(goal_yaw - pivot.yaw), std::cos(goal_yaw - pivot.yaw)));
+      if (yaw_diff > 0.25 || !safety.safe) {
+        const double half_l = 0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_;
+        const double half_w = 0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_;
+        const double circumradius = std::hypot(half_l, half_w);
+        const double min_esdf = circumradius + 0.04;
+        const double desired_esdf = circumradius + 0.10;
+
+        struct SidestepSpot
+        {
+          double x;
+          double y;
+          double esdf;
+          double detour;
+          bool preferred;
+        };
+        std::vector<SidestepSpot> spots;
+        const std::array<double, 6> radii{0.12, 0.18, 0.24, 0.30, 0.38, 0.45};
+        std::vector<Eigen::Vector2d> dirs;
+        dirs.reserve(17U);
+        const Eigen::Vector2d grad = clearance_esdf->getGradient(pivot.x, pivot.y);
+        if (grad.allFinite() && grad.norm() > 1e-4) {
+          dirs.push_back(grad.normalized());
+        }
+        for (int k = 0; k < 16; ++k) {
+          const double angle = (2.0 * M_PI * static_cast<double>(k)) / 16.0;
+          dirs.emplace_back(std::cos(angle), std::sin(angle));
+        }
+        for (double r : radii) {
+          for (const auto & d : dirs) {
+            const double tx = pivot.x + r * d.x();
+            const double ty = pivot.y + r * d.y();
+            const double dist = clearance_esdf->getDistance(tx, ty);
+            if (!std::isfinite(dist) || dist < min_esdf) {
+              continue;
+            }
+            bool duplicate = false;
+            for (const auto & existing : spots) {
+              if (std::hypot(existing.x - tx, existing.y - ty) < 0.04) {
+                duplicate = true;
+                break;
+              }
+            }
+            if (duplicate) {
+              continue;
+            }
+            const double detour =
+              std::hypot(tx - pivot.x, ty - pivot.y) +
+              std::hypot(goal_pt.x - tx, goal_pt.y - ty);
+            spots.push_back({tx, ty, dist, detour, dist >= desired_esdf});
+          }
+        }
+        std::sort(
+          spots.begin(), spots.end(),
+          [](const SidestepSpot & a, const SidestepSpot & b) {
+            if (a.preferred != b.preferred) {
+              return a.preferred;
+            }
+            if (std::abs(a.detour - b.detour) > 0.04) {
+              return a.detour < b.detour;
+            }
+            return a.esdf > b.esdf;
+          });
+        const std::size_t max_sidestep_tries = std::min<std::size_t>(spots.size(), 8U);
+        for (std::size_t s_idx = 0U; s_idx < max_sidestep_tries; ++s_idx) {
+          const auto & spot = spots[s_idx];
+          ReferenceTrajectory candidate;
+          if (!buildSidestepTerminalYawTurnaround(
+              reference, goal_yaw, anchor_index, spot.x, spot.y,
+              terminal_yaw_relocation_params_, &candidate))
+          {
+            rejected << "sidestep" << s_idx << ":build_failed;";
+            continue;
+          }
+          ++built;
+          FootprintSafetyResult candidate_safety;
+          double candidate_clearance = -std::numeric_limits<double>::infinity();
+          if (!evaluateCandidate(
+              candidate, "sidestep" + std::to_string(s_idx),
+              candidate_safety, candidate_clearance))
+          {
+            continue;
+          }
+          if (!best_candidate || candidate_clearance > best_clearance + 0.02) {
+            best_candidate = std::move(candidate);
+            best_safety = std::move(candidate_safety);
+            best_clearance = candidate_clearance;
+            best_is_sidestep = true;
+            best_turn_x = spot.x;
+            best_turn_y = spot.y;
+          }
+          if (best_clearance >= 0.08) {
+            break;
+          }
+        }
+      }
+    }
+
+    const bool accept_relocated = best_candidate.has_value() &&
+      (!safety.safe || best_clearance > original_min_clearance + 0.03);
+    if (accept_relocated) {
+      if (best_is_sidestep) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【终端航向侧移掉头成功】turn=(%.3f,%.3f) tail_start=%zu "
+          "cleared_collisions=%zu clearance=%.3f->%.3f points=%zu。",
+          best_turn_x, best_turn_y, tail_start, original_collisions,
+          std::isfinite(original_min_clearance) ? original_min_clearance : -1.0,
+          best_clearance, best_candidate->points.size());
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【终端航向重定位成功】rotation_index=%zu tail_start=%zu "
+          "window_start=%zu candidates=%zu built=%zu cleared_collisions=%zu clearance=%.3f points=%zu。",
+          best_rotation_index, tail_start, window_start, candidates.size(), built,
+          original_collisions, best_clearance, best_candidate->points.size());
+      }
+      reference = std::move(*best_candidate);
+      safety = std::move(best_safety);
+    } else if (!safety.safe) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), log_throttle_ms_,
         "【终端航向重定位失败】tail_start=%zu window_start=%zu candidates=[%s] "
@@ -2461,10 +2648,44 @@ void MincoPlannerNode::planGoal(
     forward_tunnels = detectTunnelSegments(center, *clearance_esdf, tunnel_yaw_params_);
   }
   if (!forwardTunnelEntriesAligned(reference, forward_tunnels, tunnel_yaw_params_)) {
+    std::size_t bad_index = 0U;
+    double bad_yaw = 0.0;
+    double bad_target = 0.0;
+    double bad_width = 0.0;
+    for (const auto & tunnel : forward_tunnels) {
+      if (!tunnel.forward_alignment || tunnel.axis_yaw.empty()) {
+        continue;
+      }
+      const double entry_s = reference.points[tunnel.begin].s - tunnel_yaw_params_.front_extent;
+      std::size_t first = tunnel.begin;
+      while (first > 1U && reference.points[first - 1U].s >= entry_s) {
+        --first;
+      }
+      for (std::size_t idx = first; idx <= tunnel.end; ++idx) {
+        const auto local_index = idx > tunnel.begin ? idx - tunnel.begin : 0U;
+        const double target = tunnel.axis_yaw[local_index] + tunnel_yaw_params_.yaw_offset;
+        if (std::abs(std::atan2(
+            std::sin(reference.points[idx].yaw - target),
+            std::cos(reference.points[idx].yaw - target))) > 0.20)
+        {
+          bad_index = idx;
+          bad_yaw = reference.points[idx].yaw;
+          bad_target = target;
+          bad_width = tunnel.width_estimate;
+          break;
+        }
+      }
+      if (bad_width > 0.0) {
+        break;
+      }
+    }
     RCLCPP_WARN(
-      get_logger(), "【洞口对齐拒绝】目标=%llu 快照=%llu，候选进入窄通道前未对向入口。",
+      get_logger(),
+      "【洞口对齐拒绝】目标=%llu 快照=%llu，候选进入窄通道前未对向入口 "
+      "(idx=%zu/%zu yaw=%.3f target=%.3f width=%.3f)。",
       static_cast<unsigned long long>(goal_id),
-      static_cast<unsigned long long>(map_snapshot->publication_sequence));
+      static_cast<unsigned long long>(map_snapshot->publication_sequence),
+      bad_index, reference.points.size(), bad_yaw, bad_target, bad_width);
     fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_FOOTPRINT,
       map_snapshot->generation);
     return;
@@ -2534,7 +2755,8 @@ void MincoPlannerNode::planGoal(
                                  report_status, telemetry,
                                  control_from_grid.header.frame_id.empty() ?
                                  nullptr : &control_from_grid,
-                                 replan_start.start_delay_sec)) {
+                                 replan_start.start_delay_sec,
+                                 keep_active_reference)) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_, "【参考提交丢弃】generation=%llu 因规划地图变化或过期而丢弃，等待重规划。",
       static_cast<unsigned long long>(map_snapshot->generation));
@@ -2676,7 +2898,20 @@ void MincoPlannerNode::planYaw(
             result.collisions.begin(), result.collisions.end(),
             [](const CollisionSample & sample) {return sample.trajectory_index < 5U;});
         };
-      if (holding.collisions.size() <= planned.collisions.size() &&
+      const auto planned_tunnels = (tunnel_yaw_params_.enabled && snapshot.clearance_esdf &&
+        !tunnel_segments.empty()) ?
+        detectTunnelSegments(trajectory, *snapshot.clearance_esdf, tunnel_yaw_params_) :
+        tunnel_segments;
+      const auto holding_tunnels = (tunnel_yaw_params_.enabled && snapshot.clearance_esdf &&
+        !tunnel_segments.empty()) ?
+        detectTunnelSegments(*held, *snapshot.clearance_esdf, tunnel_yaw_params_) :
+        tunnel_segments;
+      const bool planned_aligned =
+        forwardTunnelEntriesAligned(trajectory, planned_tunnels, tunnel_yaw_params_);
+      const bool holding_aligned =
+        forwardTunnelEntriesAligned(*held, holding_tunnels, tunnel_yaw_params_);
+      if ((!planned_aligned || holding_aligned) &&
+        holding.collisions.size() <= planned.collisions.size() &&
         early(holding) <= early(planned))
       {
         trajectory = std::move(*held);
@@ -2963,7 +3198,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     bool report_status,
     const PlannerCommitTelemetry & telemetry,
     const geometry_msgs::msg::TransformStamped * control_from_grid,
-    double reference_origin_delay_sec) {
+    double reference_origin_delay_sec,
+    bool preserve_active_reference) {
   std::lock_guard<std::mutex> lock(map_mutex_);
   const bool heartbeat_fresh = map_ready_topic_.empty() || steadyHeartbeatLeaseValid(
     last_map_ready_signal_, std::chrono::steady_clock::now(), map_ready_timeout_sec_);
@@ -2980,7 +3216,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     // 无停车重规划的替换候选过期：正在执行的旧参考仍受运行期复检守护，只在地图
     // 健康且快照可用时保留它；其余情况照旧撤销。
     const bool keep_guarded_reference = heartbeat_fresh && latest_map_snapshot_ &&
-      replan_advised_reference_stamp_ && active_safety_reference_ &&
+      (preserve_active_reference || replan_advised_reference_stamp_.has_value()) &&
+      active_safety_reference_ &&
       active_safety_reference_->goal_id == goal_id &&
       active_safety_reference_->localization_epoch == localization_epoch &&
       active_safety_reference_->plan_request_sequence < plan_request_sequence &&

@@ -164,6 +164,10 @@ bool relocateTerminalYawRotation(
   } else {
     const double yaw_rate_limit = std::max(1e-3, params.yaw_rate_limit);
     duration = 1.875 * std::abs(delta) / yaw_rate_limit;
+    if (params.yaw_acceleration_limit > 0.0) {
+      const double planned_accel = 0.8 * params.yaw_acceleration_limit;
+      duration = std::max(duration, std::sqrt(5.7735026919 * std::abs(delta) / planned_accel));
+    }
     const double sample_period = std::max(0.01, params.sample_period);
     const int sample_count = std::max(
       2, static_cast<int>(std::ceil(duration / sample_period)));
@@ -235,6 +239,162 @@ std::vector<std::size_t> terminalYawRelocationCandidates(
     }
   }
   return candidates;
+}
+
+bool hasTightInPlaceTerminalRotation(
+  const ReferenceTrajectory & trajectory,
+  double min_yaw_span_rad,
+  double min_footprint_clearance)
+{
+  if (trajectory.points.size() < 2U) {
+    return false;
+  }
+  const std::size_t tail = terminalCoincidentTailStart(trajectory);
+  if (tail + 1U >= trajectory.points.size()) {
+    return false;
+  }
+  double yaw_span = 0.0;
+  double min_clearance = std::numeric_limits<double>::infinity();
+  for (std::size_t i = tail; i < trajectory.points.size(); ++i) {
+    if (i > tail) {
+      yaw_span += std::abs(
+        shortestAngularDistance(trajectory.points[i - 1U].yaw, trajectory.points[i].yaw));
+    }
+    if (std::isfinite(trajectory.points[i].clearance)) {
+      min_clearance = std::min(min_clearance, trajectory.points[i].clearance);
+    }
+  }
+  return yaw_span >= min_yaw_span_rad &&
+         std::isfinite(min_clearance) &&
+         min_clearance < min_footprint_clearance;
+}
+
+bool buildSidestepTerminalYawTurnaround(
+  const ReferenceTrajectory & input,
+  double goal_yaw,
+  std::size_t anchor_index,
+  double turn_x,
+  double turn_y,
+  const TerminalYawRelocationParams & params,
+  ReferenceTrajectory * output,
+  double max_sidestep_speed,
+  double max_sidestep_accel)
+{
+  if (output == nullptr || input.points.size() < 2U || anchor_index >= input.points.size() ||
+      !std::isfinite(turn_x) || !std::isfinite(turn_y) || !std::isfinite(goal_yaw))
+  {
+    return false;
+  }
+
+  const double sample_period = std::max(0.01, params.sample_period);
+  const double yaw_rate_limit = std::max(1e-3, params.yaw_rate_limit);
+  const double v_limit = std::max(0.1, max_sidestep_speed);
+  const double a_limit = std::max(0.2, max_sidestep_accel);
+
+  ReferenceTrajectory result;
+  result.header = input.header;
+  result.points.reserve(input.points.size() + 64U);
+  for (std::size_t i = 0U; i <= anchor_index; ++i) {
+    result.points.push_back(input.points[i]);
+  }
+  freezeMotion(result.points.back());
+  result.points.back().yaw_rate = 0.0;
+
+  auto appendStraightSegment = [&](double target_x, double target_y, double fixed_yaw) {
+    const ReferencePoint origin = result.points.back();
+    const double dx = target_x - origin.x;
+    const double dy = target_y - origin.y;
+    const double dist = std::hypot(dx, dy);
+    if (dist <= 1e-4) {
+      return;
+    }
+    const double dur_v = 1.875 * dist / v_limit;
+    const double dur_a = std::sqrt(5.7735026919 * dist / a_limit);
+    const double duration = std::max({0.25, dur_v, dur_a});
+    const int steps = std::max(3, static_cast<int>(std::ceil(duration / sample_period)));
+    const double yaw_norm = normalizeAngle(fixed_yaw);
+    for (int step = 1; step <= steps; ++step) {
+      const double u = static_cast<double>(step) / static_cast<double>(steps);
+      const double u2 = u * u;
+      const double u3 = u2 * u;
+      const double u4 = u3 * u;
+      const double u5 = u4 * u;
+      const double b = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+      const double db = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+      const double ddb = (60.0 * u - 180.0 * u2 + 120.0 * u3) / (duration * duration);
+
+      ReferencePoint point = origin;
+      point.t = origin.t + duration * u;
+      point.s = origin.s + dist * b;
+      point.x = origin.x + dx * b;
+      point.y = origin.y + dy * b;
+      point.vx = dx * db;
+      point.vy = dy * db;
+      point.v = std::hypot(point.vx, point.vy);
+      point.ax = dx * ddb;
+      point.ay = dy * ddb;
+      point.yaw = yaw_norm;
+      point.yaw_rate = 0.0;
+      result.points.push_back(point);
+    }
+    freezeMotion(result.points.back());
+    result.points.back().x = target_x;
+    result.points.back().y = target_y;
+    result.points.back().yaw = yaw_norm;
+    result.points.back().yaw_rate = 0.0;
+  };
+
+  // Phase 1: hold anchor yaw while sidestepping out to open turnaround point.
+  const double anchor_yaw = normalizeAngle(result.points.back().yaw);
+  appendStraightSegment(turn_x, turn_y, anchor_yaw);
+
+  // Phase 2: rotate in place at (turn_x, turn_y) from anchor_yaw to goal_yaw.
+  {
+    const ReferencePoint pivot = result.points.back();
+    const double delta = shortestAngularDistance(pivot.yaw, goal_yaw);
+    if (std::abs(delta) > 1e-8) {
+      double duration = 1.875 * std::abs(delta) / yaw_rate_limit;
+      if (params.yaw_acceleration_limit > 0.0) {
+        const double planned_accel = 0.8 * params.yaw_acceleration_limit;
+        duration = std::max(duration, std::sqrt(5.7735026919 * std::abs(delta) / planned_accel));
+      }
+      const int steps = std::max(2, static_cast<int>(std::ceil(duration / sample_period)));
+      for (int step = 1; step <= steps; ++step) {
+        const double u = static_cast<double>(step) / static_cast<double>(steps);
+        const double u2 = u * u;
+        const double u3 = u2 * u;
+        const double u4 = u3 * u;
+        const double u5 = u4 * u;
+        const double blend = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+        const double blend_rate = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+
+        ReferencePoint point = pivot;
+        point.t = pivot.t + duration * u;
+        point.s = pivot.s;
+        freezeMotion(point);
+        point.yaw = normalizeAngle(pivot.yaw + delta * blend);
+        point.yaw_rate = delta * blend_rate;
+        result.points.push_back(point);
+      }
+    }
+    freezeMotion(result.points.back());
+    result.points.back().yaw = normalizeAngle(goal_yaw);
+    result.points.back().yaw_rate = 0.0;
+  }
+
+  // Phase 3: hold goal_yaw while sliding back to exact terminal position.
+  const ReferencePoint & goal_point = input.points.back();
+  appendStraightSegment(goal_point.x, goal_point.y, goal_yaw);
+
+  freezeMotion(result.points.back());
+  result.points.back().yaw = normalizeAngle(goal_yaw);
+  result.points.back().yaw_rate = 0.0;
+
+  if (!result.valid()) {
+    return false;
+  }
+  *output = std::move(result);
+  return true;
 }
 
 }  // namespace minco_planner

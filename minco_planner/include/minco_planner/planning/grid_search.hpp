@@ -6,20 +6,48 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
+#include <vector>
 
-#include "minco_planner/planning/grid_astar.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
+
+#include "minco_planner/planning/grid_clearance.hpp"
 
 namespace minco_planner
 {
 
-struct GridSearchParams : GridAstarParams
+struct GridSearchParams
 {
+  int obstacle_value_threshold = 50;
+  bool unknown_is_obstacle = false;
+  bool allow_diagonal = true;
+  double diagonal_cost = 1.41421356237;
+  // Omnidirectional clearance every expanded cell must have, in metres.
+  double safe_distance = 0.0;
+  // The robot already occupies the start pose; rejecting it cannot move it.
+  bool assume_start_traversable = true;
+  // Use the clearance an endpoint actually has, capped by safe_distance.
+  bool relax_endpoint_clearance = true;
+  // Lower bound for endpoint relaxation (inscribed footprint half-width).
+  double min_safe_distance = 0.0;
+  // Step cost multiplier 1 + w * ((D - d) / D)^2 for d < D; <= 0 disables.
+  double clearance_cost_weight = 0.0;
+  double clearance_cost_distance = 0.0;
+  // Cells the start may climb along non-decreasing clearance; 0 disables.
+  int start_escape_max_steps = 0;
   bool jump_enabled = true;
   int max_expanded_nodes = -1;
 };
 
-struct GridSearchResult : GridAstarResult
+struct GridSearchResult
 {
+  bool success = false;
+  std::string reason;
+  nav_msgs::msg::Path path;
+  double length = 0.0;
+  int expanded_nodes = 0;
   double cost = 0.0;  // Weighted graph cost in cell units.
   double clearance = 0.0;
   bool partial = false;  // A stoppable segment. Only success denotes the requested goal.

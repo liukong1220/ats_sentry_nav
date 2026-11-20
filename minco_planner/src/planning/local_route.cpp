@@ -94,21 +94,60 @@ std::optional<RouteObstruction> obstructedGuide(
   nav_msgs::msg::OccupancyGrid newly_blocked;
   const auto * obstruction_grid = &grid;
   if (accepted_grid && accepted_grid->header.frame_id == grid.header.frame_id &&
-    accepted_grid->info.origin == grid.info.origin &&
-    accepted_grid->info.resolution == grid.info.resolution &&
-    accepted_grid->info.width == grid.info.width &&
-    accepted_grid->info.height == grid.info.height &&
-    accepted_grid->data.size() == grid.data.size())
+    accepted_grid->info.resolution > 0.0 && !accepted_grid->data.empty())
   {
     // A graph guide uses cell centers and its tangent yaw can intersect an
     // old wall at a corner. Only newly blocked cells trigger a guide detour.
     // The bypass and the executable reference are checked on the full grid.
     newly_blocked = grid;
     const auto & params = checker.params();
-    for (std::size_t i = 0; i < grid.data.size(); ++i) {
-      const auto previous = accepted_grid->data[i];
-      if (previous < 0 ? params.unknown_is_obstacle : previous >= params.obstacle_value_threshold) {
-        newly_blocked.data[i] = 0;
+    const bool exact_layout =
+      accepted_grid->info.origin == grid.info.origin &&
+      accepted_grid->info.resolution == grid.info.resolution &&
+      accepted_grid->info.width == grid.info.width &&
+      accepted_grid->info.height == grid.info.height &&
+      accepted_grid->data.size() == grid.data.size();
+    if (exact_layout) {
+      for (std::size_t i = 0; i < grid.data.size(); ++i) {
+        const auto previous = accepted_grid->data[i];
+        if (previous < 0 ? params.unknown_is_obstacle : previous >= params.obstacle_value_threshold) {
+          newly_blocked.data[i] = 0;
+        }
+      }
+    } else {
+      const double grid_yaw = tf2::getYaw(grid.info.origin.orientation);
+      const double cg = std::cos(grid_yaw);
+      const double sg = std::sin(grid_yaw);
+      const double acc_yaw = tf2::getYaw(accepted_grid->info.origin.orientation);
+      const double ca = std::cos(acc_yaw);
+      const double sa = std::sin(acc_yaw);
+      const double grid_res = grid.info.resolution;
+      const double acc_res = accepted_grid->info.resolution;
+      for (std::uint32_t gy = 0; gy < grid.info.height; ++gy) {
+        for (std::uint32_t gx = 0; gx < grid.info.width; ++gx) {
+          const std::size_t idx =
+            static_cast<std::size_t>(gy) * grid.info.width + gx;
+          const double lx = (static_cast<double>(gx) + 0.5) * grid_res;
+          const double ly = (static_cast<double>(gy) + 0.5) * grid_res;
+          const double wx = grid.info.origin.position.x + cg * lx - sg * ly;
+          const double wy = grid.info.origin.position.y + sg * lx + cg * ly;
+          const double dx = wx - accepted_grid->info.origin.position.x;
+          const double dy = wy - accepted_grid->info.origin.position.y;
+          const int ax = static_cast<int>(std::floor((ca * dx + sa * dy) / acc_res));
+          const int ay = static_cast<int>(std::floor((-sa * dx + ca * dy) / acc_res));
+          if (ax < 0 || ay < 0 ||
+            ax >= static_cast<int>(accepted_grid->info.width) ||
+            ay >= static_cast<int>(accepted_grid->info.height))
+          {
+            continue;
+          }
+          const auto previous = accepted_grid->data[
+            static_cast<std::size_t>(ay) * accepted_grid->info.width +
+            static_cast<std::size_t>(ax)];
+          if (previous < 0 ? params.unknown_is_obstacle : previous >= params.obstacle_value_threshold) {
+            newly_blocked.data[idx] = 0;
+          }
+        }
       }
     }
     obstruction_grid = &newly_blocked;

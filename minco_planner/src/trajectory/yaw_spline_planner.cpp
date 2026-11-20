@@ -43,11 +43,96 @@ void YawSplinePlanner::applyClearanceAware(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
   const std::vector<TunnelSegment> * tunnels) const
 {
-  // 开阔区域先平滑朝向目标；只有窄通道才强制朝向路径，保留舵轮横移能力。
-  applyGoalHeading(trajectory, initial_yaw, goal_yaw);
   if (trajectory.points.size() < 2) {
+    applyGoalHeading(trajectory, initial_yaw, goal_yaw);
     return;
   }
+
+  // 若从洞外近距离接近需要车头正向对准的窄通道，先保证到达洞口前有足够转向时间：
+  // 静止起步优先在洞外起点插入平滑原地对准段；运动中则等比放长轨迹时间，避免未转到位进洞。
+  std::vector<TunnelSegment> adjusted_tunnels;
+  const std::vector<TunnelSegment> * active_tunnels = tunnels;
+  if (tunnels != nullptr && !tunnels->empty()) {
+    adjusted_tunnels = *tunnels;
+    active_tunnels = &adjusted_tunnels;
+    const double rate_limit = std::max(1e-3, params_.yaw_rate_limit);
+    const double acceleration_limit = std::max(0.0, params_.yaw_acceleration_limit);
+    for (const auto & tunnel : adjusted_tunnels) {
+      if (!tunnel.forward_alignment || tunnel.axis_yaw.empty() ||
+        tunnel.begin >= trajectory.points.size())
+      {
+        continue;
+      }
+      const double target_yaw = normalizeAngle(tunnel.axis_yaw.front() + params_.tunnel.yaw_offset);
+      const double delta = std::abs(shortestAngularDistance(initial_yaw, target_yaw));
+      if (delta <= 0.10) {
+        break;
+      }
+      const double entry_s = trajectory.points[tunnel.begin].s - params_.tunnel.front_extent;
+      std::size_t first_at_mouth = tunnel.begin;
+      while (first_at_mouth > 1U && trajectory.points[first_at_mouth - 1U].s >= entry_s) {
+        --first_at_mouth;
+      }
+      double required_time = 1.875 * delta / rate_limit;
+      if (acceleration_limit > 0.0) {
+        const double bang_bang_time = (delta >= rate_limit * rate_limit / acceleration_limit) ?
+          (delta / rate_limit + rate_limit / acceleration_limit) :
+          (2.0 * std::sqrt(delta / acceleration_limit));
+        required_time = std::max(
+          required_time,
+          std::max(std::sqrt(5.7735 * delta / acceleration_limit), bang_bang_time + 0.15));
+      }
+      const double available_time =
+        trajectory.points[first_at_mouth].t - trajectory.points.front().t;
+      if (available_time + 1e-6 < required_time) {
+        const ReferencePoint start_point = trajectory.points.front();
+        if (start_point.v < 0.15 || available_time <= 1e-3) {
+          const double sample_period = std::max(0.01, params_.terminal_yaw_sample_period);
+          const int sample_count = std::max(
+            2, static_cast<int>(std::ceil(required_time / sample_period)));
+          std::vector<ReferencePoint> prefix;
+          prefix.reserve(static_cast<std::size_t>(sample_count + 1));
+          prefix.push_back(start_point);
+          for (int step = 1; step <= sample_count; ++step) {
+            ReferencePoint point = start_point;
+            point.t = start_point.t + required_time *
+              static_cast<double>(step) / static_cast<double>(sample_count);
+            point.v = 0.0;
+            point.vx = 0.0;
+            point.vy = 0.0;
+            point.ax = 0.0;
+            point.ay = 0.0;
+            prefix.push_back(point);
+          }
+          for (std::size_t idx = 1; idx < trajectory.points.size(); ++idx) {
+            trajectory.points[idx].t += required_time;
+          }
+          prefix.insert(
+            prefix.end(), trajectory.points.begin() + 1, trajectory.points.end());
+          trajectory.points = std::move(prefix);
+          for (auto & segment : adjusted_tunnels) {
+            segment.begin += static_cast<std::size_t>(sample_count);
+            segment.end += static_cast<std::size_t>(sample_count);
+          }
+        } else {
+          const double time_scale = required_time / available_time;
+          const double t0 = start_point.t;
+          for (auto & point : trajectory.points) {
+            point.t = t0 + (point.t - t0) * time_scale;
+            point.vx /= time_scale;
+            point.vy /= time_scale;
+            point.v /= time_scale;
+            point.ax /= time_scale * time_scale;
+            point.ay /= time_scale * time_scale;
+          }
+        }
+      }
+      break;
+    }
+  }
+
+  // 开阔区域先平滑朝向目标；只有窄通道才强制朝向路径，保留舵轮横移能力。
+  applyGoalHeading(trajectory, initial_yaw, goal_yaw);
 
   std::vector<double> open_area_yaws;
   open_area_yaws.reserve(trajectory.points.size());
@@ -148,9 +233,9 @@ void YawSplinePlanner::applyClearanceAware(
     1.875 * M_PI / std::max(1e-3, rate_limit),
     acceleration_limit > 0.0 ? std::sqrt(5.7735 * M_PI / acceleration_limit) : 0.0);
   std::vector<double> tunnel_turn_start;
-  if (tunnels) {
-    tunnel_turn_start.reserve(tunnels->size());
-    for (const auto & tunnel : *tunnels) {
+  if (active_tunnels) {
+    tunnel_turn_start.reserve(active_tunnels->size());
+    for (const auto & tunnel : *active_tunnels) {
       std::size_t entry = tunnel.begin;
       const double front_s = trajectory.points[entry].s - params_.tunnel.front_extent;
       while (entry > 0U && trajectory.points[entry].s > front_s) {
@@ -166,9 +251,9 @@ void YawSplinePlanner::applyClearanceAware(
     auto & current = trajectory.points[i];
     double desired_yaw = open_area_yaws[i];
     bool tunnel_alignment = false;
-    if (tunnels != nullptr) {
-      for (std::size_t j = 0; j < tunnels->size(); ++j) {
-        const auto & tunnel = (*tunnels)[j];
+    if (active_tunnels != nullptr) {
+      for (std::size_t j = 0; j < active_tunnels->size(); ++j) {
+        const auto & tunnel = (*active_tunnels)[j];
         if (tunnel.axis_yaw.empty()) {
           continue;
         }
