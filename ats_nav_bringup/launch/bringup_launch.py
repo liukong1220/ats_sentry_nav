@@ -4,7 +4,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import IfElseSubstitution, LaunchConfiguration
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression
 
 
 def generate_launch_description():
@@ -20,6 +20,8 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration("use_respawn")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
+    lidar_mount_mode = LaunchConfiguration("lidar_mount_mode")
+    gimbal_use_base_footprint_odom = LaunchConfiguration("gimbal_use_base_footprint_odom")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     fake_vel_output_topic = LaunchConfiguration("fake_vel_output_topic")
@@ -43,12 +45,44 @@ def generate_launch_description():
         DeclareLaunchArgument("use_respawn", default_value="False"),
         DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
-        DeclareLaunchArgument("launch_fake_vel_transform", default_value="True"),
-        DeclareLaunchArgument("launch_chassis_vel_transform", default_value="True"),
-        DeclareLaunchArgument("fake_vel_output_topic", default_value="/cmd_vel/autonomy_gimbal"),
-        DeclareLaunchArgument("chassis_vel_input_topic", default_value="/cmd_vel/autonomy_gimbal"),
+        DeclareLaunchArgument(
+            "lidar_mount_mode",
+            default_value="chassis",
+            description="LiDAR mount mode: 'chassis' (fixed on chassis) or 'gimbal' (mounted on big yaw).",
+        ),
+        DeclareLaunchArgument(
+            "gimbal_use_base_footprint_odom",
+            default_value="True",
+            description="In gimbal mode, output odometry/localization in base_footprint (chassis frame) and disable linear big_yaw rotation.",
+        ),
+        DeclareLaunchArgument("launch_fake_vel_transform", default_value="False"),
+        DeclareLaunchArgument(
+            "launch_chassis_vel_transform",
+            default_value=PythonExpression([
+                "'True' if '", lidar_mount_mode, "'.lower() == 'gimbal' else 'False'",
+            ]),
+        ),
+        DeclareLaunchArgument(
+            "mpc_cmd_vel_topic",
+            default_value=IfElseSubstitution(
+                launch_fake_vel_transform,
+                "/cmd_vel/autonomy_raw",
+                IfElseSubstitution(launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"),
+            ),
+        ),
+        DeclareLaunchArgument(
+            "fake_vel_output_topic",
+            default_value=IfElseSubstitution(
+                launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"
+            ),
+        ),
+        DeclareLaunchArgument(
+            "chassis_vel_input_topic",
+            default_value=IfElseSubstitution(
+                launch_fake_vel_transform, "/cmd_vel/autonomy_gimbal", mpc_cmd_vel_topic
+            ),
+        ),
         DeclareLaunchArgument("chassis_vel_output_topic", default_value="/cmd_vel/autonomy"),
-        DeclareLaunchArgument("mpc_cmd_vel_topic", default_value="/cmd_vel/autonomy_raw"),
         DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value="True"),
         DeclareLaunchArgument(
             "require_serial_link",
@@ -71,6 +105,8 @@ def generate_launch_description():
             "slam": slam,
             "use_identified_odometry": use_identified_odometry,
             "launch_localization_fusion": launch_localization_fusion,
+            "lidar_mount_mode": lidar_mount_mode,
+            "gimbal_use_base_footprint_odom": gimbal_use_base_footprint_odom,
             "log_level": log_level,
         }.items(),
     )
@@ -84,6 +120,8 @@ def generate_launch_description():
             "params_file": params_file,
             "use_robot_state_pub": use_robot_state_pub,
             "use_respawn": use_respawn,
+            "lidar_mount_mode": lidar_mount_mode,
+            "gimbal_use_base_footprint_odom": gimbal_use_base_footprint_odom,
             "launch_fake_vel_transform": launch_fake_vel_transform,
             "launch_chassis_vel_transform": launch_chassis_vel_transform,
             "fake_vel_output_topic": fake_vel_output_topic,

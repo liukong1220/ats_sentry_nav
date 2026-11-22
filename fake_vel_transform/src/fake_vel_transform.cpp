@@ -8,8 +8,6 @@
 namespace fake_vel_transform
 {
 
-constexpr double EPSILON = 1e-5;
-
 FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
 : Node("fake_vel_transform", options)
 {
@@ -26,6 +24,8 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->declare_parameter<std::string>("input_cmd_vel_topic", "");
   this->declare_parameter<std::string>("output_cmd_vel_topic", "");
   this->declare_parameter<float>("init_spin_speed", 0.0);
+  this->declare_parameter<double>("tf_publish_rate_hz", 50.0);
+  this->declare_parameter<double>("zero_vel_epsilon", 1e-5);
 
   this->get_parameter("robot_base_frame", robot_base_frame_);
   this->get_parameter("fake_robot_base_frame", fake_robot_base_frame_);
@@ -35,6 +35,10 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->get_parameter("input_cmd_vel_topic", input_cmd_vel_topic_);
   this->get_parameter("output_cmd_vel_topic", output_cmd_vel_topic_);
   this->get_parameter("init_spin_speed", spin_speed_);
+  this->get_parameter("tf_publish_rate_hz", tf_publish_rate_hz_);
+  this->get_parameter("zero_vel_epsilon", zero_vel_epsilon_);
+  tf_publish_rate_hz_ = std::max(1.0, tf_publish_rate_hz_);
+  zero_vel_epsilon_ = std::max(0.0, zero_vel_epsilon_);
 
   if (!enable_cmd_spin_) {
     // 关闭时强制清零，避免 init_spin_speed 被误配成非零而变成常驻自旋。
@@ -73,9 +77,11 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
     odom_topic_, 10, std::bind(&FakeVelTransform::odometryCallback, this, std::placeholders::_1));
 
-  // 50Hz Timer to send transform from `robot_base_frame` to `fake_robot_base_frame`
+  // Timer to send transform from `robot_base_frame` to `fake_robot_base_frame`
+  const auto tf_period_us = std::chrono::microseconds(
+    static_cast<int64_t>(1e6 / std::min(tf_publish_rate_hz_, 1000.0)));
   timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(20), std::bind(&FakeVelTransform::publishTransform, this));
+    tf_period_us, std::bind(&FakeVelTransform::publishTransform, this));
 }
 
 void FakeVelTransform::cmdSpinCallback(const example_interfaces::msg::Float32::SharedPtr msg)
@@ -101,8 +107,9 @@ void FakeVelTransform::odometryCallback(const nav_msgs::msg::Odometry::ConstShar
 void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(state_mutex_);
-  const bool is_zero_vel = std::abs(msg->linear.x) < EPSILON && std::abs(msg->linear.y) < EPSILON &&
-                           std::abs(msg->angular.z) < EPSILON;
+  const bool is_zero_vel = std::abs(msg->linear.x) < zero_vel_epsilon_ &&
+                           std::abs(msg->linear.y) < zero_vel_epsilon_ &&
+                           std::abs(msg->angular.z) < zero_vel_epsilon_;
   if (is_zero_vel) {
     // 零速度也经由同一发布者传递，不能等待状态更新而延迟停车。
     cmd_vel_chassis_pub_->publish(transformVelocity(msg));

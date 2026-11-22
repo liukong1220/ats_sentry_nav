@@ -64,6 +64,8 @@ private:
   std::string odom_frame_;
   std::string lidar_frame_;
   double base_frame_height_{0.0};
+  double tf_lookup_timeout_sec_{0.2};
+  std::size_t max_odom_buffer_size_{4096};
   std::string base_frame_;
 
   bool base_frame_to_lidar_initialized_;
@@ -71,7 +73,6 @@ private:
   tf2::Transform tf_state_to_lidar_;
   std::deque<OdomSample> odom_buffer_;
   std::mutex odom_buffer_mutex_;
-  static constexpr std::size_t kMaxOdomBufferSize = 4096;
 };
 
 }  // namespace loam_interface

@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import IfElseSubstitution, LaunchConfiguration, TextSubstitution
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression, TextSubstitution
 from launch_ros.actions import Node
 
 
@@ -36,6 +36,8 @@ def generate_launch_description():
     launch_joy_teleop = LaunchConfiguration("launch_joy_teleop")
     launch_small_gicp_relocalization = LaunchConfiguration("launch_small_gicp_relocalization")
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
+    lidar_mount_mode = LaunchConfiguration("lidar_mount_mode")
+    gimbal_use_base_footprint_odom = LaunchConfiguration("gimbal_use_base_footprint_odom")
     launch_fake_vel_transform = LaunchConfiguration("launch_fake_vel_transform")
     launch_chassis_vel_transform = LaunchConfiguration("launch_chassis_vel_transform")
     mpc_cmd_vel_topic = LaunchConfiguration("mpc_cmd_vel_topic")
@@ -87,8 +89,23 @@ def generate_launch_description():
         DeclareLaunchArgument("launch_joy_teleop", default_value="False"),
         DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
-        DeclareLaunchArgument("launch_fake_vel_transform", default_value="True"),
-        DeclareLaunchArgument("launch_chassis_vel_transform", default_value="True"),
+        DeclareLaunchArgument(
+            "lidar_mount_mode",
+            default_value="chassis",
+            description="LiDAR mount mode: 'chassis' (fixed on chassis) or 'gimbal' (mounted on big yaw).",
+        ),
+        DeclareLaunchArgument(
+            "gimbal_use_base_footprint_odom",
+            default_value="True",
+            description="In gimbal mode, output odometry/localization in base_footprint (chassis frame) and disable linear big_yaw rotation.",
+        ),
+        DeclareLaunchArgument("launch_fake_vel_transform", default_value="False"),
+        DeclareLaunchArgument(
+            "launch_chassis_vel_transform",
+            default_value=PythonExpression([
+                "'True' if '", lidar_mount_mode, "'.lower() == 'gimbal' else 'False'",
+            ]),
+        ),
         DeclareLaunchArgument(
             "mpc_cmd_vel_topic",
             default_value=IfElseSubstitution(
@@ -143,6 +160,8 @@ def generate_launch_description():
             "use_robot_state_pub": use_robot_state_pub,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
             "launch_localization_fusion": launch_localization_fusion,
+            "lidar_mount_mode": lidar_mount_mode,
+            "gimbal_use_base_footprint_odom": gimbal_use_base_footprint_odom,
             "launch_fake_vel_transform": launch_fake_vel_transform,
             "launch_chassis_vel_transform": launch_chassis_vel_transform,
             "mpc_cmd_vel_topic": mpc_cmd_vel_topic,

@@ -18,14 +18,36 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
   this->declare_parameter<std::string>("lidar_frame", "");
   this->declare_parameter<std::string>("base_frame", "");
   this->declare_parameter<std::string>("robot_base_frame", "");
+  this->declare_parameter<std::string>("odometry_output_frame", "");
   this->declare_parameter<bool>("publish_tf", true);
+  this->declare_parameter<bool>("publish_robot_base_tf", true);
+  this->declare_parameter<bool>("publish_base_frame_tf", true);
+  this->declare_parameter<bool>("cache_lidar_to_base_tf", false);
+  this->declare_parameter<double>("tf_lookup_timeout_sec", 0.05);
+  this->declare_parameter<bool>("allow_latest_base_tf_fallback", true);
+  this->declare_parameter<double>("latest_base_tf_max_age_sec", 0.2);
+  this->declare_parameter<int>("sync_queue_size", 100);
   this->declare_parameter<bool>("use_identified_odometry", false);
 
   this->get_parameter("odom_frame", odom_frame_);
   this->get_parameter("lidar_frame", lidar_frame_);
   this->get_parameter("base_frame", base_frame_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("odometry_output_frame", odometry_output_frame_);
   this->get_parameter("publish_tf", publish_tf_);
+  this->get_parameter("publish_robot_base_tf", publish_robot_base_tf_);
+  this->get_parameter("publish_base_frame_tf", publish_base_frame_tf_);
+  this->get_parameter("cache_lidar_to_base_tf", cache_lidar_to_base_tf_);
+  this->get_parameter("tf_lookup_timeout_sec", tf_lookup_timeout_sec_);
+  this->get_parameter("allow_latest_base_tf_fallback", allow_latest_base_tf_fallback_);
+  this->get_parameter("latest_base_tf_max_age_sec", latest_base_tf_max_age_sec_);
+  this->get_parameter("sync_queue_size", sync_queue_size_);
+  tf_lookup_timeout_sec_ = std::max(0.0, tf_lookup_timeout_sec_);
+  latest_base_tf_max_age_sec_ = std::max(0.0, latest_base_tf_max_age_sec_);
+  sync_queue_size_ = std::max(2, sync_queue_size_);
+  if (odometry_output_frame_.empty()) {
+    odometry_output_frame_ = robot_base_frame_;
+  }
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_buffer_->setUsingDedicatedThread(true);
@@ -69,7 +91,7 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
     });
 
   sync_ = std::make_unique<message_filters::Synchronizer<SyncPolicy>>(
-    SyncPolicy(100), odometry_sub_, laser_cloud_sub_);
+    SyncPolicy(sync_queue_size_), odometry_sub_, laser_cloud_sub_);
   sync_->registerCallback(std::bind(
     &SensorScanGenerationNode::laserCloudAndOdometryHandler, this, std::placeholders::_1,
     std::placeholders::_2));
@@ -113,34 +135,67 @@ void SensorScanGenerationNode::odometryHandler(
   }
 
   // An empty base_frame declares "this profile has no chassis-footprint
-  // consumer". The lidar->base_frame edge is an input this node does not
-  // produce, so requiring it unconditionally turns a frame that nobody reads
-  // into a hard gate on /odometry, and with it on the whole localization chain.
-  const bool publish_chassis_frame = !base_frame_.empty();
-  if (
-    publish_chassis_frame &&
-    !lookupTransform(lidar_frame_, base_frame_, odometry_msg->header.stamp, tf_lidar_to_chassis)) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 1000,
-      "Skipping odometry publish because required lidar->base TF is unavailable.");
-    return;
+  // consumer". When odometry_output_frame_ == base_frame_ (e.g. gimbal mode
+  // with base_footprint odometry decoupling), lidar->base_frame is required
+  // for /odometry; otherwise its transient failure only skips odom->base_frame
+  // TF without blocking /odometry on robot_base_frame_.
+  const bool want_chassis_frame = !base_frame_.empty();
+  const bool output_is_base_frame =
+    want_chassis_frame && (odometry_output_frame_ == base_frame_);
+  bool has_chassis_pose = false;
+  if (want_chassis_frame) {
+    if (cache_lidar_to_base_tf_ && has_lidar_to_base_) {
+      tf_lidar_to_chassis = tf_lidar_to_base_;
+      has_chassis_pose = true;
+    } else if (lookupTransform(
+        lidar_frame_, base_frame_, odometry_msg->header.stamp, tf_lidar_to_chassis,
+        allow_latest_base_tf_fallback_)) {
+      has_chassis_pose = true;
+      if (cache_lidar_to_base_tf_) {
+        tf_lidar_to_base_ = tf_lidar_to_chassis;
+        has_lidar_to_base_ = true;
+        RCLCPP_INFO(
+          this->get_logger(), "Cached static extrinsic %s->%s, no further per-frame lookup.",
+          lidar_frame_.c_str(), base_frame_.c_str());
+      }
+    } else if (output_is_base_frame) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Skipping odometry publish because required %s->%s TF is unavailable.",
+        lidar_frame_.c_str(), base_frame_.c_str());
+      return;
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Optional %s->%s TF unavailable; continuing odometry on %s.",
+        lidar_frame_.c_str(), base_frame_.c_str(), robot_base_frame_.c_str());
+    }
   }
 
   tf_odom_to_robot_base_ = tf_odom_to_lidar * tf_lidar_to_robot_base_;
-  if (publish_chassis_frame) {
+  if (has_chassis_pose) {
     tf_odom_to_chassis_ = tf_odom_to_lidar * tf_lidar_to_chassis;
   }
   has_robot_base_pose_ = true;
 
   if (publish_tf_) {
-    if (publish_chassis_frame) {
+    if (publish_base_frame_tf_ && has_chassis_pose) {
       publishTransform(tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
     }
-    publishTransform(
+    const bool duplicate_child =
+      publish_base_frame_tf_ && has_chassis_pose && (base_frame_ == robot_base_frame_);
+    if (publish_robot_base_tf_ && !duplicate_child) {
+      publishTransform(
+        tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
+    }
+  }
+  if (output_is_base_frame) {
+    publishOdometry(
+      tf_odom_to_chassis_, odom_frame_, base_frame_, odometry_msg->header.stamp);
+  } else {
+    publishOdometry(
       tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
   }
-  publishOdometry(
-    tf_odom_to_robot_base_, odom_frame_, robot_base_frame_, odometry_msg->header.stamp);
 }
 
 void SensorScanGenerationNode::laserCloudAndOdometryHandler(
@@ -162,15 +217,35 @@ void SensorScanGenerationNode::laserCloudAndOdometryHandler(
 
 bool SensorScanGenerationNode::lookupTransform(
   const std::string & target_frame, const std::string & source_frame, const rclcpp::Time & time,
-  tf2::Transform & transform)
+  tf2::Transform & transform, bool allow_latest_fallback)
 {
   try {
     auto transform_stamped = tf_buffer_->lookupTransform(
-      target_frame, source_frame, time, rclcpp::Duration::from_seconds(0.5));
+      target_frame, source_frame, time, rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
     tf2::fromMsg(transform_stamped.transform, transform);
     return true;
   } catch (tf2::TransformException & ex) {
-    RCLCPP_WARN(this->get_logger(), "TF lookup failed: %s", ex.what());
+    if (allow_latest_fallback) {
+      try {
+        auto latest = tf_buffer_->lookupTransform(
+          target_frame, source_frame, tf2::TimePointZero, tf2::durationFromSec(0.0));
+        const rclcpp::Time latest_stamp(latest.header.stamp);
+        const double skew =
+          latest_stamp.nanoseconds() > 0 ? std::abs((time - latest_stamp).seconds()) : 0.0;
+        if (latest_base_tf_max_age_sec_ <= 0.0 || skew <= latest_base_tf_max_age_sec_) {
+          tf2::fromMsg(latest.transform, transform);
+          RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Using latest %s->%s TF (skew=%.3fs) after lookup fallback: %s",
+            target_frame.c_str(), source_frame.c_str(), skew, ex.what());
+          return true;
+        }
+      } catch (const tf2::TransformException &) {
+      }
+    }
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000, "TF lookup failed (%s->%s): %s",
+      target_frame.c_str(), source_frame.c_str(), ex.what());
     return false;
   }
 }

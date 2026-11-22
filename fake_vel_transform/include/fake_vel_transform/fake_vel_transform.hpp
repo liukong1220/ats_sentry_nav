@@ -48,6 +48,8 @@ private:
   std::string input_cmd_vel_topic_;
   std::string output_cmd_vel_topic_;
   float spin_speed_;
+  double tf_publish_rate_hz_{50.0};
+  double zero_vel_epsilon_{1e-5};
 
   std::mutex state_mutex_;
   double current_robot_base_angle_;

@@ -29,6 +29,10 @@ LoamInterfaceNode::LoamInterfaceNode(const rclcpp::NodeOptions & options)
   // the ground point below base_frame, so odom z=0 is the floor rather than the
   // gimbal / lidar mount height consumed by ROGMap projection and the planners.
   this->declare_parameter<double>("base_frame_height", 0.0);
+  tf_lookup_timeout_sec_ = std::max(
+    0.01, this->declare_parameter<double>("tf_lookup_timeout_sec", 0.2));
+  max_odom_buffer_size_ = static_cast<std::size_t>(std::max<int>(
+    64, this->declare_parameter<int>("max_odom_buffer_size", 4096)));
   // Point-LIO publishes the IMU state. Legacy lidar-pose producers keep the
   // identity defaults. These are T_state<-lidar, matching mapping.extrinsic_T/R.
   const auto state_to_lidar = this->declare_parameter<std::vector<double>>(
@@ -144,7 +148,8 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
   if (!base_frame_to_lidar_initialized_) {
     try {
       auto tf_stamped = tf_buffer_->lookupTransform(
-        base_frame_, lidar_frame_, msg->header.stamp, rclcpp::Duration::from_seconds(0.5));
+        base_frame_, lidar_frame_, msg->header.stamp,
+        rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
       tf2::Transform tf_base_frame_to_lidar;
       tf2::fromMsg(tf_stamped.transform, tf_base_frame_to_lidar);
       const tf2::Transform tf_odom_to_base_frame(
@@ -179,7 +184,7 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
 
   std::lock_guard<std::mutex> lock(odom_buffer_mutex_);
   odom_buffer_.push_back(OdomSample{rclcpp::Time(msg->header.stamp), tf_odom_to_lidar});
-  if (odom_buffer_.size() > kMaxOdomBufferSize) {
+  if (odom_buffer_.size() > max_odom_buffer_size_) {
     odom_buffer_.pop_front();
   }
 }

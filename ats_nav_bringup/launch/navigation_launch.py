@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import IfElseSubstitution, LaunchConfiguration
+from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -10,12 +10,46 @@ def generate_launch_description():
     namespace = LaunchConfiguration("namespace")
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_identified_odometry = LaunchConfiguration("use_identified_odometry")
+    lidar_mount_mode = LaunchConfiguration("lidar_mount_mode")
+    gimbal_use_base_footprint_odom = LaunchConfiguration("gimbal_use_base_footprint_odom")
+    chassis_transform_linear_with_big_yaw = LaunchConfiguration(
+        "chassis_transform_linear_with_big_yaw"
+    )
     mapping_tolerance = ParameterValue(IfElseSubstitution(
-        LaunchConfiguration("mapping_mode"), "0.03", "0.08"), value_type=float)
+        LaunchConfiguration("mapping_mode"),
+        LaunchConfiguration("mapping_goal_position_tolerance"),
+        LaunchConfiguration("localization_goal_position_tolerance")), value_type=float)
     mapping_control_tolerance = ParameterValue(IfElseSubstitution(
-        LaunchConfiguration("mapping_mode"), "0.01", "0.08"), value_type=float)
+        LaunchConfiguration("mapping_mode"),
+        LaunchConfiguration("mapping_control_position_tolerance"),
+        LaunchConfiguration("localization_control_position_tolerance")), value_type=float)
     mapping_yaw_tolerance = ParameterValue(IfElseSubstitution(
-        LaunchConfiguration("mapping_mode"), "0.05", "0.15"), value_type=float)
+        LaunchConfiguration("mapping_mode"),
+        LaunchConfiguration("mapping_goal_yaw_tolerance"),
+        LaunchConfiguration("localization_goal_yaw_tolerance")), value_type=float)
+    goal_admission_pos_tolerance = ParameterValue(IfElseSubstitution(
+        LaunchConfiguration("mapping_mode"),
+        LaunchConfiguration("mapping_goal_admission_position_tolerance"),
+        LaunchConfiguration("localization_goal_admission_position_tolerance")), value_type=float)
+    goal_admission_pos_step = ParameterValue(IfElseSubstitution(
+        LaunchConfiguration("mapping_mode"),
+        LaunchConfiguration("mapping_goal_admission_position_step"),
+        LaunchConfiguration("localization_goal_admission_position_step")), value_type=float)
+    active_nav_frame = PythonExpression([
+        "'base_footprint' if ('", lidar_mount_mode, "'.lower() == 'gimbal' and '",
+        gimbal_use_base_footprint_odom, "'.lower() == 'true') else 'gimbal_yaw_odom'",
+    ])
+    loam_base_frame_height = ParameterValue(
+        PythonExpression(["0.15 if '", lidar_mount_mode, "'.lower() == 'gimbal' else 0.07"]),
+        value_type=float,
+    )
+    sensor_publish_robot_base_tf = ParameterValue(
+        PythonExpression([
+            "not ('", lidar_mount_mode, "'.lower() == 'gimbal' and '",
+            gimbal_use_base_footprint_odom, "'.lower() == 'true')",
+        ]),
+        value_type=bool,
+    )
     params_file = LaunchConfiguration("params_file")
     use_robot_state_pub = LaunchConfiguration("use_robot_state_pub")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -33,14 +67,54 @@ def generate_launch_description():
 
     declarations = [
         DeclareLaunchArgument("mapping_mode", default_value="false"),
+        DeclareLaunchArgument("mapping_goal_position_tolerance", default_value="0.03"),
+        DeclareLaunchArgument("localization_goal_position_tolerance", default_value="0.08"),
+        DeclareLaunchArgument("mapping_control_position_tolerance", default_value="0.01"),
+        DeclareLaunchArgument("localization_control_position_tolerance", default_value="0.08"),
+        DeclareLaunchArgument("mapping_goal_yaw_tolerance", default_value="0.05"),
+        DeclareLaunchArgument("localization_goal_yaw_tolerance", default_value="0.15"),
+        DeclareLaunchArgument("mapping_goal_admission_position_tolerance", default_value="0.02"),
+        DeclareLaunchArgument("localization_goal_admission_position_tolerance", default_value="0.08"),
+        DeclareLaunchArgument("mapping_goal_admission_position_step", default_value="0.005"),
+        DeclareLaunchArgument("localization_goal_admission_position_step", default_value="0.02"),
         DeclareLaunchArgument("use_identified_odometry", default_value="false"),
         DeclareLaunchArgument("namespace", default_value=""),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
         DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
         DeclareLaunchArgument("use_respawn", default_value="False"),
-        DeclareLaunchArgument("launch_fake_vel_transform", default_value="True"),
-        DeclareLaunchArgument("launch_chassis_vel_transform", default_value="True"),
+        DeclareLaunchArgument(
+            "lidar_mount_mode",
+            default_value="chassis",
+            description="LiDAR mount mode: 'chassis' (fixed on chassis) or 'gimbal' (mounted on big yaw).",
+        ),
+        DeclareLaunchArgument(
+            "gimbal_use_base_footprint_odom",
+            default_value="True",
+            description="In gimbal mode, output odometry/localization in base_footprint (chassis frame) and disable linear big_yaw rotation.",
+        ),
+        DeclareLaunchArgument("launch_fake_vel_transform", default_value="False"),
+        DeclareLaunchArgument(
+            "launch_chassis_vel_transform",
+            default_value=PythonExpression([
+                "'True' if '", lidar_mount_mode, "'.lower() == 'gimbal' else 'False'",
+            ]),
+        ),
+        DeclareLaunchArgument(
+            "chassis_transform_linear_with_big_yaw",
+            default_value=PythonExpression([
+                "'True' if ('", lidar_mount_mode, "'.lower() == 'gimbal' and '",
+                gimbal_use_base_footprint_odom, "'.lower() != 'true') else 'False'",
+            ]),
+        ),
+        DeclareLaunchArgument(
+            "mpc_cmd_vel_topic",
+            default_value=IfElseSubstitution(
+                launch_fake_vel_transform,
+                "/cmd_vel/autonomy_raw",
+                IfElseSubstitution(launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"),
+            ),
+        ),
         DeclareLaunchArgument(
             "fake_vel_output_topic",
             default_value=IfElseSubstitution(
@@ -51,14 +125,6 @@ def generate_launch_description():
             "chassis_vel_input_topic",
             default_value=IfElseSubstitution(
                 launch_fake_vel_transform, "/cmd_vel/autonomy_gimbal", mpc_cmd_vel_topic
-            ),
-        ),
-        DeclareLaunchArgument(
-            "mpc_cmd_vel_topic",
-            default_value=IfElseSubstitution(
-                launch_fake_vel_transform,
-                "/cmd_vel/autonomy_raw",
-                IfElseSubstitution(launch_chassis_vel_transform, "/cmd_vel/autonomy_gimbal", "/cmd_vel/autonomy"),
             ),
         ),
         DeclareLaunchArgument(
@@ -116,12 +182,20 @@ def generate_launch_description():
     loam = Node(
         package="loam_interface", executable="loam_interface_node", name="loam_interface",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[params_file, common, {"use_identified_odometry": use_identified_odometry}], arguments=["--ros-args", "--log-level", log_level],
+        parameters=[params_file, common, {
+            "use_identified_odometry": use_identified_odometry,
+            "base_frame_height": loam_base_frame_height,
+        }], arguments=["--ros-args", "--log-level", log_level],
     )
     scan_generation = Node(
         package="sensor_scan_generation", executable="sensor_scan_generation_node", name="sensor_scan_generation",
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
-        parameters=[params_file, common, {"use_identified_odometry": use_identified_odometry}], arguments=["--ros-args", "--log-level", log_level],
+        parameters=[params_file, common, {
+            "use_identified_odometry": use_identified_odometry,
+            "odometry_output_frame": active_nav_frame,
+            "publish_robot_base_tf": sensor_publish_robot_base_tf,
+            "publish_base_frame_tf": True,
+        }], arguments=["--ros-args", "--log-level", log_level],
     )
     fake_transform = Node(
         package="fake_vel_transform", executable="fake_vel_transform_node", name="fake_vel_transform",
@@ -141,6 +215,9 @@ def generate_launch_description():
             "use_sim_time": use_sim_time,
             "input_cmd_vel_topic": chassis_vel_input_topic,
             "output_cmd_vel_topic": chassis_vel_output_topic,
+            "transform_linear_with_big_yaw": ParameterValue(
+                chassis_transform_linear_with_big_yaw, value_type=bool
+            ),
         }], arguments=["--ros-args", "--log-level", log_level],
     )
     cmd_vel_arbiter = Node(
@@ -158,12 +235,11 @@ def generate_launch_description():
         namespace=namespace, output="screen", respawn=use_respawn, respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
+            "robot_frame": active_nav_frame,
             # Admitted endpoint offset + controller error must stay within
             # the manager's original mapping success region.
-            "goal_admission_position_tolerance": ParameterValue(IfElseSubstitution(
-                LaunchConfiguration("mapping_mode"), "0.02", "0.08"), value_type=float),
-            "goal_admission_position_step": ParameterValue(IfElseSubstitution(
-                LaunchConfiguration("mapping_mode"), "0.005", "0.02"), value_type=float),
+            "goal_admission_position_tolerance": goal_admission_pos_tolerance,
+            "goal_admission_position_step": goal_admission_pos_step,
         }],
         arguments=["--ros-args", "--log-level", log_level],
     )

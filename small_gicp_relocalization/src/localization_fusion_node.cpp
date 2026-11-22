@@ -177,6 +177,10 @@ public:
     min_observation_inliers_ = static_cast<std::uint32_t>(
       std::max<std::int64_t>(1, declare_parameter<std::int64_t>("min_observation_inliers", 1)));
     max_registration_error_ = declare_parameter<double>("max_registration_error", -1.0);
+    status_publish_rate_hz_ = std::max(
+      1.0, declare_parameter<double>("status_publish_rate_hz", 10.0));
+    degrade_on_out_of_order_odom_ =
+      declare_parameter<bool>("degrade_on_out_of_order_odom", false);
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     localization_pub_ =
@@ -200,8 +204,10 @@ public:
     observation_sub_ = create_subscription<RelocalizationObservation>(
       observation_topic_, rclcpp::QoS(10).reliable(),
       std::bind(&LocalizationFusionNode::onObservation, this, std::placeholders::_1));
+    const auto status_period = std::chrono::milliseconds(
+      std::max(1, static_cast<int>(std::lround(1000.0 / status_publish_rate_hz_))));
     status_timer_ = create_wall_timer(
-      std::chrono::milliseconds(100), std::bind(&LocalizationFusionNode::onStatusTimer, this));
+      status_period, std::bind(&LocalizationFusionNode::onStatusTimer, this));
 
     const std::array<double, 6> initial_map_to_odom{
       initial_map_to_odom_x_,    initial_map_to_odom_y_,     initial_map_to_odom_z_,
@@ -367,12 +373,18 @@ private:
         initial_odom_timeout_only_ = false;
       }
       if (latest_odom_stamp_ && stamp < *latest_odom_stamp_) {
-        recordRejectionLocked("dropped out-of-order odometry", true);
-        if (!lost_latched_) {
-          status_ = LocalizationStatus::STATE_DEGRADED;
-          relocalizing_until_.reset();
+        if (degrade_on_out_of_order_odom_) {
+          recordRejectionLocked("dropped out-of-order odometry", true);
+          if (!lost_latched_) {
+            status_ = LocalizationStatus::STATE_DEGRADED;
+            relocalizing_until_.reset();
+          }
+          publishStatusLocked();
+        } else {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Dropped isolated out-of-order odometry frame without degrading tracking.");
         }
-        publishStatusLocked();
         return;
       }
       if (latest_odom_stamp_ && stamp == *latest_odom_stamp_) {
@@ -792,6 +804,8 @@ private:
   double min_observation_quality_{0.0};
   std::uint32_t min_observation_inliers_{1};
   double max_registration_error_{-1.0};
+  double status_publish_rate_hz_{10.0};
+  bool degrade_on_out_of_order_odom_{false};
 
   std::mutex mutex_;
   OdomInstanceTracker odom_instance_tracker_;

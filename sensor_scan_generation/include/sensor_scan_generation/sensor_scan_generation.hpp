@@ -35,7 +35,7 @@ private:
 
   bool lookupTransform(
     const std::string & target_frame, const std::string & source_frame, const rclcpp::Time & time,
-    tf2::Transform & transform);
+    tf2::Transform & transform, bool allow_latest_fallback = false);
 
   void publishTransform(
     const tf2::Transform & transform, const std::string & parent_frame,
@@ -48,8 +48,16 @@ private:
   std::string lidar_frame_;
   std::string base_frame_;
   std::string robot_base_frame_;
+  std::string odometry_output_frame_;
   std::string odom_frame_{"odom"};
   bool publish_tf_{true};
+  bool publish_robot_base_tf_{true};
+  bool publish_base_frame_tf_{true};
+  bool cache_lidar_to_base_tf_{false};
+  double tf_lookup_timeout_sec_{0.05};
+  bool allow_latest_base_tf_fallback_{true};
+  double latest_base_tf_max_age_sec_{0.2};
+  int sync_queue_size_{100};
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> br_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_laser_cloud_;
@@ -74,6 +82,8 @@ private:
   tf2::Transform tf_lidar_to_robot_base_;
   // 静态外参 lidar->robot_base_frame 首次查询成功后置 true，之后不再查 TF。
   bool has_lidar_to_robot_base_ = false;
+  tf2::Transform tf_lidar_to_base_;
+  bool has_lidar_to_base_ = false;
   tf2::Transform tf_odom_to_robot_base_;
   tf2::Transform tf_odom_to_chassis_;
   tf2::Transform previous_odom_to_robot_base_;

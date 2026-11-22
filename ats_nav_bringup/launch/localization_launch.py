@@ -2,7 +2,13 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+)
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -23,8 +29,15 @@ def generate_launch_description():
         "launch_small_gicp_relocalization"
     )
     launch_localization_fusion = LaunchConfiguration("launch_localization_fusion")
+    lidar_mount_mode = LaunchConfiguration("lidar_mount_mode")
+    gimbal_use_base_footprint_odom = LaunchConfiguration("gimbal_use_base_footprint_odom")
     log_level = LaunchConfiguration("log_level")
     slam = LaunchConfiguration("slam")
+
+    active_nav_frame = PythonExpression([
+        "'base_footprint' if ('", lidar_mount_mode, "'.lower() == 'gimbal' and '",
+        gimbal_use_base_footprint_odom, "'.lower() == 'true') else 'gimbal_yaw_odom'",
+    ])
 
     declarations = [
         DeclareLaunchArgument("use_identified_odometry", default_value="false"),
@@ -36,6 +49,16 @@ def generate_launch_description():
         DeclareLaunchArgument("use_respawn", default_value="false"),
         DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
         DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
+        DeclareLaunchArgument(
+            "lidar_mount_mode",
+            default_value="chassis",
+            description="LiDAR mount mode: 'chassis' (fixed on chassis) or 'gimbal' (mounted on big yaw).",
+        ),
+        DeclareLaunchArgument(
+            "gimbal_use_base_footprint_odom",
+            default_value="True",
+            description="In gimbal mode, output odometry/localization in base_footprint (chassis frame).",
+        ),
         DeclareLaunchArgument("log_level", default_value="info"),
         DeclareLaunchArgument("slam", default_value="False"),
     ]
@@ -64,19 +87,36 @@ def generate_launch_description():
         }],
         arguments=["--ros-args", "--log-level", log_level],
     )
-    point_lio = Node(
-        package="point_lio",
-        executable="pointlio_mapping",
-        name="point_lio",
-        namespace=namespace,
-        output="screen",
-        respawn=use_respawn,
-        respawn_delay=2.0,
-        parameters=[params_file, {
-            "use_sim_time": use_sim_time,
-        }],
-        arguments=["--ros-args", "--log-level", log_level],
-    )
+
+    def _make_point_lio(context):
+        mode = lidar_mount_mode.perform(context).strip().lower()
+        if mode not in ("chassis", "gimbal"):
+            raise ValueError(
+                f"lidar_mount_mode must be 'chassis' or 'gimbal', got {mode!r}"
+            )
+        gravity = (
+            [0.0, -9.475732, -2.539015]
+            if mode == "gimbal"
+            else [4.905, 0.0, -8.496]
+        )
+        return [
+            Node(
+                package="point_lio",
+                executable="pointlio_mapping",
+                name="point_lio",
+                namespace=namespace,
+                output="screen",
+                respawn=use_respawn,
+                respawn_delay=2.0,
+                parameters=[params_file, {
+                    "use_sim_time": use_sim_time,
+                    "mapping.gravity": gravity,
+                }],
+                arguments=["--ros-args", "--log-level", log_level],
+            )
+        ]
+
+    point_lio = OpaqueFunction(function=_make_point_lio)
     static_map_to_odom = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -109,6 +149,7 @@ def generate_launch_description():
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
             "prior_pcd_file": prior_pcd_file,
+            "robot_base_frame": active_nav_frame,
             "mapping_mode": ParameterValue(slam, value_type=bool),
             "require_odom_identity": ParameterValue(use_identified_odometry, value_type=bool),
             "publish_tf": PythonExpression(["not ", launch_localization_fusion]),
@@ -126,6 +167,7 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[params_file, {
             "use_sim_time": use_sim_time,
+            "robot_base_frame": active_nav_frame,
             "use_identified_odometry": use_identified_odometry,
             "identified_odom_topic": "odometry_identified",
             "identity_monitor_topic": "aft_mapped_to_init_identified",

@@ -146,6 +146,12 @@ public:
     input_timeout_sec_ = std::max(0.0, declare_parameter<double>("input_timeout_sec", 2.0));
     input_sync_tolerance_sec_ = std::max(
       0.0, declare_parameter<double>("input_sync_tolerance_sec", 1.0));
+    future_stamp_tolerance_sec_ = std::max(
+      0.0, declare_parameter<double>("future_stamp_tolerance_sec", 0.1));
+    tf_lookup_timeout_sec_ = std::max(
+      0.0, declare_parameter<double>("tf_lookup_timeout_sec", 0.1));
+    tf_latest_fallback_max_skew_sec_ = std::max(
+      0.0, declare_parameter<double>("tf_latest_fallback_max_skew_sec", 0.1));
     signed_distance_max_m_ = std::max(
       1e-3, declare_parameter<double>("signed_distance_max_m", 2.0));
     footprint_length_ = std::max(0.0, declare_parameter<double>("footprint_length", 0.58));
@@ -346,7 +352,7 @@ private:
       return false;
     }
     const double age = (now() - stamp).seconds();
-    return age >= -0.1 && age <= input_timeout_sec_;
+    return age >= -future_stamp_tolerance_sec_ && age <= input_timeout_sec_;
   }
 
   bool projectionFresh(const nav_msgs::msg::OccupancyGrid & grid) const
@@ -361,7 +367,7 @@ private:
       return true;
     }
     const double age = (now() - stamp).seconds();
-    return age >= -0.1 && age <= projection_snapshot_timeout_sec_;
+    return age >= -future_stamp_tolerance_sec_ && age <= projection_snapshot_timeout_sec_;
   }
 
   bool inputSynchronized(
@@ -667,20 +673,20 @@ private:
         try {
           transform = tf_buffer_.lookupTransform(
             target_frame, source_frame, rclcpp::Time(requested_stamp),
-            rclcpp::Duration::from_seconds(0.1));
+            rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
           return true;
         } catch (const tf2::TransformException & exception) {
           // Gazebo can publish a complete sensor slot just before the next
-          // localization TF slot. Preserve the existing 0.1 s contract: a
+          // localization TF slot. Preserve the bounded fallback contract: a
           // latest-TF fallback is allowed only when it is older than the
-          // requested sample by at most that same bound.
+          // requested sample by at most tf_latest_fallback_max_skew_sec_.
           try {
             const auto latest = tf_buffer_.lookupTransform(
               target_frame, source_frame, tf2::TimePointZero,
               tf2::durationFromSec(0.0));
             const double skew =
               (rclcpp::Time(requested_stamp) - rclcpp::Time(latest.header.stamp)).seconds();
-            if (skew >= 0.0 && skew <= 0.1) {
+            if (skew >= 0.0 && skew <= tf_latest_fallback_max_skew_sec_) {
               transform = latest;
               RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 2000,
@@ -748,7 +754,8 @@ private:
       try {
         override_from_projection = tf_buffer_.lookupTransform(
           fusion_params_.terrain_free_override_frame, projection_grid.header.frame_id,
-          rclcpp::Time(projection_grid.header.stamp), rclcpp::Duration::from_seconds(0.1));
+          rclcpp::Time(projection_grid.header.stamp),
+          rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
         // Static TFs may report stamp zero; lookup has already evaluated the
         // requested time, so record that query time for the fusion contract.
         override_from_projection.header.stamp = projection_grid.header.stamp;
@@ -1023,6 +1030,9 @@ private:
   double planning_resolution_{0.10};
   double input_timeout_sec_{2.0};
   double input_sync_tolerance_sec_{1.0};
+  double future_stamp_tolerance_sec_{0.1};
+  double tf_lookup_timeout_sec_{0.1};
+  double tf_latest_fallback_max_skew_sec_{0.1};
   double signed_distance_max_m_{2.0};
   double footprint_length_{0.70};
   double footprint_width_{0.55};

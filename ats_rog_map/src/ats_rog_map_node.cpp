@@ -191,6 +191,10 @@ public:
     cloud_timeout_sec_ = std::max(0.0, declare_parameter<double>("cloud_timeout_sec", 0.5));
     odom_timeout_sec_ = std::max(0.0, declare_parameter<double>("odom_timeout_sec", 0.5));
     tf_timeout_sec_ = std::max(0.0, declare_parameter<double>("tf_timeout_sec", 0.1));
+    const double health_publish_rate_hz = std::max(
+      1.0, declare_parameter<double>("health_publish_rate_hz", 10.0));
+    const int cloud_pending_poll_ms = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("cloud_pending_poll_ms", 1)));
     debug_rate_hz_ = std::max(0.0, declare_parameter<double>("debug_rate_hz", 2.0));
     map_update_trace_enabled_ = declare_parameter<bool>("map_update_trace_enabled", false);
     esdf_visualization_height_ = declare_parameter<double>("esdf_visualization_height", 0.15);
@@ -315,13 +319,14 @@ public:
       cloud_topic_, input_qos,
       std::bind(&AtsRogMapNode::deferCloud, this, std::placeholders::_1), cloud_options);
     cloud_pending_timer_ = create_wall_timer(
-      std::chrono::milliseconds(1),
+      std::chrono::milliseconds(cloud_pending_poll_ms),
       std::bind(&AtsRogMapNode::tryProcessCloud, this), cloud_callback_group_);
     localization_sub_ = create_subscription<ats_navigation_interfaces::msg::LocalizationStatus>(
       "/localization/status", rclcpp::QoS(1).reliable().transient_local(),
       std::bind(&AtsRogMapNode::onLocalizationStatus, this, std::placeholders::_1));
 
-    const auto health_period = std::chrono::milliseconds(100);
+    const auto health_period = std::chrono::milliseconds(
+      std::max(1, static_cast<int>(std::lround(1000.0 / health_publish_rate_hz))));
     health_timer_ = create_wall_timer(
       health_period, std::bind(&AtsRogMapNode::publishHealth, this), health_callback_group_);
     if (debug_rate_hz_ > 0.0) {

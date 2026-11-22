@@ -67,6 +67,7 @@ double slopeModerateDegThre = 15.0;
 double slopeSteepDegThre = 25.0;
 bool useSlopeAsObstacle = false;
 double slopeObstacleDegThre = 28.0;
+double loopRateHz = 100.0;
 
 // terrain voxel parameters
 float terrainVoxelSize = 2.0;
@@ -580,6 +581,7 @@ int main(int argc, char **argv) {
   nh->declare_parameter<double>("slopeObstacleDegThre", slopeObstacleDegThre);
   nh->declare_parameter<double>("planarVoxelSize", planarVoxelSize);
   nh->declare_parameter<int>("planarVoxelWidth", planarVoxelWidth);
+  nh->declare_parameter<double>("loop_rate_hz", loopRateHz);
 
   nh->get_parameter("scanVoxelSize", scanVoxelSize);
   nh->get_parameter("decayTime", decayTime);
@@ -628,6 +630,8 @@ int main(int argc, char **argv) {
   nh->get_parameter("slopeSteepDegThre", slopeSteepDegThre);
   nh->get_parameter("useSlopeAsObstacle", useSlopeAsObstacle);
   nh->get_parameter("slopeObstacleDegThre", slopeObstacleDegThre);
+  nh->get_parameter("loop_rate_hz", loopRateHz);
+  loopRateHz = std::max(1.0, loopRateHz);
 
   resolvePlanarVoxelLattice(nh);
 
@@ -676,7 +680,7 @@ int main(int argc, char **argv) {
   std::vector<int> pointIdxNKNSearch;
   std::vector<float> pointNKNSquaredDistance;
 
-  rclcpp::Rate rate(100);
+  rclcpp::Rate rate(loopRateHz);
   bool status = rclcpp::ok();
   while (status) {
     try {
