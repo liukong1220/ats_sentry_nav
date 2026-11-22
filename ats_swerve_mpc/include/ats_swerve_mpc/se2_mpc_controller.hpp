@@ -70,6 +70,10 @@ struct Se2MpcConfig {
   double min_line_search_step = 0.05;
   // 收敛判据：前馈更新量无穷范数小于该值即认为已收敛。
   double convergence_tolerance = 1e-3;
+  // 模块级增量限幅二分搜索迭代次数。
+  int clamp_bisection_iterations = 40;
+  // 暖启动与参考速度混合比例（0=纯参考，1=纯暖启动）。
+  double warm_start_blend_ratio = 0.7;
 };
 
 struct Se2Reference {
@@ -226,12 +230,14 @@ private:
   double cost(const std::vector<State> &states,
               const std::vector<Control> &controls,
               const std::vector<Se2Reference> &references,
-              const Control &last_control) const;
+              const Control &last_control,
+              double first_step_dt = -1.0) const;
   /** @brief 对名义 rollout 执行 iLQR 反向递推，生成反馈/前馈增益。 */
   BackwardResult backwardPass(const std::vector<State> &states,
                               const std::vector<Control> &controls,
                               const std::vector<Se2Reference> &references,
-                              const Control &last_control) const;
+                              const Control &last_control,
+                              double first_step_dt = -1.0) const;
   /** @brief 生成有效参考控制 warm start，并逐步投影到真实执行器约束内。 */
   void initializeControls(const std::vector<Se2Reference> &references,
                           const Control &last_control,

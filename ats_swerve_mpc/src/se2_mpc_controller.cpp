@@ -9,6 +9,27 @@
 
 namespace ats_swerve_mpc {
 
+namespace {
+
+/**
+ * @brief 将上一拍车体系线速度搬运到旋转 +yaw_delta 后的新车体系（等价于惯性系恒速）。
+ * @details 车体旋转 +dpsi 时，同一世界速度在新车体系下为 R(-dpsi) * v_prev；
+ *          用于加速度限幅与平滑代价，避免小陀螺/边转边走时把向心/旋转坐标变换误判为车体加速度。
+ */
+Control rotateControlLinear(const Control &control, double yaw_delta) {
+  if (!std::isfinite(yaw_delta) || std::abs(yaw_delta) <= 1e-12) {
+    return control;
+  }
+  const double c = std::cos(yaw_delta);
+  const double s = std::sin(yaw_delta);
+  Control rotated = control;
+  rotated(0) = c * control(0) + s * control(1);
+  rotated(1) = -s * control(0) + c * control(1);
+  return rotated;
+}
+
+}  // namespace
+
 /** @brief 只把 yaw 前推 yaw_rate * delay / 2；无补偿量时原样返回以保持逐位一致。 */
 State rotationPhaseCompensatedState(const State &measured, double yaw_rate,
                                     double delay) {
@@ -170,19 +191,27 @@ bool Se2MpcController::moduleIncrementFeasible(
         candidate_speed > config_.max_wheel_speed + 1e-9) {
       return false;
     }
-    if (config_.max_wheel_acceleration > 1e-6 &&
-        (candidate_velocities[index] - previous_velocities[index]).norm() >
-            max_speed_delta + 1e-9) {
-      return false;
-    }
-    if (config_.max_steer_rate > 1e-6 && candidate_speed > 1e-4 &&
-        previous_speed > 1e-4) {
+    double cosine = 1.0;
+    const bool both_moving = candidate_speed > 1e-4 && previous_speed > 1e-4;
+    if (both_moving) {
       // 取带符号点积并归一到 [-1, 1]，使反向翻转得到 pi 的真实舵角变化量。
-      const double cosine = std::clamp(
+      cosine = std::clamp(
           candidate_velocities[index].dot(previous_velocities[index]) /
               (candidate_speed * previous_speed),
           -1.0, 1.0);
-      if (std::acos(cosine) > max_steer_delta + 1e-9) {
+      if (config_.max_steer_rate > 1e-6 &&
+          std::acos(cosine) > max_steer_delta + 1e-9) {
+        return false;
+      }
+    }
+    if (config_.max_wheel_acceleration > 1e-6) {
+      // 舵轮驱动电机只加速轮子滚动标量速度，方向变化由转向电机按 max_steer_rate 承担；
+      // 避免将旋转参考系下的轮速向量偏转误算为驱动加速度（与 sim_node 物理执行器一致）。
+      const double rolling_speed_delta = both_moving
+          ? (cosine >= 0.0 ? std::abs(candidate_speed - previous_speed)
+                           : (candidate_speed + previous_speed))
+          : (candidate_velocities[index] - previous_velocities[index]).norm();
+      if (rolling_speed_delta > max_speed_delta + 1e-9) {
         return false;
       }
     }
@@ -198,9 +227,9 @@ bool Se2MpcController::moduleIncrementFeasible(
  * @param report            可选输出：车体级/轮级速度限幅是否命中。
  * @param increment_limited 可选输出：是否因模块增量不可达而被线搜索回退。
  * @return 一个 step_dt 内实车可达的车体控制。
- * @note 每步预测与每次线搜索都会调用。先按车体加速度上限裁剪 Δv，再做速度限幅；
- *       若模块级增量仍不可达，则在 previous→limited 线段上做 40 次二分，
- *       取最大可行比例，保证四轮速度向量始终来自同一车体 Twist。
+ * @note 每步预测与每次线搜索都会调用。先将上一拍线速度按 R(-wz*dt) 搬运至当前车体系，
+ *       再按真实惯性加速度上限裁剪 Δv 并做速度限幅；若模块级增量仍不可达，
+ *       则在 previous→limited 线段上做二分搜索，保证四轮速度向量始终来自同一车体 Twist。
  */
 Control Se2MpcController::clampIncrement(const Control &target,
                                          const Control &previous,
@@ -210,12 +239,14 @@ Control Se2MpcController::clampIncrement(const Control &target,
   const Control max_delta(config_.max_ax * step_dt,
                           config_.max_ay * step_dt,
                           config_.max_awz * step_dt);
-  // 同时限制速度幅值和每个 step_dt 内的增量，近似轮速与舵角执行器的加速度边界。
-  Control delta = target - previous;
+  const Control carried_previous =
+      rotateControlLinear(previous, previous(2) * step_dt);
+  // 同时限制速度幅值和每个 step_dt 内的惯性增量。
+  Control delta = target - carried_previous;
   for (int axis = 0; axis < 3; ++axis) {
     delta(axis) = std::clamp(delta(axis), -max_delta(axis), max_delta(axis));
   }
-  const Control limited = clampControl(previous + delta, report);
+  const Control limited = clampControl(carried_previous + delta, report);
   if (moduleIncrementFeasible(limited, previous, step_dt)) {
     return limited;
   }
@@ -226,7 +257,8 @@ Control Se2MpcController::clampIncrement(const Control &target,
   // 沿上一控制到候选控制做保守线搜索，保持四轮速度向量来自同一车体 Twist。
   double feasible_scale = 0.0;
   double infeasible_scale = 1.0;
-  for (int iteration = 0; iteration < 40; ++iteration) {
+  const int bisection_iters = std::max(1, config_.clamp_bisection_iterations);
+  for (int iteration = 0; iteration < bisection_iters; ++iteration) {
     const double scale = 0.5 * (feasible_scale + infeasible_scale);
     const Control candidate = previous + scale * (limited - previous);
     if (moduleIncrementFeasible(candidate, previous, step_dt)) {
@@ -253,7 +285,8 @@ Se2MpcController::rollout(const State &initial,
 double Se2MpcController::cost(const std::vector<State> &states,
                               const std::vector<Control> &controls,
                               const std::vector<Se2Reference> &references,
-                              const Control &last_control) const {
+                              const Control &last_control,
+                              double first_step_dt) const {
   const auto cost_start_time = std::chrono::steady_clock::now();
   // 归因累加在所有返回路径上生效，包含下面的非法输入早退。
   struct CostTimingScope {
@@ -269,6 +302,9 @@ double Se2MpcController::cost(const std::vector<State> &states,
       references.size() < states.size()) {
     return std::numeric_limits<double>::infinity();
   }
+  const double effective_first_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : config_.dt;
   const Matrix3 q = config_.state_weight.asDiagonal();
   const Matrix3 r = config_.control_weight.asDiagonal();
   const Matrix3 rd = config_.control_delta_weight.asDiagonal();
@@ -276,9 +312,12 @@ double Se2MpcController::cost(const std::vector<State> &states,
   double total = 0.0;
   Control previous = last_control;
   for (std::size_t i = 0; i < controls.size(); ++i) {
+    const double step_dt = i == 0 ? effective_first_dt : config_.dt;
     const State state_error = stateDifference(states[i], references[i].state);
     const Control control_error = controls[i] - references[i].control;
-    const Control delta = controls[i] - previous;
+    const Control carried_previous =
+        rotateControlLinear(previous, previous(2) * step_dt);
+    const Control delta = controls[i] - carried_previous;
     total += state_error.dot(q * state_error);
     total += control_error.dot(r * control_error);
     total += delta.dot(rd * delta);
@@ -317,11 +356,12 @@ void Se2MpcController::initializeControls(
     }
   }
   Control previous = last_control;
+  const double blend = std::clamp(config_.warm_start_blend_ratio, 0.0, 1.0);
   for (int step = 0; step < config_.horizon; ++step) {
     const Control seed =
         has_warm_start_
-            ? 0.7 * warm_controls_[static_cast<std::size_t>(step)] +
-                  0.3 * references[static_cast<std::size_t>(step)].control
+            ? blend * warm_controls_[static_cast<std::size_t>(step)] +
+                  (1.0 - blend) * references[static_cast<std::size_t>(step)].control
             : references[static_cast<std::size_t>(step)].control;
     // 仅第 0 步是本周期真正下发的控制，按实际经过步长 first_step_dt 限幅并记录饱和诊断。
     SaturationReport *report = step == 0 ? &first_step_saturation_ : nullptr;
@@ -344,12 +384,16 @@ Se2MpcController::BackwardResult
 Se2MpcController::backwardPass(const std::vector<State> &states,
                                const std::vector<Control> &controls,
                                const std::vector<Se2Reference> &references,
-                               const Control &last_control) const {
+                               const Control &last_control,
+                               double first_step_dt) const {
   BackwardResult result;
   if (states.size() != controls.size() + 1 ||
       references.size() < states.size()) {
     return result;
   }
+  const double effective_first_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : config_.dt;
   result.feedforward.assign(controls.size(), Control::Zero());
   result.feedback.assign(controls.size(), Matrix3::Zero());
   const Matrix3 q = config_.state_weight.asDiagonal();
@@ -363,6 +407,7 @@ Se2MpcController::backwardPass(const std::vector<State> &states,
 
   for (int step = static_cast<int>(controls.size()) - 1; step >= 0; --step) {
     const std::size_t index = static_cast<std::size_t>(step);
+    const double step_dt = step == 0 ? effective_first_dt : config_.dt;
     Matrix3 a;
     Matrix3 b;
     jacobians(states[index], controls[index], a, b);
@@ -370,7 +415,9 @@ Se2MpcController::backwardPass(const std::vector<State> &states,
         stateDifference(states[index], references[index].state);
     const Control control_error = controls[index] - references[index].control;
     const Control previous = step == 0 ? last_control : controls[index - 1];
-    const Control control_delta = controls[index] - previous;
+    const Control carried_previous =
+        rotateControlLinear(previous, previous(2) * step_dt);
+    const Control control_delta = controls[index] - carried_previous;
     const State stage_x = 2.0 * q * state_error;
     const Control stage_u = 2.0 * r * control_error + 2.0 * rd * control_delta;
     const State q_x = stage_x + a.transpose() * value_gradient;
@@ -443,7 +490,8 @@ Se2MpcController::solve(const State &current_state,
   const auto initial_rollout_start_time = std::chrono::steady_clock::now();
   std::vector<State> states = rollout(current_state, controls);
   rollout_ms += elapsed_ms_since(initial_rollout_start_time);
-  double current_cost = cost(states, controls, references, last_control);
+  double current_cost =
+      cost(states, controls, references, last_control, effective_first_step_dt);
 
   // 解的数值可信凭据：至少完成一次成功的反向递推（Q_uu 可分解、增益有限）。
   // 不能把"有迭代被线搜索接受"当作成功的必要条件——在速度/轮速/舵角速率约束
@@ -454,8 +502,8 @@ Se2MpcController::solve(const State &current_state,
   bool solution_certified = false;
   for (int iteration = 0; iteration < config_.max_iterations; ++iteration) {
     const auto backward_start_time = std::chrono::steady_clock::now();
-    const BackwardResult backward =
-        backwardPass(states, controls, references, last_control);
+    const BackwardResult backward = backwardPass(
+        states, controls, references, last_control, effective_first_step_dt);
     backward_pass_ms += elapsed_ms_since(backward_start_time);
     if (!backward.success) {
       break;
@@ -494,8 +542,9 @@ Se2MpcController::solve(const State &current_state,
             dynamics(candidate_states.back(), candidate_controls[index]));
         previous = candidate_controls[index];
       }
-      const double candidate_cost =
-          cost(candidate_states, candidate_controls, references, last_control);
+      const double candidate_cost = cost(
+          candidate_states, candidate_controls, references, last_control,
+          effective_first_step_dt);
       if (candidate_cost + 1e-9 < current_cost) {
         controls = std::move(candidate_controls);
         states = std::move(candidate_states);

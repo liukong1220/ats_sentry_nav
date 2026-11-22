@@ -46,6 +46,8 @@ struct CmdVelArbiterConfig
   std::chrono::milliseconds manual_timeout{300};
   std::chrono::milliseconds auto_timeout{300};
   std::chrono::milliseconds execution_command_timeout{500};
+  /// 允许跨进程 /clock 抖动导致的微小未来时间戳容差；超出仍按非法未来样本拒绝。
+  std::chrono::milliseconds execution_command_future_tolerance{50};
   /// `/serial/link_up` heartbeat 超时。无样本或超龄都必须按链路失效归零。
   std::chrono::milliseconds link_timeout{300};
   std::chrono::milliseconds map_ready_timeout{5000};
@@ -193,12 +195,16 @@ public:
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
   {
     const bool execute = mode == 1;
+    const auto min_allowed_age =
+      -std::chrono::duration_cast<std::chrono::nanoseconds>(
+        config_.execution_command_future_tolerance);
     if (
-      mode > 1 || manager_incarnation == 0 || sequence == 0 || age.count() < 0 ||
+      mode > 1 || manager_incarnation == 0 || sequence == 0 || age < min_allowed_age ||
       age > config_.execution_command_timeout)
     {
       return rejectExecutionCommand();
     }
+    const auto effective_age = age.count() < 0 ? std::chrono::nanoseconds::zero() : age;
     if (!has_manager_incarnation_) {
       has_manager_incarnation_ = true;
       active_manager_incarnation_ = manager_incarnation;
@@ -245,7 +251,7 @@ public:
     } else if (!emergency_stop_ && link_up_) {
       auto_authorized_ = true;
       has_execution_lease_ = true;
-      execution_lease_stamp_ = now - age;
+      execution_lease_stamp_ = now - effective_age;
       dual_map_execute_latched_ = false;
       supersede_deadline_.reset();
     } else {
@@ -258,7 +264,7 @@ public:
       dual_map_execute_latched_ = true;
       latched_execute_epoch_ = localization_epoch;
       latched_execute_generation_ = map_generation;
-      latched_execute_stamp_ = now - age;
+      latched_execute_stamp_ = now - effective_age;
     }
     return true;
   }

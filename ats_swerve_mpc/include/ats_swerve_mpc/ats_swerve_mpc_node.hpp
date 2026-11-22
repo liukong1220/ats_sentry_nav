@@ -166,8 +166,11 @@ private:
   double trajectory_timeout_ = 0.5;
   double emergency_stop_timeout_ = 0.5;
   double execution_command_timeout_ = 0.5;
+  double execution_command_future_tolerance_sec_ = 0.05;
   double goal_position_tolerance_ = 0.08;
   double goal_yaw_tolerance_ = 0.15;
+  double terminal_stop_speed_threshold_ = 0.2;
+  double terminal_speed_window_sec_ = 0.1;
   // 终点区平面限速 |v| <= d / tau（d = 到终点的距离）：tau [s]，0 = 关闭；只在终点区半径 [m]
   // 内、且 reference 终点速度为零时生效（报告 5.1.10 第 1 项）。
   double terminal_approach_time_constant_ = 0.0;
@@ -177,6 +180,7 @@ private:
   bool publish_debug_paths_ = true;
   bool require_localization_status_ = false;
   bool require_gimbal_status_ = false;
+  bool enforce_gimbal_lock_on_execution_ = true;
   double gimbal_status_timeout_ = 0.5;
   // 里程计允许的最大数据年龄 [s]，超时视为定位链路中断。
   double odometry_timeout_ = 0.25;

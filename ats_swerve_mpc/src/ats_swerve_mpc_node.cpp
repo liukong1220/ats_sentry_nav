@@ -16,12 +16,6 @@
 namespace ats_swerve_mpc {
 
 namespace {
-// reference 最后 0.1 s 的平均平面速度低于该值即视为在终点停车（MINCO 尾状态 v = a = 0；
-// 2 m/s^2 减速到零时最后 0.1 s 的平均速度不超过 0.1 m/s，穿越终点的 reference 为巡航速度）。
-constexpr double kTerminalStopSpeed = 0.2;
-}  // namespace
-
-namespace {
 /** @brief 读取三元素参数并在维度错误时保留物理安全默认值。 */
 Eigen::Vector3d vectorParameter(rclcpp::Node &node, const std::string &name,
                                 const Eigen::Vector3d &defaults) {
@@ -158,6 +152,8 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   gimbal_status_topic_ = declare_parameter<std::string>(
       "gimbal_status_topic", "/gimbal/yaw_status");
   require_gimbal_status_ = declare_parameter<bool>("require_gimbal_status", false);
+  enforce_gimbal_lock_on_execution_ = declare_parameter<bool>(
+      "enforce_gimbal_lock_on_execution", enforce_gimbal_lock_on_execution_);
   gimbal_status_timeout_ = std::max(
       0.1, declare_parameter<double>("gimbal_status_timeout", gimbal_status_timeout_));
   require_localization_status_ =
@@ -176,6 +172,9 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   execution_command_timeout_ = std::max(
       0.1, declare_parameter<double>("execution_command_timeout",
                                      execution_command_timeout_));
+  execution_command_future_tolerance_sec_ = std::max(
+      0.0, declare_parameter<double>("execution_command_future_tolerance_sec",
+                                     execution_command_future_tolerance_sec_));
   execution_command_enabled_ = !execution_command_topic_.empty();
   supersede_grace_sec_ = std::max(
       0.0, declare_parameter<double>("supersede_grace_sec", supersede_grace_sec_));
@@ -183,6 +182,12 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       "goal_position_tolerance", goal_position_tolerance_);
   goal_yaw_tolerance_ =
       declare_parameter<double>("goal_yaw_tolerance", goal_yaw_tolerance_);
+  terminal_stop_speed_threshold_ = std::max(
+      0.0, declare_parameter<double>("terminal_stop_speed_threshold",
+                                     terminal_stop_speed_threshold_));
+  terminal_speed_window_sec_ = std::max(
+      1e-3, declare_parameter<double>("terminal_speed_window_sec",
+                                      terminal_speed_window_sec_));
   terminal_approach_time_constant_ = std::max(
       0.0, declare_parameter<double>("terminal_approach_time_constant",
                                      terminal_approach_time_constant_));
@@ -420,6 +425,13 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
       "min_line_search_step", config.min_line_search_step);
   config.convergence_tolerance = declare_parameter<double>(
       "convergence_tolerance", config.convergence_tolerance);
+  config.clamp_bisection_iterations = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("clamp_bisection_iterations",
+                                config.clamp_bisection_iterations)));
+  config.warm_start_blend_ratio = std::clamp(
+      declare_parameter<double>("warm_start_blend_ratio",
+                                config.warm_start_blend_ratio),
+      0.0, 1.0);
   return config;
 }
 
@@ -439,6 +451,16 @@ TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
       "min_reference_progress_scale", config.min_progress_scale);
   config.command_latency_compensation = declare_parameter<double>(
       "command_latency_compensation", config.command_latency_compensation);
+  config.stationary_yaw_tolerance = declare_parameter<double>(
+      "stationary_yaw_tolerance", config.stationary_yaw_tolerance);
+  config.intermediate_rotation_handoff_tolerance = declare_parameter<double>(
+      "intermediate_rotation_handoff_tolerance",
+      config.intermediate_rotation_handoff_tolerance);
+  config.intermediate_rotation_stop_wz_threshold = declare_parameter<double>(
+      "intermediate_rotation_stop_wz_threshold",
+      config.intermediate_rotation_stop_wz_threshold);
+  config.min_rotation_span_rad = declare_parameter<double>(
+      "min_rotation_span_rad", config.min_rotation_span_rad);
   return config;
 }
 
@@ -664,7 +686,10 @@ void AtsSwerveMpcNode::onExecutionCommand(
   // arbiter sees it.  Keep the MPC gate identical to the arbiter gate so either
   // consumer fails closed on the same clock contract.
   const rclcpp::Duration command_age = receipt - command_stamp;
-  if (!stamp_valid || command_age.nanoseconds() < 0 ||
+  const std::int64_t min_allowed_age_ns =
+      -rclcpp::Duration::from_seconds(execution_command_future_tolerance_sec_)
+           .nanoseconds();
+  if (!stamp_valid || command_age.nanoseconds() < min_allowed_age_ns ||
       command_age > rclcpp::Duration::from_seconds(execution_command_timeout_)) {
     RCLCPP_ERROR(
         get_logger(),
@@ -681,6 +706,8 @@ void AtsSwerveMpcNode::onExecutionCommand(
     engageFailStop();
     return;
   }
+  const std::int64_t effective_age_ns =
+      std::max<std::int64_t>(0, command_age.nanoseconds());
   bool install_reference = false;
   bool keep_control_state = false;
   bool stop = message->mode ==
@@ -731,7 +758,7 @@ void AtsSwerveMpcNode::onExecutionCommand(
       last_execution_command_sequence_ = message->command_sequence;
     }
     last_execution_command_signal_ = std::chrono::steady_clock::now() -
-      std::chrono::nanoseconds(command_age.nanoseconds());
+      std::chrono::nanoseconds(effective_age_ns);
     const bool grace_active = supersedeGraceActiveLocked(std::chrono::steady_clock::now());
     if (!stop && grace_active &&
         message->mode == ats_navigation_interfaces::msg::ExecutionCommand::MODE_EXECUTE &&
@@ -1100,7 +1127,8 @@ bool AtsSwerveMpcNode::gimbalExecutionValidLocked(
     gimbal_status_->sequence < command.gimbal_feedback_sequence) {
     return false;
   }
-  return !command.requires_gimbal_lock || gimbal_status_->locked;
+  return !enforce_gimbal_lock_on_execution_ || !command.requires_gimbal_lock ||
+         gimbal_status_->locked;
 }
 
 /**
@@ -1202,7 +1230,8 @@ void AtsSwerveMpcNode::onControlTimer() {
     }
     goal = trajectory_tracker_.goal();
     rotation_delay = trajectory_tracker_.commandLatencyCompensation();
-    reference_terminal_speed = trajectory_tracker_.terminalSpeed();
+    reference_terminal_speed =
+        trajectory_tracker_.terminalSpeed(terminal_speed_window_sec_);
     projection = trajectory_tracker_.project(current, last_control_(2));
     references = trajectory_tracker_.buildHorizon(
         projection, controller_->config().horizon, controller_->config().dt);
@@ -1394,7 +1423,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   // 一阶趋近，tau 大于 e 倍滞后时不过冲。只对终点速度为零的 reference 生效。
   if (terminal_approach_time_constant_ > 0.0 &&
       goal_position_error <= terminal_approach_radius_ &&
-      reference_terminal_speed <= kTerminalStopSpeed) {
+      reference_terminal_speed <= terminal_stop_speed_threshold_) {
     last_control_ = limitTerminalApproachSpeed(
         last_control_, goal_position_error, terminal_approach_time_constant_);
     if (goal_position_error <= goal_position_tolerance_) {

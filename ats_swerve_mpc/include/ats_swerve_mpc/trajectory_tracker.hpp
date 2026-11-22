@@ -39,6 +39,12 @@ struct TrajectoryTrackerConfig
   double terminal_position_tolerance = 0.0;
   // In-place rotation blocks remain a forward barrier until yaw aligns within this tolerance.
   double stationary_yaw_tolerance = 0.15;
+  // Maximum position radius around an intermediate in-place rotation start for handoff.
+  double intermediate_rotation_handoff_tolerance = 0.03;
+  // Angular velocity threshold below which an intermediate rotation block may exit.
+  double intermediate_rotation_stop_wz_threshold = 0.35;
+  // Minimum angular span [rad] for a stationary segment to be treated as an in-place rotation block.
+  double min_rotation_span_rad = 0.05;
 };
 
 class TrajectoryTracker

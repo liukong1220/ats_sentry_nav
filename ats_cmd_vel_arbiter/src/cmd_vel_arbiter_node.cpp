@@ -48,6 +48,8 @@ public:
     const int auto_timeout_ms = declare_parameter<int>("auto_timeout_ms", 300);
     const int link_timeout_ms = declare_parameter<int>("link_timeout_ms", 300);
     execution_command_timeout_s_ = declare_parameter<double>("execution_command_timeout", 0.5);
+    const double execution_command_future_tolerance_s = std::max(
+      0.0, declare_parameter<double>("execution_command_future_tolerance_sec", 0.05));
     const double rate_hz = declare_parameter<double>("control_rate_hz", 50.0);
     const double supersede_grace_sec = std::max(
       0.0, declare_parameter<double>("supersede_grace_sec", 0.0));
@@ -57,6 +59,8 @@ public:
     config.auto_timeout = std::chrono::milliseconds(auto_timeout_ms);
     config.execution_command_timeout = std::chrono::milliseconds(
       static_cast<int>(execution_command_timeout_s_ * 1000.0));
+    config.execution_command_future_tolerance = std::chrono::milliseconds(
+      static_cast<int>(execution_command_future_tolerance_s * 1000.0));
     config.link_timeout = std::chrono::milliseconds(require_serial_link_ ? link_timeout_ms : 0);
     config.map_ready_timeout = std::chrono::milliseconds(
       static_cast<int>(map_ready_timeout * 1000.0));

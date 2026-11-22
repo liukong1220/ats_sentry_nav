@@ -42,6 +42,11 @@ void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
   config_.command_latency_compensation = std::max(0.0, config_.command_latency_compensation);
   config_.terminal_position_tolerance = std::max(0.0, config_.terminal_position_tolerance);
   config_.stationary_yaw_tolerance = std::max(1e-3, config_.stationary_yaw_tolerance);
+  config_.intermediate_rotation_handoff_tolerance =
+    std::max(0.0, config_.intermediate_rotation_handoff_tolerance);
+  config_.intermediate_rotation_stop_wz_threshold =
+    std::max(0.0, config_.intermediate_rotation_stop_wz_threshold);
+  config_.min_rotation_span_rad = std::max(1e-3, config_.min_rotation_span_rad);
 }
 
 //通过移动语义高效接管路径点，然后重置进，丢弃旧投影信息。
@@ -95,7 +100,7 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
     const double search_limit =
       has_progress_ ? current_time + config_.forward_search_window : trajectory_.back().time;
     constexpr double kStationaryXyEpsSq = 1e-12;
-    constexpr double kMinRotationSpanRad = 0.05;
+    const double min_rotation_span_rad = config_.min_rotation_span_rad;
     std::size_t idx = 0;
     while (idx + 1 < trajectory_.size()) {
       const bool stationary =
@@ -115,7 +120,7 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
         ++idx;
       }
       const std::size_t block_end = idx;
-      if (angular_span <= kMinRotationSpanRad) {
+      if (angular_span <= min_rotation_span_rad) {
         continue;
       }
       if (trajectory_[block_end].time < current_time - 1e-6) {
@@ -128,7 +133,8 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
         std::abs(normalizeAngle(yaw - trajectory_[block_end].state(2)));
       const bool intermediate_block = (block_end + 1 < trajectory_.size());
       const bool still_spinning = intermediate_block && std::isfinite(current_wz) &&
-        std::abs(current_wz) > 0.35;
+        config_.intermediate_rotation_stop_wz_threshold > 0.0 &&
+        std::abs(current_wz) > config_.intermediate_rotation_stop_wz_threshold;
       if (exit_yaw_error > config_.stationary_yaw_tolerance || still_spinning) {
         active_rot_begin = block_begin;
         active_rot_end = block_end;
@@ -149,12 +155,13 @@ TrajectoryProjection TrajectoryTracker::projectImpl(
   }
 
   // 当已接近中途原地转向段时，直接投影到该原地转向段内按 yaw 推进。
-  // 非末端原地转向（如贴墙侧移掉头或洞口预对齐）要求到达掉头点 3 cm 内才进入旋转，
-  // 防止提前在离掉头点 8 cm 处起转导致角落擦墙；末端转向沿用 terminal_position_tolerance。
+  // 非末端原地转向按 intermediate_rotation_handoff_tolerance 控制进入半径（默认 3 cm）；
+  // 末端转向沿用 terminal_position_tolerance。
   const bool intermediate_rotation =
     active_rot_end && (*active_rot_end + 1 < trajectory_.size());
   const double handoff_tolerance = intermediate_rotation
-    ? std::min(config_.terminal_position_tolerance, 0.03)
+    ? std::min(config_.terminal_position_tolerance,
+               config_.intermediate_rotation_handoff_tolerance)
     : config_.terminal_position_tolerance;
   if (use_yaw && active_rot_begin && active_rot_end && *active_rot_begin > 0 &&
       handoff_tolerance > 0.0 &&
