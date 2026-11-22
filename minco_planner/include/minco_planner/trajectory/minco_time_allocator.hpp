@@ -17,6 +17,9 @@ struct MincoTimeAllocatorParams
   double max_acceleration = 2.5;
   double max_lateral_acceleration = 1.5;
   double min_segment_time = 0.05;
+  double corner_turn_threshold_rad = 0.35;
+  double corner_inscribed_ratio = 0.45;
+  double min_corner_radius = 0.20;
 };
 
 struct MincoTimeAllocation

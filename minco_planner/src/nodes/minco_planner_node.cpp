@@ -254,6 +254,11 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<std::string>("map_ready_topic", map_ready_topic_);
   declare_parameter<std::string>("emergency_stop_topic", emergency_stop_topic_);
   declare_parameter<double>("map_ready_timeout_sec", map_ready_timeout_sec_);
+  declare_parameter<double>("tf_lookup_timeout_sec", tf_lookup_timeout_sec_);
+  declare_parameter<double>("runtime_tf_lookup_timeout_sec", runtime_tf_lookup_timeout_sec_);
+  declare_parameter<double>("local_route_anchor_offset", local_route_params_.anchor_offset);
+  declare_parameter<double>("local_route_bypass_padding", local_route_params_.bypass_padding);
+  declare_parameter<double>("local_route_max_local_length", local_route_params_.max_local_length);
   declare_parameter<std::int64_t>("log_throttle_ms", static_cast<std::int64_t>(log_throttle_ms_));
   map_commit_trace_enabled_ = declare_parameter<bool>("map_commit_trace_enabled", false);
   declare_parameter<double>(
@@ -354,6 +359,12 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>("max_acceleration", optimizer_params.max_acceleration);
   declare_parameter<double>("max_jerk", optimizer_params.max_jerk);
   declare_parameter<double>("max_lateral_acceleration", optimizer_params.max_lateral_acceleration);
+  declare_parameter<double>(
+    "corner_turn_threshold_rad", optimizer_params.corner_turn_threshold_rad);
+  declare_parameter<double>(
+    "corner_inscribed_ratio", optimizer_params.corner_inscribed_ratio);
+  declare_parameter<double>(
+    "min_corner_radius", optimizer_params.min_corner_radius);
   declare_parameter<int>(
     "max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   declare_parameter<double>("time_scaling_factor", optimizer_params.time_scaling_factor);
@@ -488,6 +499,12 @@ void MincoPlannerNode::declareAndLoadParams()
     "yaw_tunnel_pre_align_distance", yaw_params.tunnel.pre_align_distance);
   declare_parameter<double>(
     "yaw_tunnel_post_release_distance", yaw_params.tunnel.post_release_distance);
+  declare_parameter<double>(
+    "yaw_tunnel_axis_tolerance", yaw_params.tunnel.axis_tolerance);
+  declare_parameter<double>(
+    "yaw_tunnel_side_wall_gradient_min", yaw_params.tunnel.side_wall_gradient_min);
+  declare_parameter<double>(
+    "yaw_tunnel_side_wall_cos2_min", yaw_params.tunnel.side_wall_cos2_min);
   declare_parameter<bool>(
     "terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   declare_parameter<int>(
@@ -497,6 +514,22 @@ void MincoPlannerNode::declareAndLoadParams()
   declare_parameter<double>(
     "terminal_yaw_relocation_window_length",
     terminal_yaw_relocation_params_.terminal_window_length);
+  declare_parameter<double>(
+    "terminal_rotation_comfortable_clearance_m", terminal_rotation_comfortable_clearance_m_);
+  declare_parameter<double>(
+    "terminal_rotation_tight_yaw_span_rad", terminal_rotation_tight_yaw_span_rad_);
+  declare_parameter<double>(
+    "sidestep_min_duration", terminal_yaw_relocation_params_.sidestep_min_duration);
+  declare_parameter<double>(
+    "sidestep_max_speed", terminal_yaw_relocation_params_.sidestep_max_speed);
+  declare_parameter<double>(
+    "sidestep_max_accel", terminal_yaw_relocation_params_.sidestep_max_accel);
+  declare_parameter<double>("sidestep_min_esdf_margin_m", sidestep_min_esdf_margin_m_);
+  declare_parameter<double>("sidestep_desired_esdf_margin_m", sidestep_desired_esdf_margin_m_);
+  declare_parameter<double>("sidestep_max_radius_m", sidestep_max_radius_m_);
+  declare_parameter<int>("sidestep_max_tries", sidestep_max_tries_);
+  declare_parameter<double>("sidestep_accept_clearance_m", sidestep_accept_clearance_m_);
+  declare_parameter<double>("sidestep_min_improvement_m", sidestep_min_improvement_m_);
 
   FootprintSafetyParams footprint_params;
   declare_parameter<double>("footprint_length", footprint_params.length);
@@ -525,6 +558,16 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("emergency_stop_topic", emergency_stop_topic_);
   get_parameter("map_ready_timeout_sec", map_ready_timeout_sec_);
   map_ready_timeout_sec_ = std::max(0.1, map_ready_timeout_sec_);
+  get_parameter("tf_lookup_timeout_sec", tf_lookup_timeout_sec_);
+  tf_lookup_timeout_sec_ = std::max(0.01, tf_lookup_timeout_sec_);
+  get_parameter("runtime_tf_lookup_timeout_sec", runtime_tf_lookup_timeout_sec_);
+  runtime_tf_lookup_timeout_sec_ = std::max(0.01, runtime_tf_lookup_timeout_sec_);
+  get_parameter("local_route_anchor_offset", local_route_params_.anchor_offset);
+  local_route_params_.anchor_offset = std::max(0.0, local_route_params_.anchor_offset);
+  get_parameter("local_route_bypass_padding", local_route_params_.bypass_padding);
+  local_route_params_.bypass_padding = std::max(0.0, local_route_params_.bypass_padding);
+  get_parameter("local_route_max_local_length", local_route_params_.max_local_length);
+  local_route_params_.max_local_length = std::max(0.5, local_route_params_.max_local_length);
   std::int64_t configured_log_throttle_ms = static_cast<std::int64_t>(log_throttle_ms_);
   get_parameter("log_throttle_ms", configured_log_throttle_ms);
   log_throttle_ms_ = static_cast<std::uint64_t>(
@@ -649,6 +692,9 @@ void MincoPlannerNode::declareAndLoadParams()
   }
   get_parameter("max_jerk", optimizer_params.max_jerk);
   get_parameter("max_lateral_acceleration", optimizer_params.max_lateral_acceleration);
+  get_parameter("corner_turn_threshold_rad", optimizer_params.corner_turn_threshold_rad);
+  get_parameter("corner_inscribed_ratio", optimizer_params.corner_inscribed_ratio);
+  get_parameter("min_corner_radius", optimizer_params.min_corner_radius);
   get_parameter("max_time_scaling_iterations", optimizer_params.max_time_scaling_iterations);
   get_parameter("time_scaling_factor", optimizer_params.time_scaling_factor);
   get_parameter(
@@ -775,6 +821,14 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("yaw_tunnel_axis_min_coherence", yaw_params.tunnel.min_coherence);
   get_parameter("yaw_tunnel_pre_align_distance", yaw_params.tunnel.pre_align_distance);
   get_parameter("yaw_tunnel_post_release_distance", yaw_params.tunnel.post_release_distance);
+  get_parameter("yaw_tunnel_axis_tolerance", yaw_params.tunnel.axis_tolerance);
+  yaw_params.tunnel.axis_tolerance = std::max(0.01, yaw_params.tunnel.axis_tolerance);
+  get_parameter("yaw_tunnel_side_wall_gradient_min", yaw_params.tunnel.side_wall_gradient_min);
+  yaw_params.tunnel.side_wall_gradient_min = std::clamp(
+    yaw_params.tunnel.side_wall_gradient_min, 0.0, 1.0);
+  get_parameter("yaw_tunnel_side_wall_cos2_min", yaw_params.tunnel.side_wall_cos2_min);
+  yaw_params.tunnel.side_wall_cos2_min = std::clamp(
+    yaw_params.tunnel.side_wall_cos2_min, 0.0, 1.0);
   get_parameter("terminal_yaw_relocation_enabled", terminal_yaw_relocation_enabled_);
   get_parameter("footprint_yaw_refinement_rounds", footprint_yaw_refinement_rounds_);
   footprint_yaw_refinement_rounds_ = std::max(0, footprint_yaw_refinement_rounds_);
@@ -791,6 +845,38 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter(
     "terminal_yaw_relocation_window_length",
     terminal_yaw_relocation_params_.terminal_window_length);
+  get_parameter(
+    "terminal_rotation_comfortable_clearance_m", terminal_rotation_comfortable_clearance_m_);
+  terminal_rotation_comfortable_clearance_m_ =
+    std::max(0.0, terminal_rotation_comfortable_clearance_m_);
+  get_parameter(
+    "terminal_rotation_tight_yaw_span_rad", terminal_rotation_tight_yaw_span_rad_);
+  terminal_rotation_tight_yaw_span_rad_ = std::max(0.05, terminal_rotation_tight_yaw_span_rad_);
+  get_parameter(
+    "sidestep_min_duration", terminal_yaw_relocation_params_.sidestep_min_duration);
+  terminal_yaw_relocation_params_.sidestep_min_duration =
+    std::max(0.05, terminal_yaw_relocation_params_.sidestep_min_duration);
+  get_parameter(
+    "sidestep_max_speed", terminal_yaw_relocation_params_.sidestep_max_speed);
+  terminal_yaw_relocation_params_.sidestep_max_speed =
+    std::max(0.1, terminal_yaw_relocation_params_.sidestep_max_speed);
+  get_parameter(
+    "sidestep_max_accel", terminal_yaw_relocation_params_.sidestep_max_accel);
+  terminal_yaw_relocation_params_.sidestep_max_accel =
+    std::max(0.2, terminal_yaw_relocation_params_.sidestep_max_accel);
+  get_parameter("sidestep_min_esdf_margin_m", sidestep_min_esdf_margin_m_);
+  sidestep_min_esdf_margin_m_ = std::max(0.0, sidestep_min_esdf_margin_m_);
+  get_parameter("sidestep_desired_esdf_margin_m", sidestep_desired_esdf_margin_m_);
+  sidestep_desired_esdf_margin_m_ =
+    std::max(sidestep_min_esdf_margin_m_, sidestep_desired_esdf_margin_m_);
+  get_parameter("sidestep_max_radius_m", sidestep_max_radius_m_);
+  sidestep_max_radius_m_ = std::max(0.15, sidestep_max_radius_m_);
+  get_parameter("sidestep_max_tries", sidestep_max_tries_);
+  sidestep_max_tries_ = std::max(1, sidestep_max_tries_);
+  get_parameter("sidestep_accept_clearance_m", sidestep_accept_clearance_m_);
+  sidestep_accept_clearance_m_ = std::max(0.0, sidestep_accept_clearance_m_);
+  get_parameter("sidestep_min_improvement_m", sidestep_min_improvement_m_);
+  sidestep_min_improvement_m_ = std::max(0.0, sidestep_min_improvement_m_);
   get_parameter("footprint_length", footprint_params.length);
   get_parameter("footprint_width", footprint_params.width);
   get_parameter("footprint_safety_margin", footprint_params.safety_margin);
@@ -1078,7 +1164,7 @@ GridSearchResult MincoPlannerNode::planRoute(
       const auto * accepted_grid = same_goal ? &global_route_->snapshot->grid : prior_guide_map_.get();
       auto local = rejoinGlobalRoute(
         remaining, grid, *squared, clearance, safety_checker_, graph_search_, reference_conflict,
-        accepted_grid);
+        accepted_grid, local_route_params_);
       if (local.obstruction) {
         const double wall_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - begin).count();
@@ -1472,7 +1558,7 @@ ReferenceTrajectory MincoPlannerNode::alignedToCurrentTf(
   try {
     grid_from_control = tf_buffer_->lookupTransform(
       reference.trajectory.header.frame_id, reference.control_from_grid->header.frame_id,
-      tf2::TimePointZero, tf2::durationFromSec(0.05));
+      tf2::TimePointZero, tf2::durationFromSec(runtime_tf_lookup_timeout_sec_));
   } catch (const tf2::TransformException & exception) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), log_throttle_ms_,
@@ -2186,14 +2272,15 @@ void MincoPlannerNode::planGoal(
   // 2) 当沿路径候选全被拒，或虽安全但原地大角度转向的足迹净空极薄（< 6 cm，易被厘米级
   //    轮系滑移推入墙壁）时，利用四舵轮全向能力先保持当前航向侧移到开阔 ESDF 区域掉头，
   //    再保持目标航向平移至终点。所有候选仍过同一套零冲突矩形足迹、扫掠与洞口对齐门禁。
-  constexpr double kMinComfortableRotationClearanceM = 0.06;
+  const double comfortable_rotation_clearance_m = terminal_rotation_comfortable_clearance_m_;
   const std::size_t relocation_tail_start = terminalCoincidentTailStart(reference);
   const bool unsafe_terminal_rotation = !safety.safe && (
     collisionsConfinedToTerminalApproach(
       reference, safety, terminal_yaw_relocation_params_.terminal_window_length) ||
     (relocation_tail_start == 0U && reference.points.size() >= 2U));
   const bool tight_terminal_rotation = safety.safe &&
-    hasTightInPlaceTerminalRotation(reference, 0.35, kMinComfortableRotationClearanceM);
+    hasTightInPlaceTerminalRotation(
+      reference, terminal_rotation_tight_yaw_span_rad_, comfortable_rotation_clearance_m);
   if (terminal_yaw_relocation_enabled_ &&
     (unsafe_terminal_rotation || tight_terminal_rotation))
   {
@@ -2302,13 +2389,13 @@ void MincoPlannerNode::planGoal(
         best_rotation_index = rotation_index;
         best_is_sidestep = false;
       }
-      if (best_clearance >= kMinComfortableRotationClearanceM) {
+      if (best_clearance >= comfortable_rotation_clearance_m) {
         break;
       }
     }
 
-    // 沿路径重定位全部失败或净空仍不足 6 cm 时，搜索附近开阔 ESDF 点进行全向侧移掉头。
-    if ((!best_candidate || best_clearance < kMinComfortableRotationClearanceM) &&
+    // 沿路径重定位全部失败或净空仍不足 comfortable_rotation_clearance_m 时，搜索附近开阔 ESDF 点进行全向侧移掉头。
+    if ((!best_candidate || best_clearance < comfortable_rotation_clearance_m) &&
         clearance_esdf && clearance_esdf->available() && !reference.points.empty())
     {
       const std::size_t anchor_index =
@@ -2322,8 +2409,8 @@ void MincoPlannerNode::planGoal(
         const double half_l = 0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_;
         const double half_w = 0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_;
         const double circumradius = std::hypot(half_l, half_w);
-        const double min_esdf = circumradius + 0.04;
-        const double desired_esdf = circumradius + 0.10;
+        const double min_esdf = circumradius + sidestep_min_esdf_margin_m_;
+        const double desired_esdf = circumradius + sidestep_desired_esdf_margin_m_;
 
         struct SidestepSpot
         {
@@ -2334,7 +2421,10 @@ void MincoPlannerNode::planGoal(
           bool preferred;
         };
         std::vector<SidestepSpot> spots;
-        const std::array<double, 6> radii{0.12, 0.18, 0.24, 0.30, 0.38, 0.45};
+        const double radius_scale = sidestep_max_radius_m_ / 0.45;
+        const std::array<double, 6> radii{
+          0.12 * radius_scale, 0.18 * radius_scale, 0.24 * radius_scale,
+          0.30 * radius_scale, 0.38 * radius_scale, sidestep_max_radius_m_};
         std::vector<Eigen::Vector2d> dirs;
         dirs.reserve(17U);
         const Eigen::Vector2d grad = clearance_esdf->getGradient(pivot.x, pivot.y);
@@ -2380,7 +2470,8 @@ void MincoPlannerNode::planGoal(
             }
             return a.esdf > b.esdf;
           });
-        const std::size_t max_sidestep_tries = std::min<std::size_t>(spots.size(), 8U);
+        const std::size_t max_sidestep_tries = std::min<std::size_t>(
+          spots.size(), static_cast<std::size_t>(sidestep_max_tries_));
         for (std::size_t s_idx = 0U; s_idx < max_sidestep_tries; ++s_idx) {
           const auto & spot = spots[s_idx];
           ReferenceTrajectory candidate;
@@ -2408,7 +2499,7 @@ void MincoPlannerNode::planGoal(
             best_turn_x = spot.x;
             best_turn_y = spot.y;
           }
-          if (best_clearance >= 0.08) {
+          if (best_clearance >= sidestep_accept_clearance_m_) {
             break;
           }
         }
@@ -2416,7 +2507,7 @@ void MincoPlannerNode::planGoal(
     }
 
     const bool accept_relocated = best_candidate.has_value() &&
-      (!safety.safe || best_clearance > original_min_clearance + 0.03);
+      (!safety.safe || best_clearance > original_min_clearance + sidestep_min_improvement_m_);
     if (accept_relocated) {
       if (best_is_sidestep) {
         RCLCPP_WARN_THROTTLE(
@@ -2967,7 +3058,7 @@ bool MincoPlannerNode::lookupStartPose(
   try {
     const auto transform = tf_buffer_->lookupTransform(
       !grid.header.frame_id.empty() ? grid.header.frame_id : global_frame_,
-      robot_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      robot_frame_, tf2::TimePointZero, tf2::durationFromSec(tf_lookup_timeout_sec_));
     start.header = transform.header;
     start.pose.position.x = transform.transform.translation.x;
     start.pose.position.y = transform.transform.translation.y;
@@ -3012,7 +3103,8 @@ bool MincoPlannerNode::transformGoalToGrid(
   }
   try {
     const auto transform = tf_buffer_->lookupTransform(
-      target_frame, input.header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      target_frame, input.header.frame_id, tf2::TimePointZero,
+      tf2::durationFromSec(tf_lookup_timeout_sec_));
     tf2::doTransform(input, output, transform);
     // Start/goal poses arrive at the localization frame height; project them
     // onto the 2D planning grid plane so every path vertex stays on the ground.
@@ -3043,9 +3135,11 @@ bool MincoPlannerNode::transformPathToGlobal(
   }
   try {
     const auto transform = tf_buffer_->lookupTransform(
-      global_frame_, source_frame, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      global_frame_, source_frame, tf2::TimePointZero,
+      tf2::durationFromSec(tf_lookup_timeout_sec_));
     const auto body = tf_buffer_->lookupTransform(
-      global_frame_, robot_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+      global_frame_, robot_frame_, tf2::TimePointZero,
+      tf2::durationFromSec(tf_lookup_timeout_sec_));
     const double control_height = body.transform.translation.z;
     tf2::Transform control_from_grid;
     tf2::fromMsg(transform.transform, control_from_grid);

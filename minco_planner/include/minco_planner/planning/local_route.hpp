@@ -15,6 +15,13 @@ struct RouteObstruction
   std::size_t last;
 };
 
+struct LocalRouteParams
+{
+  double anchor_offset = 1.0;
+  double bypass_padding = 2.0;
+  double max_local_length = 7.0;
+};
+
 struct LocalRouteResult
 {
   GridSearchResult route;
@@ -40,7 +47,8 @@ LocalRouteResult rejoinGlobalRoute(
   const std::vector<double> & blocked_squared, double clearance,
   const FootprintSafetyChecker & checker, GridSearch & search,
   const std::optional<geometry_msgs::msg::Point> & reference_conflict = std::nullopt,
-  const nav_msgs::msg::OccupancyGrid * accepted_grid = nullptr);
+  const nav_msgs::msg::OccupancyGrid * accepted_grid = nullptr,
+  const LocalRouteParams & params = LocalRouteParams{});
 
 }  // namespace minco_planner
 

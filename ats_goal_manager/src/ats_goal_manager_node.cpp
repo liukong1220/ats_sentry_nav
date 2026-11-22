@@ -213,8 +213,10 @@ public:
                   std::placeholders::_1),
         std::bind(&AtsGoalManagerNode::onActionAccepted, this,
                   std::placeholders::_1));
+    const double tick_period_sec =
+        tick_rate_hz_ > 0.0 ? (1.0 / tick_rate_hz_) : emergency_stop_heartbeat_period_sec_;
     tick_timer_ = create_wall_timer(
-        std::chrono::duration<double>(emergency_stop_heartbeat_period_sec_),
+        std::chrono::duration<double>(std::max(0.005, tick_period_sec)),
         std::bind(&AtsGoalManagerNode::onTick, this));
 
     // 上电和任何无任务状态都保持急停，禁止 DDS late joiner 获得旧 reference
@@ -296,11 +298,16 @@ private:
       declare_parameter<double>("map_transform_timeout_sec", 1.0));
     require_map_status_ = declare_parameter<bool>("require_map_status", true);
     require_gimbal_status_ = declare_parameter<bool>("require_gimbal_status", true);
+    enforce_gimbal_lock_on_execution_ =
+        declare_parameter<bool>("enforce_gimbal_lock_on_execution", true);
     gimbal_status_timeout_sec_ = std::max(
         0.1, declare_parameter<double>("gimbal_status_timeout_sec", 0.5));
     emergency_stop_heartbeat_period_sec_ = std::max(
         0.02,
         declare_parameter<double>("emergency_stop_heartbeat_period_sec", 0.1));
+    tick_rate_hz_ = std::max(0.0, declare_parameter<double>("tick_rate_hz", 0.0));
+    tf_future_tolerance_sec_ = std::max(
+        0.0, declare_parameter<double>("tf_future_tolerance_sec", 0.2));
     stop_to_reference_guard_sec_ = StopReferenceBarrier::boundedGuardSeconds(
       declare_parameter<double>("stop_to_reference_guard_sec", 0.01));
     execution_command_stamp_backdate_sec_ = std::clamp(
@@ -1852,14 +1859,27 @@ private:
         stop_map_publication_sequence = map_status_publication_sequence_;
       }
     }
-    if (execution_heartbeat) {
-      publishExecutionCommand(*execution_heartbeat);
-    } else {
-      publishExecutionStop(
-        stop_goal_id, stop_localization_epoch, PlannerStatus::FAILURE_NONE,
-        stop_map_generation, stop_map_publication_sequence);
+    const auto tick_now = std::chrono::steady_clock::now();
+    bool publish_heartbeat = !last_heartbeat_publish_time_ ||
+      (tick_now - *last_heartbeat_publish_time_) >=
+        secondsToDuration(emergency_stop_heartbeat_period_sec_);
+    {
+      std::lock_guard<std::mutex> lock(emergency_stop_log_mutex_);
+      if (!last_emergency_stop_published_ || *last_emergency_stop_published_ != stop) {
+        publish_heartbeat = true;
+      }
     }
-    publishEmergencyStop(stop);
+    if (publish_heartbeat) {
+      last_heartbeat_publish_time_ = tick_now;
+      if (execution_heartbeat) {
+        publishExecutionCommand(*execution_heartbeat);
+      } else {
+        publishExecutionStop(
+          stop_goal_id, stop_localization_epoch, PlannerStatus::FAILURE_NONE,
+          stop_map_generation, stop_map_publication_sequence);
+      }
+      publishEmergencyStop(stop);
+    }
   }
 
   void finishActive(std::uint8_t result_code, const std::string &message,
@@ -2047,7 +2067,8 @@ private:
         validation_transform = transform;
         const auto stamp = rclcpp::Time(transform.header.stamp);
         const double age = (now() - stamp).seconds();
-        if (stamp.nanoseconds() > 0 && (age > map_transform_timeout_sec_ || age < -0.2)) {
+        if (stamp.nanoseconds() > 0 &&
+            (age > map_transform_timeout_sec_ || age < -tf_future_tolerance_sec_)) {
           return false;
         }
         for (auto & pose : validation_path.poses) {
@@ -2111,7 +2132,7 @@ private:
       secondsToDuration(gimbal_status_timeout_sec_);
     if (!lease_ok || !gimbal_status_->tf_healthy ||
       gimbal_status_->yaw_authority != yaw_authority ||
-      (requires_gimbal_lock && !gimbal_status_->locked) ||
+      (enforce_gimbal_lock_on_execution_ && requires_gimbal_lock && !gimbal_status_->locked) ||
       (minimum_feedback_sequence > 0 &&
        gimbal_status_->sequence < minimum_feedback_sequence) ||
       (required_request_sequence > 0 &&
@@ -2381,6 +2402,10 @@ private:
   double map_ready_timeout_sec_{3.0};
   double localization_status_timeout_sec_{1.0};
   double emergency_stop_heartbeat_period_sec_{0.1};
+  double tick_rate_hz_{0.0};
+  double tf_future_tolerance_sec_{0.2};
+  bool enforce_gimbal_lock_on_execution_{true};
+  std::optional<std::chrono::steady_clock::time_point> last_heartbeat_publish_time_;
   double stop_to_reference_guard_sec_{0.01};
   double map_wait_timeout_sec_{5.0};
   double default_goal_timeout_sec_{120.0};

@@ -186,7 +186,8 @@ std::vector<TunnelSegment> detectTunnelSegments(
       const double wall_axis = gradient_norm > 1e-6 ?
         std::atan2(gradient.y(), gradient.x()) + kPi / 2.0 : axis;
       const bool valid_side_wall =
-        gradient_norm >= 0.35 && std::cos(2.0 * (wall_axis - axis)) >= 0.85;
+        gradient_norm >= params.side_wall_gradient_min &&
+        std::cos(2.0 * (wall_axis - axis)) >= params.side_wall_cos2_min;
       const double sample_axis = valid_side_wall ? wall_axis : axis;
       const double weight = valid_side_wall ? gradient_norm : 0.5;
       sample_cos2[idx] = weight * std::cos(2.0 * sample_axis);
@@ -241,7 +242,7 @@ bool forwardTunnelEntriesAligned(
   const ReferenceTrajectory & trajectory, const std::vector<TunnelSegment> & tunnels,
   const TunnelYawParams & params)
 {
-  constexpr double kAxisTolerance = 0.20;
+  const double axis_tolerance = std::max(1e-3, params.axis_tolerance);
   for (const auto & tunnel : tunnels) {
     if (!tunnel.forward_alignment || tunnel.axis_yaw.empty()) {
       continue;
@@ -256,7 +257,7 @@ bool forwardTunnelEntriesAligned(
     for (std::size_t i = first; i <= tunnel.end; ++i) {
       const auto local_index = i > tunnel.begin ? i - tunnel.begin : 0U;
       const double target = tunnel.axis_yaw[local_index] + params.yaw_offset;
-      if (std::abs(normalize(trajectory.points[i].yaw - target)) > kAxisTolerance) {
+      if (std::abs(normalize(trajectory.points[i].yaw - target)) > axis_tolerance) {
         return false;
       }
     }

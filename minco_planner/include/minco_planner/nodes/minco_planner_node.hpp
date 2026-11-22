@@ -213,6 +213,8 @@ private:
   double footprint_width_ = 0.58;
   double footprint_safety_margin_ = 0.05;
   double map_ready_timeout_sec_ = 3.0;
+  double tf_lookup_timeout_sec_ = 0.1;
+  double runtime_tf_lookup_timeout_sec_ = 0.05;
   // 运行日志默认每 2 s 最多输出一次；结构化关键字仍保留，便于回归脚本解析。
   std::uint64_t log_throttle_ms_{2000};
   bool map_commit_trace_enabled_{false};
@@ -258,6 +260,15 @@ private:
   /// 逐个试的转向位置个数上界,只在轨迹已被判不安全时才会消耗。
   int terminal_yaw_relocation_max_candidates_ = 6;
   TerminalYawRelocationParams terminal_yaw_relocation_params_{};
+  double terminal_rotation_comfortable_clearance_m_ = 0.06;
+  double terminal_rotation_tight_yaw_span_rad_ = 0.35;
+  double sidestep_min_esdf_margin_m_ = 0.04;
+  double sidestep_desired_esdf_margin_m_ = 0.10;
+  double sidestep_max_radius_m_ = 0.45;
+  int sidestep_max_tries_ = 8;
+  double sidestep_accept_clearance_m_ = 0.08;
+  double sidestep_min_improvement_m_ = 0.03;
+  LocalRouteParams local_route_params_{};
 
   GridSearch graph_search_;
   // Only the planning callback group changes the prior layer and route cache.

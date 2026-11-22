@@ -34,6 +34,9 @@ struct MincoTrajectoryOptimizerParams
   // configured a vehicle jerk limit. The executed ATS profile sets it.
   double max_jerk = 0.0;
   double max_lateral_acceleration = 1.5;
+  double corner_turn_threshold_rad = 0.35;
+  double corner_inscribed_ratio = 0.45;
+  double min_corner_radius = 0.20;
   int max_time_scaling_iterations = 5;
   double time_scaling_factor = 1.25;
 

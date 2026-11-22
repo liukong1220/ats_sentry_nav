@@ -81,14 +81,17 @@ MincoTimeAllocation MincoTimeAllocator::allocate(
     const Eigen::Vector2d outgoing = waypoints[index + 1U] - waypoints[index];
     const double incoming_length = incoming.norm();
     const double outgoing_length = outgoing.norm();
+    const double corner_turn_threshold = std::max(0.0, params_.corner_turn_threshold_rad);
+    const double corner_inscribed_ratio = std::max(0.05, params_.corner_inscribed_ratio);
+    const double min_corner_radius = std::max(0.02, params_.min_corner_radius);
     if (incoming_length > 1e-9 && outgoing_length > 1e-9) {
       const double turn = std::abs(std::atan2(
         incoming.x() * outgoing.y() - incoming.y() * outgoing.x(), incoming.dot(outgoing)));
-      if (turn > 0.35) {
+      if (turn > corner_turn_threshold) {
         const double tan_half = std::tan(0.5 * turn);
         const double inscribed_radius = tan_half > 1e-9 ?
-          0.45 * std::min(incoming_length, outgoing_length) / tan_half : 0.0;
-        const double corner_radius = std::max(0.20, inscribed_radius);
+          corner_inscribed_ratio * std::min(incoming_length, outgoing_length) / tan_half : 0.0;
+        const double corner_radius = std::max(min_corner_radius, inscribed_radius);
         result.waypoint_speeds[index] = std::min(
           result.waypoint_speeds[index], std::sqrt(lateral_acceleration * corner_radius));
       }

@@ -40,6 +40,11 @@ struct TerminalYawRelocationParams
   /// 多出 0.025 m,恰好把左前角推过墙面 1 mm。提前转向到 goal_yaw 再平移
   /// 进目标正是这一族候选要做的事,所以问题只在触发条件太窄。
   double terminal_window_length = 1.0;
+  /// 侧移掉头单段最短时长 [s]。
+  double sidestep_min_duration = 0.25;
+  /// 侧移掉头限速与加速度上限 [m/s, m/s^2]。
+  double sidestep_max_speed = 0.6;
+  double sidestep_max_accel = 1.2;
 };
 
 /// 返回与轨迹末点坐标重合的尾段起始下标。
@@ -107,8 +112,8 @@ bool buildSidestepTerminalYawTurnaround(
   double turn_y,
   const TerminalYawRelocationParams & params,
   ReferenceTrajectory * output,
-  double max_sidestep_speed = 0.6,
-  double max_sidestep_accel = 1.2);
+  double max_sidestep_speed = -1.0,
+  double max_sidestep_accel = -1.0);
 
 }  // namespace minco_planner
 

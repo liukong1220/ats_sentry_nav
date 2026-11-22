@@ -25,6 +25,9 @@ struct TunnelYawParams
   double yaw_offset = 0.0;
   double pre_align_distance = 0.53;
   double post_release_distance = 0.31;
+  double axis_tolerance = 0.20;
+  double side_wall_gradient_min = 0.35;
+  double side_wall_cos2_min = 0.85;
   double forward_width_limit = 0.0;
   double front_extent = 0.0;
 };

@@ -17,10 +17,6 @@ namespace minco_planner
 namespace
 {
 
-constexpr double kAnchorOffset = 1.0;
-constexpr double kBypassPadding = 2.0;
-constexpr double kMaxLocalLength = 7.0;
-
 std::size_t nearestPose(
   const nav_msgs::msg::Path & path, const geometry_msgs::msg::Point & point)
 {
@@ -172,8 +168,13 @@ LocalRouteResult rejoinGlobalRoute(
   const std::vector<double> & blocked_squared, double clearance,
   const FootprintSafetyChecker & checker, GridSearch & search,
   const std::optional<geometry_msgs::msg::Point> & reference_conflict,
-  const nav_msgs::msg::OccupancyGrid * accepted_grid)
+  const nav_msgs::msg::OccupancyGrid * accepted_grid,
+  const LocalRouteParams & params)
 {
+  const double anchor_offset = std::max(0.0, params.anchor_offset);
+  const double bypass_padding = std::max(0.0, params.bypass_padding);
+  const double max_local_length = std::max(0.1, params.max_local_length);
+
   LocalRouteResult result;
   result.route.clearance = clearance;
   if (remaining.poses.size() < 2U || remaining.header.frame_id != grid.header.frame_id) {
@@ -204,14 +205,14 @@ LocalRouteResult rejoinGlobalRoute(
   std::size_t after = result.obstruction->last;
   const double first_blocked_s = points[before].s;
   const double last_blocked_s = points[after].s;
-  while (before > 0 && first_blocked_s - points[before].s < kAnchorOffset) {
+  while (before > 0 && first_blocked_s - points[before].s < anchor_offset) {
     --before;
   }
-  while (after + 1U < points.size() && points[after].s - last_blocked_s < kAnchorOffset) {
+  while (after + 1U < points.size() && points[after].s - last_blocked_s < anchor_offset) {
     ++after;
   }
   if (before >= result.obstruction->first || after <= result.obstruction->last ||
-    points[after].s - points[before].s > kMaxLocalLength ||
+    points[after].s - points[before].s > max_local_length ||
     !goalPoseFootprintFree(points[before].x, points[before].y, points[before].yaw, grid,
     checker.params()) ||
     !goalPoseFootprintFree(points[after].x, points[after].y, points[after].yaw, grid,
@@ -228,10 +229,10 @@ LocalRouteResult rejoinGlobalRoute(
     bounds.max_x = std::max(bounds.max_x, points[i].x);
     bounds.max_y = std::max(bounds.max_y, points[i].y);
   }
-  bounds.min_x -= kBypassPadding;
-  bounds.min_y -= kBypassPadding;
-  bounds.max_x += kBypassPadding;
-  bounds.max_y += kBypassPadding;
+  bounds.min_x -= bypass_padding;
+  bounds.min_y -= bypass_padding;
+  bounds.max_x += bypass_padding;
+  bounds.max_y += bypass_padding;
   const auto & saved = remaining.poses;
 
   // A bypass introduces new bends. Net clearance for the corners of the

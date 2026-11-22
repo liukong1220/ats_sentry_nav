@@ -288,8 +288,11 @@ bool buildSidestepTerminalYawTurnaround(
 
   const double sample_period = std::max(0.01, params.sample_period);
   const double yaw_rate_limit = std::max(1e-3, params.yaw_rate_limit);
-  const double v_limit = std::max(0.1, max_sidestep_speed);
-  const double a_limit = std::max(0.2, max_sidestep_accel);
+  const double v_limit = std::max(
+    0.1, max_sidestep_speed > 0.0 ? max_sidestep_speed : params.sidestep_max_speed);
+  const double a_limit = std::max(
+    0.2, max_sidestep_accel > 0.0 ? max_sidestep_accel : params.sidestep_max_accel);
+  const double min_segment_duration = std::max(0.05, params.sidestep_min_duration);
 
   ReferenceTrajectory result;
   result.header = input.header;
@@ -310,7 +313,7 @@ bool buildSidestepTerminalYawTurnaround(
     }
     const double dur_v = 1.875 * dist / v_limit;
     const double dur_a = std::sqrt(5.7735026919 * dist / a_limit);
-    const double duration = std::max({0.25, dur_v, dur_a});
+    const double duration = std::max({min_segment_duration, dur_v, dur_a});
     const int steps = std::max(3, static_cast<int>(std::ceil(duration / sample_period)));
     const double yaw_norm = normalizeAngle(fixed_yaw);
     for (int step = 1; step <= steps; ++step) {

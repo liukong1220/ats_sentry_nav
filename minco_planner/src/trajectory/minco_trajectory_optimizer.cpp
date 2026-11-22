@@ -32,6 +32,9 @@ MincoTimeAllocator makeTimeAllocator(const MincoTrajectoryOptimizerParams & para
   allocator_params.max_acceleration = params.max_acceleration;
   allocator_params.max_lateral_acceleration = params.max_lateral_acceleration;
   allocator_params.min_segment_time = params.min_segment_time;
+  allocator_params.corner_turn_threshold_rad = params.corner_turn_threshold_rad;
+  allocator_params.corner_inscribed_ratio = params.corner_inscribed_ratio;
+  allocator_params.min_corner_radius = params.min_corner_radius;
   return MincoTimeAllocator(allocator_params);
 }
 
