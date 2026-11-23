@@ -1,6 +1,7 @@
 #pragma once
 
 #include <common_lib.h>
+#include <functional>
 
 #include "Estimator.h"
 
@@ -23,6 +24,7 @@ extern bool lidar_pushed, imu_pushed;
 extern double imu_first_time;
 extern bool lose_lid;
 extern sensor_msgs::msg::Imu imu_last, imu_next;
+extern std::function<void(const sensor_msgs::msg::Imu &)> g_imu_forward_odom_hook;
 
 // extern sensor_msgs::msg::Imu::ConstSharedPtr imu_last_ptr;
 

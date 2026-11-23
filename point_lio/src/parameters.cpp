@@ -42,6 +42,18 @@ double lidar_time_inte = 0.1, first_imu_time = 0.0;
 int orig_odom_freq = 10;
 double online_refine_time = 20.0;  //unit: s
 
+int batch_update_size = 8;
+double batch_max_dt_sec = 0.0025;
+int mapping_max_iter = 1;
+bool adaptive_downsample_en = true;
+int max_surf_points = 1200;
+bool satu_soft_degrade_en = true;
+double satu_soft_ratio = 0.80;
+double satu_inflate_scale = 25.0;
+bool imu_odom_en = true;
+double imu_odom_rate_hz = 100.0;
+double imu_odom_blend_tau_s = 0.025;
+
 MeasureGroup Measures;
 
 void readParameters(std::shared_ptr<rclcpp::Node> & nh)
@@ -166,6 +178,47 @@ void readParameters(std::shared_ptr<rclcpp::Node> & nh)
 
     nh->declare_parameter<int>("ivox_nearby_type", 18);
     nh->get_parameter("ivox_nearby_type", ivox_nearby_type);
+
+    nh->declare_parameter<int>("mapping.batch_update_size", batch_update_size);
+    nh->get_parameter("mapping.batch_update_size", batch_update_size);
+    batch_update_size = std::clamp(batch_update_size, 1, 64);
+
+    nh->declare_parameter<double>("mapping.batch_max_dt_sec", batch_max_dt_sec);
+    nh->get_parameter("mapping.batch_max_dt_sec", batch_max_dt_sec);
+    batch_max_dt_sec = std::clamp(batch_max_dt_sec, 0.0, 0.02);
+
+    nh->declare_parameter<int>("mapping.max_iter", mapping_max_iter);
+    nh->get_parameter("mapping.max_iter", mapping_max_iter);
+    mapping_max_iter = std::clamp(mapping_max_iter, 1, 8);
+
+    nh->declare_parameter<bool>("mapping.adaptive_downsample_en", adaptive_downsample_en);
+    nh->get_parameter("mapping.adaptive_downsample_en", adaptive_downsample_en);
+
+    nh->declare_parameter<int>("mapping.max_surf_points", max_surf_points);
+    nh->get_parameter("mapping.max_surf_points", max_surf_points);
+    max_surf_points = std::max(100, max_surf_points);
+
+    nh->declare_parameter<bool>("mapping.satu_soft_degrade_en", satu_soft_degrade_en);
+    nh->get_parameter("mapping.satu_soft_degrade_en", satu_soft_degrade_en);
+
+    nh->declare_parameter<double>("mapping.satu_soft_ratio", satu_soft_ratio);
+    nh->get_parameter("mapping.satu_soft_ratio", satu_soft_ratio);
+    satu_soft_ratio = std::clamp(satu_soft_ratio, 0.30, 0.98);
+
+    nh->declare_parameter<double>("mapping.satu_inflate_scale", satu_inflate_scale);
+    nh->get_parameter("mapping.satu_inflate_scale", satu_inflate_scale);
+    satu_inflate_scale = std::max(0.0, satu_inflate_scale);
+
+    nh->declare_parameter<bool>("odometry.imu_odom_en", imu_odom_en);
+    nh->get_parameter("odometry.imu_odom_en", imu_odom_en);
+
+    nh->declare_parameter<double>("odometry.imu_odom_rate_hz", imu_odom_rate_hz);
+    nh->get_parameter("odometry.imu_odom_rate_hz", imu_odom_rate_hz);
+    imu_odom_rate_hz = std::clamp(imu_odom_rate_hz, 10.0, 400.0);
+
+    nh->declare_parameter<double>("odometry.imu_odom_blend_tau_s", imu_odom_blend_tau_s);
+    nh->get_parameter("odometry.imu_odom_blend_tau_s", imu_odom_blend_tau_s);
+    imu_odom_blend_tau_s = std::clamp(imu_odom_blend_tau_s, 0.0, 0.20);
   } catch (const rclcpp::ParameterTypeException & e) {
     RCLCPP_ERROR(nh->get_logger(), "Parameter type exception: %s", e.what());
   } catch (const std::exception & e) {
@@ -256,8 +309,10 @@ void logEffectiveParameters(const std::shared_ptr<rclcpp::Node> & nh)
   RCLCPP_INFO(nh->get_logger(), "[point_lio 生效参数] gravity=%s", join(gravity).c_str());
   RCLCPP_INFO(
     nh->get_logger(),
-    "[point_lio 生效参数] publish: scan_publish_en=%s publish_odometry_without_downsample=%s",
-    scan_pub_en ? "true" : "false", publish_odometry_without_downsample ? "true" : "false");
+    "[point_lio 生效参数] publish: scan_publish_en=%s publish_odometry_without_downsample=%s "
+    "imu_odom_en=%s imu_odom_rate_hz=%.1f batch_update_size=%d max_surf_points=%d",
+    scan_pub_en ? "true" : "false", publish_odometry_without_downsample ? "true" : "false",
+    imu_odom_en ? "true" : "false", imu_odom_rate_hz, batch_update_size, max_surf_points);
   if (std::all_of(extrinT.begin(), extrinT.end(), [](double v) { return v == 0.0; })) {
     RCLCPP_WARN(
       nh->get_logger(),

@@ -140,6 +140,11 @@ public:
     x_.build_SEN_state();
   }
 
+  void set_maximum_iter(int max_iter)
+  {
+    maximum_iter = std::max(1, max_iter);
+  }
+
   // iterated error state EKF propogation
   void predict(
     double & dt, processnoisecovariance & Q, const input & i_in, bool predict_state, bool prop_cov)
@@ -211,40 +216,60 @@ public:
       // Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> R = dyn_share.R;
       Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x = dyn_share.h_x;
       // Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_v = dyn_share.h_v;
-      dof_Measurement = h_x.rows();
-      m_noise = dyn_share.M_Noise;
-      // dof_Measurement_noise = dyn_share.R.rows();
-      // vectorized_state dx, dx_new;
-      // x_.boxminus(dx, x_propagated);
-      // dx_new = dx;
-      // P_ = P_propagated;
-
-      Matrix<scalar_type, n, Eigen::Dynamic> PHT;
-      Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HPHT;
-      Matrix<scalar_type, n, Eigen::Dynamic> K_;
-      if (n > dof_Measurement) {
-        PHT = P_.template block<n, 12>(0, 0) * h_x.transpose();
-        HPHT = h_x * PHT.topRows(12);
-        for (int m = 0; m < dof_Measurement; m++) {
-          HPHT(m, m) += m_noise;
-        }
-        K_ = PHT * HPHT.inverse();
-      } else {
-        Matrix<scalar_type, 12, 12> HTH = m_noise * h_x.transpose() * h_x;
-        Matrix<scalar_type, n, n> P_inv = P_.inverse();
-        P_inv.template block<12, 12>(0, 0) += HTH;
-        P_inv = P_inv.inverse();
-        K_ = P_inv.template block<n, 12>(0, 0) * h_x.transpose() * m_noise;
+      const int active_cols = static_cast<int>(h_x.cols());
+      dof_Measurement = static_cast<int>(h_x.rows());
+      m_noise = std::max(scalar_type(1e-12), dyn_share.M_Noise);
+      if (dof_Measurement <= 0 || active_cols <= 0) {
+        return false;
       }
-      Matrix<scalar_type, n, 1> dx_ =
-        K_ * z;  // - h) + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
-      // state x_before = x_;
 
-      x_.boxplus(dx_);
-      {
-        P_ = P_ - K_ * h_x * P_.template block<12, n>(0, 0);
+      Matrix<scalar_type, n, 1> dx_;
+      if (dof_Measurement <= active_cols) {
+        Matrix<scalar_type, n, Eigen::Dynamic> PHT =
+          P_.leftCols(active_cols) * h_x.transpose();
+        Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> HPHT =
+          h_x * PHT.topRows(active_cols);
+        HPHT.diagonal().array() += m_noise;
+        Matrix<scalar_type, n, Eigen::Dynamic> K_ =
+          HPHT.ldlt().solve(PHT.transpose()).transpose();
+        dx_ = K_ * z;
+        x_.boxplus(dx_);
+        if (i == maximum_iter - 1) {
+          P_ -= K_ * (h_x * P_.topRows(active_cols));
+        }
+      } else {
+        // Information-compressed exact identity on active_cols (6 when extrinsic_est_en=false):
+        // H^T (H P_cc H^T + r I)^-1 = (G P_cc + r I_c)^-1 H^T, G = H^T H.
+        const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> G = h_x.transpose() * h_x;
+        const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> P_cc =
+          P_.topLeftCorner(active_cols, active_cols);
+        Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> S_c = G * P_cc;
+        S_c.diagonal().array() += m_noise;
+        const Eigen::PartialPivLU<Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>> lu(S_c);
+        const Matrix<scalar_type, Eigen::Dynamic, 1> w = lu.solve(h_x.transpose() * z);
+        dx_ = P_.leftCols(active_cols) * w;
+        x_.boxplus(dx_);
+        if (i == maximum_iter - 1) {
+          const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> M = lu.solve(G);
+          P_ -= (P_.leftCols(active_cols) * M) * P_.topRows(active_cols);
+        }
+      }
+      if (maximum_iter > 1 && dx_.template head<6>().squaredNorm() < scalar_type(1e-10)) {
+        if (i < maximum_iter - 1) {
+          // Early convergence: apply covariance update once before breaking.
+          const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> G = h_x.transpose() * h_x;
+          const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> P_cc =
+            P_.topLeftCorner(active_cols, active_cols);
+          Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> S_c = G * P_cc;
+          S_c.diagonal().array() += m_noise;
+          const Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> M =
+            S_c.partialPivLu().solve(G);
+          P_ -= (P_.leftCols(active_cols) * M) * P_.topRows(active_cols);
+        }
+        break;
       }
     }
+    P_ = scalar_type(0.5) * (P_ + P_.transpose());
     return true;
   }
 

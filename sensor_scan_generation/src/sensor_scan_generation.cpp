@@ -72,7 +72,7 @@ SensorScanGenerationNode::SensorScanGenerationNode(const rclcpp::NodeOptions & o
 
   rmw_qos_profile_t qos_profile = {
     RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-    1,
+    20,
     RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
     RMW_QOS_POLICY_DURABILITY_VOLATILE,
     RMW_QOS_DEADLINE_DEFAULT,
@@ -109,6 +109,7 @@ void SensorScanGenerationNode::odometryHandler(
       retired_instances_.insert(current_instance_id_);
     }
     has_previous_odometry_ = false;
+    twist_pose_history_.clear();
     current_instance_id_ = instance_id;
   }
   tf2::Transform tf_odom_to_lidar;
@@ -277,25 +278,39 @@ void SensorScanGenerationNode::publishOdometry(
   out.pose.pose.position.z = origin.z();
   out.pose.pose.orientation = tf2::toMsg(transform.getRotation());
 
-  if (has_previous_odometry_) {
-    const double dt = (stamp - previous_odom_stamp_).seconds();
-    if (dt > 1e-6) {
+  if (!twist_pose_history_.empty() && stamp < twist_pose_history_.back().stamp) {
+    twist_pose_history_.clear();
+  }
+  const TwistPoseSample * ref_sample = nullptr;
+  for (auto it = twist_pose_history_.rbegin(); it != twist_pose_history_.rend(); ++it) {
+    ref_sample = &(*it);
+    if ((stamp - it->stamp).seconds() >= 0.05) {
+      break;
+    }
+  }
+  if (ref_sample != nullptr) {
+    const double dt = (stamp - ref_sample->stamp).seconds();
+    if (dt > 1e-4 && dt <= 0.5) {
       const tf2::Vector3 delta_world =
-        transform.getOrigin() - previous_odom_to_robot_base_.getOrigin();
+        transform.getOrigin() - ref_sample->pose.getOrigin();
       const tf2::Vector3 linear_velocity_world = delta_world / dt;
 
       const tf2::Matrix3x3 world_to_base(transform.getRotation().inverse());
       const tf2::Vector3 linear_velocity_base = world_to_base * linear_velocity_world;
 
       const tf2::Quaternion q_diff =
-        transform.getRotation() * previous_odom_to_robot_base_.getRotation().inverse();
+        transform.getRotation() * ref_sample->pose.getRotation().inverse();
       tf2::Vector3 angular_axis = q_diff.getAxis();
       if (
         !std::isfinite(angular_axis.x()) || !std::isfinite(angular_axis.y()) ||
         !std::isfinite(angular_axis.z())) {
         angular_axis = tf2::Vector3(0.0, 0.0, 0.0);
       }
-      const tf2::Vector3 angular_velocity_world = angular_axis * (q_diff.getAngle() / dt);
+      double angle = q_diff.getAngle();
+      if (angle > M_PI) {
+        angle -= 2.0 * M_PI;
+      }
+      const tf2::Vector3 angular_velocity_world = angular_axis * (angle / dt);
       const tf2::Vector3 angular_velocity_base = world_to_base * angular_velocity_world;
 
       out.twist.twist.linear.x = linear_velocity_base.x();
@@ -307,6 +322,12 @@ void SensorScanGenerationNode::publishOdometry(
     }
   }
 
+  twist_pose_history_.push_back(TwistPoseSample{stamp, transform});
+  while (twist_pose_history_.size() > 2U &&
+    (stamp - twist_pose_history_.front().stamp).seconds() > 0.12)
+  {
+    twist_pose_history_.pop_front();
+  }
   previous_odom_to_robot_base_ = transform;
   previous_odom_stamp_ = stamp;
   has_previous_odometry_ = true;

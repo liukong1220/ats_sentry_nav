@@ -71,6 +71,19 @@ extern int orig_odom_freq;
 extern double online_refine_time;  //unit: s
 extern double time_update_last, time_current, time_predict_last_const, t_last;
 
+// O5a: batch EKF update, adaptive surf thinning, IMU soft saturation, and high-rate IMU odom.
+extern int batch_update_size;
+extern double batch_max_dt_sec;
+extern int mapping_max_iter;
+extern bool adaptive_downsample_en;
+extern int max_surf_points;
+extern bool satu_soft_degrade_en;
+extern double satu_soft_ratio;
+extern double satu_inflate_scale;
+extern bool imu_odom_en;
+extern double imu_odom_rate_hz;
+extern double imu_odom_blend_tau_s;
+
 extern MeasureGroup Measures;
 
 void readParameters(std::shared_ptr<rclcpp::Node> & n);

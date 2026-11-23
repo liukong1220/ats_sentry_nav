@@ -222,6 +222,19 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("height_filter.enable", false);
   this->declare_parameter("height_filter.min_z", -0.5);
   this->declare_parameter("height_filter.max_z", 2.5);
+  this->declare_parameter("local_submap.enable", local_submap_enable_);
+  this->declare_parameter("local_submap.radius_m", local_submap_radius_m_);
+  this->declare_parameter("local_submap.recenter_distance_m", local_submap_recenter_distance_m_);
+  this->declare_parameter(
+    "local_submap.min_points", static_cast<std::int64_t>(local_submap_min_points_));
+  this->declare_parameter(
+    "degeneracy.weak_translation_eigenvalue", weak_translation_eigenvalue_threshold_);
+  this->declare_parameter("degeneracy.weak_yaw_eigenvalue", weak_yaw_eigenvalue_threshold_);
+  this->declare_parameter("scan_context.enable", scan_context_enable_);
+  this->declare_parameter("scan_context.grid_step_xy", 2.0);
+  this->declare_parameter("scan_context.max_radius_m", 15.0);
+  this->declare_parameter("scan_context.top_k", scan_context_top_k_);
+  this->declare_parameter("scan_context.max_distance", scan_context_max_distance_);
 
   this->get_parameter("num_threads", num_threads_);
   this->get_parameter("recovery_num_threads", recovery_num_threads_);
@@ -371,6 +384,29 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("height_filter.max_z", height_max_z);
   height_filter_min_z_ = static_cast<float>(height_min_z);
   height_filter_max_z_ = static_cast<float>(std::max(height_min_z + 1e-3, height_max_z));
+  this->get_parameter("local_submap.enable", local_submap_enable_);
+  this->get_parameter("local_submap.radius_m", local_submap_radius_m_);
+  local_submap_radius_m_ = std::max(4.0, local_submap_radius_m_);
+  this->get_parameter("local_submap.recenter_distance_m", local_submap_recenter_distance_m_);
+  local_submap_recenter_distance_m_ = std::max(0.5, local_submap_recenter_distance_m_);
+  std::int64_t submap_min_pts = static_cast<std::int64_t>(local_submap_min_points_);
+  this->get_parameter("local_submap.min_points", submap_min_pts);
+  local_submap_min_points_ = static_cast<std::size_t>(std::max<std::int64_t>(100, submap_min_pts));
+  this->get_parameter(
+    "degeneracy.weak_translation_eigenvalue", weak_translation_eigenvalue_threshold_);
+  weak_translation_eigenvalue_threshold_ = std::max(0.0, weak_translation_eigenvalue_threshold_);
+  this->get_parameter("degeneracy.weak_yaw_eigenvalue", weak_yaw_eigenvalue_threshold_);
+  weak_yaw_eigenvalue_threshold_ = std::max(0.0, weak_yaw_eigenvalue_threshold_);
+
+  ScanContextConfig sc_cfg;
+  this->get_parameter("scan_context.enable", scan_context_enable_);
+  this->get_parameter("scan_context.grid_step_xy", sc_cfg.grid_step_xy_m);
+  this->get_parameter("scan_context.max_radius_m", sc_cfg.max_radius_m);
+  this->get_parameter("scan_context.top_k", scan_context_top_k_);
+  scan_context_top_k_ = std::clamp(scan_context_top_k_, 1, 16);
+  this->get_parameter("scan_context.max_distance", scan_context_max_distance_);
+  scan_context_max_distance_ = std::clamp(scan_context_max_distance_, 0.05, 1.0);
+  scan_context_db_.setConfig(sc_cfg);
 
   coarse_max_iterations_ = std::max(1, coarse_max_iterations_);
   fine_max_iterations_ = std::max(1, fine_max_iterations_);
@@ -457,6 +493,13 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
 
   target_tree_ = std::make_shared<small_gicp::KdTree<pcl::PointCloud<pcl::PointCovariance>>>(
     target_, small_gicp::KdTreeBuilderOMP(recovery_num_threads_));
+  if (scan_context_enable_ && target_ && !target_->empty()) {
+    scan_context_db_.buildFromCloud(target_->points);
+    RCLCPP_INFO(
+      this->get_logger(), "【ScanContext数据库就绪】锚点数=%zu 步长=%.2fm 半径=%.1fm",
+      scan_context_db_.size(), scan_context_db_.config().grid_step_xy_m,
+      scan_context_db_.config().max_radius_m);
+  }
   }
 
   pcd_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -539,6 +582,10 @@ void SmallGicpRelocalizationNode::rebuildGrowingTarget()
   small_gicp::estimate_covariances_omp(*target_, num_neighbors_, recovery_num_threads_);
   target_tree_ = std::make_shared<PointKdTree>(
     target_, small_gicp::KdTreeBuilderOMP(recovery_num_threads_));
+  submap_center_xy_.reset();
+  if (scan_context_enable_ && target_ && target_->size() >= local_submap_min_points_) {
+    scan_context_db_.buildFromCloud(target_->points);
+  }
   RCLCPP_INFO(get_logger(), "S3 growing map target=%zu dropped=%zu (fusion-committed growth)",
     target_->size(), growing_map_->dropped());
 }
@@ -656,9 +703,13 @@ bool SmallGicpRelocalizationNode::isRecoveringLocalization() const
     return !has_accepted_alignment_ || need_coarse_alignment_;
   }
   using LS = ats_navigation_interfaces::msg::LocalizationStatus;
+  // 已锁定先验地图后的短暂 STATE_DEGRADED（如穿隧道时连续数帧 fine_only 未收敛）
+  // 仍由高精度 Point-LIO 维持 map->odom，不应升级为 1.73 m 大半径 coarse 搜墙；
+  // 只有真正 LOST、冷启动或由 LOST 进入的 RELOCALIZING 才进入恢复态。
   return localization_state_ == LS::STATE_UNINITIALIZED || localization_state_ == LS::STATE_LOST ||
-         localization_state_ == LS::STATE_BOOTSTRAP || localization_state_ == LS::STATE_DEGRADED ||
-         localization_state_ == LS::STATE_RELOCALIZING || !has_accepted_alignment_;
+         localization_state_ == LS::STATE_BOOTSTRAP ||
+         (localization_state_ == LS::STATE_RELOCALIZING && recovery_from_lost_) ||
+         !has_accepted_alignment_;
 }
 
 bool SmallGicpRelocalizationNode::inInitialPoseForceWindow() const
@@ -770,6 +821,41 @@ void SmallGicpRelocalizationNode::preprocessAccumulatedSource(int num_threads)
   }
 }
 
+void SmallGicpRelocalizationNode::updateTrackingSubmap(const Eigen::Vector2d & center_xy)
+{
+  if (!local_submap_enable_ || !target_ || target_->empty() || !center_xy.allFinite()) {
+    return;
+  }
+  if (submap_center_xy_ && submap_target_ && submap_target_tree_ &&
+    (center_xy - *submap_center_xy_).norm() < local_submap_recenter_distance_m_)
+  {
+    return;
+  }
+  const double r2 = local_submap_radius_m_ * local_submap_radius_m_;
+  auto cropped = std::make_shared<PointCovarianceCloud>();
+  cropped->points.reserve(std::min<std::size_t>(target_->size(), 8192U));
+  for (const auto & pt : target_->points) {
+    const double dx = static_cast<double>(pt.x) - center_xy.x();
+    const double dy = static_cast<double>(pt.y) - center_xy.y();
+    if (dx * dx + dy * dy <= r2) {
+      cropped->points.push_back(pt);
+    }
+  }
+  cropped->width = static_cast<std::uint32_t>(cropped->points.size());
+  cropped->height = 1;
+  cropped->is_dense = true;
+  if (cropped->points.size() < local_submap_min_points_) {
+    submap_target_.reset();
+    submap_target_tree_.reset();
+    submap_center_xy_.reset();
+    return;
+  }
+  submap_target_ = std::move(cropped);
+  submap_target_tree_ = std::make_shared<PointKdTree>(
+    submap_target_, small_gicp::KdTreeBuilderOMP(num_threads_));
+  submap_center_xy_ = center_xy;
+}
+
 SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::alignOnce(
   const Eigen::Isometry3d & initial_guess, float max_dist_sq, int max_iterations,
   int num_threads) const
@@ -779,8 +865,31 @@ SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::al
     attempt.reject_reason = "registration inputs unavailable";
     return attempt;
   }
-  return alignOnceOn(
-    initial_guess, max_dist_sq, max_iterations, source_, source_tree_, *register_, num_threads);
+  const bool use_submap = local_submap_enable_ && !isRecoveringLocalization() &&
+    !preferMultiGuess() && submap_target_ && submap_target_tree_;
+  const auto & active_target = use_submap ? submap_target_ : target_;
+  const auto & active_tree = use_submap ? submap_target_tree_ : target_tree_;
+  RegistrationAttempt attempt;
+  if (!source_ || !source_tree_ || !active_target || !active_tree) {
+    attempt.reject_reason = "registration inputs unavailable";
+    return attempt;
+  }
+  register_->reduction.num_threads = num_threads;
+  register_->rejector.max_dist_sq = max_dist_sq;
+  register_->optimizer.max_iterations = max_iterations;
+  const auto result = register_->align(*active_target, *source_, *active_tree, initial_guess);
+  attempt.converged = result.converged;
+  attempt.iterations = result.iterations;
+  attempt.num_inliers = result.num_inliers;
+  attempt.registration_error = normalizedRegistrationError(result.error, result.num_inliers);
+  attempt.transform = result.T_target_source;
+  attempt.information = result.H;
+  attempt.overlap_ratio = source_->empty()
+    ? 0.0
+    : static_cast<double>(result.num_inliers) / static_cast<double>(source_->size());
+  fillInformationMetrics(
+    result.H, attempt.min_information_eigenvalue, attempt.information_condition_number);
+  return attempt;
 }
 
 SmallGicpRelocalizationNode::RegistrationAttempt SmallGicpRelocalizationNode::alignOnceOn(
@@ -1086,8 +1195,29 @@ SmallGicpRelocalizationNode::runMultiGuessAlignmentOn(
     }
   }
 
-  const auto candidates =
+  auto candidates =
     buildLayeredCandidateLattice(request.seed, latticeConfig(), &outcome.lattice);
+  if (!request.descriptor_seeds.empty()) {
+    std::vector<Eigen::Isometry3d> combined;
+    combined.reserve(request.descriptor_seeds.size() + candidates.size());
+    for (const auto & sc_seed : request.descriptor_seeds) {
+      combined.push_back(sc_seed);
+    }
+    for (const auto & cand : candidates) {
+      bool dup = false;
+      for (const auto & sc_seed : request.descriptor_seeds) {
+        if (sameCandidate(cand, sc_seed, 0.20, 0.15)) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        combined.push_back(cand);
+      }
+    }
+    candidates.swap(combined);
+    outcome.lattice.generated = candidates.size();
+  }
   const std::size_t total = candidates.size();
   if (total == 0) {
     return outcome;
@@ -1400,8 +1530,12 @@ SmallGicpRelocalizationNode::runCoarseFineAlignment(
   const Eigen::Isometry3d & initial_guess, bool allow_unconverged)
 {
   const int num_threads = registration_num_threads_;
+  const bool coarse_allowed_by_state = !follow_localization_status_ ||
+                                       isRecoveringLocalization() ||
+                                       inInitialPoseForceWindow();
   const bool coarse_required = !fine_alignment_enabled_ || !coarse_first_window_only_ ||
-                               need_coarse_alignment_ || !has_accepted_alignment_;
+                               !has_accepted_alignment_ ||
+                               (need_coarse_alignment_ && coarse_allowed_by_state);
 
   RegistrationAttempt attempt;
   if (coarse_required || !fine_alignment_enabled_) {
@@ -1478,6 +1612,13 @@ void SmallGicpRelocalizationNode::performRegistration()
     return;
   }
 
+  if (local_submap_enable_ && !isRecoveringLocalization()) {
+    if (const auto odom_to_base = getOdomToRobotBase(last_scan_time_)) {
+      const Eigen::Isometry3d est_map_base = previous_result_t_ * *odom_to_base;
+      updateTrackingSubmap(est_map_base.translation().head<2>());
+    }
+  }
+
   RegistrationAttempt attempt = runCoarseFineAlignment(previous_result_t_, simRelaxAllowed());
   const CandidateEvidence evidence = attemptEvidence(
     attempt, previous_result_t_, last_hypothesis_, getOdomToRobotBase(last_scan_time_));
@@ -1527,6 +1668,40 @@ void SmallGicpRelocalizationNode::startAsyncMultiGuess()
   request.source_points = source_ ? source_->size() : 0;
   request.num_threads = registration_num_threads_;
   request.current_odom_to_base = getOdomToRobotBase(last_scan_time_);
+  if (scan_context_enable_ && !scan_context_db_.empty() &&
+    !request.confirmation_recheck && !request.seed_first &&
+    request.current_odom_to_base && source_ && !source_->empty())
+  {
+    const Eigen::Isometry3d base_from_odom = request.current_odom_to_base->inverse();
+    PointCovarianceCloud local_cloud;
+    local_cloud.points.reserve(source_->points.size());
+    for (const auto & pt : source_->points) {
+      const Eigen::Vector3d pb =
+        base_from_odom * Eigen::Vector3d(pt.x, pt.y, pt.z);
+      pcl::PointCovariance qpt = pt;
+      qpt.x = static_cast<float>(pb.x());
+      qpt.y = static_cast<float>(pb.y());
+      qpt.z = static_cast<float>(pb.z());
+      local_cloud.points.push_back(qpt);
+    }
+    const auto matches = scan_context_db_.queryRobotCentricCloud(
+      local_cloud.points, static_cast<std::size_t>(scan_context_top_k_),
+      scan_context_max_distance_);
+    for (const auto & m : matches) {
+      Eigen::Isometry3d map_to_base = Eigen::Isometry3d::Identity();
+      map_to_base.translation() << m.x, m.y, request.seed.translation().z();
+      map_to_base.linear() =
+        Eigen::AngleAxisd(m.yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      request.descriptor_seeds.push_back(map_to_base * base_from_odom);
+    }
+    if (!request.descriptor_seeds.empty()) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), log_throttle_ms_,
+        "【ScanContext召回】LOST 候选种子=%zu 最佳距离=%.3f 首选=(%.2f,%.2f,%.2f)",
+        request.descriptor_seeds.size(), matches.front().distance,
+        matches.front().x, matches.front().y, matches.front().yaw);
+    }
+  }
   if (
     last_hypothesis_ && last_hypothesis_time_ &&
     (last_scan_time_ - *last_hypothesis_time_).seconds() <= motion_reference_max_age_s_) {
@@ -1723,7 +1898,15 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
     // (straight190: pending@3.9s then fine_only wipe@5.7s).
     if (!pending_confirmation_) {
       clearConfirmation();
-      need_coarse_alignment_ = true;
+      if (!has_accepted_alignment_ || isRecoveringLocalization() || !follow_localization_status_) {
+        need_coarse_alignment_ = true;
+      }
+    } else if (!pending_holds_lattice_origin_ &&
+               attempt.reject_reason == "confirmation_recheck drifted from pending seed") {
+      // 已锁定跟踪期（非 LOST 格点恢复）若 confirmation_recheck 偏离旧 pending seed
+      // （例如隧道内单帧轴向滑移污染了 pending），立即清掉坏锚点，避免空耗 10 s 确认超时；
+      // 仍严格要求后续重新形成两次连续一致确认，不放宽任何验收门。
+      clearConfirmation();
     }
     publishObservation(
       scan_time, false, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
@@ -1900,15 +2083,17 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
       need_coarse_alignment_ = false;
     } else {
       need_coarse_alignment_ = localization_state_ == LS::STATE_LOST ||
-                               localization_state_ == LS::STATE_DEGRADED ||
-                               localization_state_ == LS::STATE_RELOCALIZING;
+                               (localization_state_ == LS::STATE_RELOCALIZING && recovery_from_lost_);
     }
   }
 
+  const Se2DirectionalInformation se2_info = computeSe2SchurInformation(
+    attempt.information, result_t_, *odom_to_robot_base,
+    weak_translation_eigenvalue_threshold_, weak_yaw_eigenvalue_threshold_);
   publishObservation(
     scan_time, true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
     "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
-    result_t_ * *odom_to_robot_base, covariance);
+    result_t_ * *odom_to_robot_base, covariance, se2_info);
   if (mapping_mode_) {
     growing_pending_source_.clear();
     for (const auto & p : source_->points) {growing_pending_source_.push_back({p.x, p.y, p.z});}
@@ -1963,7 +2148,8 @@ void SmallGicpRelocalizationNode::publishObservation(
   const rclcpp::Time & scan_time, bool accepted, std::uint8_t status,
   const std::string & message, std::size_t inliers,
   double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
-  const std::array<double, 36> & covariance)
+  const std::array<double, 36> & covariance,
+  const Se2DirectionalInformation & se2_info)
 {
   if (!observation_pub_) {
     return;
@@ -2015,6 +2201,11 @@ void SmallGicpRelocalizationNode::publishObservation(
   observation.pose.pose.orientation.w = rotation.w();
 
   observation.pose.covariance = covariance;
+  observation.se2_information = se2_info.se2_information;
+  observation.min_se2_eigenvalue = se2_info.min_se2_eigenvalue;
+  observation.weak_direction_x = se2_info.weak_direction_x;
+  observation.weak_direction_y = se2_info.weak_direction_y;
+  observation.degeneracy_mask = se2_info.degeneracy_mask;
 
   observation_pub_->publish(observation);
 }

@@ -128,13 +128,12 @@ void h_model_output(
     ekfom_data.valid = false;
     return;
   }
+  const int active_cols = extrinsic_est_en ? 12 : 6;
   ekfom_data.M_Noise = laser_point_cov;
-  ekfom_data.h_x.resize(effect_num_k, 12);
-  ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_num_k, 12);
+  ekfom_data.h_x.resize(effect_num_k, active_cols);
   ekfom_data.z.resize(effect_num_k);
   int m = 0;
   for (int j = 0; j < time_seq[k]; j++) {
-    // ekfom_data.converge = false;
     if (point_selected_surf[idx + j + 1]) {
       V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
       if (extrinsic_est_en) {
@@ -149,11 +148,11 @@ void h_model_output(
         ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
           VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
       } else {
-        M3D point_crossmat = crossmat_list[idx + j + 1];
-        V3D C(s.rot.transpose() * norm_vec);  // conjugate().normalized()
+        const M3D & point_crossmat = crossmat_list[idx + j + 1];
+        V3D C(s.rot.transpose() * norm_vec);
         V3D A(point_crossmat * C);
-        ekfom_data.h_x.block<1, 12>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
-          VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+        ekfom_data.h_x.block<1, 6>(m, 0) << norm_vec(0), norm_vec(1), norm_vec(2),
+          VEC_FROM_ARRAY(A);
       }
       ekfom_data.z(m) = -norm_vec(0) * feats_down_world->points[idx + j + 1].x -
                         norm_vec(1) * feats_down_world->points[idx + j + 1].y -
@@ -174,35 +173,25 @@ void h_model_IMU_output(state_output & s, esekfom::dyn_share_modified<double> & 
   ekfom_data.R_IMU << imu_meas_omg_cov, imu_meas_omg_cov, imu_meas_omg_cov, imu_meas_acc_cov,
     imu_meas_acc_cov, imu_meas_acc_cov;
   if (check_satu) {
-    if (fabs(angvel_avr(0)) >= 0.99 * satu_gyro) {
-      ekfom_data.satu_check[0] = true;
-      ekfom_data.z_IMU(0) = 0.0;
-    }
-
-    if (fabs(angvel_avr(1)) >= 0.99 * satu_gyro) {
-      ekfom_data.satu_check[1] = true;
-      ekfom_data.z_IMU(1) = 0.0;
-    }
-
-    if (fabs(angvel_avr(2)) >= 0.99 * satu_gyro) {
-      ekfom_data.satu_check[2] = true;
-      ekfom_data.z_IMU(2) = 0.0;
-    }
-
-    if (fabs(acc_avr(0)) >= 0.99 * satu_acc) {
-      ekfom_data.satu_check[3] = true;
-      ekfom_data.z_IMU(3) = 0.0;
-    }
-
-    if (fabs(acc_avr(1)) >= 0.99 * satu_acc) {
-      ekfom_data.satu_check[4] = true;
-      ekfom_data.z_IMU(4) = 0.0;
-    }
-
-    if (fabs(acc_avr(2)) >= 0.99 * satu_acc) {
-      ekfom_data.satu_check[5] = true;
-      ekfom_data.z_IMU(5) = 0.0;
-    }
+    const auto apply_axis_satu = [&](int axis, double raw_abs, double limit) {
+      if (limit <= 1e-6) {
+        return;
+      }
+      if (raw_abs >= 0.99 * limit) {
+        ekfom_data.satu_check[axis] = true;
+        ekfom_data.z_IMU(axis) = 0.0;
+      } else if (satu_soft_degrade_en && raw_abs > satu_soft_ratio * limit) {
+        const double span = std::max(1e-3, (0.99 - satu_soft_ratio) * limit);
+        const double u = std::clamp((raw_abs - satu_soft_ratio * limit) / span, 0.0, 1.0);
+        ekfom_data.R_IMU(axis) *= (1.0 + satu_inflate_scale * u * u);
+      }
+    };
+    apply_axis_satu(0, std::fabs(angvel_avr(0)), satu_gyro);
+    apply_axis_satu(1, std::fabs(angvel_avr(1)), satu_gyro);
+    apply_axis_satu(2, std::fabs(angvel_avr(2)), satu_gyro);
+    apply_axis_satu(3, std::fabs(acc_avr(0)), satu_acc);
+    apply_axis_satu(4, std::fabs(acc_avr(1)), satu_acc);
+    apply_axis_satu(5, std::fabs(acc_avr(2)), satu_acc);
   }
 }
 

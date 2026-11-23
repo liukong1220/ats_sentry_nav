@@ -11,6 +11,7 @@ bool timediff_set_flg = false;
 V3D gravity_lio = V3D::Zero();
 mutex mtx_buffer;
 sensor_msgs::msg::Imu imu_last, imu_next;
+std::function<void(const sensor_msgs::msg::Imu &)> g_imu_forward_odom_hook;
 // sensor_msgs::msg::Imu::ConstSharedPtr imu_last_ptr;
 
 condition_variable sig_buffer;
@@ -72,6 +73,9 @@ void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr & msg_in)
   }
   imu_deque.emplace_back(msg);
   last_timestamp_imu = timestamp;
+  if (g_imu_forward_odom_hook) {
+    g_imu_forward_odom_hook(*msg);
+  }
   // mtx_buffer.unlock();
   // sig_buffer.notify_all();
 }

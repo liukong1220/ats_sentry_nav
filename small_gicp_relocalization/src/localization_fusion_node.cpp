@@ -181,6 +181,14 @@ public:
       1.0, declare_parameter<double>("status_publish_rate_hz", 10.0));
     degrade_on_out_of_order_odom_ =
       declare_parameter<bool>("degrade_on_out_of_order_odom", false);
+    directional_fusion_config_.enable =
+      declare_parameter<bool>("directional_fusion.enable", true);
+    directional_fusion_config_.weak_axis_damping = std::clamp(
+      declare_parameter<double>("directional_fusion.weak_axis_damping", 0.0), 0.0, 1.0);
+    directional_fusion_config_.weak_yaw_damping = std::clamp(
+      declare_parameter<double>("directional_fusion.weak_yaw_damping", 0.2), 0.0, 1.0);
+    directional_fusion_config_.max_strong_nis = std::max(
+      0.0, declare_parameter<double>("directional_fusion.max_strong_nis", 36.0));
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     localization_pub_ =
@@ -390,6 +398,12 @@ private:
       if (latest_odom_stamp_ && stamp == *latest_odom_stamp_) {
         return;
       }
+      const bool is_first_odom = !last_odom_receive_time_.has_value();
+      const auto prev_status = status_;
+      const auto prev_epoch = epoch_;
+      const auto prev_odom_instance = odom_instance_tracker_.instance();
+      const auto prev_odom_epoch = odom_instance_tracker_.epoch();
+      const bool prev_latched = odom_instance_tracker_.latched();
       latest_odom_stamp_ = stamp;
       last_odom_receive_time_ = std::chrono::steady_clock::now();
       if (!observation_clock_start_) {
@@ -398,7 +412,13 @@ private:
       odom_history_.push_back(OdomPoseSample{stamp, poseToTransform(localization.pose.pose)});
       pruneHistoryLocked();
       updateHealthLocked();
-      publishStatusLocked();
+      if (is_first_odom || status_ != prev_status || epoch_ != prev_epoch ||
+        odom_instance_tracker_.instance() != prev_odom_instance ||
+        odom_instance_tracker_.epoch() != prev_odom_epoch ||
+        odom_instance_tracker_.latched() != prev_latched)
+      {
+        publishStatusLocked();
+      }
     }
     // /localization 保持连续 odom 状态；全局修正只通过唯一 map->odom 表达。
     localization_pub_->publish(localization);
@@ -512,8 +532,27 @@ private:
     }
 
 
-    const tf2::Transform candidate_map_to_odom =
-      poseToTransform(message->pose.pose) * odom_to_base->inverse();
+    const tf2::Transform observed_map_to_base = poseToTransform(message->pose.pose);
+    tf2::Transform candidate_map_to_odom = observed_map_to_base * odom_to_base->inverse();
+    if (has_map_to_odom_ && !lost_latched_ && directional_fusion_config_.enable) {
+      const DirectionalFusionResult dir_result = applyDirectionalDegeneracyFusion(
+        map_to_odom_, observed_map_to_base, *odom_to_base, message->pose.covariance,
+        message->degeneracy_mask, message->weak_direction_x, message->weak_direction_y,
+        directional_fusion_config_);
+      if (!dir_result.accepted) {
+        recordRejectionLocked(dir_result.reject_reason, true);
+        publishStatusLocked();
+        return;
+      }
+      candidate_map_to_odom = dir_result.filtered_map_to_odom;
+      if (dir_result.damped_weak_axis) {
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "【退化方向抑制】mask=%u weak_dir=(%.2f,%.2f) strong_nis=%.2f，仅融合可观测子空间修正。",
+          static_cast<unsigned>(message->degeneracy_mask),
+          message->weak_direction_x, message->weak_direction_y, dir_result.strong_nis);
+      }
+    }
     const std::optional<tf2::Transform> current_map_to_odom =
       has_map_to_odom_ ? std::optional<tf2::Transform>(map_to_odom_) : std::nullopt;
     const CorrectionUpdate correction = selectCorrectionUpdate(
@@ -806,6 +845,7 @@ private:
   double max_registration_error_{-1.0};
   double status_publish_rate_hz_{10.0};
   bool degrade_on_out_of_order_odom_{false};
+  DirectionalFusionConfig directional_fusion_config_;
 
   std::mutex mutex_;
   OdomInstanceTracker odom_instance_tracker_;

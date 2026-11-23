@@ -18,8 +18,10 @@
 // 重定位候选调度与评分的纯逻辑核心。这里只放不依赖 ROS 节点状态的函数，
 // 以便用 gtest 锁定“候选覆盖公平性、非有限误差语义、硬门、组合评分与歧义拒绝”。
 
+#include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -630,6 +632,114 @@ inline ConfirmationDecision evaluateConfirmation(
   }
   decision.consistent = true;
   return decision;
+}
+
+struct Se2DirectionalInformation
+{
+  std::array<double, 9> se2_information{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+  double min_se2_eigenvalue{0.0};
+  double min_translation_eigenvalue{0.0};
+  double yaw_marginal_information{0.0};
+  double weak_direction_x{1.0};
+  double weak_direction_y{0.0};
+  std::uint8_t degeneracy_mask{0U};
+};
+
+/// 将 small_gicp 在 odom 原点处的右扰动 6x6 Hessian [rx, ry, rz, tx, ty, tz]
+/// 精确换算到机器人底盘中心、map 系下的 [dx_b, dy_b, dz_b, dphi_x, dphi_y, dpsi_z]，
+/// 消除 odom 原点长力臂耦合，再对高度/横滚/俯仰做 Schur 补得到平面 SE(2) [x, y, yaw] 信息矩阵。
+inline Se2DirectionalInformation computeSe2SchurInformation(
+  const Eigen::Matrix<double, 6, 6> & information_gicp,
+  const Eigen::Isometry3d & map_to_odom,
+  const Eigen::Isometry3d & odom_to_base,
+  double weak_translation_threshold = 25.0,
+  double weak_yaw_threshold = 15.0)
+{
+  Se2DirectionalInformation out;
+  if (!information_gicp.allFinite() || !map_to_odom.matrix().allFinite() ||
+    !odom_to_base.matrix().allFinite())
+  {
+    return out;
+  }
+
+  const Eigen::Matrix3d R_mo = map_to_odom.rotation();
+  const Eigen::Matrix3d R_om = R_mo.transpose();
+  const Eigen::Vector3d p_ob = odom_to_base.translation();
+  Eigen::Matrix3d p_ob_skew;
+  p_ob_skew << 0.0, -p_ob.z(), p_ob.y(),
+               p_ob.z(), 0.0, -p_ob.x(),
+               -p_ob.y(), p_ob.x(), 0.0;
+
+  // Columns of T: [dx_b, dy_b, dz_b, dphi_x, dphi_y, dpsi_z] in map frame
+  // Rows of T:    [dwx, dwy, dwz, dvx, dvy, dvz] right perturbation on T_map_odom
+  Eigen::Matrix<double, 6, 6> T = Eigen::Matrix<double, 6, 6>::Zero();
+  T.block<3, 3>(0, 3) = R_om;
+  T.block<3, 3>(3, 0) = R_om;
+  T.block<3, 3>(3, 3) = p_ob_skew * R_om;
+
+  const Eigen::Matrix<double, 6, 6> H_sym = 0.5 * (information_gicp + information_gicp.transpose());
+  const Eigen::Matrix<double, 6, 6> H_base = 0.5 * (T.transpose() * H_sym * T +
+    (T.transpose() * H_sym * T).transpose());
+
+  constexpr std::array<int, 3> idx_a{{0, 1, 5}};  // [x, y, yaw]
+  constexpr std::array<int, 3> idx_b{{2, 3, 4}};  // [z, roll, pitch]
+  Eigen::Matrix3d H_aa;
+  Eigen::Matrix3d H_ab;
+  Eigen::Matrix3d H_bb;
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      H_aa(r, c) = H_base(idx_a[r], idx_a[c]);
+      H_ab(r, c) = H_base(idx_a[r], idx_b[c]);
+      H_bb(r, c) = H_base(idx_b[r], idx_b[c]);
+    }
+  }
+  H_bb.diagonal().array() += 1e-6;
+  Eigen::Matrix3d lambda_se2 = H_aa - H_ab * H_bb.ldlt().solve(H_ab.transpose());
+  lambda_se2 = 0.5 * (lambda_se2 + lambda_se2.transpose());
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> se2_solver(lambda_se2);
+  if (se2_solver.info() != Eigen::Success || !se2_solver.eigenvalues().allFinite()) {
+    return out;
+  }
+  Eigen::Vector3d evals = se2_solver.eigenvalues().cwiseMax(0.0);
+  lambda_se2 = se2_solver.eigenvectors() * evals.asDiagonal() *
+    se2_solver.eigenvectors().transpose();
+  out.min_se2_eigenvalue = evals.minCoeff();
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      out.se2_information[static_cast<std::size_t>(3 * r + c)] = lambda_se2(r, c);
+    }
+  }
+
+  const double lambda_psi_raw = std::max(1e-6, lambda_se2(2, 2));
+  Eigen::Matrix2d lambda_xy =
+    lambda_se2.block<2, 2>(0, 0) -
+    (lambda_se2.block<2, 1>(0, 2) * lambda_se2.block<1, 2>(2, 0)) / lambda_psi_raw;
+  lambda_xy = 0.5 * (lambda_xy + lambda_xy.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> xy_solver(lambda_xy);
+  if (xy_solver.info() == Eigen::Success && xy_solver.eigenvalues().allFinite()) {
+    out.min_translation_eigenvalue = std::max(0.0, xy_solver.eigenvalues()(0));
+    const Eigen::Vector2d v_min = xy_solver.eigenvectors().col(0).normalized();
+    if (v_min.allFinite()) {
+      out.weak_direction_x = v_min.x();
+      out.weak_direction_y = v_min.y();
+    }
+    if (weak_translation_threshold > 0.0 &&
+      out.min_translation_eigenvalue < weak_translation_threshold)
+    {
+      out.degeneracy_mask |= 1U;
+    }
+  }
+
+  Eigen::Matrix2d h_xy = lambda_se2.block<2, 2>(0, 0);
+  h_xy.diagonal().array() += 1e-6;
+  out.yaw_marginal_information = std::max(
+    0.0, lambda_se2(2, 2) -
+      (lambda_se2.block<1, 2>(2, 0) * h_xy.ldlt().solve(lambda_se2.block<2, 1>(0, 2)))(0, 0));
+  if (weak_yaw_threshold > 0.0 && out.yaw_marginal_information < weak_yaw_threshold) {
+    out.degeneracy_mask |= 2U;
+  }
+  return out;
 }
 
 }  // namespace small_gicp_relocalization

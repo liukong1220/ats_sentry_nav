@@ -15,7 +15,9 @@
 #ifndef SMALL_GICP_RELOCALIZATION__LOCALIZATION_FUSION_CORE_HPP_
 #define SMALL_GICP_RELOCALIZATION__LOCALIZATION_FUSION_CORE_HPP_
 
+#include <Eigen/Dense>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -185,6 +187,126 @@ inline CorrectionUpdate selectCorrectionUpdate(
     update.map_to_odom = candidate;
   }
   return update;
+}
+
+struct DirectionalFusionConfig
+{
+  bool enable{true};
+  double weak_axis_damping{0.0};
+  double weak_yaw_damping{0.2};
+  double max_strong_nis{36.0};
+};
+
+struct DirectionalFusionResult
+{
+  bool accepted{true};
+  bool damped_weak_axis{false};
+  double strong_nis{0.0};
+  tf2::Transform filtered_map_to_odom;
+  std::string reject_reason;
+};
+
+/// O5b: 在隧道/长走廊退化场景下，对不可观测弱轴方向上的修正做正交投影抑制，
+/// 同时对强可观测子空间执行归一化新息平方（NIS）门控，保留法向贴壁对齐并阻断轴向滑移。
+inline DirectionalFusionResult applyDirectionalDegeneracyFusion(
+  const tf2::Transform & current_map_to_odom,
+  const tf2::Transform & observed_map_to_base,
+  const tf2::Transform & odom_to_base,
+  const std::array<double, 36> & pose_covariance,
+  std::uint8_t degeneracy_mask,
+  double weak_dir_x,
+  double weak_dir_y,
+  const DirectionalFusionConfig & config)
+{
+  DirectionalFusionResult out;
+  out.filtered_map_to_odom = observed_map_to_base * odom_to_base.inverse();
+  if (!config.enable) {
+    return out;
+  }
+
+  const tf2::Transform pred_map_to_base = current_map_to_odom * odom_to_base;
+  const Eigen::Vector2d p_pred(
+    pred_map_to_base.getOrigin().x(), pred_map_to_base.getOrigin().y());
+  const Eigen::Vector2d p_obs(
+    observed_map_to_base.getOrigin().x(), observed_map_to_base.getOrigin().y());
+  Eigen::Vector2d dp = p_obs - p_pred;
+  const double yaw_pred = tf2::getYaw(pred_map_to_base.getRotation());
+  const double yaw_obs = tf2::getYaw(observed_map_to_base.getRotation());
+  double dyaw = std::atan2(std::sin(yaw_obs - yaw_pred), std::cos(yaw_obs - yaw_pred));
+
+  const bool weak_trans = (degeneracy_mask & 1U) != 0U;
+  const bool weak_yaw = (degeneracy_mask & 2U) != 0U;
+  Eigen::Vector2d u_weak(weak_dir_x, weak_dir_y);
+  if (!u_weak.allFinite() || u_weak.norm() < 1e-6) {
+    u_weak = Eigen::Vector2d(1.0, 0.0);
+  } else {
+    u_weak.normalize();
+  }
+  const Eigen::Vector2d u_strong(-u_weak.y(), u_weak.x());
+
+  // Extract calibrated SE(2) covariance on [x, y, yaw] (indices 0, 1, 5 of 6x6 PoseWithCovariance).
+  // Inflate covariance floor by realistic sensor/map discretization floor (0.04 m / 0.03 rad)
+  // so tight sub-millimeter GICP covariances do not over-reject valid tracking corrections.
+  constexpr std::array<int, 3> kIdx{{0, 1, 5}};
+  Eigen::Matrix3d cov_se2 = Eigen::Matrix3d::Zero();
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      cov_se2(r, c) = pose_covariance[static_cast<std::size_t>(6 * kIdx[r] + kIdx[c])];
+    }
+  }
+  cov_se2 = 0.5 * (cov_se2 + cov_se2.transpose());
+  cov_se2(0, 0) += 0.05 * 0.05;
+  cov_se2(1, 1) += 0.05 * 0.05;
+  cov_se2(2, 2) += 0.04 * 0.04;
+
+  if (config.max_strong_nis > 0.0 && cov_se2.allFinite()) {
+    if (weak_trans) {
+      const double r_perp = dp.dot(u_strong);
+      const double var_perp = std::max(
+        1e-4, (u_strong.transpose() * cov_se2.block<2, 2>(0, 0) * u_strong)(0, 0));
+      out.strong_nis = (r_perp * r_perp) / var_perp;
+      if (!weak_yaw) {
+        out.strong_nis += (dyaw * dyaw) / std::max(1e-4, cov_se2(2, 2));
+      }
+    } else {
+      Eigen::Vector3d r_vec(dp.x(), dp.y(), dyaw);
+      Eigen::LDLT<Eigen::Matrix3d> ldlt(cov_se2);
+      if (ldlt.info() == Eigen::Success) {
+        out.strong_nis = std::max(0.0, r_vec.dot(ldlt.solve(r_vec)));
+      }
+    }
+    if (std::isfinite(out.strong_nis) && out.strong_nis > config.max_strong_nis) {
+      out.accepted = false;
+      out.reject_reason = "relocalization observation failed strong-subspace NIS gate";
+      return out;
+    }
+  }
+
+  if (weak_trans || weak_yaw) {
+    if (weak_trans) {
+      const double damp = std::clamp(config.weak_axis_damping, 0.0, 1.0);
+      dp -= (1.0 - damp) * dp.dot(u_weak) * u_weak;
+      out.damped_weak_axis = true;
+    }
+    if (weak_yaw) {
+      const double damp_y = std::clamp(config.weak_yaw_damping, 0.0, 1.0);
+      dyaw *= damp_y;
+      out.damped_weak_axis = true;
+    }
+    double obs_roll = 0.0;
+    double obs_pitch = 0.0;
+    double obs_yaw_unused = 0.0;
+    tf2::Matrix3x3(observed_map_to_base.getRotation()).getRPY(obs_roll, obs_pitch, obs_yaw_unused);
+    tf2::Quaternion fused_q;
+    fused_q.setRPY(obs_roll, obs_pitch, yaw_pred + dyaw);
+    fused_q.normalize();
+    tf2::Transform fused_map_to_base;
+    fused_map_to_base.setOrigin(tf2::Vector3(
+      p_pred.x() + dp.x(), p_pred.y() + dp.y(), observed_map_to_base.getOrigin().z()));
+    fused_map_to_base.setRotation(fused_q);
+    out.filtered_map_to_odom = fused_map_to_base * odom_to_base.inverse();
+  }
+  return out;
 }
 
 }  // namespace small_gicp_relocalization

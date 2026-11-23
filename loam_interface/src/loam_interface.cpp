@@ -183,7 +183,11 @@ void LoamInterfaceNode::odometryCallback(const nav_msgs::msg::Odometry::ConstSha
     tf_odom_to_state_world_ * tf_world_to_state * tf_state_to_lidar_;
 
   std::lock_guard<std::mutex> lock(odom_buffer_mutex_);
-  odom_buffer_.push_back(OdomSample{rclcpp::Time(msg->header.stamp), tf_odom_to_lidar});
+  const rclcpp::Time sample_stamp(msg->header.stamp);
+  if (!odom_buffer_.empty() && sample_stamp < odom_buffer_.back().stamp) {
+    return;
+  }
+  odom_buffer_.push_back(OdomSample{sample_stamp, tf_odom_to_lidar});
   if (odom_buffer_.size() > max_odom_buffer_size_) {
     odom_buffer_.pop_front();
   }

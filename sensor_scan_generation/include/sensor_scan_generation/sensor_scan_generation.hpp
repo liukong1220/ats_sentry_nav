@@ -3,6 +3,7 @@
 #ifndef SENSOR_SCAN_GENERATION__SENSOR_SCAN_GENERATION_HPP_
 #define SENSOR_SCAN_GENERATION__SENSOR_SCAN_GENERATION_HPP_
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -86,6 +87,12 @@ private:
   bool has_lidar_to_base_ = false;
   tf2::Transform tf_odom_to_robot_base_;
   tf2::Transform tf_odom_to_chassis_;
+  struct TwistPoseSample
+  {
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+    tf2::Transform pose;
+  };
+  std::deque<TwistPoseSample> twist_pose_history_;
   tf2::Transform previous_odom_to_robot_base_;
   rclcpp::Time previous_odom_stamp_{0, 0, RCL_ROS_TIME};
   bool has_previous_odometry_ = false;

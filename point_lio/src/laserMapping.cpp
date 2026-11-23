@@ -129,33 +129,132 @@ void publish_frame_world(
   }
 }
 
-template <typename T>
-void set_posestamp(T & out)
+struct ImuForwardOdomState
 {
-  const auto & kf = kf_output;
-  out.position.x = kf.x_.pos(0);
-  out.position.y = kf.x_.pos(1);
-  out.position.z = kf.x_.pos(2);
-  Eigen::Quaterniond q(kf.x_.rot);
-  out.orientation.x = q.coeffs()[0];
-  out.orientation.y = q.coeffs()[1];
-  out.orientation.z = q.coeffs()[2];
-  out.orientation.w = q.coeffs()[3];
+  bool initialized = false;
+  double state_time = 0.0;
+  double last_pub_time = -1.0;
+  V3D pos = Zero3d;
+  M3D rot = Eye3d;
+  V3D vel = Zero3d;
+  V3D bg = Zero3d;
+  V3D ba = Zero3d;
+  V3D grav = Zero3d;
+  V3D omg_body = Zero3d;
+  V3D pos_corr = Zero3d;
+  V3D rot_corr = Zero3d;
+};
+
+ImuForwardOdomState g_imu_fwd;
+
+inline M3D projectSO3(const M3D & R)
+{
+  Eigen::Quaterniond q(R);
+  q.normalize();
+  return q.toRotationMatrix();
 }
 
-void publish_odometry(
+inline M3D so3ExpVec(const V3D & phi)
+{
+  const double theta = phi.norm();
+  if (theta < 1e-10) {
+    M3D skew;
+    skew << SKEW_SYM_MATRX(phi);
+    return M3D::Identity() + skew;
+  }
+  return Eigen::AngleAxisd(theta, phi / theta).toRotationMatrix();
+}
+
+inline V3D so3LogMat(const M3D & R)
+{
+  Eigen::AngleAxisd aa(R);
+  double angle = aa.angle();
+  if (!std::isfinite(angle)) {
+    return Zero3d;
+  }
+  while (angle > M_PI) angle -= 2.0 * M_PI;
+  while (angle < -M_PI) angle += 2.0 * M_PI;
+  return aa.axis() * angle;
+}
+
+inline void stepImuForwardState(
+  ImuForwardOdomState & st, const sensor_msgs::msg::Imu & imu_msg, bool decay_correction)
+{
+  const double t_imu = get_time_sec(imu_msg.header.stamp);
+  const double dt = t_imu - st.state_time;
+  if (!(dt > 0.0) || dt > 0.20) {
+    if (dt > 0.20) {
+      st.state_time = t_imu;
+    }
+    return;
+  }
+  V3D raw_omg(
+    imu_msg.angular_velocity.x, imu_msg.angular_velocity.y, imu_msg.angular_velocity.z);
+  V3D raw_acc(
+    imu_msg.linear_acceleration.x, imu_msg.linear_acceleration.y, imu_msg.linear_acceleration.z);
+  if (check_satu) {
+    for (int axis = 0; axis < 3; ++axis) {
+      if (satu_gyro > 1e-6 && std::fabs(raw_omg(axis)) >= 0.99 * satu_gyro) {
+        raw_omg(axis) = std::copysign(0.99 * satu_gyro, raw_omg(axis));
+      }
+      if (satu_acc > 1e-6 && std::fabs(raw_acc(axis)) >= 0.99 * satu_acc) {
+        raw_acc(axis) = std::copysign(0.99 * satu_acc, raw_acc(axis));
+      }
+    }
+  }
+  const V3D omg = raw_omg - st.bg;
+  const V3D acc_body = raw_acc * (G_m_s2 / std::max(1e-6, acc_norm)) - st.ba;
+  const M3D dR_half = so3ExpVec(omg * (0.5 * dt));
+  const M3D rot_mid = st.rot * dR_half;
+  const V3D acc_world = rot_mid * acc_body + st.grav;
+  st.pos += st.vel * dt + 0.5 * acc_world * (dt * dt);
+  st.vel += acc_world * dt;
+  st.rot = projectSO3(st.rot * so3ExpVec(omg * dt));
+  st.omg_body = omg;
+  st.state_time = t_imu;
+  if (decay_correction) {
+    if (imu_odom_blend_tau_s > 1e-4) {
+      const double decay = std::exp(-dt / imu_odom_blend_tau_s);
+      st.pos_corr *= decay;
+      st.rot_corr *= decay;
+    } else {
+      st.pos_corr.setZero();
+      st.rot_corr.setZero();
+    }
+  }
+}
+
+void publish_state_odometry(
+  double stamp_sec, const V3D & pos, const M3D & rot, const V3D & vel_world, const V3D & omg_body,
   const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & pubOdomAftMapped,
   const rclcpp::Publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr & identified_pub,
   const std::uint64_t instance_id)
 {
+  if (!(stamp_sec > g_imu_fwd.last_pub_time + 1e-7)) {
+    return;
+  }
+  g_imu_fwd.last_pub_time = stamp_sec;
+
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "body";
-  if (publish_odometry_without_downsample) {
-    odomAftMapped.header.stamp = get_ros_time(time_current);
-  } else {
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-  }
-  set_posestamp(odomAftMapped.pose.pose);
+  odomAftMapped.header.stamp = get_ros_time(stamp_sec);
+  odomAftMapped.pose.pose.position.x = pos(0);
+  odomAftMapped.pose.pose.position.y = pos(1);
+  odomAftMapped.pose.pose.position.z = pos(2);
+  Eigen::Quaterniond q(rot);
+  q.normalize();
+  odomAftMapped.pose.pose.orientation.x = q.coeffs()[0];
+  odomAftMapped.pose.pose.orientation.y = q.coeffs()[1];
+  odomAftMapped.pose.pose.orientation.z = q.coeffs()[2];
+  odomAftMapped.pose.pose.orientation.w = q.coeffs()[3];
+
+  const V3D vel_body = rot.transpose() * vel_world;
+  odomAftMapped.twist.twist.linear.x = vel_body(0);
+  odomAftMapped.twist.twist.linear.y = vel_body(1);
+  odomAftMapped.twist.twist.linear.z = vel_body(2);
+  odomAftMapped.twist.twist.angular.x = omg_body(0);
+  odomAftMapped.twist.twist.angular.y = omg_body(1);
+  odomAftMapped.twist.twist.angular.z = omg_body(2);
 
   ats_navigation_interfaces::msg::IdentifiedOdometry identified;
   identified.header = odomAftMapped.header;
@@ -165,6 +264,17 @@ void publish_odometry(
     identified_pub->publish(identified);
   }
   pubOdomAftMapped->publish(odomAftMapped);
+}
+
+void publish_odometry(
+  const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr & pubOdomAftMapped,
+  const rclcpp::Publisher<ats_navigation_interfaces::msg::IdentifiedOdometry>::SharedPtr & identified_pub,
+  const std::uint64_t instance_id)
+{
+  const double stamp_sec = publish_odometry_without_downsample ? time_current : lidar_end_time;
+  publish_state_odometry(
+    stamp_sec, kf_output.x_.pos, kf_output.x_.rot, kf_output.x_.vel, kf_output.x_.omg,
+    pubOdomAftMapped, identified_pub, instance_id);
 }
 
 int main(int argc, char ** argv)
@@ -193,6 +303,7 @@ int main(int argc, char ** argv)
 
   kf_output.init_dyn_share_modified_3h(
     get_f_output, df_dx_output, h_model_output, h_model_IMU_output);
+  kf_output.set_maximum_iter(mapping_max_iter);
   Eigen::Matrix<double, 30, 30> P_init_output;  // = MD(24, 24)::Identity() * 0.01;
   reset_cov_output(P_init_output);
   kf_output.change_P(P_init_output);
@@ -221,6 +332,20 @@ int main(int argc, char ** argv)
   } else {
     RCLCPP_ERROR(nh->get_logger(), "steady clock unavailable; identified odometry disabled");
   }
+  g_imu_forward_odom_hook = [&](const sensor_msgs::msg::Imu & imu_msg) {
+    if (!imu_odom_en || !g_imu_fwd.initialized) {
+      return;
+    }
+    stepImuForwardState(g_imu_fwd, imu_msg, true);
+    const double min_period = 1.0 / std::max(10.0, imu_odom_rate_hz);
+    if (g_imu_fwd.state_time - g_imu_fwd.last_pub_time >= min_period - 1e-5) {
+      const V3D disp_pos = g_imu_fwd.pos + g_imu_fwd.pos_corr;
+      const M3D disp_rot = projectSO3(g_imu_fwd.rot * so3ExpVec(g_imu_fwd.rot_corr));
+      publish_state_odometry(
+        g_imu_fwd.state_time, disp_pos, disp_rot, g_imu_fwd.vel, g_imu_fwd.omg_body,
+        pub_odom_aft_mapped, pub_identified_odom, instance_id);
+    }
+  };
 
   //------------------------------------------------------------------------------------------------------
   signal(SIGINT, SigHandle);
@@ -263,6 +388,7 @@ int main(int argc, char ** argv)
           std::sqrt(gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]);
       }
 
+      const auto scan_wall_t0 = std::chrono::steady_clock::now();
       /*** downsample the feature points in a scan ***/
       p_imu->Process(Measures, feats_undistort);
       if (space_down_sample) {
@@ -275,8 +401,52 @@ int main(int argc, char ** argv)
         *feats_down_body = *Measures.lidar;
         sort(feats_down_body->points.begin(), feats_down_body->points.end(), time_list);
       }
+      if (adaptive_downsample_en &&
+        static_cast<int>(feats_down_body->points.size()) > max_surf_points && max_surf_points >= 2)
+      {
+        const std::size_t raw_n = feats_down_body->points.size();
+        const std::size_t cap_n = static_cast<std::size_t>(max_surf_points);
+        PointCloudXYZI thinned;
+        thinned.points.reserve(cap_n);
+        for (std::size_t i = 0; i + 1 < cap_n; ++i) {
+          const std::size_t src_idx = (i * (raw_n - 1)) / (cap_n - 1);
+          thinned.points.push_back(feats_down_body->points[src_idx]);
+        }
+        thinned.points.push_back(feats_down_body->points.back());
+        thinned.width = static_cast<std::uint32_t>(thinned.points.size());
+        thinned.height = 1;
+        thinned.is_dense = feats_down_body->is_dense;
+        feats_down_body->swap(thinned);
+      }
       {
         time_seq = time_compressing<int>(feats_down_body);
+        if (batch_update_size > 1 && time_seq.size() > 1U) {
+          std::vector<int> batched;
+          batched.reserve(time_seq.size());
+          std::size_t pt_cursor = 0;
+          std::size_t grp = 0;
+          while (grp < time_seq.size()) {
+            int acc_cnt = time_seq[grp];
+            const double t_start =
+              feats_down_body->points[pt_cursor].curvature / 1000.0;
+            std::size_t end_pt = pt_cursor + static_cast<std::size_t>(acc_cnt);
+            ++grp;
+            while (grp < time_seq.size() && acc_cnt + time_seq[grp] <= batch_update_size) {
+              const std::size_t cand_end_pt = end_pt + static_cast<std::size_t>(time_seq[grp]);
+              const double t_end =
+                feats_down_body->points[cand_end_pt - 1U].curvature / 1000.0;
+              if (t_end - t_start > batch_max_dt_sec) {
+                break;
+              }
+              acc_cnt += time_seq[grp];
+              end_pt = cand_end_pt;
+              ++grp;
+            }
+            batched.push_back(acc_cnt);
+            pt_cursor = end_pt;
+          }
+          time_seq.swap(batched);
+        }
         feats_down_size = feats_down_body->points.size();
       }
 
@@ -324,8 +494,8 @@ int main(int argc, char ** argv)
       Nearest_Points.resize(feats_down_size);
 
       /*** iterated state estimation ***/
-      crossmat_list.reserve(feats_down_size);
-      pbody_list.reserve(feats_down_size);
+      crossmat_list.resize(feats_down_size);
+      pbody_list.resize(feats_down_size);
       // pbody_ext_list.reserve(feats_down_size);
 
       for (size_t i = 0; i < feats_down_body->size(); i++) {
@@ -521,14 +691,67 @@ angvel_avr << imu_last.angular_velocity.x, imu_last.angular_velocity.y,
         }
       }
       /******* Publish odometry downsample *******/
-      if (!publish_odometry_without_downsample) {
-        publish_odometry(pub_odom_aft_mapped, pub_identified_odom, instance_id);
+      {
+        ImuForwardOdomState ekf_replayed;
+        ekf_replayed.initialized = true;
+        ekf_replayed.state_time =
+          time_predict_last_const > 0.0 ? time_predict_last_const : lidar_end_time;
+        ekf_replayed.pos = kf_output.x_.pos;
+        ekf_replayed.rot = kf_output.x_.rot;
+        ekf_replayed.vel = kf_output.x_.vel;
+        ekf_replayed.bg = kf_output.x_.bg;
+        ekf_replayed.ba = kf_output.x_.ba;
+        ekf_replayed.grav = kf_output.x_.gravity;
+        ekf_replayed.omg_body = kf_output.x_.omg;
+        if (imu_odom_en) {
+          for (const auto & imu_ptr : imu_deque) {
+            if (imu_ptr && get_time_sec(imu_ptr->header.stamp) > ekf_replayed.state_time) {
+              stepImuForwardState(ekf_replayed, *imu_ptr, false);
+            }
+          }
+        }
+        if (g_imu_fwd.initialized && imu_odom_en && imu_odom_blend_tau_s > 1e-4) {
+          const V3D prev_disp_pos = g_imu_fwd.pos + g_imu_fwd.pos_corr;
+          const M3D prev_disp_rot = projectSO3(g_imu_fwd.rot * so3ExpVec(g_imu_fwd.rot_corr));
+          V3D dp = prev_disp_pos - ekf_replayed.pos;
+          if (dp.norm() > 0.15) {
+            dp.setZero();
+          }
+          V3D dr = so3LogMat(ekf_replayed.rot.transpose() * prev_disp_rot);
+          if (dr.norm() > 0.15) {
+            dr.setZero();
+          }
+          ekf_replayed.pos_corr = dp;
+          ekf_replayed.rot_corr = dr;
+        }
+        ekf_replayed.last_pub_time = g_imu_fwd.last_pub_time;
+        g_imu_fwd = ekf_replayed;
+
+        if (!publish_odometry_without_downsample) {
+          if (!imu_odom_en) {
+            publish_odometry(pub_odom_aft_mapped, pub_identified_odom, instance_id);
+          } else {
+            const double pub_t = std::max(lidar_end_time, g_imu_fwd.state_time);
+            const V3D disp_pos = g_imu_fwd.pos + g_imu_fwd.pos_corr;
+            const M3D disp_rot = projectSO3(g_imu_fwd.rot * so3ExpVec(g_imu_fwd.rot_corr));
+            publish_state_odometry(
+              pub_t, disp_pos, disp_rot, g_imu_fwd.vel, g_imu_fwd.omg_body,
+              pub_odom_aft_mapped, pub_identified_odom, instance_id);
+          }
+        }
       }
 
       /*** add the feature points to map ***/
       if (feats_down_size > 4) {
         MapIncremental();
       }
+      const double scan_wall_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - scan_wall_t0).count();
+      RCLCPP_INFO_THROTTLE(
+        nh->get_logger(), *nh->get_clock(), 2000,
+        "[point_lio 帧统计] wall_ms=%.3f surf_pts=%d batches=%zu effct_feat=%d imu_odom=%s",
+        scan_wall_ms, feats_down_size, time_seq.size(), effct_feat_num,
+        imu_odom_en ? "on" : "off");
       /******* Publish points *******/
       if (scan_pub_en || pcd_save_en) publish_frame_world(pub_laser_cloud_full_res);
     } else {

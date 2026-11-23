@@ -40,6 +40,7 @@
 #include "small_gicp/registration/reduction_omp.hpp"
 #include "small_gicp/registration/registration.hpp"
 #include "small_gicp_relocalization/relocalization_candidate_core.hpp"
+#include "small_gicp_relocalization/scan_context_descriptor.hpp"
 #include "small_gicp_relocalization/scan_input_core.hpp"
 #include "small_gicp_relocalization/growing_map.hpp"
 #include "tf2_ros/buffer.h"
@@ -106,6 +107,8 @@ private:
     bool confirmation_recheck{false};
     /// 冷启动种子优先：格点搜索之前先对 seed（init_pose）做一次粗加精，不受格点预算约束。
     bool seed_first{false};
+    /// O5c: STATE_LOST 场景下由轻量 Scan Context 描述子召回的全局高优先级候选（仍须过全部质量/确认门）。
+    std::vector<Eigen::Isometry3d> descriptor_seeds;
     std::size_t cursor{0};
     std::uint64_t sweep{0};
     bool allow_unconverged{false};
@@ -146,7 +149,8 @@ private:
     const rclcpp::Time & scan_time, bool accepted, std::uint8_t status,
     const std::string & message, std::size_t inliers,
     double error, std::size_t source_points, const Eigen::Isometry3d & map_to_robot_base,
-    const std::array<double, 36> & covariance);
+    const std::array<double, 36> & covariance,
+    const Se2DirectionalInformation & se2_info = Se2DirectionalInformation{});
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
   void localizationStatusCallback(
     const ats_navigation_interfaces::msg::LocalizationStatus::SharedPtr msg);
@@ -196,6 +200,7 @@ private:
   void drainAsyncMultiGuessResult();
   void handleRegistrationAttempt(
     RegistrationAttempt attempt, const rclcpp::Time & scan_time, std::size_t source_points);
+  void updateTrackingSubmap(const Eigen::Vector2d & center_xy);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
@@ -383,6 +388,23 @@ private:
   std::shared_ptr<PointKdTree> source_tree_;
   std::shared_ptr<PointKdTree> screen_source_tree_;
   std::shared_ptr<GicpRegistration> register_;
+
+  // O5b: 跟踪态局部子图与 SE(2) 退化方向诊断参数。
+  bool local_submap_enable_{true};
+  double local_submap_radius_m_{16.0};
+  double local_submap_recenter_distance_m_{4.0};
+  std::size_t local_submap_min_points_{600};
+  std::optional<Eigen::Vector2d> submap_center_xy_;
+  PointCovarianceCloud::Ptr submap_target_;
+  std::shared_ptr<PointKdTree> submap_target_tree_;
+  double weak_translation_eigenvalue_threshold_{25.0};
+  double weak_yaw_eigenvalue_threshold_{15.0};
+
+  // O5c: STATE_LOST 轻量 Scan Context 描述子召回。
+  bool scan_context_enable_{true};
+  int scan_context_top_k_{4};
+  double scan_context_max_distance_{0.42};
+  ScanContextDatabase scan_context_db_;
 
   rclcpp::TimerBase::SharedPtr transform_timer_;
   rclcpp::TimerBase::SharedPtr register_timer_;
