@@ -49,3 +49,16 @@ string gate_collision_indices
 string occupancy_digest
 string content_digest
 uint32 reference_point_count
+# O2 analytical derivative arrays in global_frame (aligned with reference_stamp
+# and reference_point_count on STATE_REFERENCE_READY; empty otherwise).
+float64[] reference_vx
+float64[] reference_vy
+float64[] reference_ax
+float64[] reference_ay
+float64[] reference_yaw_rate
+bool is_partial_subgoal
+bool has_spliced_tail
+# Release wall-clock stage timings [ms] for O2 budget verification.
+float32 search_wall_ms
+float32 minco_wall_ms
+float32 total_plan_wall_ms

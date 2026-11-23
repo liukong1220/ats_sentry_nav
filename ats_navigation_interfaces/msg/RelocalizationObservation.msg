@@ -26,3 +26,13 @@ uint32 source_points
 float64 registration_error
 float64 quality
 string message
+
+# O5b: 机器人中心 map 系下的 SE(2) [x, y, yaw] Schur 补信息矩阵（按行展开 3x3）与退化方向诊断。
+float64[9] se2_information
+float64 min_se2_eigenvalue
+float64 weak_direction_x
+float64 weak_direction_y
+uint8 DEGENERACY_NONE=0
+uint8 DEGENERACY_WEAK_TRANSLATION=1
+uint8 DEGENERACY_WEAK_YAW=2
+uint8 degeneracy_mask

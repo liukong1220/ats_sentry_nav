@@ -46,3 +46,11 @@ builtin_interfaces/Duration lease_duration
 uint8[32] content_digest
 nav_msgs/Path raw_path
 nav_msgs/Path reference
+# O2 optional analytical derivative arrays aligned 1:1 with reference.poses.
+float64[] reference_vx
+float64[] reference_vy
+float64[] reference_ax
+float64[] reference_ay
+float64[] reference_yaw_rate
+bool is_partial_subgoal
+bool has_spliced_tail

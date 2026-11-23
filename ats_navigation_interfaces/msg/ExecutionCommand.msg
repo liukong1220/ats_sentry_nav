@@ -58,3 +58,17 @@ uint64 validation_map_source_generation
 # parent = validation snapshot frame; child = reference frame. Same-frame
 # validation carries an explicit identity transform. Heartbeats preserve it.
 geometry_msgs/TransformStamped validation_from_reference
+# O2 analytical derivative payload in reference.header.frame_id (SI units: m/s,
+# m/s^2, rad/s). Empty arrays preserve legacy Path finite-difference fallback;
+# when populated, every array must match reference.poses.size() and be finite.
+float64[] reference_vx
+float64[] reference_vy
+float64[] reference_ax
+float64[] reference_ay
+float64[] reference_yaw_rate
+# True only when reference terminates at an online rolling/mapless local subgoal
+# inside the known-free window rather than the action's final goal.
+bool is_partial_subgoal
+# True when a local receding-horizon MINCO prefix was C2-spliced onto a safe
+# continuation/committed tail so Goal Manager can roll the horizon smoothly.
+bool has_spliced_tail
