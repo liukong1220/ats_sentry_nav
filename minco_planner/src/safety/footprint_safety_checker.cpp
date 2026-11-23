@@ -22,7 +22,8 @@ void FootprintSafetyChecker::setParams(const FootprintSafetyParams & params)
 
 FootprintSafetyResult FootprintSafetyChecker::check(
   const ReferenceTrajectory & trajectory,
-  const nav_msgs::msg::OccupancyGrid & grid) const
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const ats_rc_esdf::EsdfProvider * esdf) const
 {
   FootprintSafetyResult result;
   if (!trajectory.valid() || grid.data.empty()) {
@@ -50,10 +51,28 @@ FootprintSafetyResult FootprintSafetyChecker::check(
   // same oriented rectangular rasterization is therefore evaluated at
   // adaptively subdivided SE(2) poses.  The bound uses actual corner motion,
   // so pure rotation, lateral translation, and diagonal motion share one rule.
+  const double base_step = std::max(
+    1e-6, static_cast<double>(grid.info.resolution) *
+    std::max(1e-3, params_.swept_max_corner_step_cells));
+  const double margin_half = params_.safety_margin > 0.0 ?
+    std::max(0.005, 0.5 * params_.safety_margin) : base_step;
+  const double fine_step_m = std::min(
+    base_step,
+    std::min(margin_half, std::max(0.005, params_.swept_min_corner_step_m)));
+
   for (std::size_t i = 0; i + 1 < trajectory.points.size(); ++i) {
+    ++result.swept_segments_checked;
+    if (params_.adaptive_lipschitz_swept_enabled) {
+      if (segmentSweptAabbClear(trajectory.points[i], trajectory.points[i + 1], grid)) {
+        continue;
+      }
+      checkSegmentAdaptiveLipschitz(
+        trajectory.points[i], trajectory.points[i + 1], i, 0.0, 1.0,
+        fine_step_m, grid, esdf, result);
+      continue;
+    }
     const std::size_t subdivisions = sweptSubdivisions(
       trajectory.points[i], trajectory.points[i + 1], grid);
-    ++result.swept_segments_checked;
     for (std::size_t step = 1; step < subdivisions; ++step) {
       const double fraction = static_cast<double>(step) /
         static_cast<double>(subdivisions);
@@ -77,6 +96,170 @@ FootprintSafetyResult FootprintSafetyChecker::check(
     }
   }
   return result;
+}
+
+bool FootprintSafetyChecker::segmentSweptAabbClear(
+  const ReferencePoint & start,
+  const ReferencePoint & end,
+  const nav_msgs::msg::OccupancyGrid & grid) const
+{
+  const double resolution = grid.info.resolution;
+  if (resolution <= 0.0) {
+    return false;
+  }
+  const auto & origin = grid.info.origin;
+  const double origin_yaw = std::atan2(
+    2.0 * (origin.orientation.w * origin.orientation.z +
+      origin.orientation.x * origin.orientation.y),
+    1.0 - 2.0 * (origin.orientation.y * origin.orientation.y +
+      origin.orientation.z * origin.orientation.z));
+  const double co = std::cos(origin_yaw);
+  const double so = std::sin(origin_yaw);
+  const double cx0 = (co * (start.x - origin.position.x) +
+    so * (start.y - origin.position.y)) / resolution;
+  const double cy0 = (-so * (start.x - origin.position.x) +
+    co * (start.y - origin.position.y)) / resolution;
+  const double cx1 = (co * (end.x - origin.position.x) +
+    so * (end.y - origin.position.y)) / resolution;
+  const double cy1 = (-so * (end.x - origin.position.x) +
+    co * (end.y - origin.position.y)) / resolution;
+
+  const double hx = (0.5 * std::max(0.0, params_.length) +
+    std::max(0.0, params_.safety_margin)) / resolution;
+  const double hy = (0.5 * std::max(0.0, params_.width) +
+    std::max(0.0, params_.safety_margin)) / resolution;
+  const double dyaw = std::abs(normalizeAngle(end.yaw - start.yaw));
+  double pad_x = 0.0;
+  double pad_y = 0.0;
+  if (dyaw <= 1e-4) {
+    const double c = std::cos(start.yaw - origin_yaw);
+    const double s = std::sin(start.yaw - origin_yaw);
+    const double ac = std::abs(c);
+    const double as = std::abs(s);
+    pad_x = ac * hx + as * hy + 0.5 * (ac + as);
+    pad_y = as * hx + ac * hy + 0.5 * (ac + as);
+  } else {
+    // Exact conservative superset over all orientations yaw(u): circumscribed disc + cell half-diag.
+    const double r_diag = std::hypot(hx, hy) + 0.7071067812;
+    pad_x = r_diag;
+    pad_y = r_diag;
+  }
+  const double min_x = std::min(cx0, cx1) - pad_x;
+  const double max_x = std::max(cx0, cx1) + pad_x;
+  const double min_y = std::min(cy0, cy1) - pad_y;
+  const double max_y = std::max(cy0, cy1) + pad_y;
+  if (min_x < 0.0 || min_y < 0.0 ||
+    max_x >= static_cast<double>(grid.info.width) ||
+    max_y >= static_cast<double>(grid.info.height))
+  {
+    return false;
+  }
+  const int ix0 = static_cast<int>(std::floor(min_x));
+  const int ix1 = static_cast<int>(std::floor(max_x));
+  const int iy0 = static_cast<int>(std::floor(min_y));
+  const int iy1 = static_cast<int>(std::floor(max_y));
+  for (int iy = iy0; iy <= iy1; ++iy) {
+    for (int ix = ix0; ix <= ix1; ++ix) {
+      if (isOccupied(grid, GridIndex{ix, iy})) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void FootprintSafetyChecker::checkSegmentAdaptiveLipschitz(
+  const ReferencePoint & seg_start,
+  const ReferencePoint & seg_end,
+  std::size_t seg_index,
+  double u_start,
+  double u_end,
+  double fine_step_m,
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const ats_rc_esdf::EsdfProvider * esdf,
+  FootprintSafetyResult & result) const
+{
+  const ReferencePoint pa = interpolate(seg_start, seg_end, u_start);
+  const ReferencePoint pb = interpolate(seg_start, seg_end, u_end);
+  const double half_length = 0.5 * std::max(0.0, params_.length) +
+    std::max(0.0, params_.safety_margin);
+  const double half_width = 0.5 * std::max(0.0, params_.width) +
+    std::max(0.0, params_.safety_margin);
+  const double r_diag_m = std::hypot(half_length, half_width);
+  const double trans_disp = std::hypot(pb.x - pa.x, pb.y - pa.y);
+  const double rot_disp = r_diag_m * std::abs(normalizeAngle(pb.yaw - pa.yaw));
+  // True continuous path-length upper bound of any point in the body rectangle over [u_start, u_end].
+  const double corner_arc_upper = trans_disp + rot_disp;
+  if (corner_arc_upper <= fine_step_m || (u_end - u_start) <= 1.0 / 512.0) {
+    return;
+  }
+
+  if (segmentSweptAabbClear(pa, pb, grid)) {
+    return;
+  }
+
+  const double u_mid = 0.5 * (u_start + u_end);
+  const ReferencePoint p_mid = interpolate(seg_start, seg_end, u_mid);
+  ++result.swept_samples_checked;
+  double collision_x = 0.0;
+  double collision_y = 0.0;
+  if (sampleFootprintOccupied(p_mid, grid, collision_x, collision_y)) {
+    result.safe = false;
+    CollisionSample sample;
+    sample.trajectory_index = seg_index;
+    sample.segment_index = seg_index;
+    sample.segment_fraction = u_mid;
+    sample.swept = true;
+    sample.x = collision_x;
+    sample.y = collision_y;
+    result.collisions.push_back(sample);
+    // Once a swept collision is recorded on this sub-interval, still check siblings only down
+    // to coarse resolution so collision count remains representative without O(512) blow-up.
+    if (corner_arc_upper <= std::max(fine_step_m, 0.05)) {
+      return;
+    }
+  } else if (esdf != nullptr && esdf->available()) {
+    const double cell_diag_half = 0.7071067812 * grid.info.resolution;
+    const double d_center = esdf->getDistance(p_mid.x, p_mid.y);
+    if (std::isfinite(d_center) &&
+      d_center > r_diag_m + 0.5 * trans_disp + cell_diag_half)
+    {
+      return;
+    }
+    // Oriented perimeter 1-Lipschitz lower bound certificate around p_mid.
+    constexpr double kPerimSpacing = 0.08;
+    const int nx = std::max(1, static_cast<int>(std::ceil(2.0 * half_length / kPerimSpacing)));
+    const int ny = std::max(1, static_cast<int>(std::ceil(2.0 * half_width / kPerimSpacing)));
+    const double seg_chord_half = 0.5 * std::max(
+      2.0 * half_length / static_cast<double>(nx),
+      2.0 * half_width / static_cast<double>(ny));
+    const double required_d = seg_chord_half + 0.5 * corner_arc_upper + cell_diag_half;
+    const double cm = std::cos(p_mid.yaw);
+    const double sm = std::sin(p_mid.yaw);
+    bool certified = true;
+    auto check_local = [&](double lx, double ly) {
+      const double wx = p_mid.x + cm * lx - sm * ly;
+      const double wy = p_mid.y + sm * lx + cm * ly;
+      const double d = esdf->getDistance(wx, wy);
+      return std::isfinite(d) && d > required_d;
+    };
+    for (int k = 0; k <= nx && certified; ++k) {
+      const double lx = -half_length + 2.0 * half_length * static_cast<double>(k) / nx;
+      certified = check_local(lx, -half_width) && check_local(lx, half_width);
+    }
+    for (int k = 1; k < ny && certified; ++k) {
+      const double ly = -half_width + 2.0 * half_width * static_cast<double>(k) / ny;
+      certified = check_local(-half_length, ly) && check_local(half_length, ly);
+    }
+    if (certified) {
+      return;
+    }
+  }
+
+  checkSegmentAdaptiveLipschitz(
+    seg_start, seg_end, seg_index, u_start, u_mid, fine_step_m, grid, esdf, result);
+  checkSegmentAdaptiveLipschitz(
+    seg_start, seg_end, seg_index, u_mid, u_end, fine_step_m, grid, esdf, result);
 }
 
 bool FootprintSafetyChecker::worldToGrid(

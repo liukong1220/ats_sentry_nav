@@ -73,10 +73,12 @@ bool solveMinco(
   const std::vector<Point> & waypoints,
   const Eigen::VectorXd & durations,
   MincoS3 & minco,
-  const Eigen::Matrix<double, 2, 3> & head_state)
+  const Eigen::Matrix<double, 2, 3> & head_state,
+  const Eigen::Matrix<double, 2, 3> * tail_state = nullptr)
 {
   Eigen::Matrix<double, 2, 3> head = head_state;
-  Eigen::Matrix<double, 2, 3> tail = Eigen::Matrix<double, 2, 3>::Zero();
+  Eigen::Matrix<double, 2, 3> tail =
+    tail_state != nullptr ? *tail_state : Eigen::Matrix<double, 2, 3>::Zero();
   head.col(0) = waypoints.front();
   tail.col(0) = waypoints.back();
   Eigen::MatrixXd inner_points(2, static_cast<int>(waypoints.size()) - 2);
@@ -149,6 +151,31 @@ bool makeHeadState(
   }
   head.col(1) = limitNorm(initial_state->velocity, speed_limit);
   head.col(2) = limitNorm(initial_state->acceleration, acceleration_limit);
+  return true;
+}
+
+bool makeTailState(
+  const TerminalKinematicState * terminal_state,
+  const MincoTrajectoryOptimizerParams & params,
+  Eigen::Matrix<double, 2, 3> & tail)
+{
+  tail = Eigen::Matrix<double, 2, 3>::Zero();
+  if (terminal_state == nullptr || !terminal_state->valid) {
+    return true;
+  }
+  if (!terminal_state->velocity.allFinite() || !terminal_state->acceleration.allFinite()) {
+    return false;
+  }
+  double speed_limit = std::max(0.05, params.reference_speed);
+  if (params.max_velocity > 0.0) {
+    speed_limit = std::min(speed_limit, params.max_velocity);
+  }
+  double acceleration_limit = std::max(0.0, params.initial_state_max_acceleration);
+  if (params.max_acceleration > 0.0) {
+    acceleration_limit = std::min(acceleration_limit, params.max_acceleration);
+  }
+  tail.col(1) = limitNorm(terminal_state->velocity, speed_limit);
+  tail.col(2) = limitNorm(terminal_state->acceleration, acceleration_limit);
   return true;
 }
 
@@ -310,7 +337,8 @@ std::vector<Point> refineWaypointsWithEsdf(
   const MincoTrajectoryOptimizerParams & params,
   const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
   const ReferenceTrajectory * footprint_orientation,
-  const Eigen::Matrix<double, 2, 3> & head_state)
+  const Eigen::Matrix<double, 2, 3> & head_state,
+  const Eigen::Matrix<double, 2, 3> * tail_state = nullptr)
 {
   if (!params.esdf_obstacle_optimization_enabled || !esdf || !esdf->available()) {
     return input_waypoints;
@@ -351,19 +379,21 @@ std::vector<Point> refineWaypointsWithEsdf(
     params.footprint_length, params.footprint_width, params.footprint_safety_margin,
     params.esdf_footprint_sample_spacing) : std::vector<Point> {};
 
+  const double terminal_speed = tail_state != nullptr ? tail_state->col(1).norm() : 0.0;
   // 每轮先解出连续 MINCO，再把低净空采样点的梯度分配到相邻内部控制点。
   for (int iteration = 0; iteration < std::max(0, params.esdf_obstacle_max_iterations);
     ++iteration)
   {
-    const MincoTimeAllocation allocation = time_allocator.allocate(waypoints, head_state.col(1).norm());
+    const MincoTimeAllocation allocation =
+      time_allocator.allocate(waypoints, head_state.col(1).norm(), terminal_speed);
     if (!allocation.valid) {
       break;
     }
     const Eigen::VectorXd durations = allocation.durations;
     MincoS3 minco;
-    // 净空修正必须在与最终轨迹相同的首端边界下评估：带初速时首段形状会外扩，
+    // 净空修正必须在与最终轨迹相同的首尾边界下评估：带初速或尾速时曲线形状会外扩，
     // 若这里仍按零初速求解，修正量就落在一条实际不会被执行的曲线上。
-    if (!solveMinco(waypoints, durations, minco, head_state)) {
+    if (!solveMinco(waypoints, durations, minco, head_state, tail_state)) {
       break;
     }
     const double total_duration = std::max(1e-6, durations.sum());
@@ -480,9 +510,11 @@ std::vector<Point> refineWaypointsWithEsdf(
         trial[index] += scale * (proposed[index] - waypoints[index]);
       }
       const MincoTimeAllocation trial_allocation = time_allocator.allocate(
-        trial, head_state.col(1).norm());
+        trial, head_state.col(1).norm(), terminal_speed);
       MincoS3 trial_minco;
-      if (!trial_allocation.valid || !solveMinco(trial, trial_allocation.durations, trial_minco, head_state)) {
+      if (!trial_allocation.valid ||
+        !solveMinco(trial, trial_allocation.durations, trial_minco, head_state, tail_state))
+      {
         continue;
       }
       const double trial_minimum = minimumSampleClearance(
@@ -618,7 +650,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   const InitialKinematicState * initial_state,
   const nav_msgs::msg::OccupancyGrid * planning_grid,
   const FootprintSafetyChecker * safety_checker,
-  MincoOptimizationTrace * trace) const
+  MincoOptimizationTrace * trace,
+  const TerminalKinematicState * terminal_state) const
 {
   ReferenceTrajectory trajectory;
   const auto optimization_started = std::chrono::steady_clock::now();
@@ -676,13 +709,21 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
     finishTrace("non_finite_initial_state");
     return trajectory;
   }
+  Eigen::Matrix<double, 2, 3> tail_state = Eigen::Matrix<double, 2, 3>::Zero();
+  if (!makeTailState(terminal_state, params_, tail_state)) {
+    finishTrace("non_finite_terminal_state");
+    return trajectory;
+  }
+  const bool has_tail_state = terminal_state != nullptr && terminal_state->valid;
   const double guide_spacing = std::max(0.0, params_.guide_control_point_spacing);
   if (guide_spacing > 1e-6) {
     waypoints = densifyWaypoints(waypoints, guide_spacing);
   }
   waypoints = smoothGuideWithEsdf(waypoints, params_, esdf);
   const std::vector<Point> pre_refinement_waypoints = waypoints;
-  waypoints = refineWaypointsWithEsdf(waypoints, params_, esdf, footprint_orientation, head_state);
+  waypoints = refineWaypointsWithEsdf(
+    waypoints, params_, esdf, footprint_orientation, head_state,
+    has_tail_state ? &tail_state : nullptr);
   if (guide_spacing > 1e-6) {
     waypoints = densifyWaypoints(waypoints, guide_spacing);
   }
@@ -694,6 +735,17 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
       const double along = head_state.col(1).dot(direction);
       if (along < 0.0) {
         head_state.col(1) -= direction * along;
+      }
+    }
+    if (has_tail_state && !terminal_state->exact_splice) {
+      Point tail_direction = waypoints.back() - waypoints[waypoints.size() - 2U];
+      const double tail_length = tail_direction.norm();
+      if (tail_length > 1e-6) {
+        tail_direction /= tail_length;
+        const double along_tail = tail_state.col(1).dot(tail_direction);
+        if (along_tail < 0.0) {
+          tail_state.col(1) -= tail_direction * along_tail;
+        }
       }
     }
   }
@@ -710,7 +762,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
     waypoints, std::max(0.05, params_.joint_waypoint_spacing));
   const MincoTimeAllocator time_allocator = makeTimeAllocator(params_);
   const MincoTimeAllocation initial_allocation = time_allocator.allocate(
-    waypoints, head_state.col(1).norm());
+    waypoints, head_state.col(1).norm(), has_tail_state ? tail_state.col(1).norm() : 0.0);
   if (!initial_allocation.valid) {
     finishTrace("time_allocation_invalid");
     return trajectory;
@@ -751,7 +803,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   }
   const MincoJointResult joint = joint_optimizer.optimize(
     head_state, waypoints, initial_allocation.durations, distance_query, yaw_query,
-    joint_obstacle ? std::vector<Point>() : dense_guide);
+    joint_obstacle ? std::vector<Point>() : dense_guide,
+    has_tail_state ? &tail_state : nullptr);
   if (trace) {
     trace->joint_piece_count = static_cast<int>(initial_allocation.durations.size());
     trace->joint_iterations = joint.iterations;
@@ -775,7 +828,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   waypoints = joint.waypoints;
   Eigen::VectorXd durations = joint.durations;
   MincoS3 minco;
-  if (!solveMinco(waypoints, durations, minco, head_state)) {
+  if (!solveMinco(waypoints, durations, minco, head_state, has_tail_state ? &tail_state : nullptr)) {
     finishTrace("minco_s3_initial_solve_failed");
     return trajectory;
   }
@@ -859,7 +912,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
       break;
     }
     local_time_scaled = true;
-    if (!solveMinco(waypoints, durations, minco, head_state)) {
+    if (!solveMinco(waypoints, durations, minco, head_state, has_tail_state ? &tail_state : nullptr)) {
       trajectory.points.clear();
       finishTrace("minco_s3_scaled_solve_failed");
       return trajectory;
@@ -889,7 +942,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
     const double uniform_scale = std::max(
       std::max(1.01, params_.time_scaling_factor), 1.01 * required_scale);
     durations *= uniform_scale;
-    if (!solveMinco(waypoints, durations, minco, head_state)) {
+    if (!solveMinco(waypoints, durations, minco, head_state, has_tail_state ? &tail_state : nullptr)) {
       finishTrace("minco_s3_uniform_scaled_solve_failed");
       return trajectory;
     }
@@ -969,26 +1022,40 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const InitialKinematicState * initial_state,
   const nav_msgs::msg::OccupancyGrid * planning_grid,
   const FootprintSafetyChecker * safety_checker,
-  MincoOptimizationTrace * trace) const
+  MincoOptimizationTrace * trace,
+  const TerminalKinematicState * terminal_state) const
 {
   static constexpr double kSeedLadder[] = {1.0, 0.5, 0.25, 0.0};
-  const bool seeded = initial_state != nullptr && initial_state->valid &&
+  const bool head_seeded = initial_state != nullptr && initial_state->valid &&
     (initial_state->velocity.squaredNorm() > 1e-12 ||
     initial_state->acceleration.squaredNorm() > 1e-12);
+  const bool tail_seeded = terminal_state != nullptr && terminal_state->valid &&
+    (terminal_state->velocity.squaredNorm() > 1e-12 ||
+    terminal_state->acceleration.squaredNorm() > 1e-12);
+  const bool seeded = head_seeded || tail_seeded;
   ReferenceTrajectory result;
   MincoOptimizationTrace attempt_trace;
   const std::size_t rungs = seeded ? 4U : 1U;
   for (std::size_t rung = 0; rung < rungs; ++rung) {
-    InitialKinematicState scaled;
-    const InitialKinematicState * seed = initial_state;
-    if (seeded && kSeedLadder[rung] != 1.0) {
-      scaled = *initial_state;
-      scaled.velocity *= kSeedLadder[rung];
-      scaled.acceleration *= kSeedLadder[rung];
-      seed = &scaled;
+    InitialKinematicState scaled_head;
+    const InitialKinematicState * head_seed = initial_state;
+    if (head_seeded && kSeedLadder[rung] != 1.0) {
+      scaled_head = *initial_state;
+      scaled_head.velocity *= kSeedLadder[rung];
+      scaled_head.acceleration *= kSeedLadder[rung];
+      head_seed = &scaled_head;
+    }
+    TerminalKinematicState scaled_tail;
+    const TerminalKinematicState * tail_seed = terminal_state;
+    if (tail_seeded && kSeedLadder[rung] != 1.0) {
+      scaled_tail = *terminal_state;
+      scaled_tail.velocity *= kSeedLadder[rung];
+      scaled_tail.acceleration *= kSeedLadder[rung];
+      tail_seed = &scaled_tail;
     }
     result = optimizeOnce(
-      raw_path, esdf, footprint_orientation, seed, planning_grid, safety_checker, &attempt_trace);
+      raw_path, esdf, footprint_orientation, head_seed, planning_grid, safety_checker,
+      &attempt_trace, tail_seed);
     attempt_trace.seed_scale = kSeedLadder[rung];
     const bool dynamic_failure = attempt_trace.failure_reason == "dynamic_limits_unsatisfied" ||
       attempt_trace.failure_reason == "dynamic_scaling_non_contractive";
@@ -1000,6 +1067,144 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     *trace = attempt_trace;
   }
   return result;
+}
+
+ReferenceTrajectory MincoTrajectoryOptimizer::buildContinuationTail(
+  const nav_msgs::msg::Path & tail_path,
+  const InitialKinematicState & junction_state,
+  const nav_msgs::msg::OccupancyGrid * planning_grid,
+  const FootprintSafetyChecker * safety_checker) const
+{
+  ReferenceTrajectory trajectory;
+  trajectory.header = tail_path.header;
+  PathGeometryPreprocessor preprocessor(params_.geometry_preprocessor);
+  const PathGeometryResult preprocessing = preprocessor.preprocess(
+    tail_path, planning_grid, safety_checker);
+  std::vector<Point> waypoints = preprocessing.waypoints;
+  if (waypoints.size() < 2U) {
+    return trajectory;
+  }
+  waypoints = MincoJointOptimizer::resampleByArcLength(
+    waypoints, std::max(0.25, params_.joint_waypoint_spacing));
+  if (waypoints.size() < 2U) {
+    return trajectory;
+  }
+  Eigen::Matrix<double, 2, 3> head_state = Eigen::Matrix<double, 2, 3>::Zero();
+  if (!makeHeadState(&junction_state, params_, head_state)) {
+    return trajectory;
+  }
+  const double reference_speed = std::max(0.05, params_.reference_speed);
+  const double sample_spacing = std::max(0.02, params_.sample_spacing);
+  const MincoTimeAllocator time_allocator = makeTimeAllocator(params_);
+  const MincoTimeAllocation allocation =
+    time_allocator.allocate(waypoints, head_state.col(1).norm(), 0.0);
+  if (!allocation.valid) {
+    return trajectory;
+  }
+  Eigen::VectorXd durations = allocation.durations;
+  MincoS3 minco;
+  if (!solveMinco(waypoints, durations, minco, head_state, nullptr)) {
+    return trajectory;
+  }
+  bool dynamic_limits_satisfied = false;
+  double peak_velocity = 0.0;
+  double peak_acceleration = 0.0;
+  double peak_jerk = 0.0;
+  double peak_lateral = 0.0;
+  std::vector<double> segment_peak_velocities;
+  std::vector<double> segment_peak_accelerations;
+  std::vector<double> segment_peak_jerks;
+  std::vector<double> segment_peak_laterals;
+  const auto effectiveAccelerations = [&](const std::vector<double> & laterals) {
+      std::vector<double> scaled = segment_peak_accelerations;
+      if (params_.max_lateral_acceleration > 0.0 && params_.max_acceleration > 0.0) {
+        for (std::size_t index = 0; index < scaled.size() && index < laterals.size(); ++index) {
+          scaled[index] = std::max(
+            scaled[index],
+            laterals[index] * params_.max_acceleration / params_.max_lateral_acceleration);
+        }
+      }
+      return scaled;
+    };
+  const int max_iters = std::max(1, params_.max_time_scaling_iterations);
+  for (int iter = 0; iter <= max_iters; ++iter) {
+    findDynamicExtrema(
+      minco, sample_spacing, reference_speed, peak_velocity, peak_acceleration, peak_jerk,
+      peak_lateral, segment_peak_velocities, segment_peak_accelerations, segment_peak_jerks,
+      segment_peak_laterals);
+    const bool velocity_ok = params_.max_velocity <= 0.0 ||
+      peak_velocity <= params_.max_velocity + 1e-6;
+    const bool acceleration_ok = params_.max_acceleration <= 0.0 ||
+      peak_acceleration <= params_.max_acceleration + 1e-6;
+    const bool jerk_ok = params_.max_jerk <= 0.0 || peak_jerk <= params_.max_jerk + 1e-6;
+    const bool lateral_ok = params_.max_lateral_acceleration <= 0.0 ||
+      peak_lateral <= params_.max_lateral_acceleration + 1e-6;
+    if (velocity_ok && acceleration_ok && jerk_ok && lateral_ok) {
+      dynamic_limits_satisfied = true;
+      break;
+    }
+    if (iter == max_iters) {
+      break;
+    }
+    if (!time_allocator.applyLocalDynamicScaling(
+        durations, segment_peak_velocities, effectiveAccelerations(segment_peak_laterals),
+        segment_peak_jerks, params_.max_velocity, params_.max_acceleration, params_.max_jerk))
+    {
+      double required_scale = 1.05;
+      if (params_.max_velocity > 0.0) {
+        required_scale = std::max(required_scale, 1.02 * peak_velocity / params_.max_velocity);
+      }
+      if (params_.max_acceleration > 0.0) {
+        required_scale = std::max(
+          required_scale, 1.02 * std::sqrt(peak_acceleration / params_.max_acceleration));
+      }
+      if (params_.max_jerk > 0.0) {
+        required_scale = std::max(
+          required_scale, 1.02 * std::cbrt(peak_jerk / params_.max_jerk));
+      }
+      if (params_.max_lateral_acceleration > 0.0) {
+        required_scale = std::max(
+          required_scale, 1.02 * std::sqrt(peak_lateral / params_.max_lateral_acceleration));
+      }
+      durations *= required_scale;
+    }
+    if (!solveMinco(waypoints, durations, minco, head_state, nullptr)) {
+      return trajectory;
+    }
+  }
+  if (!dynamic_limits_satisfied) {
+    return trajectory;
+  }
+  double accumulated_time = 0.0;
+  double accumulated_distance = 0.0;
+  Point previous_position = waypoints.front();
+  for (int piece = 0; piece < minco.pieceCount(); ++piece) {
+    const double duration = minco.pieceDuration(piece);
+    const int steps = std::max(
+      1, static_cast<int>(std::ceil(duration * reference_speed / sample_spacing)));
+    const int first_step = piece == 0 ? 0 : 1;
+    for (int step = first_step; step <= steps; ++step) {
+      const double local_time = duration * static_cast<double>(step) / steps;
+      const MincoSample sample = minco.sample(piece, local_time);
+      if (!trajectory.points.empty()) {
+        accumulated_distance += (sample.position - previous_position).norm();
+      }
+      ReferencePoint point;
+      point.t = accumulated_time + local_time;
+      point.s = accumulated_distance;
+      point.x = sample.position.x();
+      point.y = sample.position.y();
+      point.vx = sample.velocity.x();
+      point.vy = sample.velocity.y();
+      point.ax = sample.acceleration.x();
+      point.ay = sample.acceleration.y();
+      point.v = sample.velocity.norm();
+      trajectory.points.push_back(point);
+      previous_position = sample.position;
+    }
+    accumulated_time += duration;
+  }
+  return trajectory;
 }
 
 }  // namespace minco_planner

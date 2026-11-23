@@ -38,7 +38,8 @@ public:
   void setParams(const MincoTimeAllocatorParams & params);
   MincoTimeAllocation allocate(
     const std::vector<Eigen::Vector2d> & waypoints,
-    double initial_speed = 0.0) const;
+    double initial_speed = 0.0,
+    double terminal_speed = 0.0) const;
   bool applyLocalDynamicScaling(
     Eigen::VectorXd & durations,
     const std::vector<double> & segment_peak_velocities,

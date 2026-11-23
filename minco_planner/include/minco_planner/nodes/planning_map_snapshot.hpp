@@ -117,6 +117,13 @@ struct PlannerStatusState
     status.map_generation = generation;
     status.state = Status::STATE_FAILED;
     status.failure_reason = failure_reason;
+    status.reference_vx.clear();
+    status.reference_vy.clear();
+    status.reference_ax.clear();
+    status.reference_ay.clear();
+    status.reference_yaw_rate.clear();
+    status.is_partial_subgoal = false;
+    status.has_spliced_tail = false;
     return update(status);
   }
 };

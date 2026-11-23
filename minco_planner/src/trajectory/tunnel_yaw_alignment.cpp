@@ -139,6 +139,15 @@ std::vector<TunnelSegment> detectTunnelSegments(
     std::vector<double> tangent_yaws(count, 0.0);
     std::vector<double> sample_cos2(count, 0.0);
     std::vector<double> sample_sin2(count, 0.0);
+    struct WallSample
+    {
+      bool valid = false;
+      double lx = 0.0;
+      double ly = 0.0;
+      double rx = 0.0;
+      double ry = 0.0;
+    };
+    std::vector<WallSample> wall_samples(count);
     double cos2 = 0.0;
     double sin2 = 0.0;
     double weight_sum = 0.0;
@@ -177,6 +186,12 @@ std::vector<TunnelSegment> detectTunnelSegments(
       if (plus > 0.0 && minus > 0.0 && plus + minus <= params.max_width + probe_step) {
         width_sum += plus + minus;
         ++width_count;
+        wall_samples[idx] = WallSample{
+          true,
+          point.x + nx * plus,
+          point.y + ny * plus,
+          point.x - nx * minus,
+          point.y - ny * minus};
       }
 
       // 仅采信指向两侧平行壁面的 ESDF 梯度：中线梯度趋零或洞口/拐角梯度偏离通道切线
@@ -202,24 +217,82 @@ std::vector<TunnelSegment> detectTunnelSegments(
       continue;
     }
     segment.width_estimate = width_sum / static_cast<double>(width_count);
-    if (segment.coherence < params.min_coherence) {
-      segment.axis_yaw = tangent_yaws;
-    } else {
-      for (std::size_t k = begin; k <= end; ++k) {
-        const std::size_t idx = k - begin;
-        const double center_s = trajectory.points[k].s;
-        double win_cos2 = 0.0;
-        double win_sin2 = 0.0;
+    double pca_coherence_sum = 0.0;
+    std::size_t pca_count = 0U;
+    for (std::size_t k = begin; k <= end; ++k) {
+      const std::size_t idx = k - begin;
+      const double center_s = trajectory.points[k].s;
+      bool used_pca = false;
+      if (params.sidewall_pca_enabled) {
+        double mean_lx = 0.0, mean_ly = 0.0, mean_rx = 0.0, mean_ry = 0.0;
+        std::size_t valid_pairs = 0U;
         for (std::size_t m = begin; m <= end; ++m) {
-          if (std::abs(trajectory.points[m].s - center_s) <= smooth_window) {
-            win_cos2 += sample_cos2[m - begin];
-            win_sin2 += sample_sin2[m - begin];
+          const auto & ws = wall_samples[m - begin];
+          if (ws.valid && std::abs(trajectory.points[m].s - center_s) <= smooth_window) {
+            mean_lx += ws.lx;
+            mean_ly += ws.ly;
+            mean_rx += ws.rx;
+            mean_ry += ws.ry;
+            ++valid_pairs;
           }
         }
-        segment.axis_yaw[idx] = (std::hypot(win_cos2, win_sin2) > 1e-6) ?
-          normalize(std::atan2(win_sin2, win_cos2) / 2.0) :
-          tangent_yaws[idx];
+        if (valid_pairs >= 3U) {
+          const double inv_n = 1.0 / static_cast<double>(valid_pairs);
+          mean_lx *= inv_n;
+          mean_ly *= inv_n;
+          mean_rx *= inv_n;
+          mean_ry *= inv_n;
+          double sxx = 0.0, sxy = 0.0, syy = 0.0;
+          for (std::size_t m = begin; m <= end; ++m) {
+            const auto & ws = wall_samples[m - begin];
+            if (ws.valid && std::abs(trajectory.points[m].s - center_s) <= smooth_window) {
+              const double dlx = ws.lx - mean_lx;
+              const double dly = ws.ly - mean_ly;
+              const double drx = ws.rx - mean_rx;
+              const double dry = ws.ry - mean_ry;
+              sxx += dlx * dlx + drx * drx;
+              sxy += dlx * dly + drx * dry;
+              syy += dly * dly + dry * dry;
+            }
+          }
+          const double trace = sxx + syy;
+          if (trace > 1e-5) {
+            const double diff = sxx - syy;
+            const double disc = std::hypot(diff, 2.0 * sxy);
+            const double anisotropy = disc / (trace + 1e-9);
+            const double pca_axis = 0.5 * std::atan2(2.0 * sxy, diff);
+            if (anisotropy >= params.min_coherence &&
+              std::cos(2.0 * (pca_axis - tangent_yaws[idx])) >= params.side_wall_cos2_min)
+            {
+              segment.axis_yaw[idx] = tunnelAlignedYaw(pca_axis, 0.0, tangent_yaws[idx]);
+              pca_coherence_sum += anisotropy;
+              ++pca_count;
+              used_pca = true;
+            }
+          }
+        }
       }
+      if (!used_pca) {
+        if (segment.coherence < params.min_coherence) {
+          segment.axis_yaw[idx] = tangent_yaws[idx];
+        } else {
+          double win_cos2 = 0.0;
+          double win_sin2 = 0.0;
+          for (std::size_t m = begin; m <= end; ++m) {
+            if (std::abs(trajectory.points[m].s - center_s) <= smooth_window) {
+              win_cos2 += sample_cos2[m - begin];
+              win_sin2 += sample_sin2[m - begin];
+            }
+          }
+          segment.axis_yaw[idx] = (std::hypot(win_cos2, win_sin2) > 1e-6) ?
+            normalize(std::atan2(win_sin2, win_cos2) / 2.0) :
+            tangent_yaws[idx];
+        }
+      }
+    }
+    if (pca_count > 0U) {
+      segment.coherence = std::max(
+        segment.coherence, pca_coherence_sum / static_cast<double>(pca_count));
     }
     const double start_s = trajectory.points.front().s;
     const bool approaching_from_outside =
@@ -236,6 +309,133 @@ std::vector<TunnelSegment> detectTunnelSegments(
     ++i;
   }
   return segments;
+}
+
+void resolveTerminalTunnelGoalAlignment(
+  std::vector<TunnelSegment> & tunnels,
+  const ReferenceTrajectory & trajectory,
+  double goal_yaw,
+  bool is_final_goal,
+  const TunnelYawParams & params)
+{
+  if (!params.enabled || !params.terminal_goal_axial_override_enabled || !is_final_goal ||
+    tunnels.empty() || trajectory.points.size() < 2U)
+  {
+    return;
+  }
+  const double total_end_s = trajectory.points.back().s;
+  const double start_s = trajectory.points.front().s;
+  const double narrow_turn_diameter = 2.0 * std::max(0.30, params.circumscribed_radius) + 0.04;
+  for (auto & segment : tunnels) {
+    if (segment.axis_yaw.empty() || segment.end >= trajectory.points.size()) {
+      continue;
+    }
+    // 仅当最终目标点本身位于不能原地 180° 掉头的窄通道内部/口部时触发：
+    // 若 goal_yaw 与隧道轴线同轴（含反向同轴，如 V1 在东口外侧对齐 yaw=0 后倒车 0.5 m 入位），
+    // 则在洞外预先将车头正方向对齐到该同轴方向并全程保持轴向滑入目标，避免洞内 180° 原地扫掠碰撞。
+    const bool ends_inside_tunnel =
+      (total_end_s - trajectory.points[segment.end].s) <=
+      std::max(0.25, params.front_extent + 0.15);
+    if (!ends_inside_tunnel || segment.width_estimate >= narrow_turn_diameter) {
+      continue;
+    }
+    const double nearest_axial =
+      tunnelAlignedYaw(segment.axis_yaw.back(), params.yaw_offset, goal_yaw);
+    if (std::abs(normalize(goal_yaw - nearest_axial)) > std::max(1e-3, params.axis_tolerance)) {
+      continue;
+    }
+    segment.terminal_goal_axial_override = true;
+    const bool approaching_from_outside =
+      (trajectory.points[segment.begin].s - start_s) > params.front_extent + 1e-6;
+    if (approaching_from_outside) {
+      segment.forward_alignment = true;
+    }
+    const double desired_raw_axis = normalize(nearest_axial - params.yaw_offset);
+    for (double & axis_val : segment.axis_yaw) {
+      axis_val = tunnelAlignedYaw(axis_val, 0.0, desired_raw_axis);
+    }
+  }
+}
+
+double computeDynamicPreAlignDistance(
+  const ReferenceTrajectory & trajectory,
+  const TunnelSegment & tunnel,
+  double initial_yaw,
+  double initial_yaw_rate,
+  const TunnelYawParams & params,
+  double yaw_rate_limit,
+  double yaw_accel_limit)
+{
+  const double base_pre = std::max(0.0, params.pre_align_distance);
+  if (!params.dynamic_pre_align_enabled || tunnel.axis_yaw.empty() ||
+    tunnel.begin >= trajectory.points.size() || trajectory.points.size() < 2U)
+  {
+    return base_pre;
+  }
+  const double target_yaw = tunnel.forward_alignment ?
+    normalize(tunnel.axis_yaw.front() + params.yaw_offset) :
+    tunnelAlignedYaw(tunnel.axis_yaw.front(), params.yaw_offset, initial_yaw);
+  const double delta = std::abs(normalize(target_yaw - initial_yaw));
+  const double w_max = std::max(0.1, yaw_rate_limit);
+  const double a_max = std::max(0.1, yaw_accel_limit > 0.0 ? yaw_accel_limit : 2.0);
+  const double brake_time = std::abs(initial_yaw_rate) / a_max;
+  const double turn_time = std::max(
+    1.875 * delta / w_max,
+    std::sqrt(5.7735026919 * delta / a_max));
+  const double total_required_time =
+    brake_time + turn_time + std::max(0.0, params.pre_align_time_margin);
+
+  const double armed_s =
+    trajectory.points[tunnel.begin].s - params.front_extent - std::max(0.0, params.armed_distance);
+  std::size_t armed_idx = tunnel.begin;
+  while (armed_idx > 0U && trajectory.points[armed_idx].s > armed_s) {
+    --armed_idx;
+  }
+  const double t_armed = trajectory.points[armed_idx].t;
+  const double t_start = t_armed - total_required_time;
+  std::size_t start_idx = armed_idx;
+  while (start_idx > 0U && trajectory.points[start_idx].t > t_start) {
+    --start_idx;
+  }
+  const double dynamic_pre = std::max(
+    0.0, trajectory.points[tunnel.begin].s - trajectory.points[start_idx].s);
+  return std::max(base_pre, dynamic_pre);
+}
+
+TunnelTraversalPhase classifyTunnelTraversalPhase(
+  const ReferenceTrajectory & trajectory,
+  std::size_t point_index,
+  const TunnelSegment & tunnel,
+  double dynamic_pre_align_distance,
+  const TunnelYawParams & params)
+{
+  if (!params.enabled || tunnel.axis_yaw.empty() || point_index >= trajectory.points.size() ||
+    tunnel.begin >= trajectory.points.size() || tunnel.end >= trajectory.points.size())
+  {
+    return TunnelTraversalPhase::kOpen;
+  }
+  const double s = trajectory.points[point_index].s;
+  const double half_len = std::max(0.0, params.front_extent);
+  const double s_mouth = trajectory.points[tunnel.begin].s - half_len;
+  const double s_armed = s_mouth - std::max(0.0, params.armed_distance);
+  const double s_prepare = std::min(
+    s_armed, trajectory.points[tunnel.begin].s - std::max(params.pre_align_distance, dynamic_pre_align_distance));
+  // Full-vehicle exit: rear bumper (or front bumper when reversing out) clears tunnel.end by half_len.
+  const double s_rear_clear = trajectory.points[tunnel.end].s + half_len;
+  const double s_exit_done = s_rear_clear + std::max(0.0, params.post_release_distance);
+  if (s < s_prepare || s > s_exit_done) {
+    return TunnelTraversalPhase::kOpen;
+  }
+  if (s < s_armed) {
+    return TunnelTraversalPhase::kPrepare;
+  }
+  if (s < s_mouth) {
+    return TunnelTraversalPhase::kArmed;
+  }
+  if (s <= s_rear_clear) {
+    return TunnelTraversalPhase::kCommitted;
+  }
+  return TunnelTraversalPhase::kExit;
 }
 
 bool forwardTunnelEntriesAligned(

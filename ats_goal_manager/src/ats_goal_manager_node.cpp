@@ -251,6 +251,9 @@ private:
     // 无停车重规划进行中：旧参考继续执行，expected_plan_request_sequence 指向新请求。
     bool replacement_pending{false};
     double requested_position_tolerance{0.0};
+    std::optional<geometry_msgs::msg::Point> last_rolling_commit_pos{std::nullopt};
+    std::optional<rclcpp::Time> last_rolling_commit_time{std::nullopt};
+    std::uint64_t last_rolling_publication_sequence{0};
   };
 
   void loadParameters() {
@@ -348,6 +351,14 @@ private:
     // 守护），从当前位姿发起完整重规划，新参考就绪后直接替换。默认关闭保持原行为。
     replan_without_stop_enabled_ =
       declare_parameter<bool>("replan_without_stop_enabled", false);
+    rolling_replan_enabled_ =
+      declare_parameter<bool>("rolling_replan_enabled", true);
+    rolling_replan_hz_ = std::clamp(
+      declare_parameter<double>("rolling_replan_hz", 10.0), 0.5, 25.0);
+    rolling_replan_advance_m_ = std::max(
+      0.3, declare_parameter<double>("rolling_replan_advance_m", 2.0));
+    rolling_replan_stop_distance_m_ = std::max(
+      0.0, declare_parameter<double>("rolling_replan_stop_distance_m", 1.5));
     PlanProgressWatchdogParams progress_params;
     progress_params.progress_min_delta_m = std::max(
       0.0, declare_parameter<double>("progress_min_delta_m", 0.10));
@@ -1291,6 +1302,35 @@ private:
       (pending_yaw_authority_request_ ? pending_yaw_authority_request_->request_sequence : 0);
     command.gimbal_feedback_sequence = gimbal_status_ ? gimbal_status_->sequence : 0;
     command.reference = committed;
+    const std::size_t expected_pts = committed.poses.size();
+    const bool has_derivatives = !planner_ready_status_->reference_vx.empty();
+    if (has_derivatives) {
+      const auto allFiniteVec = [](const std::vector<double> & v) {
+          return std::all_of(v.begin(), v.end(), [](double x) {return std::isfinite(x);});
+        };
+      if (planner_ready_status_->reference_vx.size() != expected_pts ||
+        planner_ready_status_->reference_vy.size() != expected_pts ||
+        planner_ready_status_->reference_ax.size() != expected_pts ||
+        planner_ready_status_->reference_ay.size() != expected_pts ||
+        planner_ready_status_->reference_yaw_rate.size() != expected_pts ||
+        !allFiniteVec(planner_ready_status_->reference_vx) ||
+        !allFiniteVec(planner_ready_status_->reference_vy) ||
+        !allFiniteVec(planner_ready_status_->reference_ax) ||
+        !allFiniteVec(planner_ready_status_->reference_ay) ||
+        !allFiniteVec(planner_ready_status_->reference_yaw_rate))
+      {
+        fail_stop_ = true;
+        noteStopReason("commit_malformed_reference_derivatives");
+        return;
+      }
+      command.reference_vx = planner_ready_status_->reference_vx;
+      command.reference_vy = planner_ready_status_->reference_vy;
+      command.reference_ax = planner_ready_status_->reference_ax;
+      command.reference_ay = planner_ready_status_->reference_ay;
+      command.reference_yaw_rate = planner_ready_status_->reference_yaw_rate;
+    }
+    command.is_partial_subgoal = planner_ready_status_->is_partial_subgoal;
+    command.has_spliced_tail = planner_ready_status_->has_spliced_tail;
     if (require_planning_snapshot_) {
       // The full-path check above and this assignment share mutex_. Preserve
       // MINCO provenance; bind the actual final validation independently.
@@ -1305,6 +1345,15 @@ private:
     active_goal_->wait_for_publication_after = 0;
     active_goal_->committed_plan_request_sequence = planner_ready_status_->plan_request_sequence;
     active_goal_->committed_planning_target = active_goal_->requested_planning_target;
+    if (has_current_planning_pose_) {
+      active_goal_->last_rolling_commit_pos = current_planning_pose_.pose.position;
+    } else if (!committed.poses.empty()) {
+      active_goal_->last_rolling_commit_pos = committed.poses.front().pose.position;
+    }
+    active_goal_->last_rolling_commit_time = commit_stamp;
+    active_goal_->last_rolling_publication_sequence =
+      planning_snapshot_ ? planning_snapshot_->publication_sequence :
+      planner_ready_status_->map_publication_sequence;
     if (replacing) {
       RCLCPP_INFO(
         get_logger(), "【无停车重规划】目标=%llu 新参考已替换（请求序号=%llu），全程未急停。",
@@ -1520,7 +1569,11 @@ private:
               std::abs(std::atan2(std::sin(yaw_delta), std::cos(yaw_delta)));
           const double position_tolerance = active_goal_->requested_position_tolerance > 0.0 ?
             active_goal_->requested_position_tolerance : goal_position_tolerance_;
-          const bool pose_converged = distance <= position_tolerance &&
+          const bool on_partial_subgoal =
+            active_execution_command_ && active_execution_command_->is_partial_subgoal;
+          // 局部推进子目标只作为单次 NavigateToPose 内的滚动跳板；未规划到真实终点前绝不判 SUCCEEDED。
+          const bool pose_converged = !on_partial_subgoal &&
+            distance <= position_tolerance &&
             yaw_error <= goal_yaw_tolerance_;
           bool velocity_converged = false;
           if (terminal_motion_.enabled()) {
@@ -1575,6 +1628,44 @@ private:
               RCLCPP_INFO(get_logger(), "S3 endpoint retarget drift=%.4f threshold=%.4f goal=%llu map_tf_stamp_ns=%lld",
                 drift, retarget_threshold_, static_cast<unsigned long long>(active_goal_->id),
                 static_cast<long long>(rclcpp::Time(latest_target.header.stamp).nanoseconds()));
+            } else if (rolling_replan_enabled_ &&
+              (active_execution_command_->is_partial_subgoal ||
+               (active_execution_command_->has_spliced_tail &&
+                distance > std::max(progress_hold_distance_m_, rolling_replan_stop_distance_m_))))
+            {
+              const rclcpp::Time tick_now = now();
+              const double min_period_sec = 1.0 / std::max(0.5, rolling_replan_hz_);
+              const bool period_ready = !active_goal_->last_rolling_commit_time ||
+                (tick_now - *active_goal_->last_rolling_commit_time).seconds() >= min_period_sec;
+              double advanced_m = 0.0;
+              if (active_goal_->last_rolling_commit_pos) {
+                advanced_m = std::hypot(
+                  current_planning_pose_.pose.position.x - active_goal_->last_rolling_commit_pos->x,
+                  current_planning_pose_.pose.position.y - active_goal_->last_rolling_commit_pos->y);
+              }
+              const auto & subgoal_end = active_execution_command_->reference.poses.back().pose.position;
+              const double dist_to_subgoal = std::hypot(
+                subgoal_end.x - current_planning_pose_.pose.position.x,
+                subgoal_end.y - current_planning_pose_.pose.position.y);
+              const std::uint64_t latest_pub = planning_snapshot_ ?
+                planning_snapshot_->publication_sequence : 0U;
+              const double subgoal_lookahead_m = std::max(rolling_replan_advance_m_, 2.5);
+              const bool partial_trigger = active_execution_command_->is_partial_subgoal &&
+                ((dist_to_subgoal <= subgoal_lookahead_m && advanced_m >= 0.35) ||
+                 (latest_pub > active_goal_->last_rolling_publication_sequence &&
+                  (advanced_m >= 0.4 * rolling_replan_advance_m_ || dist_to_subgoal <= 0.60)));
+              const bool spliced_trigger = !active_execution_command_->is_partial_subgoal &&
+                active_execution_command_->has_spliced_tail &&
+                advanced_m >= rolling_replan_advance_m_;
+              if (period_ready && (partial_trigger || spliced_trigger)) {
+                endpoint_retarget = PlannerStatus();
+                endpoint_retarget->goal_id = active_goal_->id;
+                endpoint_retarget->localization_epoch = active_goal_->localization_epoch;
+                endpoint_retarget->plan_request_sequence =
+                  active_goal_->committed_plan_request_sequence;
+                terminal_converged_since_.reset();
+                reached = false;
+              }
             }
           }
           if (pose_converged || in_progress_hold) {
@@ -2432,6 +2523,10 @@ private:
   bool require_map_status_{true};
   bool require_gimbal_status_{true};
   bool require_planning_snapshot_{false};
+  bool rolling_replan_enabled_{true};
+  double rolling_replan_hz_{10.0};
+  double rolling_replan_advance_m_{2.0};
+  double rolling_replan_stop_distance_m_{1.5};
 
   std::mutex mutex_;
   std::mutex emergency_stop_log_mutex_;

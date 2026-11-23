@@ -61,6 +61,7 @@ public:
     const nav_msgs::msg::OccupancyGrid & grid, JointDistanceFieldMode mode)
   {
     field_.clear();
+    field_ptr_ = nullptr;
     if (mode == JointDistanceFieldMode::kLegacy) {
       return false;
     }
@@ -81,17 +82,24 @@ public:
     {
       return false;
     }
-    if (!esdf.copySignedDistanceField(field_) ||
-      field_.size() != static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_))
+    const std::size_t expected_size =
+      static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
+    if (const std::vector<double> * borrowed = esdf.rawSignedDistanceFieldPtr();
+      borrowed != nullptr && borrowed->size() == expected_size)
     {
-      field_.clear();
-      return false;
+      field_ptr_ = borrowed;
+    } else {
+      if (!esdf.copySignedDistanceField(field_) || field_.size() != expected_size) {
+        field_.clear();
+        return false;
+      }
+      field_ptr_ = &field_;
     }
     mode_ = mode;
     return true;
   }
 
-  bool valid() const {return !field_.empty();}
+  bool valid() const {return field_ptr_ != nullptr && !field_ptr_->empty();}
 
   /**
    * @brief 距离与梯度（世界系）；在栅格可查询范围外或邻域含非有限值时返回 false。
@@ -99,7 +107,7 @@ public:
    */
   bool query(const Eigen::Vector2d & position, double & distance, Eigen::Vector2d & gradient) const
   {
-    if (field_.empty()) {
+    if (field_ptr_ == nullptr || field_ptr_->empty()) {
       return false;
     }
     const double gx = (position.x() - origin_x_) / resolution_ - 0.5;
@@ -148,7 +156,7 @@ private:
   {
     x = std::max(0, std::min(x, width_ - 1));
     y = std::max(0, std::min(y, height_ - 1));
-    return field_[static_cast<std::size_t>(y) * static_cast<std::size_t>(width_) +
+    return (*field_ptr_)[static_cast<std::size_t>(y) * static_cast<std::size_t>(width_) +
         static_cast<std::size_t>(x)];
   }
 
@@ -164,6 +172,7 @@ private:
   }
 
   std::vector<double> field_;
+  const std::vector<double> * field_ptr_ = nullptr;
   JointDistanceFieldMode mode_ = JointDistanceFieldMode::kLegacy;
   int width_ = 0;
   int height_ = 0;

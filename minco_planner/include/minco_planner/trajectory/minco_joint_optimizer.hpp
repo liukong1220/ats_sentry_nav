@@ -103,6 +103,9 @@ struct MincoJointProblem
   // col(0) 为起点，col(1)/col(2) 为首端速度/加速度。
   Eigen::Matrix<double, 2, 3> head_state = Eigen::Matrix<double, 2, 3>::Zero();
   Eigen::Vector2d tail_position = Eigen::Vector2d::Zero();
+  // O2 局部滚动段尾端速度/加速度（默认全零：独立 action 最终目标确定性停车）。
+  Eigen::Vector2d tail_velocity = Eigen::Vector2d::Zero();
+  Eigen::Vector2d tail_acceleration = Eigen::Vector2d::Zero();
   int piece_count = 0;
   JointDistanceQuery distance;
   JointYawQuery yaw;
@@ -180,7 +183,8 @@ public:
     const Eigen::VectorXd & initial_durations,
     const JointDistanceQuery & distance,
     const JointYawQuery & yaw,
-    const std::vector<Eigen::Vector2d> & guide = {}) const;
+    const std::vector<Eigen::Vector2d> & guide = {},
+    const Eigen::Matrix<double, 2, 3> * tail_state = nullptr) const;
 
   /**
    * @brief 代价与梯度，x = [vec(q) (2(N-1)); τ (N)]。

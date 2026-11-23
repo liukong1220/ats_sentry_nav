@@ -5,6 +5,7 @@
 
 #include <vector>
 
+#include "ats_rc_esdf/esdf/esdf_provider.hpp"
 #include "minco_planner/trajectory/reference_trajectory.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 
@@ -21,6 +22,9 @@ struct FootprintSafetyParams
   // The maximum displacement of the farthest rectangular corner between two
   // swept samples, expressed in planning-grid cells.
   double swept_max_corner_step_cells = 0.5;
+  // O3: segment AABB + ESDF 1-Lipschitz adaptive swept subdivision down to min(margin/2, 0.01 m).
+  bool adaptive_lipschitz_swept_enabled = true;
+  double swept_min_corner_step_m = 0.01;
 };
 
 struct CollisionSample
@@ -51,7 +55,8 @@ public:
   const FootprintSafetyParams & params() const {return params_;}
   FootprintSafetyResult check(
     const ReferenceTrajectory & trajectory,
-    const nav_msgs::msg::OccupancyGrid & grid) const;
+    const nav_msgs::msg::OccupancyGrid & grid,
+    const ats_rc_esdf::EsdfProvider * esdf = nullptr) const;
 
 private:
   struct GridIndex
@@ -59,6 +64,21 @@ private:
     int x = 0;
     int y = 0;
   };
+
+  bool segmentSweptAabbClear(
+    const ReferencePoint & start,
+    const ReferencePoint & end,
+    const nav_msgs::msg::OccupancyGrid & grid) const;
+  void checkSegmentAdaptiveLipschitz(
+    const ReferencePoint & seg_start,
+    const ReferencePoint & seg_end,
+    std::size_t seg_index,
+    double u_start,
+    double u_end,
+    double fine_step_m,
+    const nav_msgs::msg::OccupancyGrid & grid,
+    const ats_rc_esdf::EsdfProvider * esdf,
+    FootprintSafetyResult & result) const;
 
   bool worldToGrid(
     const nav_msgs::msg::OccupancyGrid & grid,

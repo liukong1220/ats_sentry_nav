@@ -217,6 +217,8 @@ double MincoJointOptimizer::evaluate(
 
   Eigen::Matrix<double, 2, 3> tail = Eigen::Matrix<double, 2, 3>::Zero();
   tail.col(0) = problem.tail_position;
+  tail.col(1) = problem.tail_velocity;
+  tail.col(2) = problem.tail_acceleration;
   MincoS3 minco;
   if (!minco.solve(problem.head_state, tail, inner, durations)) {
     return kInfeasible;
@@ -442,7 +444,8 @@ MincoJointResult MincoJointOptimizer::optimize(
   const Eigen::VectorXd & initial_durations,
   const JointDistanceQuery & distance,
   const JointYawQuery & yaw,
-  const std::vector<Eigen::Vector2d> & guide) const
+  const std::vector<Eigen::Vector2d> & guide,
+  const Eigen::Matrix<double, 2, 3> * tail_state) const
 {
   using Clock = std::chrono::steady_clock;
   const auto started = Clock::now();
@@ -457,7 +460,8 @@ MincoJointResult MincoJointOptimizer::optimize(
   const int piece_count = static_cast<int>(initial_durations.size());
   if (initial_waypoints.size() < 2U ||
     piece_count + 1 != static_cast<int>(initial_waypoints.size()) ||
-    !head_state.allFinite() || !initial_durations.allFinite() ||
+    !head_state.allFinite() || (tail_state != nullptr && !tail_state->allFinite()) ||
+    !initial_durations.allFinite() ||
     (initial_durations.array() <= 0.0).any())
   {
     result.termination = "invalid_input";
@@ -474,6 +478,10 @@ MincoJointResult MincoJointOptimizer::optimize(
   problem.head_state = head_state;
   problem.head_state.col(0) = initial_waypoints.front();
   problem.tail_position = initial_waypoints.back();
+  if (tail_state != nullptr) {
+    problem.tail_velocity = tail_state->col(1);
+    problem.tail_acceleration = tail_state->col(2);
+  }
   problem.piece_count = piece_count;
   problem.distance = distance;
   problem.yaw = yaw;

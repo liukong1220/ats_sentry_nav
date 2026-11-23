@@ -16,7 +16,8 @@ void YawSplinePlanner::setParams(const YawSplinePlannerParams & params) { params
 
 void YawSplinePlanner::apply(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
-  const std::vector<TunnelSegment> * tunnels) const
+  const std::vector<TunnelSegment> * tunnels,
+  bool is_final_goal) const
 {
   if (trajectory.points.empty()) {
     return;
@@ -26,7 +27,7 @@ void YawSplinePlanner::apply(
     return;
   }
   if (params_.mode == "clearance_aware") {
-    applyClearanceAware(trajectory, initial_yaw, goal_yaw, tunnels);
+    applyClearanceAware(trajectory, initial_yaw, goal_yaw, tunnels, is_final_goal);
     return;
   }
   if (params_.mode == "hold") {
@@ -41,7 +42,8 @@ void YawSplinePlanner::apply(
 
 void YawSplinePlanner::applyClearanceAware(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
-  const std::vector<TunnelSegment> * tunnels) const
+  const std::vector<TunnelSegment> * tunnels,
+  bool is_final_goal) const
 {
   if (trajectory.points.size() < 2) {
     applyGoalHeading(trajectory, initial_yaw, goal_yaw);
@@ -233,8 +235,12 @@ void YawSplinePlanner::applyClearanceAware(
     1.875 * M_PI / std::max(1e-3, rate_limit),
     acceleration_limit > 0.0 ? std::sqrt(5.7735 * M_PI / acceleration_limit) : 0.0);
   std::vector<double> tunnel_turn_start;
+  std::vector<double> tunnel_dynamic_pre;
+  std::vector<double> tunnel_locked_branch_offset;
   if (active_tunnels) {
     tunnel_turn_start.reserve(active_tunnels->size());
+    tunnel_dynamic_pre.reserve(active_tunnels->size());
+    tunnel_locked_branch_offset.reserve(active_tunnels->size());
     for (const auto & tunnel : *active_tunnels) {
       std::size_t entry = tunnel.begin;
       const double front_s = trajectory.points[entry].s - params_.tunnel.front_extent;
@@ -242,6 +248,21 @@ void YawSplinePlanner::applyClearanceAware(
         --entry;
       }
       tunnel_turn_start.push_back(trajectory.points[entry].t - alignment_time);
+      tunnel_dynamic_pre.push_back(computeDynamicPreAlignDistance(
+        trajectory, tunnel, initial_yaw, 0.0, params_.tunnel, rate_limit, acceleration_limit));
+      // 起点已在隧道内/洞口时（如隧道内后退脱困/退出），锁定当前与隧道正方向对齐的同轴分支（0 或 pi），
+      // 全程保持正方向沿隧道轴线直到整车完全退出隧道口，绝不在隧道内尝试 180° 掉头。
+      double branch_shift = 0.0;
+      if (!tunnel.forward_alignment && !tunnel.axis_yaw.empty()) {
+        const double aligned_init =
+          tunnelAlignedYaw(tunnel.axis_yaw.front(), params_.tunnel.yaw_offset, initial_yaw);
+        const double base_target =
+          normalizeAngle(tunnel.axis_yaw.front() + params_.tunnel.yaw_offset);
+        if (std::abs(shortestAngularDistance(aligned_init, base_target)) > 0.5 * M_PI) {
+          branch_shift = M_PI;
+        }
+      }
+      tunnel_locked_branch_offset.push_back(branch_shift);
     }
   }
   trajectory.points.front().yaw = previous_yaw;
@@ -257,15 +278,27 @@ void YawSplinePlanner::applyClearanceAware(
         if (tunnel.axis_yaw.empty()) {
           continue;
         }
-        const double begin_s = trajectory.points[tunnel.begin].s - params_.tunnel.pre_align_distance;
-        const double end_s = trajectory.points[tunnel.end].s + params_.tunnel.post_release_distance;
-        const bool prealign = tunnel.forward_alignment && current.t >= tunnel_turn_start[j];
-        if ((current.s >= begin_s || prealign) && current.s <= end_s) {
+        const TunnelTraversalPhase phase = classifyTunnelTraversalPhase(
+          trajectory, i, tunnel, tunnel_dynamic_pre[j], params_.tunnel);
+        const bool prealign = tunnel.forward_alignment && current.t >= tunnel_turn_start[j] &&
+          current.s <= trajectory.points[tunnel.end].s + params_.tunnel.front_extent +
+            params_.tunnel.post_release_distance;
+        if (phase != TunnelTraversalPhase::kOpen || prealign) {
           const std::size_t local_index =
             std::min(tunnel.axis_yaw.size() - 1, i >= tunnel.begin ? i - tunnel.begin : 0U);
-          desired_yaw = tunnel.forward_alignment ?
-            normalizeAngle(tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset) :
-            tunnelAlignedYaw(tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
+          if (tunnel.forward_alignment) {
+            desired_yaw = normalizeAngle(tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset);
+          } else if (trajectory.points[tunnel.begin].s - start_s <=
+            params_.tunnel.front_extent + 1e-6)
+          {
+            // 已在隧道中：严格锁定进入时的隧道轴线方向（允许 v_x < 0 直线倒车退出隧道）。
+            desired_yaw = normalizeAngle(
+              tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset +
+              tunnel_locked_branch_offset[j]);
+          } else {
+            desired_yaw = tunnelAlignedYaw(
+              tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
+          }
           tunnel_alignment = true;
           break;
         }
@@ -331,7 +364,10 @@ void YawSplinePlanner::applyClearanceAware(
   }
   // 窄通道可能延续到最终位置。此时保留通道内的切线 yaw，再追加原地、
   // 限速的目标朝向过渡，避免 Navigate action 在位置到达后永久 tracking。
-  appendTerminalGoalYawTransition(trajectory, goal_yaw);
+  // 对于非最终目标的滚动局部子目标（且末点速度非零），不追加原地转向停顿。
+  if (is_final_goal || std::hypot(trajectory.points.back().vx, trajectory.points.back().vy) <= 0.05) {
+    appendTerminalGoalYawTransition(trajectory, goal_yaw);
+  }
 }
 
 void YawSplinePlanner::appendTerminalGoalYawTransition(

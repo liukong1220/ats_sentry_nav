@@ -127,9 +127,15 @@ inline bool validPlannerCandidate(
       candidate.reference.header.frame_id != candidate.header.frame_id) {
     return false;
   }
-  return monotonicPathStamps(candidate.raw_path) &&
-         monotonicPathStamps(candidate.reference);
-}
+    return monotonicPathStamps(candidate.raw_path) &&
+           monotonicPathStamps(candidate.reference) &&
+           (candidate.reference_vx.empty() ||
+            (candidate.reference_vx.size() == candidate.reference.poses.size() &&
+             candidate.reference_vy.size() == candidate.reference.poses.size() &&
+             candidate.reference_ax.size() == candidate.reference.poses.size() &&
+             candidate.reference_ay.size() == candidate.reference.poses.size() &&
+             candidate.reference_yaw_rate.size() == candidate.reference.poses.size()));
+  }
 
 } // namespace minco_planner
 

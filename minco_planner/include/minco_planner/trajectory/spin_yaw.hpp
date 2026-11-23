@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "minco_planner/trajectory/reference_trajectory.hpp"
+#include "minco_planner/trajectory/tunnel_yaw_alignment.hpp"
 
 namespace minco_planner
 {
@@ -98,7 +99,11 @@ inline bool appendSpinTerminalGoal(
 /// 所以窄段（隧道）内的 yaw 就是规划 yaw（含隧道轴线对齐），出窄段后再次自旋。
 /// 平移部分的位置、时间不变；停止终点的原地尾段替换为减速与目标 yaw 收敛段，必要时延长。
 /// 纯原地 yaw 参考不自旋。净空 NaN 按非净空处理。失败时原参考不变。
-inline bool applySpinYaw(ReferenceTrajectory & trajectory, const SpinYawParams & params)
+inline bool applySpinYaw(
+  ReferenceTrajectory & trajectory,
+  const SpinYawParams & params,
+  const std::vector<TunnelSegment> * tunnels = nullptr,
+  const TunnelYawParams * tunnel_params = nullptr)
 {
   if (!trajectory.valid() || !std::isfinite(params.rate) || !(params.rate > 0.0) ||
     !std::isfinite(params.angular_accel) || !std::isfinite(params.blend_rate_limit))
@@ -128,6 +133,11 @@ inline bool applySpinYaw(ReferenceTrajectory & trajectory, const SpinYawParams &
   {
     return false;
   }
+  // 终点附近极短平移微调（< 0.40 m 且初始未在自旋）不凭空起旋，避免先背离目标角再反向回正。
+  const double travel_distance = points[terminal_begin].s - points.front().s;
+  if (terminal_stop && travel_distance < 0.40 && std::abs(params.initial_rate) <= 0.25) {
+    return false;
+  }
   std::vector<char> spin_ok(n, 0);
   double last_narrow_s = -std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i < n; ++i) {
@@ -147,6 +157,22 @@ inline bool applySpinYaw(ReferenceTrajectory & trajectory, const SpinYawParams &
     }
     if (next_narrow_s - points[k].s <= std::max(0.0, params.stop_before_narrow_m)) {
       spin_ok[k] = 0;
+    }
+  }
+  if (tunnels != nullptr && tunnel_params != nullptr && tunnel_params->enabled) {
+    for (const auto & tunnel : *tunnels) {
+      const double dyn_pre = computeDynamicPreAlignDistance(
+        candidate, tunnel, points.front().yaw,
+        std::max(std::abs(params.initial_rate), params.rate),
+        *tunnel_params, params.blend_rate_limit, params.angular_accel);
+      const double effective_pre = std::max(dyn_pre, std::max(0.0, params.stop_before_narrow_m));
+      for (std::size_t i = 0; i < n; ++i) {
+        if (classifyTunnelTraversalPhase(candidate, i, tunnel, effective_pre, *tunnel_params) !=
+          TunnelTraversalPhase::kOpen)
+        {
+          spin_ok[i] = 0;
+        }
+      }
     }
   }
 

@@ -48,9 +48,11 @@ public:
   explicit YawSplinePlanner(YawSplinePlannerParams params = YawSplinePlannerParams());
 
   void setParams(const YawSplinePlannerParams & params);
+  const YawSplinePlannerParams & params() const { return params_; }
   void apply(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
-    const std::vector<TunnelSegment> * tunnels = nullptr) const;
+    const std::vector<TunnelSegment> * tunnels = nullptr,
+    bool is_final_goal = true) const;
 
 private:
   void applyGoalHeading(
@@ -58,7 +60,8 @@ private:
   void applyPathTangent(ReferenceTrajectory & trajectory, double initial_yaw) const;
   void applyClearanceAware(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
-    const std::vector<TunnelSegment> * tunnels) const;
+    const std::vector<TunnelSegment> * tunnels,
+    bool is_final_goal) const;
   void appendTerminalGoalYawTransition(
     ReferenceTrajectory & trajectory, double goal_yaw) const;
   static double normalizeAngle(double angle);

@@ -97,10 +97,9 @@ struct MincoTrajectoryOptimizerParams
   double joint_g_epsilon = 1e-5;
   int joint_max_iterations = 200;
   double joint_time_budget_ms = 15.0;
-  // 联合优化用的距离场："legacy" = provider.query()（距离取原始场、梯度取平滑场，两者不是
-  // 同一个函数）；"bilinear"/"bicubic" = 拷出原始场自己插值，值与梯度同源
-  // （见 consistent_distance_field.hpp）。需要 planning_grid 与 ESDF 几何一致，否则回退 legacy。
-  std::string joint_distance_field = "legacy";
+  // 联合优化用的距离场："bicubic"（默认，C1 连续）或 "bilinear" = 拷出原始场自己插值，值与梯度同源
+  // （见 consistent_distance_field.hpp）；仅在栅格几何不符时安全回退 provider 查询。
+  std::string joint_distance_field = "bicubic";
   // > 0 时联合优化的障碍罚用 C1 平滑 L1（A.22.1），权重 [代价/m]；0 = 三次铰链
   // joint_obstacle_weight。mu 为二次段与线性段的分界违例量 [m]。
   double joint_obstacle_smooth_l1_weight = 0.0;
@@ -147,6 +146,20 @@ struct InitialKinematicState
   Eigen::Vector2d velocity{0.0, 0.0};
   // 世界系线加速度 [m/s^2]；无可靠估计时保持零，仅播种速度即可。
   Eigen::Vector2d acceleration{0.0, 0.0};
+};
+
+/**
+ * @brief O2 局部滚动段的末端运动状态（世界系）。
+ *
+ * valid=false（默认）表示独立 action 的最终目标或无安全续接边界，强制零速零加速度停车；
+ * valid=true 仅用于存在安全已知自由续接段的局部滚动窗口末端，保证不在局部拼接点急刹。
+ */
+struct TerminalKinematicState
+{
+  bool valid = false;
+  Eigen::Vector2d velocity{0.0, 0.0};
+  Eigen::Vector2d acceleration{0.0, 0.0};
+  bool exact_splice = false;
 };
 
 struct MincoOptimizationTrace
@@ -215,10 +228,21 @@ public:
     const InitialKinematicState * initial_state = nullptr,
     const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
     const FootprintSafetyChecker * safety_checker = nullptr,
-    MincoOptimizationTrace * trace = nullptr) const;
+    MincoOptimizationTrace * trace = nullptr,
+    const TerminalKinematicState * terminal_state = nullptr) const;
+
+  /**
+   * @brief O2 快速代数续接段生成（带状 LU + 动力学时间缩放，不跑 L-BFGS），用于在局部滚动窗口
+   *        末端 C2 平滑衔接至最终目标确定性停车。
+   */
+  ReferenceTrajectory buildContinuationTail(
+    const nav_msgs::msg::Path & tail_path,
+    const InitialKinematicState & junction_state,
+    const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
+    const FootprintSafetyChecker * safety_checker = nullptr) const;
 
 private:
-  // 单次优化（原 optimize 的全部内容）；optimize 在它外面套首端种子回退。
+  // 单次优化（原 optimize 的全部内容）；optimize 在它外面套首尾种子回退。
   ReferenceTrajectory optimizeOnce(
     const nav_msgs::msg::Path & raw_path,
     const ats_rc_esdf::RcTraversabilityEsdfProvider * esdf,
@@ -226,7 +250,8 @@ private:
     const InitialKinematicState * initial_state,
     const nav_msgs::msg::OccupancyGrid * planning_grid,
     const FootprintSafetyChecker * safety_checker,
-    MincoOptimizationTrace * trace) const;
+    MincoOptimizationTrace * trace,
+    const TerminalKinematicState * terminal_state) const;
 
   MincoTrajectoryOptimizerParams params_;
 };

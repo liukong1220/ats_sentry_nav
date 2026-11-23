@@ -44,7 +44,8 @@ void MincoTimeAllocator::setParams(const MincoTimeAllocatorParams & params)
 }
 
 MincoTimeAllocation MincoTimeAllocator::allocate(
-  const std::vector<Eigen::Vector2d> & waypoints, double initial_speed) const
+  const std::vector<Eigen::Vector2d> & waypoints, double initial_speed,
+  double terminal_speed) const
 {
   MincoTimeAllocation result;
   if (waypoints.size() < 2U) {
@@ -104,7 +105,9 @@ MincoTimeAllocation MincoTimeAllocator::allocate(
     result.waypoint_speeds.front() = std::min(
       result.waypoint_speeds.front(), bounded_initial_speed);
   }
-  result.waypoint_speeds.back() = 0.0;
+  const double bounded_terminal_speed = std::isfinite(terminal_speed) ?
+    std::max(0.0, terminal_speed) : 0.0;
+  result.waypoint_speeds.back() = std::min(result.waypoint_speeds.back(), bounded_terminal_speed);
 
   for (std::size_t index = 0; index + 1U < count; ++index) {
     const double reachable = std::sqrt(std::max(

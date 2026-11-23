@@ -58,6 +58,16 @@ struct PlannerCommitTelemetry
   std::string occupancy_digest;
   std::string content_digest;
   std::uint32_t reference_point_count{0};
+  std::vector<double> reference_vx;
+  std::vector<double> reference_vy;
+  std::vector<double> reference_ax;
+  std::vector<double> reference_ay;
+  std::vector<double> reference_yaw_rate;
+  bool is_partial_subgoal{false};
+  bool has_spliced_tail{false};
+  float search_wall_ms{0.0F};
+  float minco_wall_ms{0.0F};
+  float total_plan_wall_ms{0.0F};
 };
 
 class MincoPlannerNode : public rclcpp::Node
@@ -80,7 +90,8 @@ private:
     const geometry_msgs::msg::PoseStamped & goal,
     bool goal_pose_footprint_verified,
     double & used_clearance,
-    const std::vector<double> * blocked_squared = nullptr);
+    const std::vector<double> * blocked_squared = nullptr,
+    bool allow_partial_subgoal = false);
   GridSearchResult planRoute(
     const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
     const geometry_msgs::msg::PoseStamped & start,
@@ -128,7 +139,7 @@ private:
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
   void planYaw(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot,
-    double start_yaw, double goal_yaw) const;
+    double start_yaw, double goal_yaw, bool is_final_goal = true) const;
   void annotateClearance(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
   std::vector<Eigen::Vector2d> footprintSamples(
@@ -238,6 +249,7 @@ private:
   double reference_window_backward_sec_{0.0};
   double body_yaw_follow_clearance_ = 0.55;
   bool force_body_yaw_follow_ = false;
+  bool tunnel_lock_gimbal_ = true;
   SpinPolicy spin_policy_;
   SpinYawParams spin_yaw_params_;
   /// Preferred graph-search clearance (circumscribed all-yaw footprint radius).
@@ -268,6 +280,35 @@ private:
   int sidestep_max_tries_ = 8;
   double sidestep_accept_clearance_m_ = 0.08;
   double sidestep_min_improvement_m_ = 0.03;
+  // O2 局部滚动窗口与拼接参数。
+  bool rolling_horizon_enabled_ = true;
+  double rolling_horizon_length_m_ = 8.0;
+  double rolling_min_tail_length_m_ = 2.0;
+  // O1/A3 无先验远目标局部前沿接续参数。
+  bool partial_subgoal_continuation_enabled_ = true;
+  bool partial_subgoal_only_without_prior_ = true;
+  double partial_subgoal_min_advance_m_ = 0.30;
+  // 中心 ESDF 候选已过矩形足迹门且最小足迹净空 >= 该阈值时跳过冗余二次足迹联合优化。
+  double footprint_refinement_skip_clearance_m_ = 0.04;
+  // O2 Release 墙钟预算与统计参数。
+  double minco_stage_budget_ms_ = 20.0;
+  double plan_wall_budget_ms_ = 30.0;
+  double rolling_replan_wall_budget_ms_ = 35.0;
+  double plan_hard_wall_budget_ms_ = 0.0;
+  double optimizer_params_cached_speed_ = 1.5;
+  double optimizer_params_cached_max_accel_ = 2.5;
+  double optimizer_params_cached_lat_accel_ = 1.5;
+  struct PlanWallStats
+  {
+    std::mutex mutex;
+    std::uint64_t calls{0};
+    std::uint64_t minco_over_budget{0};
+    std::uint64_t plan_over_budget{0};
+    std::vector<double> minco_samples_ms;
+    std::vector<double> total_samples_ms;
+    std::size_t ring_cursor{0};
+  };
+  PlanWallStats plan_wall_stats_;
   LocalRouteParams local_route_params_{};
 
   GridSearch graph_search_;

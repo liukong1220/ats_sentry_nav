@@ -32,7 +32,7 @@ reference 和急停由 Goal Manager 发布。速度链细节见仓库根 README�
 
 ### 图搜索
 
-- 默认 JPS（`search_algorithm: jps`），`astar` 切换为 A*；`astar_fallback` 让 JPS 失败时回退 A*。
+- 默认统一混合图搜索（`search_algorithm: hybrid`：均匀区跳点剪枝，近墙/窄通道自动退化为加权 A*），也可设为 `jps` 或 `astar`。
 - 首选净空取 `jps_safe_distance` 与全 yaw 外接半径 `hypot(L/2 + m, W/2 + m)` 的较大者，
   当前profile足迹下约为`0.435592 m`；YAML中的`jps_safe_distance=0.36`是配置值，不等于首选搜索实际净空。
 - `clearance_relaxation_enabled` 开启时，首选档无路再退到下限档。未配置
