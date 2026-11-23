@@ -34,6 +34,8 @@ struct GroundProjection
 {
   // 0 free, 100 raw occupied, -1 unknown. Downstream owns metric clearance/inflation.
   nav_msgs::msg::OccupancyGrid occupancy_grid;
+  // Optional aligned mask (100 = multi-frame confirmed TUNNEL_FREE column, 0 otherwise).
+  nav_msgs::msg::OccupancyGrid tunnel_free_grid;
   std::uint64_t generation{0};
   std::uint64_t odom_instance_id{0};
   std::uint64_t odom_epoch{0};

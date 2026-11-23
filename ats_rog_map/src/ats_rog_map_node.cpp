@@ -237,6 +237,11 @@ public:
       "odom_layer.cloud_clear_ray_radius", layer_config.cloud_clear_ray_radius);
     layer_config.cloud_clear_endpoint_margin = declare_parameter<double>(
       "odom_layer.cloud_clear_endpoint_margin", layer_config.cloud_clear_endpoint_margin);
+    layer_config.tunnel_free_enabled = declare_parameter<bool>(
+      "odom_layer.tunnel_free_enabled", layer_config.tunnel_free_enabled);
+    layer_config.tunnel_free_confirm_frames = std::max(
+      1, static_cast<int>(declare_parameter<int>(
+        "odom_layer.tunnel_free_confirm_frames", layer_config.tunnel_free_confirm_frames)));
     odom_layer_ = std::make_unique<OdomLayerStore>(layer_config);
     GroundColumnConfig column_config;
     column_config.surface_max = declare_parameter<double>(
@@ -257,6 +262,8 @@ public:
       "odom_layer.floor_plane_enabled", column_config.floor_plane_enabled);
     column_config.floor_plane_band = declare_parameter<double>(
       "odom_layer.floor_plane_band", column_config.floor_plane_band);
+    column_config.tunnel_free_enabled = layer_config.tunnel_free_enabled;
+    column_config.tunnel_free_confirm_frames = layer_config.tunnel_free_confirm_frames;
     ground_columns_ = std::make_unique<GroundColumnGrid>(
       layer_config.width, layer_config.height, layer_config.resolution,
       layer_config.origin_x, layer_config.origin_y, column_config);
@@ -717,11 +724,29 @@ private:
       std::lock_guard<std::mutex> lock(layer_mutex_);
       const auto & c = odom_layer_->config();
       const double resolution = std::max(c.resolution, static_cast<double>(requested_resolution));
-      response.occupancy_grid = layerGrid(
-        std::floor((layer_center_x_ - 0.5 * layer_window_x_) / resolution) * resolution,
-        std::floor((layer_center_y_ - 0.5 * layer_window_y_) / resolution) * resolution,
-        static_cast<std::uint32_t>(std::ceil(layer_window_x_ / resolution)),
-        static_cast<std::uint32_t>(std::ceil(layer_window_y_ / resolution)), resolution);
+      const double win_ox =
+        std::floor((layer_center_x_ - 0.5 * layer_window_x_) / resolution) * resolution;
+      const double win_oy =
+        std::floor((layer_center_y_ - 0.5 * layer_window_y_) / resolution) * resolution;
+      const auto win_w = static_cast<std::uint32_t>(std::ceil(layer_window_x_ / resolution));
+      const auto win_h = static_cast<std::uint32_t>(std::ceil(layer_window_y_ / resolution));
+      response.occupancy_grid = layerGrid(win_ox, win_oy, win_w, win_h, resolution);
+      if (c.tunnel_free_enabled) {
+        response.tunnel_free_grid.header = response.occupancy_grid.header;
+        response.tunnel_free_grid.info = response.occupancy_grid.info;
+        response.tunnel_free_grid.data.assign(
+          static_cast<std::size_t>(win_w) * win_h, 0);
+        for (std::uint32_t y = 0; y < win_h; ++y) {
+          for (std::uint32_t x = 0; x < win_w; ++x) {
+            if (odom_layer_->sampleTunnelFree(
+                win_ox + x * resolution, win_oy + y * resolution,
+                win_ox + (x + 1) * resolution, win_oy + (y + 1) * resolution))
+            {
+              response.tunnel_free_grid.data[static_cast<std::size_t>(y) * win_w + x] = 100;
+            }
+          }
+        }
+      }
       trace_grid = std::chrono::steady_clock::now();
       if (odom_layer_pub_->get_subscription_count() > 0) {
         odom_layer_debug = layerGrid(c.origin_x, c.origin_y, c.width, c.height, c.resolution);
@@ -1343,12 +1368,18 @@ public:
       };
     const auto sample_started = std::chrono::steady_clock::now();
     const bool use_ground = projection_follow_measured_ground_;
+    const bool export_tunnel_free = odom_layer_->config().tunnel_free_enabled;
     std::unique_lock<std::mutex> layer_lock(layer_mutex_, std::defer_lock);
-    if (use_ground) {
+    if (use_ground || export_tunnel_free) {
       layer_lock.lock();
     }
     const auto & layer_config = odom_layer_->config();
     const auto & column_config = ground_columns_->config();
+    if (export_tunnel_free) {
+      response->tunnel_free_grid.header = grid.header;
+      response->tunnel_free_grid.info = grid.info;
+      response->tunnel_free_grid.data.assign(cell_count, 0);
+    }
     for (std::uint32_t my = 0; my < grid.info.height; ++my) {
       for (std::uint32_t mx = 0; mx < grid.info.width; ++mx) {
         const std::size_t index =
@@ -1361,9 +1392,14 @@ public:
         bool known_free = false;
         double cell_z_min = z_min;
         double cell_z_max = z_max;
+        const double x0 = grid.info.origin.position.x + mx * resolution;
+        const double y0 = grid.info.origin.position.y + my * resolution;
+        if (export_tunnel_free &&
+          odom_layer_->sampleTunnelFree(x0, y0, x0 + resolution, y0 + resolution))
+        {
+          response->tunnel_free_grid.data[index] = 100;
+        }
         if (use_ground) {
-          const double x0 = grid.info.origin.position.x + mx * resolution;
-          const double y0 = grid.info.origin.position.y + my * resolution;
           const int value = odom_layer_->sampleFootprint(x0, y0, x0 + resolution, y0 + resolution);
           occupied = value == 100;
           if (value == 0) {
@@ -1378,7 +1414,14 @@ public:
                 *ground + column_config.surface_max);
               cell_z_max = std::min(static_cast<double>(box_max.z()),
                 *ground + column_config.robot_height + column_config.top_margin);
-              known_free = cell_z_max >= cell_z_min;
+              if (ground_columns_->state(gx, gy) == ColumnState::kTunnelFree) {
+                if (const auto headroom = ground_columns_->ceilingHeadroom(gx, gy)) {
+                  const double ceiling_voxel_bottom =
+                    std::floor(headroom->ceiling_low / z_step) * z_step - 1e-4;
+                  cell_z_max = std::min(cell_z_max, ceiling_voxel_bottom);
+                }
+              }
+              known_free = true;
             }
           }
         }
@@ -1422,7 +1465,7 @@ public:
         }
       }
     }
-    if (use_ground) {
+    if (layer_lock.owns_lock()) {
       layer_lock.unlock();
     }
     sample_ms = 1000.0 * std::chrono::duration<double>(

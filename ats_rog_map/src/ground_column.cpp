@@ -57,7 +57,7 @@ ColumnState classifyGroundColumn(
   if (ceiling != heights.end() && *ceiling - *ground_z >= clearance - 1e-9 &&
     (hollow || span > config.tunnel_span_max || heights.front() > *ground_z + config.surface_max))
   {
-    return ColumnState::kFree;
+    return config.tunnel_free_enabled ? ColumnState::kTunnelFree : ColumnState::kFree;
   }
   return ColumnState::kOccupied;
 }
@@ -74,6 +74,8 @@ GroundColumnGrid::GroundColumnGrid(
   columns_.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
   ground_.resize(columns_.size());
   ray_observed_.resize(columns_.size(), false);
+  frame_touched_.resize(columns_.size(), false);
+  tunnel_free_observations_.resize(columns_.size(), 0U);
 }
 
 bool GroundColumnGrid::valid(int x, int y) const
@@ -123,6 +125,7 @@ void GroundColumnGrid::observe(
     const VoxelReturns observed{extent, {{py * 4 + px, extent}}};
     const auto inserted = column.emplace(bin, observed);
     if (!inserted.second) {extendReturns(inserted.first->second, observed);}
+    frame_touched_[index(x, y)] = true;
   }
   // Preserve the connected identity while retaining every higher return in its
   // fixed surface band, including another Z voxel. A disconnected lower surface
@@ -177,9 +180,33 @@ void GroundColumnGrid::observe(
         if (std::abs(candidate.low[2] - support[2]) <= config_.max_ground_slope *
             std::hypot(candidate.low[0] - support[0], candidate.low[1] - support[1]) +
             config_.support_noise + 1e-6)
-        {ground_[i] = candidate; merge_support_band(i); queue.emplace(x + dx, y + dy);}
+        {
+          ground_[i] = candidate;
+          merge_support_band(i);
+          frame_touched_[i] = true;
+          queue.emplace(x + dx, y + dy);
+        }
       }
     }
+  }
+  if (config_.tunnel_free_enabled) {
+    for (int y = 0; y < height_; ++y) {
+      for (int x = 0; x < width_; ++x) {
+        const auto i = index(x, y);
+        if (!frame_touched_[i]) {continue;}
+        frame_touched_[i] = false;
+        const auto raw = rawState(x, y);
+        if (raw == ColumnState::kTunnelFree) {
+          if (tunnel_free_observations_[i] < 65535U) {
+            ++tunnel_free_observations_[i];
+          }
+        } else if (raw == ColumnState::kOccupied || raw == ColumnState::kUnknown) {
+          tunnel_free_observations_[i] = 0U;
+        }
+      }
+    }
+  } else {
+    std::fill(frame_touched_.begin(), frame_touched_.end(), false);
   }
 }
 
@@ -663,7 +690,7 @@ bool GroundColumnGrid::hasDisconnectedLowerReturn(int x, int y) const
   return low[2] < anchor[2] - allowance - 1e-9;
 }
 
-ColumnState GroundColumnGrid::state(int x, int y) const
+ColumnState GroundColumnGrid::rawState(int x, int y) const
 {
   if (!valid(x, y)) {return ColumnState::kUnknown;}
   const auto observed = std::max(static_cast<int>(columns_[index(x, y)].size()),
@@ -730,6 +757,21 @@ ColumnState GroundColumnGrid::state(int x, int y) const
     observed, 0.0, config_, columns_[index(x, y)].size());
 }
 
+ColumnState GroundColumnGrid::state(int x, int y) const
+{
+  const ColumnState raw = rawState(x, y);
+  if (raw == ColumnState::kTunnelFree && config_.tunnel_free_enabled &&
+    config_.tunnel_free_confirm_frames > 1)
+  {
+    if (tunnel_free_observations_[index(x, y)] <
+      static_cast<unsigned int>(config_.tunnel_free_confirm_frames))
+    {
+      return ColumnState::kFree;
+    }
+  }
+  return raw;
+}
+
 bool GroundColumnGrid::clearVoxel(const std::array<double, 3> & point)
 {
   return clearVoxel(point, -std::numeric_limits<double>::infinity());
@@ -775,8 +817,11 @@ bool GroundColumnGrid::clearVoxel(
   const bool removed_support = floor &&
     static_cast<int>(std::floor(floor->low[2] / config_.voxel_resolution)) <= found->first &&
     static_cast<int>(std::floor(floor->high[2] / config_.voxel_resolution)) >= found->first;
-  if (removed_support) {floor.reset();}
+  if (removed_support) {floor.reset(); tunnel_free_observations_[index(x, y)] = 0U;}
   column.erase(found);
+  if (!hasOverhead(x, y)) {
+    tunnel_free_observations_[index(x, y)] = 0U;
+  }
   // Removing the last overhead return disables the local board-support model.
   support_planes_.erase(index(x, y));
   const bool support_changed = removed_support ||
@@ -796,7 +841,11 @@ bool GroundColumnGrid::clearVoxel(
 
 void GroundColumnGrid::observeRayCell(int x, int y)
 {
-  if (valid(x, y)) {ray_observed_[index(x, y)] = true;}
+  if (valid(x, y)) {
+    const auto i = index(x, y);
+    ray_observed_[i] = true;
+    frame_touched_[i] = true;
+  }
 }
 
 void GroundColumnGrid::clear()
@@ -805,5 +854,7 @@ void GroundColumnGrid::clear()
   for (auto & c : columns_) {c.clear();}
   std::fill(ground_.begin(), ground_.end(), std::nullopt);
   std::fill(ray_observed_.begin(), ray_observed_.end(), false);
+  std::fill(frame_touched_.begin(), frame_touched_.end(), false);
+  std::fill(tunnel_free_observations_.begin(), tunnel_free_observations_.end(), 0U);
 }
 }  // namespace ats_rog_map

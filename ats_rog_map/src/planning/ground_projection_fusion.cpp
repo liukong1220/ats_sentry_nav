@@ -27,32 +27,6 @@ bool validGrid(const nav_msgs::msg::OccupancyGrid & grid)
          grid.data.size() == cell_count;
 }
 
-bool sampleGrid(
-  const nav_msgs::msg::OccupancyGrid & grid, double world_x, double world_y, int8_t & value)
-{
-  if (!validGrid(grid)) {
-    return false;
-  }
-  tf2::Quaternion origin_rotation;
-  tf2::fromMsg(grid.info.origin.orientation, origin_rotation);
-  const double yaw = tf2::getYaw(origin_rotation);
-  const double dx = world_x - grid.info.origin.position.x;
-  const double dy = world_y - grid.info.origin.position.y;
-  const double local_x = std::cos(yaw) * dx + std::sin(yaw) * dy;
-  const double local_y = -std::sin(yaw) * dx + std::cos(yaw) * dy;
-  const int mx = static_cast<int>(std::floor(local_x / grid.info.resolution));
-  const int my = static_cast<int>(std::floor(local_y / grid.info.resolution));
-  if (mx < 0 || my < 0 || mx >= static_cast<int>(grid.info.width) ||
-    my >= static_cast<int>(grid.info.height))
-  {
-    return false;
-  }
-  value = grid.data[
-    static_cast<std::size_t>(my) * static_cast<std::size_t>(grid.info.width) +
-    static_cast<std::size_t>(mx)];
-  return true;
-}
-
 void projectionCellCenter(
   const nav_msgs::msg::OccupancyGrid & grid, unsigned int mx, unsigned int my,
   double & world_x, double & world_y)
@@ -66,12 +40,99 @@ void projectionCellCenter(
   world_y = grid.info.origin.position.y + std::sin(yaw) * local_x + std::cos(yaw) * local_y;
 }
 
+struct FastGridSampler
+{
+  const std::int8_t * data{nullptr};
+  int width{0};
+  int height{0};
+  double origin_x{0.0};
+  double origin_y{0.0};
+  double cos_yaw{1.0};
+  double sin_yaw{0.0};
+  double inv_res{0.0};
+  bool valid{false};
+
+  static FastGridSampler from(const nav_msgs::msg::OccupancyGrid * grid)
+  {
+    FastGridSampler sampler;
+    if (grid == nullptr || !validGrid(*grid)) {
+      return sampler;
+    }
+    tf2::Quaternion origin_rotation;
+    tf2::fromMsg(grid->info.origin.orientation, origin_rotation);
+    const double yaw = tf2::getYaw(origin_rotation);
+    sampler.data = grid->data.data();
+    sampler.width = static_cast<int>(grid->info.width);
+    sampler.height = static_cast<int>(grid->info.height);
+    sampler.origin_x = grid->info.origin.position.x;
+    sampler.origin_y = grid->info.origin.position.y;
+    sampler.cos_yaw = std::cos(yaw);
+    sampler.sin_yaw = std::sin(yaw);
+    sampler.inv_res = 1.0 / grid->info.resolution;
+    sampler.valid = true;
+    return sampler;
+  }
+
+  inline bool sample(double world_x, double world_y, int8_t & value) const
+  {
+    if (!valid) {
+      return false;
+    }
+    const double dx = world_x - origin_x;
+    const double dy = world_y - origin_y;
+    const double local_x = cos_yaw * dx + sin_yaw * dy;
+    const double local_y = -sin_yaw * dx + cos_yaw * dy;
+    const int mx = static_cast<int>(std::floor(local_x * inv_res));
+    const int my = static_cast<int>(std::floor(local_y * inv_res));
+    if (mx < 0 || my < 0 || mx >= width || my >= height) {
+      return false;
+    }
+    value = data[static_cast<std::size_t>(my) * static_cast<std::size_t>(width) +
+      static_cast<std::size_t>(mx)];
+    return true;
+  }
+};
+
+struct FastAffine2D
+{
+  double r00{1.0}, r01{0.0}, tx{0.0};
+  double r10{0.0}, r11{1.0}, ty{0.0};
+
+  static FastAffine2D from(const tf2::Transform & tf)
+  {
+    const auto & b = tf.getBasis();
+    const auto & o = tf.getOrigin();
+    return FastAffine2D{b[0][0], b[0][1], o.x(), b[1][0], b[1][1], o.y()};
+  }
+
+  inline void apply(double x, double y, double & ox, double & oy) const
+  {
+    ox = r00 * x + r01 * y + tx;
+    oy = r10 * x + r11 * y + ty;
+  }
+};
+
 void aggregateStaticFootprint(
   const nav_msgs::msg::OccupancyGrid & static_map,
   const nav_msgs::msg::OccupancyGrid & planning_grid,
   unsigned int output_mx, unsigned int output_my, int obstacle_threshold,
   bool & occupied, bool & known_free, int & value)
 {
+  // Fast path when static_map and planning_grid share the exact same resolution (e.g. 0.05 m).
+  if (std::abs(static_map.info.resolution - planning_grid.info.resolution) <= 1e-9) {
+    if (output_mx < static_map.info.width && output_my < static_map.info.height) {
+      const int static_value = static_map.data[
+        static_cast<std::size_t>(output_my) * static_map.info.width +
+        static_cast<std::size_t>(output_mx)];
+      if (static_value >= obstacle_threshold) {
+        occupied = true;
+      } else if (static_value >= 0) {
+        known_free = true;
+        value = std::max(value, static_value);
+      }
+    }
+    return;
+  }
   // planning_grid copies the static map origin and orientation, so their cell footprints are
   // axis-aligned in the same map-local coordinates even when the map is rotated in world space.
   const long double static_resolution = static_map.info.resolution;
@@ -348,7 +409,8 @@ bool GroundProjectionFusion::fuse(
   const geometry_msgs::msg::TransformStamped & static_from_projection,
   const GroundProjectionFusionParams & params,
   GroundProjectionFusionResult & result,
-  const geometry_msgs::msg::TransformStamped * override_from_projection)
+  const geometry_msgs::msg::TransformStamped * override_from_projection,
+  const nav_msgs::msg::OccupancyGrid * tunnel_free_grid)
 {
   result.planning_grid = nav_msgs::msg::OccupancyGrid();
   result.known_free_cells = 0;
@@ -397,14 +459,42 @@ bool GroundProjectionFusion::fuse(
     tf2::fromMsg(override_from_projection->transform, override_transform);
   }
 
+  const FastGridSampler rog_sampler = FastGridSampler::from(&rog_projection);
+  const FastGridSampler terrain_sampler = FastGridSampler::from(&traversability_grid);
+  const FastGridSampler slope_sampler = FastGridSampler::from(&slope_grid);
+  const FastGridSampler static_sampler = FastGridSampler::from(&static_map);
+  const FastGridSampler tunnel_free_sampler = FastGridSampler::from(tunnel_free_grid);
+  const FastAffine2D proj_from_static_2d = FastAffine2D::from(projection_from_static_transform);
+  const FastAffine2D static_from_proj_2d = FastAffine2D::from(static_from_projection_transform);
+  const FastAffine2D override_2d =
+    override_enabled ? FastAffine2D::from(override_transform) : FastAffine2D{};
+
+  tf2::Quaternion out_origin_rot;
+  tf2::fromMsg(result.planning_grid.info.origin.orientation, out_origin_rot);
+  const double out_yaw = tf2::getYaw(out_origin_rot);
+  const double out_cos = std::cos(out_yaw);
+  const double out_sin = std::sin(out_yaw);
+  const double out_ox = result.planning_grid.info.origin.position.x;
+  const double out_oy = result.planning_grid.info.origin.position.y;
+  const double out_res = result.planning_grid.info.resolution;
+
+  const double map_w_m = static_map.info.width * static_map.info.resolution;
+  const double map_h_m = static_map.info.height * static_map.info.resolution;
+  const double border = std::max(0.0, params.static_map_geofence_border_m);
+  const bool check_override = override_enabled && !params.terrain_free_override_rects.empty();
+  const bool check_tunnel_free = params.tunnel_free_suppresses_terrain && tunnel_free_sampler.valid;
+
   for (unsigned int my = 0; my < result.planning_grid.info.height; ++my) {
+    const double local_y = (static_cast<double>(my) + 0.5) * out_res;
+    const double row_base_x = out_ox - out_sin * local_y;
+    const double row_base_y = out_oy + out_cos * local_y;
+    const std::size_t row_offset =
+      static_cast<std::size_t>(my) * static_cast<std::size_t>(result.planning_grid.info.width);
     for (unsigned int mx = 0; mx < result.planning_grid.info.width; ++mx) {
-      const std::size_t index =
-        static_cast<std::size_t>(my) *
-        static_cast<std::size_t>(result.planning_grid.info.width) + mx;
-      double static_x = 0.0;
-      double static_y = 0.0;
-      projectionCellCenter(result.planning_grid, mx, my, static_x, static_y);
+      const std::size_t index = row_offset + mx;
+      const double local_x = (static_cast<double>(mx) + 0.5) * out_res;
+      const double static_x = row_base_x + out_cos * local_x;
+      const double static_y = row_base_y + out_sin * local_x;
 
       int value = 0;
       bool occupied = false;
@@ -418,14 +508,36 @@ bool GroundProjectionFusion::fuse(
             static_map, result.planning_grid, mx, my, static_threshold,
             occupied, known_free, value);
         }
+      } else if (params.use_static_map_geofence_only && params.has_static_map &&
+        static_sampler.valid)
+      {
+        double map_px = static_x;
+        double map_py = static_y;
+        if (params.output_in_projection_frame) {
+          static_from_proj_2d.apply(static_x, static_y, map_px, map_py);
+        }
+        const double dx = map_px - static_sampler.origin_x;
+        const double dy = map_py - static_sampler.origin_y;
+        const double lx = static_sampler.cos_yaw * dx + static_sampler.sin_yaw * dy;
+        const double ly = -static_sampler.sin_yaw * dx + static_sampler.cos_yaw * dy;
+        int8_t static_sample = -1;
+        const bool in_bounds = static_sampler.sample(map_px, map_py, static_sample);
+        if (!in_bounds || static_sample < 0 ||
+          lx < border || ly < border || lx > map_w_m - border || ly > map_h_m - border)
+        {
+          if (!in_bounds || static_sample < 0 || static_sample >= static_threshold) {
+            occupied = true;
+          }
+        }
       }
 
-      const tf2::Vector3 projection_point =
-        params.output_in_projection_frame ? tf2::Vector3(static_x, static_y, 0.0) :
-        projection_from_static_transform * tf2::Vector3(static_x, static_y, 0.0);
+      double proj_x = static_x;
+      double proj_y = static_y;
+      if (!params.output_in_projection_frame) {
+        proj_from_static_2d.apply(static_x, static_y, proj_x, proj_y);
+      }
       int8_t rog_value = -1;
-      if (sampleGrid(
-          rog_projection, projection_point.x(), projection_point.y(), rog_value))
+      if (rog_sampler.sample(proj_x, proj_y, rog_value))
       {
         if (rog_value >= terrain_threshold) {
           occupied = true;
@@ -436,13 +548,23 @@ bool GroundProjectionFusion::fuse(
       }
 
       bool corridor_static_free = false;
-      if (!occupied && known_free && override_enabled &&
-        !params.terrain_free_override_rects.empty()) {
-        const tf2::Vector3 static_point = override_transform * projection_point;
+      if (!occupied && check_tunnel_free) {
+        int8_t tunnel_free_val = 0;
+        if (tunnel_free_sampler.sample(proj_x, proj_y, tunnel_free_val) &&
+          tunnel_free_val > 0)
+        {
+          known_free = true;
+          corridor_static_free = true;
+        }
+      }
+      if (!occupied && known_free && check_override) {
+        double ov_x = 0.0;
+        double ov_y = 0.0;
+        override_2d.apply(proj_x, proj_y, ov_x, ov_y);
         for (std::size_t r = 0; r + 3 < params.terrain_free_override_rects.size(); r += 4) {
           const auto & q = params.terrain_free_override_rects;
-          if (static_point.x() >= q[r] && static_point.x() <= q[r + 2] &&
-            static_point.y() >= q[r + 1] && static_point.y() <= q[r + 3])
+          if (ov_x >= q[r] && ov_x <= q[r + 2] &&
+            ov_y >= q[r + 1] && ov_y <= q[r + 3])
           {
             corridor_static_free = true;
             break;
@@ -451,8 +573,7 @@ bool GroundProjectionFusion::fuse(
       }
 
       int8_t terrain_value = -1;
-      if (sampleGrid(
-          traversability_grid, projection_point.x(), projection_point.y(), terrain_value))
+      if (terrain_sampler.sample(proj_x, proj_y, terrain_value))
       {
         if (terrain_value >= terrain_threshold) {
           if (!corridor_static_free) {occupied = true;}
@@ -463,7 +584,7 @@ bool GroundProjectionFusion::fuse(
       }
 
       int8_t slope_value = -1;
-      if (sampleGrid(slope_grid, projection_point.x(), projection_point.y(), slope_value))
+      if (slope_sampler.sample(proj_x, proj_y, slope_value))
       {
         if (static_cast<double>(slope_value) * slope_scale / 100.0 >=
           params.slope_obstacle_degrees)

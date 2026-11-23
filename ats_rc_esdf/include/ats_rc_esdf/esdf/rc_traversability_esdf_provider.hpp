@@ -44,7 +44,8 @@ public:
     const nav_msgs::msg::OccupancyGrid * height_diff_grid = nullptr,
     const nav_msgs::msg::OccupancyGrid * occupancy_ratio_grid = nullptr,
     const nav_msgs::msg::OccupancyGrid * ground_confidence_grid = nullptr,
-    const nav_msgs::msg::OccupancyGrid * slope_grid = nullptr);
+    const nav_msgs::msg::OccupancyGrid * slope_grid = nullptr,
+    bool build_smoothed_gradient = true);
 
   // Loads a signed field computed by updateGrid elsewhere (same row-major order,
   // metres, positive in free space). Only the smoothed gradient field is rebuilt;
@@ -62,6 +63,9 @@ public:
   // Copies the raw signed field in row-major OccupancyGrid order. This is used
   // only for inspection and transport; runtime queries keep using interpolation.
   bool copySignedDistanceField(std::vector<double> & field) const;
+
+  // Zero-copy read-only view for immutable snapshot consumers (PlanningMapSnapshot).
+  const std::vector<double> * rawSignedDistanceFieldPtr() const;
 
   // Debug / integration helpers for later modules.
   RollingWindowBounds getRollingWindowBounds() const;

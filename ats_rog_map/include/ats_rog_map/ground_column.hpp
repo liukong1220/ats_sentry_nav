@@ -13,7 +13,7 @@
 
 namespace ats_rog_map
 {
-enum class ColumnState {kUnknown, kFree, kOccupied};
+enum class ColumnState {kUnknown, kFree, kTunnelFree, kOccupied};
 
 struct GroundColumnConfig
 {
@@ -50,6 +50,9 @@ struct GroundColumnConfig
   // replaces the per-voxel extrema as the support estimate when it is well posed.
   bool floor_plane_enabled{true};
   double floor_plane_band{0.015};
+  // O3: independent switch & multi-frame confirmation for TUNNEL_FREE columns under overhangs.
+  bool tunnel_free_enabled{true};
+  int tunnel_free_confirm_frames{2};
 };
 
 // Measured clearance of the lowest return above the connected support interval.
@@ -153,6 +156,7 @@ private:
     const ReturnExtent & evidence) const;
   bool hasOverhead(int x, int y) const;
   bool hasDisconnectedLowerReturn(int x, int y) const;
+  ColumnState rawState(int x, int y) const;
   bool valid(int x, int y) const;
   std::size_t index(int x, int y) const;
   int width_;
@@ -164,6 +168,8 @@ private:
   std::vector<std::map<int, VoxelReturns>> columns_;
   std::vector<std::optional<VoxelReturns>> ground_;
   std::vector<bool> ray_observed_;
+  std::vector<bool> frame_touched_;
+  std::vector<unsigned int> tunnel_free_observations_;
   // GroundColumnGrid is owned by the serialized odom-layer integration. These
   // fits are valid only until observe(), clearVoxel() or clear() changes evidence.
   mutable std::unordered_map<std::size_t, std::vector<SupportPlane>> support_planes_;

@@ -126,6 +126,10 @@ public:
       declare_parameter<bool>("output_in_projection_frame", false) || mapping_mode_;
     fusion_params_.use_static_map_obstacles = declare_parameter<bool>(
       "use_static_map_obstacles", true);
+    fusion_params_.use_static_map_geofence_only = declare_parameter<bool>(
+      "use_static_map_geofence_only", false);
+    fusion_params_.static_map_geofence_border_m = std::max(
+      0.0, declare_parameter<double>("static_map_geofence_border_m", 0.35));
     fusion_params_.terrain_free_override_rects = declare_parameter<std::vector<double>>(
       "terrain_free_override_rects", std::vector<double>{});
     fusion_params_.mapping_mode = mapping_mode_;
@@ -133,6 +137,8 @@ public:
       "terrain_free_override_frame", "map");
     fusion_params_.diagnostic_allow_terrain_free_override = declare_parameter<bool>(
       "diagnostic_allow_terrain_free_override", false);
+    fusion_params_.tunnel_free_suppresses_terrain = declare_parameter<bool>(
+      "tunnel_free_suppresses_terrain", true);
     if (mapping_mode_ && !fusion_params_.terrain_free_override_rects.empty()) {
       RCLCPP_WARN(get_logger(), "Terrain rectangle prior in mapping mode: %s",
         fusion_params_.diagnostic_allow_terrain_free_override ?
@@ -666,6 +672,7 @@ private:
         slope_fresh ? 1 : 0, slope_synchronized ? 1 : 0);
     }
 
+    const auto t_tf_start = std::chrono::steady_clock::now();
     const auto lookupAtProjectionStamp = [this](
       const std::string & target_frame, const std::string & source_frame,
       const builtin_interfaces::msg::Time & requested_stamp,
@@ -766,10 +773,14 @@ private:
           exception.what());
       }
     }
+    const auto t_fuse_start = std::chrono::steady_clock::now();
     GroundProjectionFusionResult fusion;
+    const nav_msgs::msg::OccupancyGrid * tunnel_free_ptr =
+      response.tunnel_free_grid.data.empty() ? nullptr : &response.tunnel_free_grid;
     if (!GroundProjectionFusion::fuse(
         projection_grid, *traversability, *slope, *static_map,
-        static_from_projection, current_fusion_params, fusion, override_transform))
+        static_from_projection, current_fusion_params, fusion, override_transform,
+        tunnel_free_ptr))
     {
       publishUnavailable("ROGMap terrain fusion failed");
       return;
@@ -789,9 +800,10 @@ private:
       return;
     }
 
+    const auto t_esdf_start = std::chrono::steady_clock::now();
     planning_esdf_.updateGrid(
       fusion.planning_grid, fusion_params_.terrain_obstacle_value_threshold,
-      fusion_params_.unknown_is_obstacle);
+      fusion_params_.unknown_is_obstacle, 100, nullptr, nullptr, nullptr, nullptr, false);
     std::vector<double> signed_distance;
     if (!planning_esdf_.copySignedDistanceField(signed_distance)) {
       last_blocking_grid_ = fusion.planning_grid;
@@ -804,6 +816,7 @@ private:
           "localization changed before planning snapshot commit");
       return;
     }
+    const auto t_snap_start = std::chrono::steady_clock::now();
     last_numeric_snapshot_ = numeric_snapshot;
     last_blocking_grid_ = fusion.planning_grid;
     const builtin_interfaces::msg::Time publication_stamp = now();
@@ -816,6 +829,7 @@ private:
       publishUnavailable("fused planning snapshot serialization failed");
       return;
     }
+    const auto t_pub_start = std::chrono::steady_clock::now();
     publishPlanningGridViz(fusion.planning_grid);
     const double footprint_radius = std::hypot(
       0.5 * footprint_length_ + footprint_safety_margin_,
@@ -836,12 +850,20 @@ private:
     last_rog_generation_ = response.generation;
     planning_snapshot_pub_->publish(planning_snapshot);
     publishMapStatus(true, response.generation, "planning snapshot ready");
+    const auto t_done = std::chrono::steady_clock::now();
+    const auto ms_between = [](auto a, auto b) {
+      return 1000.0 * std::chrono::duration<double>(b - a).count();
+    };
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu numeric_esdf=%zu",
+      "P2 snapshot generation=%llu free=%zu occupied=%zu unknown=%zu ego_clear=%zu numeric_esdf=%zu "
+      "stage_ms(tf/fuse/esdf/snap/pub)=%.1f/%.1f/%.1f/%.1f/%.1f",
       static_cast<unsigned long long>(response.generation), fusion.known_free_cells,
       fusion.occupied_cells, fusion.unknown_cells, ego_unknown_cleared,
-      numeric_snapshot.signed_distance.size());
+      numeric_snapshot.signed_distance.size(),
+      ms_between(t_tf_start, t_fuse_start), ms_between(t_fuse_start, t_esdf_start),
+      ms_between(t_esdf_start, t_snap_start), ms_between(t_snap_start, t_pub_start),
+      ms_between(t_pub_start, t_done));
   }
 
   // 每格一个点，颜色见 distance_viz.hpp：占据黑，外接半径内红，到

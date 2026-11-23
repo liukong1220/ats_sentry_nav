@@ -75,6 +75,7 @@ bool OdomLayerStore::observeHit(
   value->last_visible_time = stamp;
   value->observed_time += bounded_dt;
   value->state = OdomCellState::kOccupied;
+  value->tunnel_free_count = 0U;
   if (value->layer == OdomCellLayer::kDynamic && !value->cleared_once &&
     value->hit_time_accum >= config_.static_promotion_seconds)
   {
@@ -97,9 +98,10 @@ bool OdomLayerStore::invalidateFree(const int x, const int y, const double stamp
 {
   auto * value = cell(x, y);
   if (value == nullptr || !std::isfinite(stamp) || stamp < value->last_visible_time ||
-    value->state != OdomCellState::kFree)
+    (value->state != OdomCellState::kFree && value->state != OdomCellState::kTunnelFree))
   {return false;}
   value->state = OdomCellState::kUnknown;
+  value->tunnel_free_count = 0U;
   value->last_visible_time = stamp;
   return true;
 }
@@ -233,7 +235,29 @@ bool OdomLayerStore::observeFree(int x, int y, double stamp, double observed_dt)
   const bool cleared = observeRayClear(x, y, stamp, true);
   value->last_visible_time = stamp;
   value->observed_time += std::clamp(observed_dt, 0.0, config_.max_frame_dt_seconds);
-  value->state = OdomCellState::kFree;
+  if (value->state != OdomCellState::kTunnelFree) {
+    value->state = OdomCellState::kFree;
+  }
+  return cleared;
+}
+
+bool OdomLayerStore::observeTunnelFree(int x, int y, double stamp, double observed_dt)
+{
+  auto * value = cell(x, y);
+  if (!value || !std::isfinite(stamp) || stamp <= value->last_visible_time) {return false;}
+  const bool cleared = observeRayClear(x, y, stamp, true);
+  value->last_visible_time = stamp;
+  value->observed_time += std::clamp(observed_dt, 0.0, config_.max_frame_dt_seconds);
+  if (config_.tunnel_free_enabled) {
+    if (value->tunnel_free_count < 65535U) {
+      ++value->tunnel_free_count;
+    }
+    const int required = std::max(1, config_.tunnel_free_confirm_frames);
+    value->state = (static_cast<int>(value->tunnel_free_count) >= required) ?
+      OdomCellState::kTunnelFree : OdomCellState::kFree;
+  } else {
+    value->state = OdomCellState::kFree;
+  }
   return cleared;
 }
 
@@ -267,10 +291,44 @@ std::int8_t OdomLayerStore::sampleFootprint(
     for (int x = first_x; x <= last_x; ++x) {
       const auto state = cell(x, y)->state;
       if (state == OdomCellState::kOccupied) {return 100;}
-      all_free = all_free && state == OdomCellState::kFree;
+      all_free = all_free &&
+        (state == OdomCellState::kFree || state == OdomCellState::kTunnelFree);
     }
   }
   return all_free ? 0 : -1;
+}
+
+bool OdomLayerStore::sampleTunnelFree(
+  double min_x, double min_y, double max_x, double max_y) const
+{
+  if (!config_.tunnel_free_enabled || !std::isfinite(min_x) || !std::isfinite(min_y) ||
+    !std::isfinite(max_x) || !std::isfinite(max_y) || max_x <= min_x || max_y <= min_y)
+  {return false;}
+  const auto lattice = [&](double coordinate, double origin) {
+      const double value = (coordinate - origin) / config_.resolution;
+      if (!std::isfinite(value)) {return value;}
+      const double boundary = std::round(value);
+      const double roundoff = 8 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(coordinate / config_.resolution) +
+        std::abs(origin / config_.resolution));
+      return std::abs(value - boundary) <= roundoff ? boundary : value;
+    };
+  const double x0 = lattice(min_x, config_.origin_x), x1 = lattice(max_x, config_.origin_x);
+  const double y0 = lattice(min_y, config_.origin_y), y1 = lattice(max_y, config_.origin_y);
+  if (x0 < 0.0 || y0 < 0.0 || x1 > config_.width || y1 > config_.height) {return false;}
+  const int first_x = static_cast<int>(std::floor(std::clamp(x0, 0.0, double(config_.width))));
+  const int first_y = static_cast<int>(std::floor(std::clamp(y0, 0.0, double(config_.height))));
+  const int last_x = static_cast<int>(std::ceil(std::clamp(x1, 0.0, double(config_.width)))) - 1;
+  const int last_y = static_cast<int>(std::ceil(std::clamp(y1, 0.0, double(config_.height)))) - 1;
+  if (first_x > last_x || first_y > last_y) {return false;}
+  for (int y = first_y; y <= last_y; ++y) {
+    for (int x = first_x; x <= last_x; ++x) {
+      if (cell(x, y)->state != OdomCellState::kTunnelFree) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool OdomLayerStore::observeRayClear(
@@ -434,7 +492,7 @@ bool OdomLayerStore::save(
         points.push_back(transform(
           config_.origin_x + (static_cast<double>(x) + 0.5) * config_.resolution,
           config_.origin_y + (static_cast<double>(y) + 0.5) * config_.resolution, 0.0));
-      } else if (value.state == OdomCellState::kFree) {
+      } else if (value.state == OdomCellState::kFree || value.state == OdomCellState::kTunnelFree) {
         pixel = 254U;
       }
       pixels[index(x, y)] = pixel;

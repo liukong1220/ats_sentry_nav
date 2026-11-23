@@ -262,7 +262,9 @@ OdomLayerFrameStats integrateOdomLayerFrame(
     const int x = static_cast<int>(i % c.width), y = static_cast<int>(i / c.width);
     const auto state = columns.state(x, y);
     if (!(flags[i] & 16U)) {
-      if (state != ColumnState::kFree) {layer.invalidateFree(x, y, stamp);}
+      if (state != ColumnState::kFree && state != ColumnState::kTunnelFree) {
+        layer.invalidateFree(x, y, stamp);
+      }
       continue;
     }
     if (state == ColumnState::kOccupied) {
@@ -271,6 +273,10 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         layer.invalidateFree(x, y, stamp);
         layer.observeVisible(x, y, stamp);
       }
+    }
+    else if (state == ColumnState::kTunnelFree) {
+      stats.ray_cleared_cells += layer.observeTunnelFree(x, y, stamp, frame_dt) ? 1U : 0U;
+      ++stats.non_obstacle;
     }
     else if (state == ColumnState::kFree) {
       stats.ray_cleared_cells += layer.observeFree(x, y, stamp, frame_dt) ? 1U : 0U;

@@ -63,6 +63,11 @@ struct GroundProjectionFusionParams
   // Default true keeps the P2 contract (static walls block planning).  O1/S3 may
   // set false only after the odom global layer feeds the planning grid.
   bool use_static_map_obstacles{true};
+  // O1 optional mode when use_static_map_obstacles=false and has_static_map=true:
+  // prior static map enforces only outer arena geofence/unknown exterior while
+  // interior obstacles come strictly from real-time ROGMap/terrain/slope observations.
+  bool use_static_map_geofence_only{false};
+  double static_map_geofence_border_m{0.35};
   // Keep the legacy static-map geometry unless production selects the local odom window.
   bool output_in_projection_frame{false};
   // 场地先验；建图或缺静态图时默认禁用，诊断 A/B 必须显式授权。
@@ -73,6 +78,8 @@ struct GroundProjectionFusionParams
   // 平铺 [xmin, ymin, xmax, ymax]*N，在独立声明的 frame 中判定。
   // 仅抑制 terrain/slope，静态占据和 ROG 占据始终优先。
   std::vector<double> terrain_free_override_rects;
+  // O3: 多帧确认的 TUNNEL_FREE 列仅抑制粗 terrain/slope 壁面外溢，永不抑制静态墙或 ROG 实时占据。
+  bool tunnel_free_suppresses_terrain{true};
 };
 
 /// @brief Plan A for single-frame terrain hard-obstacle spikes.
@@ -134,7 +141,8 @@ public:
     const geometry_msgs::msg::TransformStamped & static_from_projection,
     const GroundProjectionFusionParams & params,
     GroundProjectionFusionResult & result,
-    const geometry_msgs::msg::TransformStamped * override_from_projection = nullptr);
+    const geometry_msgs::msg::TransformStamped * override_from_projection = nullptr,
+    const nav_msgs::msg::OccupancyGrid * tunnel_free_grid = nullptr);
   static std::size_t clearUnknownCircle(
     GroundProjectionFusionResult & result, double world_x, double world_y, double radius);
   static std::size_t clearUnknownFootprint(

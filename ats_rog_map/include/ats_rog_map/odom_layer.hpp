@@ -18,6 +18,7 @@ enum class OdomCellState : std::uint8_t
 {
   kUnknown,
   kFree,
+  kTunnelFree,
   kOccupied
 };
 
@@ -44,6 +45,8 @@ struct OdomLayerConfig
   double cloud_resolution{0.10};
   double cloud_clear_ray_radius{0.01};
   double cloud_clear_endpoint_margin{0.20};
+  bool tunnel_free_enabled{true};
+  int tunnel_free_confirm_frames{2};
 };
 
 struct OdomLayerCell
@@ -57,6 +60,7 @@ struct OdomLayerCell
   double last_visible_time{0.0};
   bool cleared_once{false};
   std::uint32_t clear_count{0};
+  std::uint16_t tunnel_free_count{0};
 };
 
 struct OdomLayerTransform
@@ -109,6 +113,7 @@ public:
   bool observeHit(int x, int y, double stamp, double observed_dt);
   bool observePoint(const std::array<double, 3> & point, double stamp, double observed_dt);
   bool observeFree(int x, int y, double stamp, double observed_dt);
+  bool observeTunnelFree(int x, int y, double stamp, double observed_dt);
   void clearCloudVoxel(const std::array<double, 3> & point, double stamp);
   bool hasRayClearCandidate(const std::array<double, 3> & voxel_location, double stamp) const;
   std::vector<std::array<int, 3>> rayClearCandidates(double stamp) const;
@@ -119,6 +124,7 @@ public:
     double stamp);
   // Conservative area-overlap sampling in odom; outside and unobserved are unknown.
   std::int8_t sampleFootprint(double min_x, double min_y, double max_x, double max_y) const;
+  bool sampleTunnelFree(double min_x, double min_y, double max_x, double max_y) const;
 
   // Mark a cell as visible without asserting either a hit or a ray clear.
   bool observeVisible(int x, int y, double stamp);

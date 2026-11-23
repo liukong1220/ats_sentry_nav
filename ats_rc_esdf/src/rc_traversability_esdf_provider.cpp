@@ -178,7 +178,8 @@ void RcTraversabilityEsdfProvider::updateGrid(
   const nav_msgs::msg::OccupancyGrid * height_diff_grid,
   const nav_msgs::msg::OccupancyGrid * occupancy_ratio_grid,
   const nav_msgs::msg::OccupancyGrid * ground_confidence_grid,
-  const nav_msgs::msg::OccupancyGrid * slope_grid)
+  const nav_msgs::msg::OccupancyGrid * slope_grid,
+  bool build_smoothed_gradient)
 {
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -295,7 +296,9 @@ void RcTraversabilityEsdfProvider::updateGrid(
   }
 
   rebuildSignedDistanceField(obstacle_mask, free_mask);
-  rebuildSmoothedDistanceField();
+  if (build_smoothed_gradient) {
+    rebuildSmoothedDistanceField();
+  }
   available_ = true;
 }
 
@@ -413,6 +416,15 @@ bool RcTraversabilityEsdfProvider::copySignedDistanceField(std::vector<double> &
   }
   field = distance_field_;
   return true;
+}
+
+const std::vector<double> * RcTraversabilityEsdfProvider::rawSignedDistanceFieldPtr() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!available_ || distance_field_.empty()) {
+    return nullptr;
+  }
+  return &distance_field_;
 }
 
 RollingWindowBounds RcTraversabilityEsdfProvider::getRollingWindowBounds() const
