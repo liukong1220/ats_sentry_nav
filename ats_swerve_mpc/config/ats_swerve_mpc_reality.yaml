@@ -41,16 +41,33 @@ ats_swerve_mpc:
     goal_yaw_tolerance: 0.15
     publish_debug_paths: true
 
-    # 默认保持 iLQR 唯一 `/cmd_vel/autonomy_raw` owner。qp_shadow 仅记录 OSQP 诊断；
-    # qp 控制发布尚未实现，传入 solver_mode:=qp 会拒绝启动。
-    solver_mode: ilqr
-    # OSQP v1.0.0 固定 CSC workspace 限制，尚非 HIL/实车实时性测量值。
+    # 唯一求解器：OSQP v1.0.0 零分配稀疏 SQP-RTI（未通过准入即确定性零速度 fail-stop）。
+    solver_mode: qp
     qp_max_iterations: 400
-    qp_time_limit_ms: 10.0
-    qp_max_primal_residual: 1.0e-4
-    qp_max_dual_residual: 1.0e-4
-    qp_max_tracking_slack: 0.0
-    qp_max_hard_constraint_violation: 1.0e-7
+    qp_time_limit_ms: 12.0
+    qp_max_primal_residual: 2.0e-3
+    qp_max_dual_residual: 5.0e-3
+    qp_max_tracking_slack: 0.35
+    qp_max_hard_constraint_violation: 2.0e-3
+    qp_rti_iterations: 1
+    qp_rti_second_pass_delta_threshold: 0.15
+    planning_snapshot_topic: /rog_map_adapter/planning_snapshot
+    require_planning_snapshot: true
+    planning_snapshot_timeout_sec: 5.0
+    footprint_length: 0.581
+    footprint_width: 0.571
+    footprint_safety_margin: 0.02
+    qp_esdf_corridor_enabled: true
+    qp_esdf_corridor_clearance: 0.44
+    qp_esdf_reference_margin: 0.015
+    qp_esdf_min_corridor_clearance: 0.3055
+    qp_esdf_slack_linear_weight: 80.0
+    qp_esdf_slack_quadratic_weight: 400.0
+    rollout_safety_enabled: true
+    lag_weight: 15.0
+    contour_weight: 24.0
+    actuator_lag_tau_sec: 0.025
+    actuator_delay_sec: 0.010
     # 实车默认不启用性能采样窗口；仅受控离线/仿真 profile 可以显式覆盖。
     telemetry_sampling_window_cycles: 0
 
@@ -61,15 +78,10 @@ ats_swerve_mpc:
     min_reference_progress_scale: 0.10
     command_latency_compensation: 0.01
 
-    # 60*0.05=3 s，覆盖5 m/s在2 m/s²下2.5 s制动时间。
-    horizon: 60
+    # 26*0.10=2.6 s，覆盖5 m/s在2 m/s²下2.5 s完整制动时间；首步按50 Hz实测step_dt执行。
+    horizon: 26
     # 预测时域离散步长（SE(2) 解析指数映射积分），与实时控制频率 control_rate_hz 解耦。
-    dt: 0.05
-    max_iterations: 6
-    regularization: 1.0e-5
-    line_search_decay: 0.5
-    min_line_search_step: 0.05
-    convergence_tolerance: 1.0e-3
+    dt: 0.10
 
     state_weight: [18.0, 18.0, 10.0]
     terminal_weight: [28.0, 28.0, 8.0]

@@ -16,42 +16,129 @@
 namespace ats_swerve_mpc {
 
 /**
- * @brief LTV-QP 的唯一 checked dimension 结果。
- * @details 所有运行期 dense buffer、CSC setup 和节点 controller 构造都必须消费同一个
- *          结果。计算只使用 checked size_t 算术，并在转成 Eigen/int 前执行 horizon、整数
- *          表示范围和 dense payload 上限检查，避免 timer 或启动路径发生巨型分配/有符号溢出。
+ * @brief QP 矩阵的不可变压缩列（CSC）稀疏 pattern。
+ * @details 行索引和列偏移属于后端契约。具体求解器 setup 后只可更新数值；pattern 变化必须
+ *          被拒绝并在控制 timer 外显式 setup，不能触发隐式分配。
+ */
+struct LtvQpSparseStructure {
+  int rows = 0;
+  int columns = 0;
+  std::vector<int> column_offsets;
+  std::vector<int> row_indices;
+
+  /** @brief 校验 CSC 尺寸、列偏移和行序；失败即禁止 backend 数值更新。 */
+  bool valid(std::string *error = nullptr) const;
+  /** @brief 比较完整行/列 pattern，防止 timer 内隐式重建 solver workspace。 */
+  bool samePattern(const LtvQpSparseStructure &other) const;
+};
+
+/**
+ * @brief LTV-QP 的唯一 checked dimension 结果（固定稀疏 CSC 布局）。
  */
 struct LtvQpDimensions {
   bool valid = false;
   int horizon = 0;
+  int state_vars = 0;
+  int control_vars = 0;
+  int slack_vars = 0;
   int decision_size = 0;
   int equality_rows = 0;
+  int body_accel_rows = 0;
+  int wheel_octagon_rows = 0;
+  int wheel_rate_rows = 0;
+  int esdf_corridor_rows = 0;
   int inequality_rows = 0;
+  int bound_rows = 0;
   int constraint_rows = 0;
-  std::size_t dense_buffer_bytes = 0;
+  std::size_t sparse_buffer_bytes = 0;
   const char *validation_error = "invalid LTV-QP dimensions";
 };
 
-/** @brief 已审计的 dense LTV-QP 资源上限；当前正式配置 horizon=30 不受影响。 */
+/** @brief 已审计的 LTV-QP 最大预测步数（正式配置 horizon=60 在内）。 */
 constexpr int kLtvQpMaximumHorizon = 64;
-/** @brief 矩阵/向量 double payload 上限，不包含 Eigen/OSQP 小对象元数据。 */
-constexpr std::size_t kLtvQpDenseBufferMaximumBytes = 3U * 1024U * 1024U;
+/** @brief 稀疏数值缓冲上限（实际 horizon=60 约 120 KiB，远低于上限）。 */
+constexpr std::size_t kLtvQpSparseBufferMaximumBytes = 512U * 1024U;
 
-/**
- * @brief 计算并校验固定 LTV-QP 的所有维度和 dense payload 大小。
- * @param horizon 预测步数。
- * @return 失败时 `valid=false` 且不进行任何分配；成功时返回可直接用于 Eigen/OSQP 的
- *         int 维度。
- */
+/** @brief 计算并校验固定稀疏 LTV-QP 的所有维度与字节上界。 */
 LtvQpDimensions checkedLtvQpDimensions(int horizon);
 
+/** @brief 单个预测步在 odom 系下的线性化 ESDF 安全走廊样本。 */
+struct EsdfCorridorSample {
+  bool active = false;
+  double signed_distance_m = 0.0;
+  double target_clearance_m = 0.0;
+  Eigen::Vector2d gradient_odom = Eigen::Vector2d::Zero();
+};
+
+/** @brief QP 内部线性化 ESDF 安全走廊软约束配置。 */
+struct LtvQpEsdfConfig {
+  bool enabled = false;
+  double corridor_clearance_m = 0.44;
+  double reference_margin_m = 0.015;
+  double min_corridor_clearance_m = 0.305;
+  double slack_linear_weight = 400.0;
+  double slack_quadratic_weight = 4000.0;
+  double max_slack_m = 0.35;
+};
+
+/** @brief 预计算的固定 CSC 数值槽位索引（启动期一次构建，控制周期 O(1) 直填无查找）。 */
+struct LtvQpSlotMap {
+  struct StateStepSlots {
+    int p_xx = -1;
+    int p_xy = -1;
+    int p_yy = -1;
+    int p_yaw = -1;
+    std::array<int, 3> a_init_diag{{-1, -1, -1}};
+    std::array<int, 3> a_dyn_next_diag{{-1, -1, -1}};
+    std::array<std::array<int, 3>, 3> a_dyn_state{{
+        {{-1, -1, -1}}, {{-1, -1, -1}}, {{-1, -1, -1}}}};
+    int a_esdf_x = -1;
+    int a_esdf_y = -1;
+  };
+
+  struct ControlStepSlots {
+    // Upper triangle of 3x3 diagonal block: (0,0), (0,1), (1,1), (0,2), (1,2), (2,2)
+    int p_u00 = -1;
+    int p_u01 = -1;
+    int p_u11 = -1;
+    int p_u02 = -1;
+    int p_u12 = -1;
+    int p_u22 = -1;
+    // Full 3x3 super-diagonal block (u_{k-1} rows, u_k cols), valid when step > 0
+    std::array<std::array<int, 3>, 3> p_prev_curr{{
+        {{-1, -1, -1}}, {{-1, -1, -1}}, {{-1, -1, -1}}}};
+    int p_slack = -1;
+
+    // Dynamics equality step k: -B_{k,0} on u_k
+    std::array<std::array<int, 3>, 3> a_dyn_curr{{
+        {{-1, -1, -1}}, {{-1, -1, -1}}, {{-1, -1, -1}}}};
+    // Dynamics equality step k (when k > 0): -B_{k,-1} on u_{k-1}
+    std::array<std::array<int, 3>, 3> a_dyn_prev{{
+        {{-1, -1, -1}}, {{-1, -1, -1}}, {{-1, -1, -1}}}};
+
+    // Rotating-frame body accel step k: +I on u_k, -J_rot on u_{k-1} (when k > 0)
+    std::array<int, 3> a_accel_curr_diag{{-1, -1, -1}};
+    std::array<std::array<int, 3>, 3> a_accel_prev{{
+        {{-1, -1, -1}}, {{-1, -1, -1}}, {{-1, -1, -1}}}};
+
+    // 8 exact outer-envelope octagonal wheel-speed rows on u_k (8 rows x 3 cols)
+    std::array<std::array<int, 3>, 8> a_wheel_oct{{}};
+
+    // Control variable box bounds (3 rows) + ESDF slack coeff & bound
+    std::array<int, 3> a_ctrl_bound_diag{{-1, -1, -1}};
+    int a_esdf_slack = -1;
+    int a_slack_bound = -1;
+  };
+
+  std::vector<StateStepSlots> states;
+  std::vector<ControlStepSlots> controls;
+};
+
 /**
- * @brief 与后端无关的 LTV-MPC 二次规划数值描述。
+ * @brief 零分配固定 CSC 稀疏 LTV-QP 问题缓冲。
  *
- * @details 决策顺序固定为 `[delta_x_0 ... delta_x_N, delta_u_0 ... delta_u_N-1]`。
- *          本类型只表达由同周期 iLQR 名义轨迹线性化得到的矩阵和值，不携带 ROS
- *          状态、求解状态或发布权。任何 OSQP/HPIPM/qpOASES 适配器都必须在其
- *          结果到达既有 fail-stop 节点之前通过独立硬约束复核。
+ * @details 决策顺序固定为 `[delta_x_0..delta_x_N, delta_u_0..delta_u_{N-1}, s_1..s_N]`。
+ *          彻底移除 2 MiB 稠密矩阵构造与清零开销，直接在预分配 CSC 数组中更新非零元。
  */
 struct LtvQpProblem {
   bool valid = false;
@@ -62,34 +149,39 @@ struct LtvQpProblem {
   bool zero_speed_guard_active = false;
   std::array<bool, 4> angle_rate_linearization_valid{{false, false, false, false}};
 
-  Eigen::MatrixXd hessian;
+  LtvQpSparseStructure hessian_structure;
+  std::vector<double> hessian_values;
+  LtvQpSparseStructure constraint_structure;
+  std::vector<double> constraint_values;
   Eigen::VectorXd gradient;
-  Eigen::MatrixXd equality_matrix;
-  Eigen::VectorXd equality_lower;
-  Eigen::VectorXd equality_upper;
-  Eigen::MatrixXd inequality_matrix;
-  Eigen::VectorXd inequality_lower;
-  Eigen::VectorXd inequality_upper;
-  Eigen::VectorXd lower_bound;
-  Eigen::VectorXd upper_bound;
+  Eigen::VectorXd lower;
+  Eigen::VectorXd upper;
+  LtvQpSlotMap slots;
 
-  /** @brief 返回第 step 个状态偏差块在固定决策向量中的起始列。 */
   int stateOffset(int step) const {
     const auto dimensions = checkedLtvQpDimensions(horizon);
     return dimensions.valid && state_dimension == 3 && control_dimension == 3 &&
                    step >= 0 && step <= horizon
-               ? state_dimension * step
+               ? 3 * step
                : -1;
   }
-  /** @brief 返回第 step 个控制偏差块在固定决策向量中的起始列。 */
+
   int controlOffset(int step) const {
     const auto dimensions = checkedLtvQpDimensions(horizon);
     return dimensions.valid && state_dimension == 3 && control_dimension == 3 &&
                    step >= 0 && step < horizon
-               ? dimensions.equality_rows + control_dimension * step
+               ? dimensions.state_vars + 3 * step
                : -1;
   }
-  /** @brief 返回 [delta_x,delta_u] 固定布局的总决策维度。 */
+
+  int slackOffset(int step) const {
+    const auto dimensions = checkedLtvQpDimensions(horizon);
+    return dimensions.valid && state_dimension == 3 && control_dimension == 3 &&
+                   step >= 0 && step < horizon
+               ? dimensions.state_vars + dimensions.control_vars + step
+               : -1;
+  }
+
   int decisionSize() const {
     const auto dimensions = checkedLtvQpDimensions(horizon);
     return dimensions.valid && state_dimension == 3 && control_dimension == 3
@@ -97,62 +189,49 @@ struct LtvQpProblem {
                : 0;
   }
 
-  /**
-   * @brief 校验 LTV-QP 稠密缓冲是否仍符合固定的状态、控制和约束行布局。
-   * @details 该检查只验证各矩阵/向量的尺寸，不接受仅凭 `valid` 标志访问 Eigen 缓冲；
-   *          因而可以在 backend 数值拷贝和 candidate 准入前阻止结构损坏导致的越界访问。
-   */
+  int constraintRows() const {
+    const auto dimensions = checkedLtvQpDimensions(horizon);
+    return dimensions.valid && state_dimension == 3 && control_dimension == 3
+               ? dimensions.constraint_rows
+               : 0;
+  }
+
   bool hasExpectedLayout() const;
-
-  /**
-   * @brief 校验所有双边约束下界不超过上界。
-   * @details 变量上下界允许 OSQP 使用正负无穷，但 NaN 和任一 `lower > upper` 都会失败。
-   *          调用前不需要假定矩阵尺寸正确：本函数会先复核固定布局。
-   */
   bool hasOrderedBounds() const;
-
-  /**
-   * @brief 校验所有矩阵和向量数值后再允许 backend/reconstructor 索引访问。
-   * @details 系数矩阵、gradient 和等式/不等式 bounds 必须 finite；变量上下界允许
-   *          OSQP 使用 +/-infinity，但 NaN 永远拒绝。该函数不依赖 `valid` 标志。
-   */
   bool hasFiniteNumerics() const;
 };
 
 class LtvQpBuilder {
 public:
-  /**
-   * @brief 在控制 timer 外按固定 horizon 预分配稠密 LTV-QP 工作缓冲。
-   * @details 决策维度与约束行数在此确定；timer 内只覆盖数值，禁止借此函数隐式改变结构。
-   */
+  /** @brief 生成 ATS 稀疏 LTV-QP 的固定上三角 Hessian CSC pattern。 */
+  static LtvQpSparseStructure buildHessianPattern(int horizon);
+  /** @brief 生成 ATS 稀疏 LTV-QP 的固定约束矩阵 CSC pattern。 */
+  static LtvQpSparseStructure buildConstraintPattern(int horizon);
+
+  /** @brief 在控制 timer 外预分配固定稀疏 CSC 缓冲与 O(1) 槽位映射。 */
   static LtvQpProblem allocate(int horizon);
 
-  /**
-   * @brief 围绕 iLQR 名义 rollout 构造凸二次跟踪问题。
-   * @details 包含 SE(2) 一阶线性动力学、车体系速度边界和车体加速度/控制增量边界。
-   *          轮速范数与舵角约束不在此伪线性化；低速方向未定义由
-   *          angle_rate_linearization_valid 显式暴露，未来主链接入前必须独立验证。
-   */
+  /** @brief 围绕名义轨迹一次分配并直填固定稀疏 LTV-QP。 */
   static LtvQpProblem build(
       const State &current_state, const std::vector<State> &nominal_states,
       const std::vector<Control> &nominal_controls,
       const std::vector<Se2Reference> &references, const Control &last_control,
       const Se2MpcConfig &config,
       const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig(),
-      double first_step_dt = -1.0);
+      double first_step_dt = -1.0,
+      const LtvQpEsdfConfig &esdf_config = LtvQpEsdfConfig(),
+      const std::vector<EsdfCorridorSample> *esdf_samples = nullptr);
 
-  /**
-   * @brief 在不改变维度的前提下重填已有的 LTV-QP 数值缓冲。
-   * @details 预分配 buffer 的完整 layout 不匹配时直接 fail-closed；控制 timer 不会因
-   *          损坏对象隐式重新分配大型 dense 矩阵。需要新维度时必须在 timer 外显式 allocate。
-   */
+  /** @brief 零分配直填既有固定稀疏 LTV-QP 缓冲（控制 timer 热路径）。 */
   static bool build(
       const State &current_state, const std::vector<State> &nominal_states,
       const std::vector<Control> &nominal_controls,
       const std::vector<Se2Reference> &references, const Control &last_control,
       const Se2MpcConfig &config, LtvQpProblem &problem,
       const ZeroSpeedGuardConfig &guard_config = ZeroSpeedGuardConfig(),
-      double first_step_dt = -1.0);
+      double first_step_dt = -1.0,
+      const LtvQpEsdfConfig &esdf_config = LtvQpEsdfConfig(),
+      const std::vector<EsdfCorridorSample> *esdf_samples = nullptr);
 };
 
 }  // namespace ats_swerve_mpc

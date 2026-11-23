@@ -1,6 +1,6 @@
 # ats_swerve_mpc
 
-ATS 四舵轮独立转向底盘的全向 SE(2) MPC 跟踪器。正式控制器为约束 iLQR（`solver_mode: ilqr`）。
+ATS 四舵轮独立转向底盘的全向 SE(2) MPC 跟踪器。唯一正式求解器为 OSQP v1.0.0 零分配稀疏 SQP-RTI（`solver_mode: qp`）。
 
 状态为世界系 `[x, y, yaw]`，控制为车体系 `[vx, vy, wz]`，以 `geometry_msgs/Twist` 发布到
 `command_topic`（默认 `/cmd_vel/autonomy_raw`）。模型保留真实横移能力，不引入差速 ICR 或曲率约束。
@@ -37,40 +37,27 @@ MuJoCo（2027入口复用`rmuc_2025_mujoco.launch.py`的公共编排）启动MPC
 
 ```bash
 ros2 launch ats_mujoco_sim rmuc_2027_mujoco.launch.py localization_source:=lio
-# 可选：solver_mode:=qp_shadow
 ```
 
 ## 当前速度口径与待验收项
 
-2026-11-16正式根profile及独立MPC配置的`max_vx/max_vy/max_wheel_speed`均为`5.0 m/s`、`max_wz=3.0 rad/s`、`max_awz=2.0 rad/s²`，平移加速度`max_ax/max_ay=2.0 m/s²`；`horizon=60`、`dt=0.05 s`。平移叠加自旋时仍受逐轮合成速度约束，轴向上限不意味着对角线或旋转时可以超出轮速预算。
+正式根profile及独立MPC配置的`max_vx/max_vy/max_wheel_speed`均为`5.0 m/s`、`max_wz=3.0 rad/s`、`max_awz=2.0 rad/s²`，平移加速度`max_ax/max_ay=2.0 m/s²`；`horizon=26`、`dt=0.10 s`（2.6 s 前瞻，首步按 50 Hz 实测 `step_dt` 执行）。平移叠加自旋时仍受逐轮合成速度约束，轴向上限不意味着对角线或旋转时可以超出轮速预算。
 
 轮半径`0.0425 m`；`motor_max_rpm=1348.1359885`为结合冗余系数1.2反算的暂定等效参数，不是实测电机规格。5 m/s是暂定能力上限，实车8–10 m/s等待测量后再定；MINCO单轮时间缩放仍未启用。
 
 当前终端接近区1 m来自旧低速配置，不能据构建和单测声称5 m/s制动/终点精度通过。直线静止到静止、加减速度2 m/s²时，达到5 m/s至少需12.5 m；当前对称点直线约12.060 m，理想峰值约4.911 m/s。最终记录reference、自主/selected/底盘命令和真值曲线，未触发上限时单列未验证，见[2027方案](../../../docs/nav_acceptance/20261116_2027_final_test_plan.md)。
 
-## LTV-QP 迁移状态
+## OSQP v1.0.0 零分配稀疏 SQP-RTI
 
 OSQP v1.0.0 源码位于 `../third_party/osqp`，以静态库链接。QDLDL v0.1.8
 （commit `138fdac58b9cd1c4137ff1b99152c8108a6cff5b`）内置于 `../third_party/qdldl`，
 由 `FETCHCONTENT_SOURCE_DIR_QDLDL` 指向该目录，配置时不再从 GitHub 拉取。
 
-`solver_mode` 取值：
+`solver_mode` 仅允许 `qp`（OSQP v1.0.0 SQP-RTI 唯一求解器；旧 `ilqr` 与 `qp_shadow` 已删除，未通过准入或触发碰撞门禁时确定性输出零速度 fail-stop）：
 
-| 值 | 行为 |
-| :--- | :--- |
-| `ilqr`（默认） | iLQR 唯一产生控制输出 |
-| `qp_shadow` | 预分配 OSQP 后端，只读取同周期冻结的输入快照做诊断与遥测，不发布 QP Twist；setup 失败时保持 iLQR |
-| `qp` | 保留值，节点启动时拒绝 |
-
-- `Se2Model`：iLQR 与 LTV-QP 共用的 SE(2) 动力学、Jacobian 与 rollout；
+- `Se2Model`：SE(2) 指数映射动力学（含一阶执行器滞后 `actuator_lag_tau_sec` 与命令延迟补偿）、Jacobian 与 rollout；
 - `ZeroSpeedGuard`：轮速接近零、方向未定义时禁止舵角线性化（带滞回），不会凭空生成原地舵角指令；
-- `LtvQpBuilder`：围绕 iLQR 名义 rollout 构造凸跟踪 QP，包含 SE(2) 线性动力学、车体速度边界和
-  控制增量边界；轮速范数与舵角约束尚未线性化进 QP。
-
-`qp_max_iterations`、`qp_time_limit_ms`、`qp_max_primal_residual`、`qp_max_dual_residual`、
-`qp_max_tracking_slack`、`qp_max_hard_constraint_violation` 是 shadow 后端的准入上限，不是性能实测结论。
-QP 路径目前仅用于诊断，不能写成实车求解器。急停、定位、授权租约、reference 新鲜度和零速度
-行为仍由现有节点负责。
+- `LtvQpBuilder`：围绕名义 rollout 构造固定稀疏模式 LTV-QP，包含 SE(2) 线性动力学、旋转系加速度约束、内接八边形轮速约束、线性化 ESDF 安全走廊与沿迹/横迹（Lag/Contouring）权重；非线性四轮滚转加速度/舵角速率约束由 `Se2MpcController::clampStepIncrement` 精确投影与独立审计复核。
 
 ## 构建与测试
 

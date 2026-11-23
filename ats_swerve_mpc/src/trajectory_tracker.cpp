@@ -47,6 +47,7 @@ void TrajectoryTracker::setConfig(const TrajectoryTrackerConfig & config)
   config_.intermediate_rotation_stop_wz_threshold =
     std::max(0.0, config_.intermediate_rotation_stop_wz_threshold);
   config_.min_rotation_span_rad = std::max(1e-3, config_.min_rotation_span_rad);
+  config_.feedforward_accel_lead_sec = std::max(0.0, config_.feedforward_accel_lead_sec);
 }
 
 //通过移动语义高效接管路径点，然后重置进，丢弃旧投影信息。
@@ -353,6 +354,7 @@ std::vector<Se2Reference> TrajectoryTracker::buildHorizon(
       return {};
     }
     reference.control *= scale;
+    reference.world_acceleration *= (scale * scale);
     references.push_back(reference);
   }
   return references;
@@ -367,6 +369,7 @@ bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) c
   if (time >= trajectory_.back().time) {
     reference.state = trajectory_.back().state;
     reference.control.setZero();
+    reference.world_acceleration.setZero();
     return true;
   }
   std::size_t upper = 1;
@@ -381,14 +384,36 @@ bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) c
   reference.state.head<2>() =
     first.state.head<2>() + ratio * (second.state.head<2>() - first.state.head<2>());
   reference.state(2) = interpolateAngle(first.state(2), second.state(2), ratio);
-  const Eigen::Vector2d world_velocity =
-    (second.state.head<2>() - first.state.head<2>()) / duration;
+  Eigen::Vector2d world_velocity;
+  double yaw_rate = 0.0;
+  if (config_.use_derivative_feedforward && first.has_derivatives && second.has_derivatives) {
+    world_velocity =
+      (1.0 - ratio) * first.world_velocity + ratio * second.world_velocity;
+    reference.world_acceleration =
+      (1.0 - ratio) * first.world_acceleration + ratio * second.world_acceleration;
+    yaw_rate = (1.0 - ratio) * first.yaw_rate + ratio * second.yaw_rate;
+    const bool stationary_xy =
+      (second.state.head<2>() - first.state.head<2>()).squaredNorm() <= 1e-12;
+    if (stationary_xy && std::abs(yaw_rate) <= 1e-9 &&
+      std::abs(normalizeAngle(second.state(2) - first.state(2))) > 1e-6)
+    {
+      yaw_rate = normalizeAngle(second.state(2) - first.state(2)) / duration;
+    }
+    if (config_.feedforward_accel_lead_sec > 0.0 && !stationary_xy) {
+      world_velocity += config_.feedforward_accel_lead_sec * reference.world_acceleration;
+    }
+  } else {
+    world_velocity =
+      (second.state.head<2>() - first.state.head<2>()) / duration;
+    reference.world_acceleration.setZero();
+    yaw_rate = normalizeAngle(second.state(2) - first.state(2)) / duration;
+  }
   // MINCO 速度在世界系，MPC 控制量必须转换为当前车体系 [vx, vy, wz]。
   const double cosine = std::cos(reference.state(2));
   const double sine = std::sin(reference.state(2));
   reference.control(0) = cosine * world_velocity.x() + sine * world_velocity.y();
   reference.control(1) = -sine * world_velocity.x() + cosine * world_velocity.y();
-  reference.control(2) = normalizeAngle(second.state(2) - first.state(2)) / duration;
+  reference.control(2) = yaw_rate;
   return true;
 }
 

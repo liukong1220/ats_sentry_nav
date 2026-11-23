@@ -7,6 +7,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +19,7 @@
 #include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "ats_navigation_interfaces/msg/gimbal_yaw_status.hpp"
 #include "ats_navigation_interfaces/msg/planner_status.hpp"
+#include "ats_navigation_interfaces/msg/planning_map_snapshot.hpp"
 #include "ats_swerve_mpc/emergency_stop_watchdog.hpp"
 #include "ats_swerve_mpc/qp/control_cycle_snapshot.hpp"
 #include "ats_swerve_mpc/qp/control_cycle_telemetry.hpp"
@@ -53,6 +56,24 @@ private:
     std::uint64_t sequence{0};
   };
 
+  enum class RolloutSafetyLevel : int {
+    kSafe = 0,
+    kSlowdown = 1,
+    kBrake = 2,
+    kUnsafeStop = 3,
+  };
+
+  struct RolloutSafetyEvaluation {
+    RolloutSafetyLevel level = RolloutSafetyLevel::kSafe;
+    double speed_scale = 1.0;
+    double min_footprint_clearance_m = std::numeric_limits<double>::infinity();
+  };
+
+  struct CommandHistorySample {
+    double stamp_sec = 0.0;
+    Control control = Control::Zero();
+  };
+
   /** @brief 接收里程计并维护供控制 timer 读取的最新状态、时间与跳变证据。 */
   void onOdometry(const nav_msgs::msg::Odometry::SharedPtr message);
   /** @brief 兼容 legacy Path；ExecutionCommand 启用时该入口不得重新授权运动。 */
@@ -63,7 +84,33 @@ private:
   void onPlannerStatus(
       const ats_navigation_interfaces::msg::PlannerStatus::SharedPtr message);
   void onMapReady(const std_msgs::msg::Bool::SharedPtr message);
+  void onPlanningSnapshot(
+      const ats_navigation_interfaces::msg::PlanningMapSnapshot::SharedPtr message);
   bool mapReadyFreshLocked() const;
+  bool planningSnapshotUsableLocked(
+      std::chrono::steady_clock::time_point now_steady,
+      std::shared_ptr<const ats_navigation_interfaces::msg::PlanningMapSnapshot>
+          *out_snapshot = nullptr,
+      Eigen::Vector3d *out_snapshot_from_odom = nullptr) const;
+  std::vector<EsdfCorridorSample> extractEsdfCorridorSamples(
+      const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+      const Eigen::Vector3d &snapshot_from_odom,
+      const std::vector<State> &nominal_states,
+      const std::vector<Se2Reference> &references) const;
+  RolloutSafetyEvaluation evaluateRolloutFootprintSafety(
+      const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+      const Eigen::Vector3d &snapshot_from_odom,
+      const std::vector<State> &rollout_states) const;
+  State advanceStateThroughCommandDelay(const State &measured_state,
+                                        double now_sec,
+                                        double rotation_delay) const;
+  bool solveSqpRti(
+      const ControlCycleSnapshot &snapshot,
+      const ats_navigation_interfaces::msg::PlanningMapSnapshot *map_snapshot,
+      const Eigen::Vector3d &snapshot_from_odom,
+      ControlCycleTelemetrySample &telemetry,
+      Se2MpcResult &out_result,
+      RolloutSafetyEvaluation &out_rollout_safety);
   bool mapExecutionValidLocked(
       const ats_navigation_interfaces::msg::ExecutionCommand & command) const;
   /** @brief 处理 legacy emergency stop；false 不能越过结构化 ExecutionCommand 授权。 */
@@ -75,7 +122,7 @@ private:
   /** @brief 接收云台 yaw 健康回执；与当前执行 lease 不匹配时立即停止。 */
   void onGimbalYawStatus(
       const ats_navigation_interfaces::msg::GimbalYawStatus::SharedPtr message);
-  /** @brief 控制周期唯一入口：完整检查健康、求解 iLQR、唯一发布并可选 shadow。 */
+  /** @brief 控制周期唯一入口：完整检查健康、求解 OSQP SQP-RTI 并唯一发布。 */
   void onControlTimer();
   /**
    * @brief 进入急停状态、清空 tracker/warm state 并通过既有唯一发布者发送零速度。
@@ -99,7 +146,8 @@ private:
    */
   bool installPath(
     const nav_msgs::msg::Path & message, bool keep_control_state = false,
-    std::optional<CommandOrder> command = std::nullopt);
+    std::optional<CommandOrder> command = std::nullopt,
+    const ats_navigation_interfaces::msg::ExecutionCommand * execution_command = nullptr);
   /** @brief 在 trajectory mutex 内判断换代宽限是否仍在进行（有 active 命令且未急停）。 */
   bool supersedeGraceActiveLocked(std::chrono::steady_clock::time_point now) const;
   /** @brief 在 trajectory mutex 内校验 active 命令：本 generation 有效，或处于换代宽限。 */
@@ -118,15 +166,12 @@ private:
   bool odometryUsable(State & current);
   /** @brief 检查动力学参数是否落在实车合理区间，并对越界项输出中文 ERROR/WARN。 */
   void validateDynamicsParameters(const Se2MpcConfig & config);
-  /** @brief 输出车体/轮级饱和与 iLQR 求解耗时的分级中文诊断日志。 */
+  /** @brief 输出车体/轮级饱和与 OSQP SQP-RTI 求解耗时的分级中文诊断日志。 */
   void reportSolverDiagnostics(const Se2MpcResult & result);
-  /** @brief 对同周期 iLQR 名义轨迹构造/求解 QP，仅记录复核结果。 */
-  void runQpShadow(const ControlCycleSnapshot &snapshot,
-                   ControlCycleTelemetrySample &telemetry);
   /**
-   * @brief 提交本次 iLQR/QP 周期的定长 telemetry，并拆分所有 deadline 根因。
+   * @brief 提交本次 OSQP SQP-RTI 周期的定长 telemetry，并拆分所有 deadline 根因。
    * @details 本函数只更新固定 128 槽数组及饱和计数，不进行 JSON、文件或阻塞 I/O；它不能
-   *          改写 iLQR command、tracker、warm-start 或任何外部安全状态。
+   *          改写控制指令、tracker、warm-start 或任何外部安全状态。
    */
   void finalizeControlTelemetry(
       ControlCycleTelemetrySample telemetry,
@@ -135,7 +180,7 @@ private:
   void dumpControlTelemetry(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
-  /** @brief 从 ROS 参数加载 SE(2) 物理约束和 iLQR 权重，不改变 frame 语义。 */
+  /** @brief 从 ROS 参数加载 SE(2) 物理约束和 MPC 权重，不改变 frame 语义。 */
   Se2MpcConfig loadConfig();
   /** @brief 从 ROS 参数加载有限路径搜索窗、偏差降速和时延补偿。 */
   TrajectoryTrackerConfig loadTrackerConfig();
@@ -156,6 +201,22 @@ private:
   std::string planner_status_topic_;
   std::string map_ready_topic_;
   double map_ready_timeout_sec_ = 5.0;
+  std::string planning_snapshot_topic_ = "/rog_map_adapter/planning_snapshot";
+  bool require_planning_snapshot_ = false;
+  double planning_snapshot_timeout_sec_ = 5.0;
+  double footprint_length_ = 0.581;
+  double footprint_width_ = 0.571;
+  double footprint_safety_margin_ = 0.02;
+  LtvQpEsdfConfig qp_esdf_config_{};
+  bool rollout_safety_enabled_ = true;
+  double rollout_immediate_stop_horizon_sec_ = 0.20;
+  double rollout_brake_horizon_sec_ = 0.70;
+  double rollout_slowdown_horizon_sec_ = 1.20;
+  double rollout_slowdown_clearance_m_ = 0.05;
+  double rollout_min_slowdown_scale_ = 0.45;
+  double rollout_hard_stop_penetration_m_ = 0.06;
+  int qp_rti_iterations_ = 2;
+  double qp_rti_second_pass_delta_threshold_ = 0.15;
   std::string command_topic_;
   std::string emergency_stop_topic_;
   std::string localization_status_topic_;
@@ -190,7 +251,7 @@ private:
   double odometry_jump_yaw_ = 0.8;
   // 求解耗时告警阈值占控制周期的比例（0~1）。
   double solve_time_warn_ratio_ = 0.6;
-  std::string solver_mode_ = "ilqr";
+  std::string solver_mode_ = "qp";
   LtvQpSolverSettings qp_solver_settings_;
   std::unique_ptr<LtvQpOsqpSolver> qp_solver_;
   LtvQpProblem qp_problem_buffer_;
@@ -198,7 +259,7 @@ private:
   bool qp_warm_start_valid_ = false;
   // 0 保持最近 128 槽诊断；正数时只导出同一 Execute/reference/map 身份的固定窗口。
   std::size_t telemetry_sampling_window_cycles_ = 0;
-  // 计时环同时记录 ilqr baseline 与 qp_shadow，服务导出时复制，控制 timer 不做字符串序列化。
+  // 计时环记录 OSQP SQP-RTI 周期统计，服务导出时复制，控制 timer 不做字符串序列化。
   ControlCycleTelemetryRing control_telemetry_;
   mutable std::mutex control_telemetry_mutex_;
   std::optional<std::chrono::steady_clock::time_point>
@@ -245,6 +306,13 @@ private:
   std::uint64_t supersede_old_generation_{0};
   bool map_ready_{false};
   std::optional<std::chrono::steady_clock::time_point> last_map_ready_signal_;
+  std::shared_ptr<const ats_navigation_interfaces::msg::PlanningMapSnapshot>
+      planning_snapshot_;
+  bool planning_snapshot_ready_{false};
+  std::optional<std::chrono::steady_clock::time_point>
+      last_planning_snapshot_signal_;
+  mutable std::mutex command_history_mutex_;
+  std::deque<CommandHistorySample> command_delay_history_;
   std::optional<ats_navigation_interfaces::msg::ExecutionCommand>
       active_execution_command_;
   std::optional<ats_navigation_interfaces::msg::GimbalYawStatus> gimbal_status_;
@@ -257,6 +325,9 @@ private:
   rclcpp::Subscription<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr
       planner_status_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr map_ready_sub_;
+  rclcpp::Subscription<
+      ats_navigation_interfaces::msg::PlanningMapSnapshot>::SharedPtr
+      planning_snapshot_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<ats_navigation_interfaces::msg::LocalizationStatus>::
       SharedPtr localization_status_sub_;

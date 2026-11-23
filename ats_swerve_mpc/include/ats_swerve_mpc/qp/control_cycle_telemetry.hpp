@@ -17,15 +17,8 @@ namespace ats_swerve_mpc {
 enum class ControlCycleTimingStage : std::size_t {
   kStateTrajectorySnapshot = 0,
   kReferenceExtraction,
-  kIlqrSolve,
-  // 以下五项是 kIlqrSolve 的内部拆分，只用于实时性归因，不是新增的串行开销。
-  // kIlqrJacobian 内含于 kIlqrBackwardPass，累加时不得重复计入。
-  kIlqrWarmStart,
-  kIlqrRollout,
-  kIlqrBackwardPass,
-  kIlqrJacobian,
-  kIlqrLineSearch,
-  kIlqrCommandPublish,
+  kActiveSolve,
+  kCommandPublish,
   kQpProblemBuild,
   kOsqpNumericUpdate,
   kQpBackendPhase,
@@ -55,7 +48,6 @@ enum class ControlCycleDeadlineCause : std::size_t {
   kOsqpTimeLimitStatus = 0,
   kOsqpSolveBudgetOverrun,
   kCallbackPeriodOverrun,
-  kIlqrSolveBudgetOverrun,
   kQpProblemBuildBudgetOverrun,
   kQpUpdateBudgetOverrun,
   kQpPhaseBudgetOverrun,
@@ -88,7 +80,7 @@ struct ControlCycleTimingDistribution {
 /** @brief 一个控制周期的定长、无路径内容性能与 QP 审计记录。 */
 struct ControlCycleTelemetrySample {
   std::uint64_t cycle_sequence = 0;
-  bool qp_shadow_attempted = false;
+  bool qp_attempted = false;
   std::uint64_t snapshot_identity_digest = 0;
   bool same_snapshot_identity = false;
   // 下列字段共同定义采样窗口的 Execute/reference/map 身份；它们仅用于诊断配对，
@@ -122,8 +114,7 @@ struct ControlCycleTelemetrySample {
   double hard_constraint_margin = 0.0;
   double slack_maximum = 0.0;
   std::array<double, 3> qp_first_control{{0.0, 0.0, 0.0}};
-  std::array<double, 3> ilqr_first_control{{0.0, 0.0, 0.0}};
-  std::array<double, 3> first_control_delta{{0.0, 0.0, 0.0}};
+  std::array<double, 3> published_first_control{{0.0, 0.0, 0.0}};
   bool candidate_feasible = false;
   std::array<char, 96> rejection_reason{{}};
   bool collision_gate = false;
@@ -136,6 +127,11 @@ struct ControlCycleTelemetrySample {
   double nonzero_bound_abs_minimum = 0.0;
   double bound_abs_maximum = 0.0;
   double zero_delta_dynamic_equality_residual = 0.0;
+  double cross_track_error_m = 0.0;
+  double published_wheel_speed_max_mps = 0.0;
+  double wheel_speed_violation_mps = 0.0;
+  int rti_iterations = 0;
+  int rollout_safety_level = 0;
 
   std::array<double, kControlCycleTimingStageCount> stage_ms{{}};
   std::array<bool, kControlCycleTimingStageCount> stage_recorded{{}};
@@ -218,6 +214,14 @@ private:
   bool sampling_window_started_ = false;
   bool sampling_window_identity_changed_ = false;
   ControlCycleTelemetrySample sampling_window_identity_;
+  std::uint64_t total_active_cycles_ = 0;
+  double cross_track_sum_sq_ = 0.0;
+  double cross_track_max_m_ = 0.0;
+  double max_wheel_speed_violation_mps_ = 0.0;
+  std::uint64_t wheel_speed_violation_count_ = 0;
+  std::uint64_t rollout_slowdown_count_ = 0;
+  std::uint64_t rollout_brake_count_ = 0;
+  std::uint64_t rollout_unsafe_stop_count_ = 0;
 };
 
 /** @brief 返回稳定 JSON 字段使用的阶段名。 */

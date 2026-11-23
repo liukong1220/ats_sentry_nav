@@ -6,7 +6,6 @@
 #include <array>
 #include <vector>
 
-#include <Eigen/Cholesky>
 #include <Eigen/Core>
 
 #include "ats_swerve_mpc/se2_model.hpp"
@@ -14,7 +13,7 @@
 namespace ats_swerve_mpc {
 
 /**
- * @brief 四舵轮底盘 SE(2) MPC（iLQR）配置。
+ * @brief 四舵轮底盘 SE(2) MPC（OSQP v1.0.0 稀疏 SQP-RTI）配置。
  *
  * 所有量纲统一为 SI：长度 m、速度 m/s、加速度 m/s^2、角度 rad、角速度 rad/s。
  * 控制量为车体系 Twist [vx, vy, wz]，状态量为世界系位姿 [x, y, yaw]。
@@ -22,29 +21,36 @@ namespace ats_swerve_mpc {
  */
 struct Se2MpcConfig {
   // 预测步数（无量纲）。horizon * dt 即预测时域长度，需覆盖实车一次制动距离。
-  int horizon = 20;
-  // 离散步长 [s]。必须与控制线程周期一致，否则预测时间轴与实际执行时间轴错位。
-  double dt = 0.1;
+  int horizon = 26;
+  // 离散步长 [s]。与 50 Hz 实时控制周期解耦，首步增量约束按实测 step_dt 计算。
+  double dt = 0.10;
   // 状态跟踪权重 [x, y, yaw]：位置误差权重大于航向，保证先贴合路径再修航向。
-  Eigen::Vector3d state_weight{18.0, 18.0, 4.0};
+  Eigen::Vector3d state_weight{18.0, 18.0, 10.0};
   // 控制幅值权重 [vx, vy, wz]：抑制无谓大速度，等价于能耗惩罚。
   Eigen::Vector3d control_weight{0.12, 0.12, 0.08};
   // 控制增量权重 [dvx, dvy, dwz]：抑制指令抖振，直接决定舵轮舵角的平滑度。
-  Eigen::Vector3d control_delta_weight{0.7, 0.7, 0.25};
+  Eigen::Vector3d control_delta_weight{0.70, 0.70, 0.60};
   // 终端状态权重：比 state_weight 更大，保证时域末端收敛到参考点。
   Eigen::Vector3d terminal_weight{28.0, 28.0, 8.0};
+  // 沿迹（lag）与横迹（contouring）局部旋转代价权重；<=0 时回退为 state_weight(0/1)。
+  double lag_weight = 15.0;
+  double contour_weight = 24.0;
+  // 一阶执行器响应滞后时间常数 tau_u [s]（0 表示理想瞬时响应）。
+  double actuator_lag_tau_sec = 0.025;
+  // 纯传输/下位机命令延迟缓冲时间 [s]（0 表示仅使用旋转相位补偿）。
+  double actuator_delay_sec = 0.010;
   // 车体前向最大线速度 [m/s]。对应实车纵向可用速度上限（受电机额定转速约束）。
-  double max_vx = 2.0;
+  double max_vx = 5.0;
   // 车体侧向最大线速度 [m/s]。四舵轮为全向底盘，横向能力与纵向同级。
-  double max_vy = 2.0;
+  double max_vy = 5.0;
   // 车体最大偏航角速度 [rad/s]。实车受舵轮转向速率与轮速上限共同限制。
-  double max_wz = 2.5;
+  double max_wz = 3.0;
   // 车体纵向最大加速度 [m/s^2]。对应轮胎-地胶附着极限与电机扭矩上限的较小者。
-  double max_ax = 2.5;
+  double max_ax = 2.0;
   // 车体侧向最大加速度 [m/s^2]，物理含义同 max_ax，方向为车体 y。
-  double max_ay = 2.5;
+  double max_ay = 2.0;
   // 车体最大偏航角加速度 [rad/s^2]。超过该值实车会出现舵轮打滑与航向过冲。
-  double max_awz = 4.0;
+  double max_awz = 2.0;
   // 轮心相对底盘中心的 x 向半轴偏置 [m]（不是完整前后轮距）。
   // 实车对应：舵轮转向轴中心到底盘几何中心的纵向距离，MuJoCo 模型为 0.270。
   double wheel_base_x = 0.0;
@@ -60,80 +66,32 @@ struct Se2MpcConfig {
   // 单个舵轮的最大转向角速度 [rad/s]。实车对应转向电机转速经减速比换算的结果，
   // 是"原地掉头/横移切换"能否在一个控制周期内完成的关键约束。
   double max_steer_rate = 0.0;
-  // iLQR 单周期最大迭代次数（无量纲）。上限受控制周期实时预算约束。
-  int max_iterations = 6;
-  // Q_uu 正则化系数，防止低速工况下反向递推奇异。
-  double regularization = 1e-5;
-  // 线搜索步长衰减比例（0~1）。
-  double line_search_decay = 0.5;
-  // 线搜索最小步长，低于该值判定本次迭代无法下降代价。
-  double min_line_search_step = 0.05;
-  // 收敛判据：前馈更新量无穷范数小于该值即认为已收敛。
-  double convergence_tolerance = 1e-3;
   // 模块级增量限幅二分搜索迭代次数。
-  int clamp_bisection_iterations = 40;
+  int clamp_bisection_iterations = 20;
   // 暖启动与参考速度混合比例（0=纯参考，1=纯暖启动）。
-  double warm_start_blend_ratio = 0.7;
+  double warm_start_blend_ratio = 0.5;
 };
 
 struct Se2Reference {
   State state = State::Zero();
   Control control = Control::Zero();
+  Eigen::Vector2d world_acceleration = Eigen::Vector2d::Zero();
 };
 
 /**
  * @brief 旋转相位补偿（报告附录 A.9）：把求解用状态的 yaw 换成 psi + omega * t_d / 2。
- * @param measured 测量得到的世界系状态 [x, y, yaw]。
- * @param yaw_rate MPC 采用的车体 yaw 角速度 omega [rad/s]（节点取上一拍已发布指令的 wz）。
- * @param delay 控制延迟 t_d [s]（节点取 command_latency_compensation）。
- * @return 仅 yaw 被前推 omega * t_d / 2 并归一化的状态；位置不变。delay 或 yaw_rate 为 0、
- *         或乘积不是有限数时原样返回，行为与未补偿时逐位一致。
- * @details iLQR 的车体系指令经 `Se2Model::dynamics` 按状态 yaw 旋到世界系，等价于“世界系误差
- *          按 yaw 旋到车体系”。指令实际生效在延迟之后，车体已多转 omega * t_d，不补偿时
- *          横向会偏出 |v| * sin(omega * t_d / 2)。yaw 误差项同时看到这份前推，属预期。
  */
 State rotationPhaseCompensatedState(const State &measured, double yaw_rate,
                                     double delay);
 
 /**
- * @brief MPC 求解结果与实车诊断标志。
- *
- * success 语义：控制/状态序列长度合法、代价有限，并且本周期至少完成一次成功的
- * iLQR 反向递推（Q_uu 可分解、反馈/前馈增益全部有限）。反向递推失败时判定失败，
- * 因为此时返回的只是上一周期的暖启动序列，控制已失去反馈闭环。
- * 注意"线搜索未接受任何候选"不判失败：约束（车体速度/轮速/舵角速率）激活时，
- * 限幅会把候选压回当前序列，代价无法下降但当前序列仍是约束集内的可执行解。
+ * @brief MPC（OSQP SQP-RTI）求解结果与实车诊断标志。
  */
-/**
- * @brief 单个 iLQR 求解周期内的分阶段单调时钟耗时，单位毫秒。
- *
- * 用途仅限实时性归因：把 `solve_time_ms` 拆到具体 owner，避免把整个 solve
- * 笼统记为"iLQR 慢"。各阶段互不重叠，`jacobian_ms` 是 `backward_pass_ms`
- * 的内含子项（backward pass 每步都调用 `jacobians`），因此
- * `warm_start_ms + rollout_ms + backward_pass_ms + line_search_ms` 才与
- * `solve_time_ms` 可比，累加时不得再叠加 `jacobian_ms`。
- */
-struct Se2MpcStageTiming {
-  // warm start 构造（initializeControls）耗时。
-  double warm_start_ms = 0.0;
-  // 名义轨迹 rollout 累计耗时（含线搜索候选之外的初始 rollout）。
-  double rollout_ms = 0.0;
-  // 反向递推累计耗时，包含其内部的 jacobians 调用。
-  double backward_pass_ms = 0.0;
-  // backward pass 内部线性化累计耗时；是 backward_pass_ms 的子项。
-  double jacobian_ms = 0.0;
-  // 受约束线搜索累计耗时（候选前向仿真、限幅与代价评估）。
-  double line_search_ms = 0.0;
-  // 代价评估累计耗时；分布在初始 rollout 与线搜索候选中，为交叉子项。
-  double cost_ms = 0.0;
-};
-
 struct Se2MpcResult {
   bool success = false;
   std::vector<Control> controls;
   std::vector<State> states;
   int iterations = 0;
-  // 被线搜索接受的迭代次数；为 0 表示本周期完全没有改进。
   int accepted_iterations = 0;
   double cost = 0.0;
   double solve_time_ms = 0.0;
@@ -146,68 +104,71 @@ struct Se2MpcResult {
   // 四舵轮模块级约束是否真正生效；为 false 说明 wheel_base_* 或轮速上限未配置，
   // 此时只有车体级限幅在起作用，属于实车高危配置错误。
   bool module_limits_active = false;
-  // 分阶段耗时；只用于归因，不参与任何 gate 判定。
-  Se2MpcStageTiming stage_timing;
 };
 
 class Se2MpcController {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-  /** @brief 创建 iLQR 控制器并初始化共享 SE(2) 模型和 warm-start 状态。 */
+  /** @brief 创建四舵轮 SE(2) 运动学约束投影器与 SQP-RTI 名义轨迹构造器。 */
   explicit Se2MpcController(const Se2MpcConfig &config = Se2MpcConfig());
 
-  /**
-   * @brief 在当前状态和参考 horizon 上执行一次完整 iLQR 控制周期。
-   * @param first_step_dt 可选：本周期相对上一拍控制量的实际时间步长 [s]；<=0 时回退为 config_.dt。
-   *                      用于将实时控制周期/实测间隔与预测时域步长解耦。
-   * @details 该函数保留既有主控制链：先生成/复用控制序列，再做 rollout、
-   *          backward pass、线搜索和真实四轮硬约束限幅，返回的首个控制才可发布。
-   */
-  Se2MpcResult solve(const State &current_state,
-                     const std::vector<Se2Reference> &references,
-                     const Control &last_control,
-                     double first_step_dt = -1.0);
   /** @brief 替换动力学和代价配置，并清空与旧配置不兼容的 warm start。 */
   void setConfig(const Se2MpcConfig &config);
-  /** @brief 清空控制序列和求解器内部状态，使下一周期回到确定性初始路径。 */
+  /** @brief 清空控制序列和内部 warm-start 状态，使下一周期回到确定性初始路径。 */
   void reset();
 
-  /** @brief 只读返回当前生效的 MPC 参数，供 node 和 QP adapter 共用。 */
+  /** @brief 只读返回当前生效的 MPC 参数，供 node 和 LTV-QP 共用。 */
   const Se2MpcConfig &config() const { return config_; }
+
+  /** @brief 计算阶段或终端的沿迹/横迹旋转状态权重矩阵 R(theta_ref)*diag(q_l,q_c)*R(theta_ref)^T。 */
+  static Eigen::Matrix3d stateCostMatrix(const Se2MpcConfig &config,
+                                         const Se2Reference &reference,
+                                         bool terminal = false);
+
+  /**
+   * @brief 为 SQP-RTI 构造满足真实执行器与八边形轮速边界的名义控制序列（连续时间前移 warm-start + 参考混合）。
+   */
+  std::vector<Control> buildNominalControls(
+      const std::vector<Se2Reference> &references, const Control &last_control,
+      double first_step_dt, bool octagon_wheel_clamp = false,
+      bool *first_step_body_saturated = nullptr,
+      bool *first_step_wheel_saturated = nullptr,
+      bool *first_step_increment_limited = nullptr);
+
+  /** @brief 将通过准入的 SQP-RTI 控制序列提交回共享 warm-start 缓冲。 */
+  void commitWarmControls(const std::vector<Control> &controls);
+
+  /** @brief 使用共享模型（含可选一阶执行器滞后）执行非线性前向 rollout。 */
+  std::vector<State> rolloutTrajectory(const State &initial,
+                                       const std::vector<Control> &controls,
+                                       const Control &last_control,
+                                       double first_step_dt) const;
+
+  /** @brief 将单步目标控制按真实旋转系加速度、轮加速度与舵角速率投影到可达集。 */
+  Control clampStepIncrement(const Control &target, const Control &previous,
+                             double step_dt,
+                             bool *body_saturated = nullptr,
+                             bool *wheel_saturated = nullptr,
+                             bool *increment_limited = nullptr) const;
+
+  /** @brief 计算给定车体控制下四轮中的最大轮速 [m/s]。 */
+  double computeMaxModuleSpeed(const Control &control) const {
+    return maxModuleSpeed(control);
+  }
 
   /**
    * @brief 四舵轮模块级约束是否处于完全生效状态。
-   * @return true 表示半轴偏置与单轮速度上限都已配置，模块级限幅真实生效；
-   *         false 表示配置缺失，只能退化为车体平移速度限幅（实车高危）。
-   * @note 供控制节点在启动与运行期打印中文告警，避免"仿真通过实车超速"。
    */
   bool moduleLimitsActive() const;
 
 private:
-  using Matrix3 = Eigen::Matrix3d;
-
   // 限幅命中情况，用于向上层输出饱和诊断。
   struct SaturationReport {
     bool body = false;   // 车体 vx/vy/wz 任一触及上限
     bool wheel = false;  // 单轮速度触及上限（等比缩放已触发）
   };
 
-  struct BackwardResult {
-    bool success = false;
-    std::vector<Control> feedforward;
-    std::vector<Matrix3> feedback;
-  };
-
-  /** @brief 对内部代价和 rollout 统一执行 yaw 归一化。 */
-  static double normalizeAngle(double angle);
-  /** @brief 计算 iLQR 代价使用的 SE(2) 最短状态误差。 */
-  static State stateDifference(const State &lhs, const State &rhs);
-  /** @brief 使用共享模型推进一个控制步，避免 iLQR 与 QP 动力学分叉。 */
-  State dynamics(const State &state, const Control &control) const;
-  /** @brief 计算 iLQR backward pass 所需的状态/控制线性化矩阵。 */
-  void jacobians(const State &state, const Control &control,
-                 Matrix3 &state_jacobian, Matrix3 &control_jacobian) const;
   /** @brief 施加车体速度和真实四轮速度幅值限制，并记录饱和来源。 */
   Control clampControl(const Control &control,
                        SaturationReport *report = nullptr) const;
@@ -223,40 +184,16 @@ private:
                          double step_dt,
                          SaturationReport *report = nullptr,
                          bool *increment_limited = nullptr) const;
-  /** @brief 使用共享模型生成当前 iLQR 名义轨迹。 */
-  std::vector<State> rollout(const State &initial,
-                             const std::vector<Control> &controls) const;
-  /** @brief 计算状态跟踪、控制幅值、控制增量和 terminal 总代价。 */
-  double cost(const std::vector<State> &states,
-              const std::vector<Control> &controls,
-              const std::vector<Se2Reference> &references,
-              const Control &last_control,
-              double first_step_dt = -1.0) const;
-  /** @brief 对名义 rollout 执行 iLQR 反向递推，生成反馈/前馈增益。 */
-  BackwardResult backwardPass(const std::vector<State> &states,
-                              const std::vector<Control> &controls,
-                              const std::vector<Se2Reference> &references,
-                              const Control &last_control,
-                              double first_step_dt = -1.0) const;
   /** @brief 生成有效参考控制 warm start，并逐步投影到真实执行器约束内。 */
   void initializeControls(const std::vector<Se2Reference> &references,
                           const Control &last_control,
                           double first_step_dt);
 
   Se2MpcConfig config_;
-  // iLQR 名义轨迹与 LTV-QP candidate 非线性复核共用此模型，禁止维护第二套动力学。
-  Se2Model model_;
   std::vector<Control> warm_controls_;
   bool has_warm_start_ = false;
-  // 本周期首步（即真正下发的那一步）限幅命中记录：在前向生成过程中累积，
-  // 不能在求解结束后对已限幅的结果再限幅一次——那样永远得不到命中标志。
   SaturationReport first_step_saturation_;
   bool first_step_increment_limited_ = false;
-  // 归因累加器：`jacobians` 与 `cost` 都在 const 路径上被调用，故用 mutable
-  // 累加。两者在每次 `solve` 入口清零，只在单一控制 timer 线程内使用，不参与
-  // 任何 gate 判定，也不改变求解数值。
-  mutable double jacobian_accumulated_ms_ = 0.0;
-  mutable double cost_accumulated_ms_ = 0.0;
 };
 
 } // namespace ats_swerve_mpc

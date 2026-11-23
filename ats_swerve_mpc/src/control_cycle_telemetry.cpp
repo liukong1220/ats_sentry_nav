@@ -58,13 +58,8 @@ const char *controlCycleTimingStageName(ControlCycleTimingStage stage) {
   switch (stage) {
     case ControlCycleTimingStage::kStateTrajectorySnapshot: return "state_trajectory_snapshot_ms";
     case ControlCycleTimingStage::kReferenceExtraction: return "reference_extraction_ms";
-    case ControlCycleTimingStage::kIlqrSolve: return "ilqr_solve_ms";
-    case ControlCycleTimingStage::kIlqrWarmStart: return "ilqr_warm_start_ms";
-    case ControlCycleTimingStage::kIlqrRollout: return "ilqr_rollout_ms";
-    case ControlCycleTimingStage::kIlqrBackwardPass: return "ilqr_backward_pass_ms";
-    case ControlCycleTimingStage::kIlqrJacobian: return "ilqr_jacobian_ms";
-    case ControlCycleTimingStage::kIlqrLineSearch: return "ilqr_line_search_ms";
-    case ControlCycleTimingStage::kIlqrCommandPublish: return "ilqr_command_publish_ms";
+    case ControlCycleTimingStage::kActiveSolve: return "active_solve_ms";
+    case ControlCycleTimingStage::kCommandPublish: return "command_publish_ms";
     case ControlCycleTimingStage::kQpProblemBuild: return "qp_problem_build_ms";
     case ControlCycleTimingStage::kOsqpNumericUpdate: return "osqp_numeric_update_ms";
     case ControlCycleTimingStage::kQpBackendPhase: return "qp_backend_phase_ms";
@@ -87,7 +82,6 @@ const char *controlCycleDeadlineCauseName(ControlCycleDeadlineCause cause) {
     case ControlCycleDeadlineCause::kOsqpTimeLimitStatus: return "osqp_time_limit_status_count";
     case ControlCycleDeadlineCause::kOsqpSolveBudgetOverrun: return "osqp_solve_budget_overrun_count";
     case ControlCycleDeadlineCause::kCallbackPeriodOverrun: return "callback_period_overrun_count";
-    case ControlCycleDeadlineCause::kIlqrSolveBudgetOverrun: return "ilqr_solve_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpProblemBuildBudgetOverrun: return "qp_problem_build_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpUpdateBudgetOverrun: return "qp_update_budget_overrun_count";
     case ControlCycleDeadlineCause::kQpPhaseBudgetOverrun: return "qp_phase_budget_overrun_count";
@@ -161,6 +155,14 @@ void ControlCycleTelemetryRing::configureSamplingWindow(
   deadline_cause_counts_.fill(0);
   cursor_ = 0;
   count_ = 0;
+  total_active_cycles_ = 0;
+  cross_track_sum_sq_ = 0.0;
+  cross_track_max_m_ = 0.0;
+  max_wheel_speed_violation_mps_ = 0.0;
+  wheel_speed_violation_count_ = 0;
+  rollout_slowdown_count_ = 0;
+  rollout_brake_count_ = 0;
+  rollout_unsafe_stop_count_ = 0;
 }
 
 bool ControlCycleTelemetryRing::push(
@@ -200,6 +202,27 @@ bool ControlCycleTelemetryRing::push(
   }
   cursor_ = (cursor_ + 1) % kCapacity;
   count_ = std::min(kCapacity, count_ + 1);
+  saturatingIncrement(total_active_cycles_);
+  if (std::isfinite(sample.cross_track_error_m)) {
+    const double cte = std::abs(sample.cross_track_error_m);
+    cross_track_sum_sq_ += cte * cte;
+    cross_track_max_m_ = std::max(cross_track_max_m_, cte);
+  }
+  if (std::isfinite(sample.wheel_speed_violation_mps) &&
+      sample.wheel_speed_violation_mps > 0.0) {
+    max_wheel_speed_violation_mps_ = std::max(
+        max_wheel_speed_violation_mps_, sample.wheel_speed_violation_mps);
+    if (sample.wheel_speed_violation_mps > 1e-6) {
+      saturatingIncrement(wheel_speed_violation_count_);
+    }
+  }
+  if (sample.rollout_safety_level == 1) {
+    saturatingIncrement(rollout_slowdown_count_);
+  } else if (sample.rollout_safety_level == 2) {
+    saturatingIncrement(rollout_brake_count_);
+  } else if (sample.rollout_safety_level >= 3) {
+    saturatingIncrement(rollout_unsafe_stop_count_);
+  }
   return true;
 }
 
@@ -245,7 +268,7 @@ std::string ControlCycleTelemetryRing::toJson(
     const ControlCycleTelemetryMetadata &metadata) const {
   std::ostringstream stream;
   stream << std::setprecision(17);
-  stream << "{\"schema_version\":4,\"metadata\":{\"solver_mode\":";
+  stream << "{\"schema_version\":5,\"metadata\":{\"solver_mode\":";
   appendJsonString(stream, metadata.solver_mode);
   stream << ",\"control_rate_hz\":";
   appendDouble(stream, metadata.control_rate_hz);
@@ -279,7 +302,23 @@ std::string ControlCycleTelemetryRing::toJson(
         static_cast<ControlCycleDeadlineCause>(index)));
     stream << ':' << deadline_cause_counts_[index];
   }
-  stream << "},\"timing_summary\":{";
+  stream << "},\"tracking_and_safety_summary\":{\"total_active_cycles\":"
+         << total_active_cycles_ << ",\"cross_track_rms_m\":";
+  const double cte_rms =
+      total_active_cycles_ > 0
+          ? std::sqrt(cross_track_sum_sq_ /
+                      static_cast<double>(total_active_cycles_))
+          : 0.0;
+  appendDouble(stream, cte_rms);
+  stream << ",\"cross_track_max_m\":";
+  appendDouble(stream, cross_track_max_m_);
+  stream << ",\"max_wheel_speed_violation_mps\":";
+  appendDouble(stream, max_wheel_speed_violation_mps_);
+  stream << ",\"wheel_speed_violation_count\":" << wheel_speed_violation_count_
+         << ",\"rollout_slowdown_count\":" << rollout_slowdown_count_
+         << ",\"rollout_brake_count\":" << rollout_brake_count_
+         << ",\"rollout_unsafe_stop_count\":" << rollout_unsafe_stop_count_
+         << "},\"timing_summary\":{";
   for (std::size_t index = 0; index < kControlCycleTimingStageCount; ++index) {
     if (index != 0) {
       stream << ',';
@@ -305,8 +344,8 @@ std::string ControlCycleTelemetryRing::toJson(
     }
     const ControlCycleTelemetrySample &sample = sampleAt(sample_index);
     stream << "{\"cycle_sequence\":" << sample.cycle_sequence
-           << ",\"qp_shadow_attempted\":"
-           << (sample.qp_shadow_attempted ? "true" : "false")
+           << ",\"qp_attempted\":"
+           << (sample.qp_attempted ? "true" : "false")
            << ",\"snapshot_identity_digest\":" << sample.snapshot_identity_digest
            << ",\"same_snapshot_identity\":"
            << (sample.same_snapshot_identity ? "true" : "false")
@@ -357,19 +396,12 @@ std::string ControlCycleTelemetryRing::toJson(
       }
       appendDouble(stream, sample.qp_first_control[axis]);
     }
-    stream << "],\"ilqr_first_control\":[";
-    for (std::size_t axis = 0; axis < sample.ilqr_first_control.size(); ++axis) {
+    stream << "],\"published_first_control\":[";
+    for (std::size_t axis = 0; axis < sample.published_first_control.size(); ++axis) {
       if (axis != 0) {
         stream << ',';
       }
-      appendDouble(stream, sample.ilqr_first_control[axis]);
-    }
-    stream << "],\"first_control_delta\":[";
-    for (std::size_t axis = 0; axis < sample.first_control_delta.size(); ++axis) {
-      if (axis != 0) {
-        stream << ',';
-      }
-      appendDouble(stream, sample.first_control_delta[axis]);
+      appendDouble(stream, sample.published_first_control[axis]);
     }
     stream << ']';
     stream << ",\"candidate_feasible\":"
@@ -379,6 +411,14 @@ std::string ControlCycleTelemetryRing::toJson(
     stream << ",\"collision_gate\":"
            << (sample.collision_gate ? "true" : "false")
            << ",\"map_gate\":" << (sample.map_gate ? "true" : "false")
+           << ",\"cross_track_error_m\":";
+    appendDouble(stream, sample.cross_track_error_m);
+    stream << ",\"published_wheel_speed_max_mps\":";
+    appendDouble(stream, sample.published_wheel_speed_max_mps);
+    stream << ",\"wheel_speed_violation_mps\":";
+    appendDouble(stream, sample.wheel_speed_violation_mps);
+    stream << ",\"rti_iterations\":" << sample.rti_iterations
+           << ",\"rollout_safety_level\":" << sample.rollout_safety_level
            << ",\"qp_problem_metrics\":";
     if (sample.qp_problem_metrics_recorded) {
       stream << "{\"hessian_diagonal_minimum\":";

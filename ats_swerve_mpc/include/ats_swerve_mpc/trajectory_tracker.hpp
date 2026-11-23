@@ -17,6 +17,10 @@ struct TimedState
 {
   double time = 0.0;
   State state = State::Zero();
+  bool has_derivatives = false;
+  Eigen::Vector2d world_velocity = Eigen::Vector2d::Zero();
+  Eigen::Vector2d world_acceleration = Eigen::Vector2d::Zero();
+  double yaw_rate = 0.0;
 };
 
 struct TrajectoryProjection
@@ -45,6 +49,10 @@ struct TrajectoryTrackerConfig
   double intermediate_rotation_stop_wz_threshold = 0.35;
   // Minimum angular span [rad] for a stationary segment to be treated as an in-place rotation block.
   double min_rotation_span_rad = 0.05;
+  // O2: consume analytical derivatives carried by ExecutionCommand when present.
+  bool use_derivative_feedforward = true;
+  // Optional first-order lag feedforward lead tau_u [s]: u_ff = v_ref + tau_u * a_ref.
+  double feedforward_accel_lead_sec = 0.0;
 };
 
 class TrajectoryTracker
@@ -81,6 +89,9 @@ public:
       return 0.0;
     }
     const auto & last = trajectory_.back();
+    if (config_.use_derivative_feedforward && last.has_derivatives) {
+      return last.world_velocity.norm();
+    }
     // Compare timestamps against a timestamp boundary, not a rounded duration
     // against window. Otherwise 13.1 - 13.0 < 0.1 can pull a cruising segment
     // into a fully stopped tail and disable the terminal approach speed cap.

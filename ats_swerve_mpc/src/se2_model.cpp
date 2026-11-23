@@ -101,6 +101,133 @@ std::vector<State> Se2Model::rollout(
   return states;
 }
 
+Control Se2Model::rotateControlLinear(const Control &control, double yaw_delta) {
+  if (!std::isfinite(yaw_delta) || std::abs(yaw_delta) <= 1e-12) {
+    return control;
+  }
+  const double c = std::cos(yaw_delta);
+  const double s = std::sin(yaw_delta);
+  Control rotated = control;
+  rotated(0) = c * control(0) + s * control(1);
+  rotated(1) = -s * control(0) + c * control(1);
+  return rotated;
+}
+
+Eigen::Matrix3d Se2Model::rotateControlLinearJacobian(const Control &control,
+                                                      double step_dt) {
+  Eigen::Matrix3d jacobian = Eigen::Matrix3d::Identity();
+  if (!std::isfinite(step_dt) || std::abs(step_dt) <= 1e-12) {
+    return jacobian;
+  }
+  const double yaw_delta = control(2) * step_dt;
+  if (!std::isfinite(yaw_delta)) {
+    return jacobian;
+  }
+  const double c = std::cos(yaw_delta);
+  const double s = std::sin(yaw_delta);
+  jacobian(0, 0) = c;
+  jacobian(0, 1) = s;
+  jacobian(0, 2) = step_dt * (-s * control(0) + c * control(1));
+  jacobian(1, 0) = -s;
+  jacobian(1, 1) = c;
+  jacobian(1, 2) = step_dt * (-c * control(0) - s * control(1));
+  jacobian(2, 0) = 0.0;
+  jacobian(2, 1) = 0.0;
+  jacobian(2, 2) = 1.0;
+  return jacobian;
+}
+
+double Se2Model::actuatorLagGamma(double dt, double lag_tau_sec) {
+  if (!std::isfinite(lag_tau_sec) || lag_tau_sec <= 1e-6 ||
+      !std::isfinite(dt) || dt <= 1e-9) {
+    return 1.0;
+  }
+  const double ratio = dt / lag_tau_sec;
+  double gamma = 1.0;
+  if (ratio < 1e-4) {
+    gamma = 0.5 * ratio - (ratio * ratio) / 6.0 +
+            (ratio * ratio * ratio) / 24.0;
+  } else {
+    gamma = 1.0 - (1.0 - std::exp(-ratio)) / ratio;
+  }
+  if (gamma < 0.05) {
+    return 0.05;
+  }
+  if (gamma > 1.0) {
+    return 1.0;
+  }
+  return gamma;
+}
+
+Control Se2Model::effectiveControlWithLag(const Control &control,
+                                          const Control &previous_control,
+                                          double previous_carry_dt,
+                                          double step_dt,
+                                          double lag_tau_sec) {
+  const double gamma = actuatorLagGamma(step_dt, lag_tau_sec);
+  if (gamma >= 1.0 - 1e-12) {
+    return control;
+  }
+  const Control carried_previous = rotateControlLinear(
+      previous_control, previous_control(2) * previous_carry_dt);
+  return (1.0 - gamma) * carried_previous + gamma * control;
+}
+
+State Se2Model::dynamicsWithLag(const State &state, const Control &control,
+                                const Control &previous_control,
+                                double previous_carry_dt, double dt,
+                                double lag_tau_sec) {
+  const Control effective = effectiveControlWithLag(
+      control, previous_control, previous_carry_dt, dt, lag_tau_sec);
+  return dynamics(state, effective, dt);
+}
+
+void Se2Model::jacobiansWithLag(const State &state, const Control &control,
+                                const Control &previous_control,
+                                double previous_carry_dt, double dt,
+                                double lag_tau_sec,
+                                Eigen::Matrix3d &state_jacobian,
+                                Eigen::Matrix3d &current_control_jacobian,
+                                Eigen::Matrix3d &previous_control_jacobian) {
+  const double gamma = actuatorLagGamma(dt, lag_tau_sec);
+  if (gamma >= 1.0 - 1e-12) {
+    jacobians(state, control, dt, state_jacobian, current_control_jacobian);
+    previous_control_jacobian.setZero();
+    return;
+  }
+  const Control effective = effectiveControlWithLag(
+      control, previous_control, previous_carry_dt, dt, lag_tau_sec);
+  Eigen::Matrix3d effective_b = Eigen::Matrix3d::Zero();
+  jacobians(state, effective, dt, state_jacobian, effective_b);
+  current_control_jacobian = gamma * effective_b;
+  previous_control_jacobian =
+      (1.0 - gamma) * effective_b *
+      rotateControlLinearJacobian(previous_control, previous_carry_dt);
+}
+
+std::vector<State> Se2Model::rolloutWithLag(
+    const State &initial, const std::vector<Control> &controls,
+    const Control &last_control, double first_step_dt, double dt,
+    double lag_tau_sec) {
+  if (!std::isfinite(lag_tau_sec) || lag_tau_sec <= 1e-6) {
+    return Se2Model(dt).rollout(initial, controls);
+  }
+  const double effective_first_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : dt;
+  std::vector<State> states;
+  states.reserve(controls.size() + 1);
+  states.push_back(initial);
+  Control previous = last_control;
+  for (std::size_t index = 0; index < controls.size(); ++index) {
+    const double carry_dt = index == 0 ? effective_first_dt : dt;
+    states.push_back(dynamicsWithLag(states.back(), controls[index], previous,
+                                     carry_dt, dt, lag_tau_sec));
+    previous = controls[index];
+  }
+  return states;
+}
+
 /** @brief 用 atan2(sin,cos) 折返航向，避免在 +/-pi 边界累积角度漂移。 */
 double Se2Model::normalizeAngle(double angle) {
   return std::atan2(std::sin(angle), std::cos(angle));

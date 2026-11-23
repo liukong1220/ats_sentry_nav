@@ -59,34 +59,47 @@ int currentRosDomainId() {
 }
 
 /**
- * @brief 提取真实 LTV 矩阵的有限尺度指标，供离线收敛归因而非在线调参。
- * @details 只扫描已经预分配的 dense buffer；不复制矩阵、不修改 QP 数值，也不把指标用于
- *          candidate 准入。zero-delta residual 指 $z=0$ 时动态等式的最大绝对残差。
+ * @brief 从预分配稀疏 CSC LTV-QP 中以 O(nnz) 提取有限尺度诊断指标。
  */
 void recordQpProblemMetrics(const LtvQpProblem &problem,
                             ControlCycleTelemetrySample &telemetry) {
-  if (!problem.valid || problem.hessian.rows() <= 0 ||
-      problem.hessian.rows() != problem.hessian.cols() ||
-      problem.equality_matrix.rows() < 3 || !problem.hessian.allFinite() ||
-      !problem.equality_matrix.allFinite() || !problem.inequality_matrix.allFinite() ||
-      !problem.equality_lower.allFinite()) {
+  const auto dims = checkedLtvQpDimensions(problem.horizon);
+  if (!problem.valid || !dims.valid || !problem.hasExpectedLayout() ||
+      !problem.hasFiniteNumerics()) {
     return;
   }
-  telemetry.hessian_diagonal_minimum = problem.hessian.diagonal().minCoeff();
-  telemetry.hessian_diagonal_maximum = problem.hessian.diagonal().maxCoeff();
+  telemetry.hessian_diagonal_minimum = std::numeric_limits<double>::infinity();
+  telemetry.hessian_diagonal_maximum =
+      -std::numeric_limits<double>::infinity();
+  for (int col = 0; col < problem.decisionSize(); ++col) {
+    const int end = problem.hessian_structure
+                        .column_offsets[static_cast<std::size_t>(col + 1)];
+    if (end > 0) {
+      const double diag_val =
+          problem.hessian_values[static_cast<std::size_t>(end - 1)];
+      telemetry.hessian_diagonal_minimum =
+          std::min(telemetry.hessian_diagonal_minimum, diag_val);
+      telemetry.hessian_diagonal_maximum =
+          std::max(telemetry.hessian_diagonal_maximum, diag_val);
+    }
+  }
+  const int m = problem.constraintRows();
+  std::vector<double> row_norm_sq(static_cast<std::size_t>(m), 0.0);
+  for (std::size_t idx = 0; idx < problem.constraint_values.size(); ++idx) {
+    const int row = problem.constraint_structure.row_indices[idx];
+    const double val = problem.constraint_values[idx];
+    row_norm_sq[static_cast<std::size_t>(row)] += val * val;
+  }
   telemetry.constraint_row_l2_minimum = std::numeric_limits<double>::infinity();
   telemetry.constraint_row_l2_maximum = 0.0;
-  const auto update_row_range = [&telemetry](const Eigen::MatrixXd &matrix) {
-    for (int row = 0; row < matrix.rows(); ++row) {
-      const double norm = matrix.row(row).norm();
-      telemetry.constraint_row_l2_minimum =
-          std::min(telemetry.constraint_row_l2_minimum, norm);
-      telemetry.constraint_row_l2_maximum =
-          std::max(telemetry.constraint_row_l2_maximum, norm);
-    }
-  };
-  update_row_range(problem.equality_matrix);
-  update_row_range(problem.inequality_matrix);
+  const int check_rows = dims.equality_rows + dims.inequality_rows;
+  for (int row = 0; row < check_rows; ++row) {
+    const double norm = std::sqrt(row_norm_sq[static_cast<std::size_t>(row)]);
+    telemetry.constraint_row_l2_minimum =
+        std::min(telemetry.constraint_row_l2_minimum, norm);
+    telemetry.constraint_row_l2_maximum =
+        std::max(telemetry.constraint_row_l2_maximum, norm);
+  }
   telemetry.nonzero_bound_abs_minimum = std::numeric_limits<double>::infinity();
   telemetry.bound_abs_maximum = 0.0;
   const auto update_bound_range = [&telemetry](const Eigen::VectorXd &bounds) {
@@ -95,22 +108,25 @@ void recordQpProblemMetrics(const LtvQpProblem &problem,
       if (!std::isfinite(magnitude)) {
         continue;
       }
-      telemetry.bound_abs_maximum = std::max(telemetry.bound_abs_maximum, magnitude);
-      // 忽略 nominal +/- limit 相减留下的机器精度残差，只统计可解释的约束尺度。
+      telemetry.bound_abs_maximum =
+          std::max(telemetry.bound_abs_maximum, magnitude);
       if (magnitude > 1e-12) {
         telemetry.nonzero_bound_abs_minimum =
             std::min(telemetry.nonzero_bound_abs_minimum, magnitude);
       }
     }
   };
-  update_bound_range(problem.equality_lower);
-  update_bound_range(problem.equality_upper);
-  update_bound_range(problem.inequality_lower);
-  update_bound_range(problem.inequality_upper);
-  update_bound_range(problem.lower_bound);
-  update_bound_range(problem.upper_bound);
-  telemetry.zero_delta_dynamic_equality_residual = problem.equality_lower.tail(
-      problem.equality_lower.size() - 3).cwiseAbs().maxCoeff();
+  update_bound_range(problem.lower);
+  update_bound_range(problem.upper);
+  if (!std::isfinite(telemetry.nonzero_bound_abs_minimum)) {
+    telemetry.nonzero_bound_abs_minimum = 0.0;
+  }
+  telemetry.zero_delta_dynamic_equality_residual =
+      dims.equality_rows > 3
+          ? problem.lower.segment(3, dims.equality_rows - 3)
+                .cwiseAbs()
+                .maxCoeff()
+          : 0.0;
   telemetry.qp_problem_metrics_recorded =
       std::isfinite(telemetry.hessian_diagonal_minimum) &&
       std::isfinite(telemetry.hessian_diagonal_maximum) &&
@@ -119,6 +135,140 @@ void recordQpProblemMetrics(const LtvQpProblem &problem,
       std::isfinite(telemetry.nonzero_bound_abs_minimum) &&
       std::isfinite(telemetry.bound_abs_maximum) &&
       std::isfinite(telemetry.zero_delta_dynamic_equality_residual);
+}
+
+bool validPlanningSnapshotPayload(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot) {
+  const auto count =
+      static_cast<std::size_t>(snapshot.info.width) * snapshot.info.height;
+  if (!snapshot.ready || snapshot.header.frame_id.empty() ||
+      snapshot.source_generation == 0U ||
+      snapshot.publication_sequence == 0U ||
+      snapshot.occupied_value_threshold <= 0 ||
+      snapshot.occupied_value_threshold > 100 ||
+      !std::isfinite(snapshot.info.resolution) ||
+      snapshot.info.resolution <= 0.0F || count == 0U ||
+      snapshot.occupancy.size() != count ||
+      snapshot.signed_distance_m.size() != count ||
+      snapshot.gradient_x.size() != count ||
+      snapshot.gradient_y.size() != count) {
+    return false;
+  }
+  const auto &q = snapshot.info.origin.orientation;
+  const double norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+  if (!std::isfinite(norm) || std::abs(norm - 1.0) > 1e-3) {
+    return false;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto occ = snapshot.occupancy[i];
+    const auto dist = snapshot.signed_distance_m[i];
+    const auto gx = snapshot.gradient_x[i];
+    const auto gy = snapshot.gradient_y[i];
+    if (occ < -1 || occ > 100 || !std::isfinite(dist) || !std::isfinite(gx) ||
+        !std::isfinite(gy)) {
+      return false;
+    }
+    const bool blocked =
+        occ >= snapshot.occupied_value_threshold ||
+        (occ == -1 && snapshot.unknown_is_obstacle);
+    if (blocked ? dist > 0.0F : dist < 0.0F) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool sampleSnapshotEsdfBilinear(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+    double snap_x, double snap_y, double &out_distance_m,
+    Eigen::Vector2d *out_gradient_snap) {
+  const double res = static_cast<double>(snapshot.info.resolution);
+  const auto &origin = snapshot.info.origin;
+  const double oyaw = tf2::getYaw(origin.orientation);
+  const double co = std::cos(oyaw);
+  const double so = std::sin(oyaw);
+  const double dx = snap_x - origin.position.x;
+  const double dy = snap_y - origin.position.y;
+  const double gx = (co * dx + so * dy) / res - 0.5;
+  const double gy = (-so * dx + co * dy) / res - 0.5;
+  const int w = static_cast<int>(snapshot.info.width);
+  const int h = static_cast<int>(snapshot.info.height);
+  if (gx < -0.5 || gy < -0.5 || gx > static_cast<double>(w) - 0.5 ||
+      gy > static_cast<double>(h) - 0.5) {
+    out_distance_m = -res;
+    if (out_gradient_snap != nullptr) {
+      out_gradient_snap->setZero();
+    }
+    return false;
+  }
+  const double clamped_x = std::clamp(gx, 0.0, static_cast<double>(w - 1));
+  const double clamped_y = std::clamp(gy, 0.0, static_cast<double>(h - 1));
+  const int x0 = std::min(w - 1, static_cast<int>(std::floor(clamped_x)));
+  const int y0 = std::min(h - 1, static_cast<int>(std::floor(clamped_y)));
+  const int x1 = std::min(w - 1, x0 + 1);
+  const int y1 = std::min(h - 1, y0 + 1);
+  const double tx = clamped_x - static_cast<double>(x0);
+  const double ty = clamped_y - static_cast<double>(y0);
+
+  const auto idx = [w](int cx, int cy) {
+    return static_cast<std::size_t>(cy) * static_cast<std::size_t>(w) +
+           static_cast<std::size_t>(cx);
+  };
+  const std::size_t i00 = idx(x0, y0);
+  const std::size_t i10 = idx(x1, y0);
+  const std::size_t i01 = idx(x0, y1);
+  const std::size_t i11 = idx(x1, y1);
+  const double d00 = snapshot.signed_distance_m[i00];
+  const double d10 = snapshot.signed_distance_m[i10];
+  const double d01 = snapshot.signed_distance_m[i01];
+  const double d11 = snapshot.signed_distance_m[i11];
+  out_distance_m = (1.0 - ty) * ((1.0 - tx) * d00 + tx * d10) +
+                   ty * ((1.0 - tx) * d01 + tx * d11);
+  if (out_gradient_snap != nullptr) {
+    const double gx_val =
+        (1.0 - ty) * ((1.0 - tx) * snapshot.gradient_x[i00] +
+                      tx * snapshot.gradient_x[i10]) +
+        ty * ((1.0 - tx) * snapshot.gradient_x[i01] +
+              tx * snapshot.gradient_x[i11]);
+    const double gy_val =
+        (1.0 - ty) * ((1.0 - tx) * snapshot.gradient_y[i00] +
+                      tx * snapshot.gradient_y[i10]) +
+        ty * ((1.0 - tx) * snapshot.gradient_y[i01] +
+              tx * snapshot.gradient_y[i11]);
+    *out_gradient_snap = Eigen::Vector2d(gx_val, gy_val);
+  }
+  return true;
+}
+
+bool snapshotCenterCellFree(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+    double snap_x, double snap_y) {
+  const double res = static_cast<double>(snapshot.info.resolution);
+  const auto &origin = snapshot.info.origin;
+  const double oyaw = tf2::getYaw(origin.orientation);
+  const double co = std::cos(oyaw);
+  const double so = std::sin(oyaw);
+  const double dx = snap_x - origin.position.x;
+  const double dy = snap_y - origin.position.y;
+  const double cx = (co * dx + so * dy) / res;
+  const double cy = (-so * dx + co * dy) / res;
+  if (cx < 0.0 || cy < 0.0 || cx >= snapshot.info.width ||
+      cy >= snapshot.info.height) {
+    return false;
+  }
+  const int ix = static_cast<int>(std::floor(cx));
+  const int iy = static_cast<int>(std::floor(cy));
+  const std::size_t index =
+      static_cast<std::size_t>(iy) * snapshot.info.width +
+      static_cast<std::size_t>(ix);
+  const int occ = snapshot.occupancy[index];
+  if (occ >= snapshot.occupied_value_threshold) {
+    return false;
+  }
+  if (occ < 0 && snapshot.unknown_is_obstacle) {
+    return false;
+  }
+  return true;
 }
 
 constexpr std::uint64_t kTelemetrySummaryInterval = 16;
@@ -143,6 +293,56 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       "map_ready_topic", "/rog_map_adapter/ready");
   map_ready_timeout_sec_ = std::max(0.1, declare_parameter<double>(
       "map_ready_timeout_sec", map_ready_timeout_sec_));
+  planning_snapshot_topic_ = declare_parameter<std::string>(
+      "planning_snapshot_topic", planning_snapshot_topic_);
+  planning_snapshot_timeout_sec_ = std::max(
+      0.1, declare_parameter<double>("planning_snapshot_timeout_sec",
+                                     map_ready_timeout_sec_));
+  footprint_length_ = std::max(
+      0.0, declare_parameter<double>("footprint_length", footprint_length_));
+  footprint_width_ = std::max(
+      0.0, declare_parameter<double>("footprint_width", footprint_width_));
+  footprint_safety_margin_ = std::max(
+      0.0, declare_parameter<double>("footprint_safety_margin",
+                                     footprint_safety_margin_));
+  qp_esdf_config_.enabled =
+      declare_parameter<bool>("qp_esdf_corridor_enabled", true);
+  qp_esdf_config_.corridor_clearance_m = std::max(
+      0.0, declare_parameter<double>("qp_esdf_corridor_clearance", 0.44));
+  qp_esdf_config_.reference_margin_m = std::max(
+      0.0, declare_parameter<double>("qp_esdf_reference_margin", 0.015));
+  qp_esdf_config_.min_corridor_clearance_m = std::max(
+      0.0, declare_parameter<double>(
+               "qp_esdf_min_corridor_clearance",
+               0.5 * std::min(footprint_length_, footprint_width_) +
+                   footprint_safety_margin_));
+  qp_esdf_config_.slack_linear_weight = std::max(
+      0.0, declare_parameter<double>("qp_esdf_slack_linear_weight", 400.0));
+  qp_esdf_config_.slack_quadratic_weight = std::max(
+      1.0, declare_parameter<double>("qp_esdf_slack_quadratic_weight", 4000.0));
+  rollout_safety_enabled_ =
+      declare_parameter<bool>("rollout_safety_enabled", true);
+  rollout_immediate_stop_horizon_sec_ = std::max(
+      0.0, declare_parameter<double>("rollout_immediate_stop_horizon_sec",
+                                     rollout_immediate_stop_horizon_sec_));
+  rollout_brake_horizon_sec_ = std::max(
+      rollout_immediate_stop_horizon_sec_,
+      declare_parameter<double>("rollout_brake_horizon_sec",
+                                rollout_brake_horizon_sec_));
+  rollout_slowdown_horizon_sec_ = std::max(
+      rollout_brake_horizon_sec_,
+      declare_parameter<double>("rollout_slowdown_horizon_sec",
+                                rollout_slowdown_horizon_sec_));
+  rollout_slowdown_clearance_m_ = std::max(
+      0.0, declare_parameter<double>("rollout_slowdown_clearance_m",
+                                     rollout_slowdown_clearance_m_));
+  rollout_min_slowdown_scale_ = std::clamp(
+      declare_parameter<double>("rollout_min_slowdown_scale",
+                                rollout_min_slowdown_scale_),
+      0.1, 1.0);
+  rollout_hard_stop_penetration_m_ = std::max(
+      0.0, declare_parameter<double>("rollout_hard_stop_penetration_m",
+                                     rollout_hard_stop_penetration_m_));
   command_topic_ = declare_parameter<std::string>("command_topic",
                                                   "/cmd_vel/autonomy_raw");
   emergency_stop_topic_ = declare_parameter<std::string>(
@@ -176,6 +376,8 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       0.0, declare_parameter<double>("execution_command_future_tolerance_sec",
                                      execution_command_future_tolerance_sec_));
   execution_command_enabled_ = !execution_command_topic_.empty();
+  require_planning_snapshot_ = declare_parameter<bool>(
+      "require_planning_snapshot", execution_command_enabled_);
   supersede_grace_sec_ = std::max(
       0.0, declare_parameter<double>("supersede_grace_sec", supersede_grace_sec_));
   goal_position_tolerance_ = declare_parameter<double>(
@@ -208,28 +410,28 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       declare_parameter<double>("solve_time_warn_ratio",
                                 solve_time_warn_ratio_),
       0.1, 1.0);
-  solver_mode_ = declare_parameter<std::string>("solver_mode", "ilqr");
-  if (solver_mode_ != "ilqr" && solver_mode_ != "qp_shadow" &&
-      solver_mode_ != "qp") {
+  solver_mode_ = declare_parameter<std::string>("solver_mode", "qp");
+  if (solver_mode_ != "qp") {
     throw std::invalid_argument(
-        "solver_mode must be one of ilqr, qp_shadow, qp");
-  }
-  if (solver_mode_ == "qp") {
-    throw std::invalid_argument(
-        "solver_mode=qp is reserved and cannot publish QP control in this phase");
+        "solver_mode must be 'qp' (OSQP v1.0.0 SQP-RTI is the sole MPC solver)");
   }
   qp_solver_settings_.max_iterations = declare_parameter<int>(
       "qp_max_iterations", 400);
   qp_solver_settings_.time_limit_ms = declare_parameter<double>(
-      "qp_time_limit_ms", 10.0);
+      "qp_time_limit_ms", 12.0);
   qp_solver_settings_.max_primal_residual = declare_parameter<double>(
-      "qp_max_primal_residual", 1e-4);
+      "qp_max_primal_residual", 2.0e-3);
   qp_solver_settings_.max_dual_residual = declare_parameter<double>(
-      "qp_max_dual_residual", 1e-4);
+      "qp_max_dual_residual", 5.0e-3);
   qp_solver_settings_.max_tracking_slack = declare_parameter<double>(
-      "qp_max_tracking_slack", 0.0);
+      "qp_max_tracking_slack", 0.35);
   qp_solver_settings_.max_hard_constraint_violation = declare_parameter<double>(
-      "qp_max_hard_constraint_violation", 1e-7);
+      "qp_max_hard_constraint_violation", 2e-3);
+  qp_esdf_config_.max_slack_m = qp_solver_settings_.max_tracking_slack;
+  qp_rti_iterations_ = std::clamp(
+      static_cast<int>(declare_parameter<int>("qp_rti_iterations", 1)), 1, 2);
+  qp_rti_second_pass_delta_threshold_ = std::max(
+      0.01, declare_parameter<double>("qp_rti_second_pass_delta_threshold", 0.15));
   const int requested_sampling_cycles = declare_parameter<int>(
       "telemetry_sampling_window_cycles", 0);
   if (requested_sampling_cycles < 0 ||
@@ -241,8 +443,6 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       static_cast<std::size_t>(requested_sampling_cycles);
   control_telemetry_.configureSamplingWindow(telemetry_sampling_window_cycles_);
   const Se2MpcConfig mpc_config = loadConfig();
-  // 在创建 Se2MpcController 前统一拒绝无法表示或超过 dense 资源审计上限的 horizon；
-  // 这样 solver_mode=ilqr 也不会因异常参数先分配不可控的预测缓存。
   const auto ltv_dimensions = checkedLtvQpDimensions(mpc_config.horizon);
   if (!ltv_dimensions.valid) {
     throw std::invalid_argument(std::string("invalid LTV-QP dimensions: ") +
@@ -253,20 +453,17 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
   }
   validateDynamicsParameters(mpc_config);
   controller_ = std::make_unique<Se2MpcController>(mpc_config);
-  if (solver_mode_ == "qp_shadow") {
-    qp_problem_buffer_ = LtvQpBuilder::allocate(ltv_dimensions.horizon);
-    if (!qp_problem_buffer_.hasExpectedLayout()) {
-      throw std::invalid_argument(
-          "LTV-QP buffer allocation did not produce the checked layout");
-    }
-    qp_solver_ = std::make_unique<LtvQpOsqpSolver>(
-        ltv_dimensions, qp_solver_settings_);
-    if (!qp_solver_->initialized()) {
-      RCLCPP_ERROR(get_logger(),
-                   "OSQP v1.0.0 shadow 后端初始化失败；保持 iLQR 主链，"
-                   "不生成伪造 QP 结果。");
-      qp_solver_.reset();
-    }
+  qp_problem_buffer_ = LtvQpBuilder::allocate(ltv_dimensions.horizon);
+  if (!qp_problem_buffer_.hasExpectedLayout()) {
+    throw std::invalid_argument(
+        "LTV-QP sparse buffer allocation did not produce the checked layout");
+  }
+  qp_solver_ = std::make_unique<LtvQpOsqpSolver>(
+      ltv_dimensions, qp_solver_settings_);
+  if (!qp_solver_->initialized()) {
+    RCLCPP_ERROR(get_logger(),
+                 "OSQP v1.0.0 后端初始化失败；控制周期将保持确定性零速度 fail-stop。");
+    qp_solver_.reset();
   }
   trajectory_tracker_.setConfig(loadTrackerConfig());
 
@@ -331,6 +528,17 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
       std::bind(&AtsSwerveMpcNode::onGimbalYawStatus, this,
                 std::placeholders::_1));
   }
+  if (require_planning_snapshot_ && planning_snapshot_topic_.empty()) {
+    throw std::invalid_argument(
+        "require_planning_snapshot=true requires a non-empty planning_snapshot_topic");
+  }
+  if (!planning_snapshot_topic_.empty()) {
+    planning_snapshot_sub_ = create_subscription<
+        ats_navigation_interfaces::msg::PlanningMapSnapshot>(
+        planning_snapshot_topic_, rclcpp::QoS(1).reliable().transient_local(),
+        std::bind(&AtsSwerveMpcNode::onPlanningSnapshot, this,
+                  std::placeholders::_1));
+  }
   command_pub_ = create_publisher<geometry_msgs::msg::Twist>(command_topic_,
                                                              rclcpp::QoS(10));
   predicted_path_pub_ =
@@ -353,7 +561,7 @@ AtsSwerveMpcNode::AtsSwerveMpcNode(const rclcpp::NodeOptions &options)
               command_topic_.c_str(), controller_->config().horizon,
               controller_->config().dt, control_rate_hz_);
   RCLCPP_INFO(get_logger(),
-              "【求解器配置】模式=%s（qp_shadow 仅诊断，iLQR 保持唯一输出所有者）",
+              "【求解器配置】模式=%s（OSQP v1.0.0 零分配稀疏 SQP-RTI 唯一主求解器，未通过准入即确定性零速度 fail-stop）",
               solver_mode_.c_str());
 }
 
@@ -370,6 +578,17 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
                                                 config.control_delta_weight);
   config.terminal_weight =
       vectorParameter(*this, "terminal_weight", config.terminal_weight);
+  config.lag_weight =
+      declare_parameter<double>("lag_weight", config.lag_weight);
+  config.contour_weight =
+      declare_parameter<double>("contour_weight", config.contour_weight);
+  config.actuator_lag_tau_sec = std::max(
+      0.0, declare_parameter<double>("actuator_lag_tau_sec",
+                                     config.actuator_lag_tau_sec));
+  config.actuator_delay_sec = std::clamp(
+      declare_parameter<double>("actuator_delay_sec",
+                                config.actuator_delay_sec),
+      0.0, 0.25);
   config.max_vx = declare_parameter<double>("max_vx", config.max_vx);
   config.max_vy = declare_parameter<double>("max_vy", config.max_vy);
   config.max_wz = declare_parameter<double>("max_wz", config.max_wz);
@@ -415,16 +634,6 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
       actuator_redundancy, conservative_wheel_speed, config.max_wheel_speed,
       steer_max_rpm, steer_gear_ratio, raw_steer_rate, conservative_steer_rate,
       config.max_steer_rate);
-  config.max_iterations =
-      declare_parameter<int>("max_iterations", config.max_iterations);
-  config.regularization =
-      declare_parameter<double>("regularization", config.regularization);
-  config.line_search_decay =
-      declare_parameter<double>("line_search_decay", config.line_search_decay);
-  config.min_line_search_step = declare_parameter<double>(
-      "min_line_search_step", config.min_line_search_step);
-  config.convergence_tolerance = declare_parameter<double>(
-      "convergence_tolerance", config.convergence_tolerance);
   config.clamp_bisection_iterations = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("clamp_bisection_iterations",
                                 config.clamp_bisection_iterations)));
@@ -461,6 +670,12 @@ TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
       config.intermediate_rotation_stop_wz_threshold);
   config.min_rotation_span_rad = declare_parameter<double>(
       "min_rotation_span_rad", config.min_rotation_span_rad);
+  config.use_derivative_feedforward = declare_parameter<bool>(
+      "use_derivative_feedforward", config.use_derivative_feedforward);
+  const double default_lead_sec =
+      controller_ ? controller_->config().actuator_lag_tau_sec : 0.0;
+  config.feedforward_accel_lead_sec = declare_parameter<double>(
+      "feedforward_accel_lead_sec", default_lead_sec);
   return config;
 }
 
@@ -568,9 +783,11 @@ void AtsSwerveMpcNode::onPath(const nav_msgs::msg::Path::SharedPtr message) {
  *          仅 keep_control_state=true（同一 goal/epoch/generation 内换轨）时保留二者。
  *          失败不覆盖原有安全状态，调用方负责进入 fail-stop。
  */
-bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
-                                   bool keep_control_state,
-                                   std::optional<CommandOrder> command) {
+bool AtsSwerveMpcNode::installPath(
+    const nav_msgs::msg::Path & message,
+    bool keep_control_state,
+    std::optional<CommandOrder> command,
+    const ats_navigation_interfaces::msg::ExecutionCommand * execution_command) {
   if (require_localization_status_ && !localization_tracking_.load()) {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -588,12 +805,35 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
                  message.header.frame_id.c_str(), frame_id_.c_str());
     return false;
   }
+  const std::size_t pose_count = message.poses.size();
+  bool has_derivatives = false;
+  if (execution_command != nullptr) {
+    const bool any_derivatives =
+      !execution_command->reference_vx.empty() ||
+      !execution_command->reference_vy.empty() ||
+      !execution_command->reference_ax.empty() ||
+      !execution_command->reference_ay.empty() ||
+      !execution_command->reference_yaw_rate.empty();
+    if (any_derivatives) {
+      if (execution_command->reference_vx.size() != pose_count ||
+          execution_command->reference_vy.size() != pose_count ||
+          execution_command->reference_ax.size() != pose_count ||
+          execution_command->reference_ay.size() != pose_count ||
+          execution_command->reference_yaw_rate.size() != pose_count) {
+        RCLCPP_ERROR(get_logger(),
+                     "【参考丢弃】ExecutionCommand 导数数组长度与 poses=%zu 不一致。",
+                     pose_count);
+        return false;
+      }
+      has_derivatives = true;
+    }
+  }
   std::vector<TimedState> parsed;
-  parsed.reserve(message.poses.size());
+  parsed.reserve(pose_count);
   const double header_time = rclcpp::Time(message.header.stamp).seconds();
   bool monotonic = true;
   double previous_time = -std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i < message.poses.size(); ++i) {
+  for (std::size_t i = 0; i < pose_count; ++i) {
     const auto &pose = message.poses[i];
     double pose_time = rclcpp::Time(pose.header.stamp).seconds();
     if (pose_time <= 0.0) {
@@ -607,6 +847,21 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
     if (!timed.state.allFinite()) {
       return false;
     }
+    if (has_derivatives) {
+      timed.world_velocity << execution_command->reference_vx[i],
+          execution_command->reference_vy[i];
+      timed.world_acceleration << execution_command->reference_ax[i],
+          execution_command->reference_ay[i];
+      timed.yaw_rate = execution_command->reference_yaw_rate[i];
+      if (!timed.world_velocity.allFinite() ||
+          !timed.world_acceleration.allFinite() ||
+          !std::isfinite(timed.yaw_rate)) {
+        RCLCPP_ERROR(get_logger(),
+                     "【参考丢弃】ExecutionCommand 导数包含非有限值（i=%zu）。", i);
+        return false;
+      }
+      timed.has_derivatives = true;
+    }
     parsed.push_back(timed);
     previous_time = pose_time;
   }
@@ -614,6 +869,7 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
     const double start_time = header_time > 0.0 ? header_time : now().seconds();
     for (std::size_t i = 0; i < parsed.size(); ++i) {
       parsed[i].time = start_time + fallback_path_dt_ * static_cast<double>(i);
+      parsed[i].has_derivatives = false;
     }
   }
   {
@@ -645,8 +901,17 @@ bool AtsSwerveMpcNode::installPath(const nav_msgs::msg::Path & message,
                                        maximum_tracking_duration +
                                        std::max(0.0, trajectory_timeout_));
   }
+  // 任何新轨迹切换均重置 OSQP 对偶热启动，避免旧参考的 active-set 乘子污染新轨迹求解。
+  qp_warm_start_valid_ = false;
+  if (qp_solver_) {
+    qp_solver_->resetWarmStart();
+  }
   if (!keep_control_state) {
     controller_->reset();
+    {
+      std::lock_guard<std::mutex> history_lock(command_history_mutex_);
+      command_delay_history_.clear();
+    }
     last_control_.setZero();
     last_control_update_stamp_.reset();
     last_control_update_steady_.reset();
@@ -847,7 +1112,8 @@ void AtsSwerveMpcNode::onExecutionCommand(
   }
   if (install_reference &&
       !installPath(message->reference, keep_control_state,
-                   CommandOrder{message->manager_incarnation, message->command_sequence})) {
+                   CommandOrder{message->manager_incarnation, message->command_sequence},
+                   message.get())) {
     RCLCPP_ERROR(
         get_logger(),
         "【执行授权拒绝】TRACE execution_command rejected=reference_install incarnation=%llu sequence=%llu "
@@ -1037,6 +1303,606 @@ void AtsSwerveMpcNode::onMapReady(const std_msgs::msg::Bool::SharedPtr message) 
   if (stop) {
     engageFailStop();
   }
+}
+
+void AtsSwerveMpcNode::onPlanningSnapshot(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot::SharedPtr
+        message) {
+  const bool payload_valid =
+      message != nullptr && validPlanningSnapshotPayload(*message);
+  bool stop = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    if (!payload_valid) {
+      planning_snapshot_.reset();
+      planning_snapshot_ready_ = false;
+      stop = require_planning_snapshot_ && active_execution_command_.has_value();
+    } else {
+      if (planning_snapshot_ &&
+          planning_snapshot_->localization_epoch == message->localization_epoch &&
+          message->publication_sequence <
+              planning_snapshot_->publication_sequence) {
+        return;
+      }
+      planning_snapshot_ = message;
+      planning_snapshot_ready_ = true;
+      last_planning_snapshot_signal_ = std::chrono::steady_clock::now();
+    }
+  }
+  if (stop) {
+    engageFailStop();
+  }
+}
+
+bool AtsSwerveMpcNode::planningSnapshotUsableLocked(
+    std::chrono::steady_clock::time_point now_steady,
+    std::shared_ptr<const ats_navigation_interfaces::msg::PlanningMapSnapshot>
+        *out_snapshot,
+    Eigen::Vector3d *out_snapshot_from_odom) const {
+  if (out_snapshot != nullptr) {
+    out_snapshot->reset();
+  }
+  if (out_snapshot_from_odom != nullptr) {
+    out_snapshot_from_odom->setZero();
+  }
+  if (!planning_snapshot_ || !planning_snapshot_ready_ ||
+      !last_planning_snapshot_signal_ ||
+      now_steady < *last_planning_snapshot_signal_) {
+    return !require_planning_snapshot_;
+  }
+  const double age = std::chrono::duration<double>(
+                         now_steady - *last_planning_snapshot_signal_)
+                         .count();
+  if (age > planning_snapshot_timeout_sec_) {
+    return !require_planning_snapshot_;
+  }
+  if (active_execution_command_) {
+    if (planning_snapshot_->localization_epoch !=
+        active_execution_command_->localization_epoch) {
+      return !require_planning_snapshot_;
+    }
+  } else if (require_localization_status_ && localization_epoch_) {
+    if (planning_snapshot_->localization_epoch != *localization_epoch_) {
+      return !require_planning_snapshot_;
+    }
+  }
+
+  Eigen::Vector3d snap_from_odom = Eigen::Vector3d::Zero();
+  const std::string &snap_frame = planning_snapshot_->header.frame_id;
+  const std::string &ref_frame =
+      trajectory_frame_.empty() ? frame_id_ : trajectory_frame_;
+  if (snap_frame != ref_frame) {
+    if (!active_execution_command_) {
+      return !require_planning_snapshot_;
+    }
+    const auto &tf_msg = active_execution_command_->validation_from_reference;
+    if (tf_msg.header.frame_id != snap_frame ||
+        (!tf_msg.child_frame_id.empty() && tf_msg.child_frame_id != ref_frame)) {
+      return !require_planning_snapshot_;
+    }
+    const auto &q = tf_msg.transform.rotation;
+    const double q_norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (!std::isfinite(q_norm) || std::abs(q_norm - 1.0) > 1e-2 ||
+        !std::isfinite(tf_msg.transform.translation.x) ||
+        !std::isfinite(tf_msg.transform.translation.y)) {
+      return !require_planning_snapshot_;
+    }
+    snap_from_odom(0) = tf_msg.transform.translation.x;
+    snap_from_odom(1) = tf_msg.transform.translation.y;
+    snap_from_odom(2) = tf2::getYaw(q);
+  }
+
+  if (out_snapshot != nullptr) {
+    *out_snapshot = planning_snapshot_;
+  }
+  if (out_snapshot_from_odom != nullptr) {
+    *out_snapshot_from_odom = snap_from_odom;
+  }
+  return true;
+}
+
+std::vector<EsdfCorridorSample> AtsSwerveMpcNode::extractEsdfCorridorSamples(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+    const Eigen::Vector3d &snapshot_from_odom,
+    const std::vector<State> &nominal_states,
+    const std::vector<Se2Reference> &references) const {
+  const int horizon = controller_->config().horizon;
+  std::vector<EsdfCorridorSample> samples(static_cast<std::size_t>(horizon));
+  if (!qp_esdf_config_.enabled ||
+      nominal_states.size() < static_cast<std::size_t>(horizon + 1) ||
+      references.size() < static_cast<std::size_t>(horizon + 1)) {
+    return samples;
+  }
+  const double ct = std::cos(snapshot_from_odom(2));
+  const double st = std::sin(snapshot_from_odom(2));
+  for (int step = 0; step < horizon; ++step) {
+    const std::size_t k = static_cast<std::size_t>(step + 1);
+    const State &nom = nominal_states[k];
+    const State &ref = references[k].state;
+    const double nom_sx = ct * nom(0) - st * nom(1) + snapshot_from_odom(0);
+    const double nom_sy = st * nom(0) + ct * nom(1) + snapshot_from_odom(1);
+    double d_nom = 0.0;
+    Eigen::Vector2d grad_snap = Eigen::Vector2d::Zero();
+    if (!sampleSnapshotEsdfBilinear(snapshot, nom_sx, nom_sy, d_nom,
+                                    &grad_snap)) {
+      continue;
+    }
+    const double ref_sx = ct * ref(0) - st * ref(1) + snapshot_from_odom(0);
+    const double ref_sy = st * ref(0) + ct * ref(1) + snapshot_from_odom(1);
+    double d_ref = qp_esdf_config_.corridor_clearance_m;
+    sampleSnapshotEsdfBilinear(snapshot, ref_sx, ref_sy, d_ref, nullptr);
+    const double target = std::clamp(
+        std::min(qp_esdf_config_.corridor_clearance_m,
+                 d_ref - qp_esdf_config_.reference_margin_m),
+        qp_esdf_config_.min_corridor_clearance_m,
+        qp_esdf_config_.corridor_clearance_m);
+    if (d_nom > target + 0.60 || grad_snap.norm() <= 1e-3) {
+      continue;
+    }
+    auto &sample = samples[static_cast<std::size_t>(step)];
+    sample.active = true;
+    sample.signed_distance_m = d_nom;
+    sample.target_clearance_m = target;
+    sample.gradient_odom(0) = ct * grad_snap(0) + st * grad_snap(1);
+    sample.gradient_odom(1) = -st * grad_snap(0) + ct * grad_snap(1);
+  }
+  return samples;
+}
+
+AtsSwerveMpcNode::RolloutSafetyEvaluation
+AtsSwerveMpcNode::evaluateRolloutFootprintSafety(
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot &snapshot,
+    const Eigen::Vector3d &snapshot_from_odom,
+    const std::vector<State> &rollout_states) const {
+  RolloutSafetyEvaluation eval;
+  if (!rollout_safety_enabled_ || rollout_states.size() < 2U) {
+    return eval;
+  }
+  const double res = static_cast<double>(snapshot.info.resolution);
+  const double hx = 0.5 * footprint_length_ + footprint_safety_margin_;
+  const double hy = 0.5 * footprint_width_ + footprint_safety_margin_;
+  const double r_circum = std::hypot(hx, hy);
+  const double ct = std::cos(snapshot_from_odom(2));
+  const double st = std::sin(snapshot_from_odom(2));
+  const double dt = controller_->config().dt;
+
+  const auto evalPoseClearance = [&](const State &state_odom,
+                                     bool &center_free) -> double {
+    const double sx =
+        ct * state_odom(0) - st * state_odom(1) + snapshot_from_odom(0);
+    const double sy =
+        st * state_odom(0) + ct * state_odom(1) + snapshot_from_odom(1);
+    const double syaw = state_odom(2) + snapshot_from_odom(2);
+    center_free = snapshotCenterCellFree(snapshot, sx, sy);
+    double d_center = 0.0;
+    sampleSnapshotEsdfBilinear(snapshot, sx, sy, d_center, nullptr);
+    const double lb = d_center - r_circum - 0.5 * res;
+    if (center_free && lb >= rollout_slowdown_clearance_m_ + 0.01) {
+      return lb;
+    }
+    const double cy = std::cos(syaw);
+    const double sy_s = std::sin(syaw);
+    double min_d = std::numeric_limits<double>::infinity();
+    constexpr int kEdgeSamples = 3;
+    for (int side = -1; side <= 1; side += 2) {
+      for (int i = 0; i <= kEdgeSamples; ++i) {
+        const double u = -1.0 + 2.0 * static_cast<double>(i) /
+                                    static_cast<double>(kEdgeSamples);
+        const std::array<Eigen::Vector2d, 2> pts{{
+            Eigen::Vector2d(side * hx, u * hy),
+            Eigen::Vector2d(u * hx, side * hy)}};
+        for (const auto &local_p : pts) {
+          const double px = sx + cy * local_p(0) - sy_s * local_p(1);
+          const double py = sy + sy_s * local_p(0) + cy * local_p(1);
+          double dp = 0.0;
+          sampleSnapshotEsdfBilinear(snapshot, px, py, dp, nullptr);
+          min_d = std::min(min_d, dp - 0.5 * res);
+        }
+      }
+    }
+    return min_d;
+  };
+
+  bool init_center_free = true;
+  const double init_clearance =
+      evalPoseClearance(rollout_states.front(), init_center_free);
+  const int max_steps = std::min(
+      static_cast<int>(rollout_states.size()) - 1,
+      std::max(
+          1, static_cast<int>(std::ceil(rollout_slowdown_horizon_sec_ /
+                                        std::max(1e-3, dt)))));
+
+  for (int step = 1; step <= max_steps; ++step) {
+    const double t_sec = static_cast<double>(step) * dt;
+    bool center_free = true;
+    const double clearance = evalPoseClearance(
+        rollout_states[static_cast<std::size_t>(step)], center_free);
+    eval.min_footprint_clearance_m =
+        std::min(eval.min_footprint_clearance_m, clearance);
+    const bool worsening = clearance < init_clearance - 0.005;
+
+    if (t_sec <= rollout_immediate_stop_horizon_sec_ + 1e-6) {
+      if (!center_free ||
+          (clearance < -rollout_hard_stop_penetration_m_ && worsening)) {
+        eval.level = RolloutSafetyLevel::kUnsafeStop;
+        eval.speed_scale = 0.0;
+        return eval;
+      }
+    }
+    if (t_sec <= rollout_brake_horizon_sec_ + 1e-6 && clearance < -0.005 &&
+        (init_clearance >= -0.005 || worsening)) {
+      eval.level = RolloutSafetyLevel::kBrake;
+      const double ratio = std::clamp(
+          t_sec / std::max(0.1, rollout_brake_horizon_sec_), 0.20, 0.60);
+      eval.speed_scale = std::min(eval.speed_scale, ratio);
+    } else if (clearance < rollout_slowdown_clearance_m_ &&
+               eval.level != RolloutSafetyLevel::kBrake) {
+      eval.level = RolloutSafetyLevel::kSlowdown;
+      const double ratio =
+          rollout_slowdown_clearance_m_ > 1e-6
+              ? std::clamp(clearance / rollout_slowdown_clearance_m_, 0.0, 1.0)
+              : 1.0;
+      const double scale =
+          rollout_min_slowdown_scale_ +
+          (1.0 - rollout_min_slowdown_scale_) * ratio;
+      eval.speed_scale = std::min(eval.speed_scale, scale);
+    }
+  }
+  return eval;
+}
+
+State AtsSwerveMpcNode::advanceStateThroughCommandDelay(
+    const State &measured_state, double now_sec, double rotation_delay) const {
+  const double delay_sec = controller_->config().actuator_delay_sec;
+  if (!std::isfinite(delay_sec) || delay_sec <= 1e-4) {
+    return rotationPhaseCompensatedState(measured_state, last_control_(2),
+                                         rotation_delay);
+  }
+  std::deque<CommandHistorySample> history_copy;
+  {
+    std::lock_guard<std::mutex> lock(command_history_mutex_);
+    history_copy = command_delay_history_;
+  }
+  if (history_copy.empty()) {
+    return Se2Model::dynamics(measured_state, last_control_, delay_sec);
+  }
+  const double window_start = now_sec - delay_sec;
+  State predicted = measured_state;
+  double cursor = window_start;
+  Control active_u = history_copy.front().control;
+  for (const auto &entry : history_copy) {
+    if (entry.stamp_sec <= window_start) {
+      active_u = entry.control;
+      continue;
+    }
+    if (entry.stamp_sec > now_sec) {
+      break;
+    }
+    const double seg_dt = entry.stamp_sec - cursor;
+    if (seg_dt > 1e-6) {
+      predicted = Se2Model::dynamics(predicted, active_u, seg_dt);
+      cursor = entry.stamp_sec;
+    }
+    active_u = entry.control;
+  }
+  if (now_sec > cursor + 1e-6) {
+    predicted = Se2Model::dynamics(predicted, active_u, now_sec - cursor);
+  }
+  return predicted;
+}
+
+bool AtsSwerveMpcNode::solveSqpRti(
+    const ControlCycleSnapshot &snapshot,
+    const ats_navigation_interfaces::msg::PlanningMapSnapshot *map_snapshot,
+    const Eigen::Vector3d &snapshot_from_odom,
+    ControlCycleTelemetrySample &telemetry, Se2MpcResult &out_result,
+    RolloutSafetyEvaluation &out_rollout_safety) {
+  const auto sqp_start = std::chrono::steady_clock::now();
+  if (!qp_solver_ || !qp_solver_->initialized()) {
+    telemetry.status = LtvQpSolverStatus::kBackendUnavailable;
+    std::snprintf(telemetry.rejection_reason.data(),
+                  telemetry.rejection_reason.size(), "%s",
+                  "backend_unavailable");
+    return false;
+  }
+
+  bool first_body_sat = false;
+  bool first_wheel_sat = false;
+  bool first_inc_lim = false;
+  std::vector<Control> nominal_controls = controller_->buildNominalControls(
+      snapshot.references, snapshot.last_control_before_solve,
+      snapshot.first_step_dt, true, &first_body_sat, &first_wheel_sat,
+      &first_inc_lim);
+  std::vector<State> nominal_states = controller_->rolloutTrajectory(
+      snapshot.current_state, nominal_controls,
+      snapshot.last_control_before_solve, snapshot.first_step_dt);
+
+  LtvQpSolveResult qp_res;
+  LtvQpPrimalCandidate candidate;
+  LtvQpCandidateAudit audit;
+  RolloutSafetyEvaluation rollout_safety;
+  double total_build_ms = 0.0;
+  double total_update_ms = 0.0;
+  double total_backend_ms = 0.0;
+  double total_complete_ms = 0.0;
+  double total_solve_ms = 0.0;
+  double total_recon_ms = 0.0;
+  double total_audit_ms = 0.0;
+  int executed_rti = 0;
+
+  for (int rti_pass = 0; rti_pass < qp_rti_iterations_; ++rti_pass) {
+    const auto build_start = std::chrono::steady_clock::now();
+    std::vector<EsdfCorridorSample> esdf_samples;
+    if (map_snapshot != nullptr && qp_esdf_config_.enabled) {
+      esdf_samples = extractEsdfCorridorSamples(
+          *map_snapshot, snapshot_from_odom, nominal_states,
+          snapshot.references);
+    }
+    const bool built = LtvQpBuilder::build(
+        snapshot.current_state, nominal_states, nominal_controls,
+        snapshot.references, snapshot.last_control_before_solve,
+        controller_->config(), qp_problem_buffer_, ZeroSpeedGuardConfig(),
+        snapshot.first_step_dt, qp_esdf_config_,
+        esdf_samples.empty() ? nullptr : &esdf_samples);
+    total_build_ms += elapsedMilliseconds(build_start,
+                                          std::chrono::steady_clock::now());
+    if (!built) {
+      qp_res.status = LtvQpSolverStatus::kInvalidProblem;
+      break;
+    }
+    if (rti_pass == 0) {
+      recordQpProblemMetrics(qp_problem_buffer_, telemetry);
+    }
+
+    LtvQpWarmStart rti_warm;
+    const LtvQpWarmStart *warm_ptr = nullptr;
+    if (qp_warm_start_valid_ &&
+        qp_warm_start_.dual.size() == qp_problem_buffer_.constraintRows()) {
+      const int horizon = qp_problem_buffer_.horizon;
+      const auto dims = checkedLtvQpDimensions(horizon);
+      rti_warm.primal = Eigen::VectorXd::Zero(qp_problem_buffer_.decisionSize());
+      const int esdf_base = dims.equality_rows + dims.body_accel_rows +
+                            dims.wheel_octagon_rows + dims.wheel_rate_rows;
+      for (int s = 0; s < horizon; ++s) {
+        rti_warm.primal(qp_problem_buffer_.slackOffset(s)) =
+            std::max(0.0, qp_problem_buffer_.lower(esdf_base + s));
+      }
+      if (rti_pass == 0 && horizon > 1) {
+        // Fractionally shift dual blocks forward by first_step_dt / dt to match
+        // the receding horizon window at 50 Hz (consistent with initializeControls).
+        const double shift = std::clamp(
+            snapshot.first_step_dt / std::max(1e-6, controller_->config().dt),
+            0.0, 1.0);
+        rti_warm.dual = Eigen::VectorXd::Zero(dims.constraint_rows);
+        const auto shiftBlock = [&](int base, int stride, int count) {
+          for (int k = 0; k + 1 < count; ++k) {
+            rti_warm.dual.segment(base + k * stride, stride) =
+                (1.0 - shift) * qp_warm_start_.dual.segment(base + k * stride, stride) +
+                shift * qp_warm_start_.dual.segment(base + (k + 1) * stride, stride);
+          }
+          rti_warm.dual.segment(base + (count - 1) * stride, stride) =
+              qp_warm_start_.dual.segment(base + (count - 1) * stride, stride);
+        };
+        rti_warm.dual.segment<3>(0) = qp_warm_start_.dual.segment<3>(0);
+        shiftBlock(3, 3, horizon);
+        int cursor = dims.equality_rows;
+        shiftBlock(cursor, 3, horizon);
+        cursor += dims.body_accel_rows;
+        shiftBlock(cursor, 8, horizon);
+        cursor += dims.wheel_octagon_rows + dims.wheel_rate_rows;
+        shiftBlock(cursor, 1, horizon);
+        cursor += dims.esdf_corridor_rows;
+        shiftBlock(cursor, 3, horizon);
+        cursor += 3 * horizon;
+        shiftBlock(cursor, 1, horizon);
+      } else {
+        rti_warm.dual = qp_warm_start_.dual;
+      }
+      for (int s = 0; s < horizon; ++s) {
+        if (qp_problem_buffer_.lower(esdf_base + s) < -0.5) {
+          rti_warm.dual(esdf_base + s) = 0.0;
+        }
+      }
+      warm_ptr = &rti_warm;
+    }
+
+    qp_res = qp_solver_->solveLtvProblem(qp_problem_buffer_,
+                                         qp_solver_settings_, warm_ptr);
+    ++executed_rti;
+    total_update_ms += qp_res.wall_update_time_ms;
+    total_backend_ms += qp_res.wall_qp_phase_time_ms;
+    total_complete_ms += qp_res.wall_complete_qp_phase_time_ms;
+    total_solve_ms += qp_res.wall_solve_time_ms;
+
+    if ((qp_res.status != LtvQpSolverStatus::kSolved &&
+         qp_res.status != LtvQpSolverStatus::kSolvedInaccurate) ||
+        qp_res.primal_solution.size() != qp_problem_buffer_.decisionSize() ||
+        qp_res.dual_solution.size() != qp_problem_buffer_.constraintRows()) {
+      break;
+    }
+    qp_warm_start_.primal = qp_res.primal_solution;
+    qp_warm_start_.dual = qp_res.dual_solution;
+    qp_warm_start_valid_ = true;
+
+    const auto recon_start = std::chrono::steady_clock::now();
+    candidate = LtvQpCandidateReconstructor::reconstruct(
+        snapshot.current_state, qp_problem_buffer_, nominal_controls,
+        controller_->config(), qp_res, snapshot.last_control_before_solve,
+        snapshot.first_step_dt);
+    total_recon_ms += elapsedMilliseconds(recon_start,
+                                          std::chrono::steady_clock::now());
+    if (!candidate.valid) {
+      break;
+    }
+
+    double max_delta_u = 0.0;
+    for (int step = 0; step < qp_problem_buffer_.horizon; ++step) {
+      max_delta_u = std::max(
+          max_delta_u,
+          qp_res.primal_solution
+              .segment<3>(qp_problem_buffer_.controlOffset(step))
+              .lpNorm<Eigen::Infinity>());
+    }
+    const double elapsed_sqp_ms =
+        elapsedMilliseconds(sqp_start, std::chrono::steady_clock::now());
+    if (rti_pass + 1 < qp_rti_iterations_ &&
+        max_delta_u > qp_rti_second_pass_delta_threshold_ &&
+        elapsed_sqp_ms < 0.45 * qp_solver_settings_.time_limit_ms) {
+      Control prev_u = snapshot.last_control_before_solve;
+      for (int step = 0; step < qp_problem_buffer_.horizon; ++step) {
+        const std::size_t idx = static_cast<std::size_t>(step);
+        const double sdt =
+            step == 0 ? snapshot.first_step_dt : controller_->config().dt;
+        nominal_controls[idx] = controller_->clampStepIncrement(
+            candidate.controls[idx], prev_u, sdt);
+        prev_u = nominal_controls[idx];
+      }
+      nominal_states = controller_->rolloutTrajectory(
+          snapshot.current_state, nominal_controls,
+          snapshot.last_control_before_solve, snapshot.first_step_dt);
+      continue;
+    }
+    break;
+  }
+
+  recordTiming(telemetry, ControlCycleTimingStage::kQpProblemBuild,
+               total_build_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kOsqpNumericUpdate,
+               total_update_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kQpBackendPhase,
+               total_backend_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kQpCompletePhase,
+               total_complete_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kOsqpSolve, total_solve_ms);
+  recordTiming(telemetry, ControlCycleTimingStage::kPrimalReconstructionRollout,
+               total_recon_ms);
+
+  if (candidate.valid && map_snapshot != nullptr) {
+    rollout_safety = evaluateRolloutFootprintSafety(
+        *map_snapshot, snapshot_from_odom, candidate.states);
+  }
+
+  LtvQpCandidateSafety safety;
+  safety.inputs_healthy = snapshot.localization_fresh &&
+                          snapshot.reference_fresh &&
+                          snapshot.execution_lease_valid &&
+                          snapshot.gimbal_valid;
+  safety.emergency_stop_active = snapshot.emergency_stop_active;
+  safety.collision_free =
+      rollout_safety.level != RolloutSafetyLevel::kUnsafeStop;
+  safety.localization_fresh = snapshot.localization_fresh;
+  safety.reference_fresh = snapshot.reference_fresh;
+  safety.execution_lease_valid = snapshot.execution_lease_valid;
+  safety.gimbal_valid = snapshot.gimbal_valid;
+  safety.map_fresh = snapshot.map_fresh;
+
+  LtvQpSolverSettings audit_settings = qp_solver_settings_;
+  audit_settings.time_limit_ms =
+      qp_solver_settings_.time_limit_ms * std::max(1, executed_rti);
+  const auto audit_start = std::chrono::steady_clock::now();
+  if (candidate.valid) {
+    audit = LtvQpCandidateValidator::validate(
+        qp_problem_buffer_, nominal_controls,
+        snapshot.last_control_before_solve, controller_->config(),
+        ZeroSpeedGuardConfig(), audit_settings, safety, qp_res, candidate,
+        snapshot.first_step_dt);
+  } else {
+    audit = LtvQpCandidateValidator::validate(
+        qp_problem_buffer_, nominal_controls,
+        snapshot.last_control_before_solve, controller_->config(),
+        ZeroSpeedGuardConfig(), audit_settings, safety, qp_res,
+        snapshot.first_step_dt);
+  }
+  total_audit_ms =
+      elapsedMilliseconds(audit_start, std::chrono::steady_clock::now());
+  recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
+               total_audit_ms);
+
+  telemetry.qp_attempted = true;
+  telemetry.rti_iterations = executed_rti;
+  telemetry.same_snapshot_identity =
+      snapshot.identity_digest_valid &&
+      snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
+  telemetry.status = qp_res.status;
+  telemetry.iterations = qp_res.iterations;
+  telemetry.warm_start_used = qp_res.warm_start_used;
+  telemetry.osqp_reported_update_ms = qp_res.update_time_ms;
+  telemetry.osqp_reported_solve_ms = qp_res.solve_time_ms;
+  telemetry.osqp_wall_update_ms = total_update_ms;
+  telemetry.osqp_wall_solve_ms = total_solve_ms;
+  telemetry.qp_complete_phase_ms = total_complete_ms;
+  telemetry.osqp_wall_qp_phase_ms = total_backend_ms;
+  telemetry.primal_residual = qp_res.primal_residual;
+  telemetry.dual_residual = qp_res.dual_residual;
+  telemetry.hard_constraint_margin =
+      qp_solver_settings_.max_hard_constraint_violation -
+      std::max(qp_res.hard_constraint_maximum_violation,
+               audit.actual_hard_constraint_maximum_violation);
+  telemetry.slack_maximum =
+      std::max(qp_res.slack_maximum, audit.actual_slack_maximum);
+  telemetry.candidate_feasible = audit.feasible;
+  const char *reason =
+      audit.rejection_reason.empty() ? "none" : audit.rejection_reason.c_str();
+  std::snprintf(telemetry.rejection_reason.data(),
+                telemetry.rejection_reason.size(), "%s", reason);
+  telemetry.collision_gate = safety.collision_free;
+  telemetry.map_gate = safety.map_fresh;
+
+  if (!audit.feasible || !candidate.valid || candidate.controls.empty()) {
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 500,
+        "【QP诊断】status=%s iter=%d prim=%.2e dual=%.2e rho=%.3e rho_upd=%d "
+        "slack=%.3f hard_viol=%.2e wall_solve=%.2fms reason=%s",
+        ltvQpSolverStatusName(qp_res.status), qp_res.iterations,
+        qp_res.primal_residual, qp_res.dual_residual, qp_res.rho,
+        qp_res.rho_updates, telemetry.slack_maximum,
+        audit.actual_hard_constraint_maximum_violation, total_solve_ms, reason);
+    const bool keep_warm_start =
+        (qp_res.status == LtvQpSolverStatus::kSolved ||
+         qp_res.status == LtvQpSolverStatus::kSolvedInaccurate ||
+         qp_res.status == LtvQpSolverStatus::kMaxIterations ||
+         qp_res.status == LtvQpSolverStatus::kTimeLimit) &&
+        qp_res.primal_solution.size() == qp_problem_buffer_.decisionSize() &&
+        qp_res.dual_solution.size() == qp_problem_buffer_.constraintRows() &&
+        qp_res.primal_solution.allFinite() && qp_res.dual_solution.allFinite();
+    if (keep_warm_start) {
+      qp_warm_start_.primal = qp_res.primal_solution;
+      qp_warm_start_.dual = qp_res.dual_solution;
+      qp_warm_start_valid_ = true;
+    } else {
+      qp_warm_start_valid_ = false;
+      qp_solver_->resetWarmStart();
+    }
+    out_rollout_safety = rollout_safety;
+    return false;
+  }
+
+  bool post_body_sat = false;
+  bool post_wheel_sat = false;
+  bool post_inc_lim = false;
+  candidate.controls.front() = controller_->clampStepIncrement(
+      candidate.controls.front(), snapshot.last_control_before_solve,
+      snapshot.first_step_dt, &post_body_sat, &post_wheel_sat, &post_inc_lim);
+  controller_->commitWarmControls(candidate.controls);
+
+  out_result.success = true;
+  out_result.controls = std::move(candidate.controls);
+  out_result.states = std::move(candidate.states);
+  out_result.iterations = qp_res.iterations;
+  out_result.accepted_iterations = executed_rti;
+  out_result.cost = 0.0;
+  out_result.solve_time_ms =
+      elapsedMilliseconds(sqp_start, std::chrono::steady_clock::now());
+  out_result.body_limit_saturated = first_body_sat || post_body_sat;
+  out_result.wheel_limit_saturated = first_wheel_sat || post_wheel_sat;
+  out_result.increment_limited = first_inc_lim || post_inc_lim;
+  out_result.module_limits_active = controller_->moduleLimitsActive();
+  out_rollout_safety = rollout_safety;
+  for (int axis = 0; axis < 3; ++axis) {
+    telemetry.qp_first_control[static_cast<std::size_t>(axis)] =
+        out_result.controls.front()(axis);
+  }
+  return true;
 }
 
 /**
@@ -1311,19 +2177,31 @@ void AtsSwerveMpcNode::onControlTimer() {
     publishZeroCommandForFailure(nullptr);
     return;
   }
-  // 6. 调用 MPC 求解
+  // 6. 校验规划地图快照健康与 epoch 绑定，并调用 MPC（SQP-RTI 或 iLQR）求解
+  std::shared_ptr<const ats_navigation_interfaces::msg::PlanningMapSnapshot>
+      active_map_snapshot;
+  Eigen::Vector3d snapshot_from_odom = Eigen::Vector3d::Zero();
+  bool map_snapshot_fresh = false;
+  {
+    std::lock_guard<std::mutex> lock(trajectory_mutex_);
+    map_snapshot_fresh = planningSnapshotUsableLocked(
+        cycle_start, &active_map_snapshot, &snapshot_from_odom);
+  }
+  if (require_planning_snapshot_ && !map_snapshot_fresh) {
+    publishZeroCommandForFailure("规划地图快照过期、未就绪或 epoch 不一致");
+    return;
+  }
+
   const auto snapshot_start = cycle_start;
   ControlCycleSnapshot snapshot;
   snapshot.cycle_sequence = cycle_sequence;
   snapshot.steady_start = cycle_start;
-  // 附录 A.9 旋转相位补偿：求解用 psi + omega * t_d / 2 代替 psi（位置不变）。omega 取上一拍
-  // 已发布指令的 wz（last_control_(2)），即 MPC 动力学实际积分的角速度；节点只保存位姿
-  // [x,y,yaw]、不读里程计 twist，位姿差分估角速率会带来噪声和额外滞后，所以不做实测回退。
-  // t_d 取预测域起点已在用的 command_latency_compensation，不新增参数；不乘进度缩放，
-  // 因为延迟是物理量。投影、终点判定、里程计门禁仍用未补偿的 current。debug 预测路径的
-  // 首个 yaw 因此是补偿后的值。
-  snapshot.current_state =
-      rotationPhaseCompensatedState(current, last_control_(2), rotation_delay);
+  const double now_sec_for_delay =
+      get_clock()->ros_time_is_active()
+          ? now().seconds()
+          : std::chrono::duration<double>(cycle_start.time_since_epoch()).count();
+  snapshot.current_state = advanceStateThroughCommandDelay(
+      current, now_sec_for_delay, rotation_delay);
   snapshot.references = references;
   snapshot.last_control_before_solve = last_control_;
   snapshot.first_step_dt = actual_step_dt;
@@ -1336,8 +2214,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   snapshot.emergency_stop_active = fail_stop_engaged_.load() ||
       (emergency_stop_watchdog_enabled_ &&
        emergency_stop_watchdog_.stopRequired());
-  // 节点尚无独立 map/footprint 健康生产者；在真实 snapshot 接入前必须 fail-closed。
-  snapshot.map_fresh = false;
+  snapshot.map_fresh = map_snapshot_fresh;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex_);
     snapshot.reference_frame = trajectory_frame_.empty() ? frame_id_ : trajectory_frame_;
@@ -1387,37 +2264,68 @@ void AtsSwerveMpcNode::onControlTimer() {
   recordTiming(telemetry, ControlCycleTimingStage::kReferenceExtraction,
                reference_extraction_ms);
 
-  const auto ilqr_start = std::chrono::steady_clock::now();
-  const Se2MpcResult result =
-      controller_->solve(snapshot.current_state, snapshot.references,
-                         snapshot.last_control_before_solve,
-                         snapshot.first_step_dt);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrSolve,
-               elapsedMilliseconds(ilqr_start, std::chrono::steady_clock::now()));
-  // iLQR 内部拆分：仅为把 solve 的耗时归属到具体阶段，它们是 kIlqrSolve 的
-  // 子项而非额外串行开销；kIlqrJacobian 又内含于 kIlqrBackwardPass。
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrWarmStart,
-               result.stage_timing.warm_start_ms);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrRollout,
-               result.stage_timing.rollout_ms);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrBackwardPass,
-               result.stage_timing.backward_pass_ms);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrJacobian,
-               result.stage_timing.jacobian_ms);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrLineSearch,
-               result.stage_timing.line_search_ms);
-  if (!result.success || result.controls.empty()) {
-    RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "【MPC求解失败】iLQR 未获得可信解：迭代 %d 次、被接受 %d 次、代价 %.4f、"
-        "耗时 %.2f ms、横向误差 %.3f m；已切换零速度兜底并复位控制器。",
-        result.iterations, result.accepted_iterations, result.cost,
-        result.solve_time_ms, projection.cross_track_error);
-    publishZeroCommandForFailure(nullptr);
+  Se2MpcResult result;
+  RolloutSafetyEvaluation rollout_safety;
+  const auto active_solve_start = std::chrono::steady_clock::now();
+  const bool qp_ok = solveSqpRti(
+      snapshot, active_map_snapshot.get(), snapshot_from_odom, telemetry,
+      result, rollout_safety);
+  recordTiming(telemetry, ControlCycleTimingStage::kActiveSolve,
+               elapsedMilliseconds(active_solve_start,
+                                   std::chrono::steady_clock::now()));
+  telemetry.rollout_safety_level = static_cast<int>(rollout_safety.level);
+  telemetry.cross_track_error_m = projection.cross_track_error;
+
+  if (!qp_ok || !result.success || result.controls.empty()) {
+    if (rollout_safety.level == RolloutSafetyLevel::kUnsafeStop) {
+      publishZeroCommandForFailure("预测滚动轨迹触发近端硬碰撞门禁");
+    } else {
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "【MPC求解失败】OSQP SQP-RTI 未获得可信解（status=%s reason=%s iter=%d "
+          "耗时=%.2f ms 横向误差=%.3f m）；已触发确定性零速度 fail-stop。",
+          ltvQpSolverStatusName(telemetry.status),
+          telemetry.rejection_reason.data(), telemetry.iterations,
+          telemetry.osqp_wall_solve_ms, projection.cross_track_error);
+      publishZeroCommandForFailure(nullptr);
+    }
+    finalizeControlTelemetry(telemetry, cycle_start);
     return;
   }
-  // 7. 应用第一个控制量并发布
+  if (rollout_safety.level == RolloutSafetyLevel::kUnsafeStop) {
+    publishZeroCommandForFailure("预测滚动轨迹触发近端硬碰撞门禁");
+    finalizeControlTelemetry(telemetry, cycle_start);
+    return;
+  }
+  // 7. 应用第一个控制量（含健康预测期 SLOWDOWN/BRAKE 平滑减速与终点区限速）并发布
   last_control_ = result.controls.front();
+  if ((rollout_safety.level == RolloutSafetyLevel::kSlowdown ||
+       rollout_safety.level == RolloutSafetyLevel::kBrake) &&
+      rollout_safety.speed_scale < 1.0 - 1e-6) {
+    Control scaled_target = last_control_;
+    if (rollout_safety.level == RolloutSafetyLevel::kSlowdown) {
+      // kSlowdown 表示预测无碰撞但靠近墙面（如 0.80 m 窄隧道）；仅限制高速接近，
+      // 保留 0.35 m/s 慢速蠕行下限，避免在无碰撞窄通道重启时把起步速度乘衰至零。
+      constexpr double kSlowdownCrawlFloorMps = 0.35;
+      const double linear_speed = scaled_target.head<2>().norm();
+      if (linear_speed > kSlowdownCrawlFloorMps) {
+        const double target_speed =
+            std::max(kSlowdownCrawlFloorMps,
+                     linear_speed * rollout_safety.speed_scale);
+        scaled_target.head<2>() *= (target_speed / linear_speed);
+      }
+    } else {
+      // kBrake 表示预测在制动窗内进入负净空，严格无下限减速。
+      scaled_target.head<2>() *= rollout_safety.speed_scale;
+    }
+    last_control_ = controller_->clampStepIncrement(
+        scaled_target, snapshot.last_control_before_solve,
+        snapshot.first_step_dt);
+    if (!result.controls.empty()) {
+      result.controls.front() = last_control_;
+      controller_->commitWarmControls(result.controls);
+    }
+  }
   // 终点区限速（报告 5.1.10 第 1 项）：MPC 的模型里没有底盘约 0.4 s 的响应滞后，离终点
   // 0.15-0.3 m 时仍给 0.9-1.0 m/s，冲过终点再拉回。终点区内按 |v| <= d / tau 限速，相当于
   // 一阶趋近，tau 大于 e 倍滞后时不过冲。只对终点速度为零的 reference 生效。
@@ -1439,23 +2347,30 @@ void AtsSwerveMpcNode::onControlTimer() {
           goal_yaw_error / terminal_approach_time_constant_, deceleration_floor);
       last_control_(2) = std::clamp(last_control_(2), -yaw_rate_limit, yaw_rate_limit);
     }
+    if (!result.controls.empty()) {
+      result.controls.front() = last_control_;
+      controller_->commitWarmControls(result.controls);
+    }
   }
   const auto command_publish_start = std::chrono::steady_clock::now();
   publishCommand(last_control_);
-  recordTiming(telemetry, ControlCycleTimingStage::kIlqrCommandPublish,
+  recordTiming(telemetry, ControlCycleTimingStage::kCommandPublish,
                elapsedMilliseconds(command_publish_start,
                                    std::chrono::steady_clock::now()));
   for (int axis = 0; axis < 3; ++axis) {
-    telemetry.ilqr_first_control[static_cast<std::size_t>(axis)] = last_control_(axis);
+    telemetry.published_first_control[static_cast<std::size_t>(axis)] =
+        last_control_(axis);
   }
+  const double max_pub_wheel = controller_->computeMaxModuleSpeed(last_control_);
+  telemetry.published_wheel_speed_max_mps = max_pub_wheel;
+  telemetry.wheel_speed_violation_mps =
+      controller_->config().max_wheel_speed > 1e-6
+          ? std::max(0.0, max_pub_wheel - controller_->config().max_wheel_speed)
+          : 0.0;
   const auto diagnostics_log_start = std::chrono::steady_clock::now();
   reportSolverDiagnostics(result);
   double logging_publish_ms = elapsedMilliseconds(
       diagnostics_log_start, std::chrono::steady_clock::now());
-  snapshot.ilqr_result = result;
-  if (solver_mode_ == "qp_shadow") {
-    runQpShadow(snapshot, telemetry);
-  }
   // 8. 发布调试路径
   if (publish_debug_paths_) {
     publishPath(result.states, predicted_path_pub_);
@@ -1469,12 +2384,11 @@ void AtsSwerveMpcNode::onControlTimer() {
   const auto debug_log_start = std::chrono::steady_clock::now();
   RCLCPP_DEBUG(get_logger(),
                "【MPC调试】vx=%.3f vy=%.3f wz=%.3f 横向误差=%.3f "
-               "进度比例=%.2f 代价=%.3f "
-               "求解=%.2fms",
+               "进度比例=%.2f 求解=%.2fms",
                last_control_(0), last_control_(1), last_control_(2),
                projection.cross_track_error,
                trajectory_tracker_.progressScale(projection.cross_track_error),
-               result.cost, result.solve_time_ms);
+               result.solve_time_ms);
   logging_publish_ms += elapsedMilliseconds(debug_log_start,
                                              std::chrono::steady_clock::now());
   recordTiming(telemetry, ControlCycleTimingStage::kLoggingPublish,
@@ -1483,144 +2397,8 @@ void AtsSwerveMpcNode::onControlTimer() {
 }
 
 /**
- * @brief 对已发布 iLQR 同周期名义轨迹执行 OSQP shadow 审计。
- * @details 用 snapshot 的 current/reference/solve 前 last_control 构建固定结构 LTV-QP，
- *          再从 primal 重建 delta_u、做共享模型非线性 rollout 和 hard-check；无论 solved、
- *          timeout 或 reject 都不发布 QP 控制，也不影响 iLQR warm-start。
- */
-void AtsSwerveMpcNode::runQpShadow(
-    const ControlCycleSnapshot &snapshot,
-    ControlCycleTelemetrySample &telemetry) {
-  LtvQpSolveResult result;
-  LtvQpPrimalCandidate candidate;
-  LtvQpCandidateAudit audit;
-  const bool backend_available = qp_solver_ && qp_solver_->initialized();
-  const auto problem_build_start = std::chrono::steady_clock::now();
-  const bool problem_built = backend_available && LtvQpBuilder::build(
-      snapshot.current_state, snapshot.ilqr_result.states,
-      snapshot.ilqr_result.controls, snapshot.references,
-      snapshot.last_control_before_solve, controller_->config(),
-      qp_problem_buffer_, ZeroSpeedGuardConfig(), snapshot.first_step_dt);
-  if (problem_built) {
-    recordQpProblemMetrics(qp_problem_buffer_, telemetry);
-  }
-  recordTiming(telemetry, ControlCycleTimingStage::kQpProblemBuild,
-               elapsedMilliseconds(problem_build_start,
-                                   std::chrono::steady_clock::now()));
-  if (!backend_available) {
-    result.status = LtvQpSolverStatus::kBackendUnavailable;
-  } else if (!problem_built) {
-    result.status = LtvQpSolverStatus::kInvalidProblem;
-  } else {
-    const LtvQpProblem &problem = qp_problem_buffer_;
-    result = qp_solver_->solveLtvProblem(
-        problem, qp_solver_settings_,
-        qp_warm_start_valid_ ? &qp_warm_start_ : nullptr);
-  }
-  if (problem_built) {
-    recordTiming(telemetry, ControlCycleTimingStage::kOsqpNumericUpdate,
-                 result.wall_update_time_ms);
-    recordTiming(telemetry, ControlCycleTimingStage::kQpBackendPhase,
-                 result.wall_qp_phase_time_ms);
-    recordTiming(telemetry, ControlCycleTimingStage::kQpCompletePhase,
-                 result.wall_complete_qp_phase_time_ms);
-    recordTiming(telemetry, ControlCycleTimingStage::kOsqpSolve,
-                 result.wall_solve_time_ms);
-  }
-  const LtvQpProblem &problem = qp_problem_buffer_;
-  if (result.status == LtvQpSolverStatus::kSolved &&
-      result.primal_solution.size() == problem.decisionSize() &&
-      result.dual_solution.size() == qp_solver_->constraintStructure().rows &&
-      result.primal_solution.allFinite() && result.dual_solution.allFinite()) {
-    qp_warm_start_.primal = result.primal_solution;
-    qp_warm_start_.dual = result.dual_solution;
-    qp_warm_start_valid_ = true;
-  } else {
-    if (qp_solver_) {
-      qp_solver_->resetWarmStart();
-    }
-    qp_warm_start_valid_ = false;
-  }
-  LtvQpCandidateSafety safety;
-  safety.inputs_healthy = snapshot.localization_fresh &&
-                          snapshot.reference_fresh &&
-                          snapshot.execution_lease_valid &&
-                          snapshot.gimbal_valid;
-  safety.emergency_stop_active = snapshot.emergency_stop_active;
-  safety.collision_free = false;
-  safety.localization_fresh = snapshot.localization_fresh;
-  safety.reference_fresh = snapshot.reference_fresh;
-  safety.execution_lease_valid = snapshot.execution_lease_valid;
-  safety.gimbal_valid = snapshot.gimbal_valid;
-  safety.map_fresh = snapshot.map_fresh;
-  if (result.status == LtvQpSolverStatus::kSolved && problem_built) {
-    const auto reconstruction_start = std::chrono::steady_clock::now();
-    candidate = LtvQpCandidateReconstructor::reconstruct(
-        snapshot.current_state, problem, snapshot.ilqr_result.controls,
-        controller_->config(), result);
-    recordTiming(telemetry,
-                 ControlCycleTimingStage::kPrimalReconstructionRollout,
-                 elapsedMilliseconds(reconstruction_start,
-                                     std::chrono::steady_clock::now()));
-    const auto audit_start = std::chrono::steady_clock::now();
-    audit = LtvQpCandidateValidator::validate(
-        problem, snapshot.ilqr_result.controls,
-        snapshot.last_control_before_solve, controller_->config(),
-        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result, candidate,
-        snapshot.first_step_dt);
-    recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
-                 elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
-  } else {
-    const auto audit_start = std::chrono::steady_clock::now();
-    audit = LtvQpCandidateValidator::validate(
-        problem, snapshot.ilqr_result.controls,
-        snapshot.last_control_before_solve, controller_->config(),
-        ZeroSpeedGuardConfig(), qp_solver_settings_, safety, result,
-        snapshot.first_step_dt);
-    recordTiming(telemetry, ControlCycleTimingStage::kCandidateHardCheck,
-                 elapsedMilliseconds(audit_start, std::chrono::steady_clock::now()));
-  }
-
-  telemetry.qp_shadow_attempted = true;
-  telemetry.same_snapshot_identity = snapshot.identity_digest_valid &&
-      snapshot.identity_digest == controlCycleSnapshotIdentityDigest(snapshot);
-  telemetry.status = result.status;
-  telemetry.iterations = result.iterations;
-  telemetry.warm_start_used = result.warm_start_used;
-  telemetry.osqp_reported_update_ms = result.update_time_ms;
-  telemetry.osqp_reported_solve_ms = result.solve_time_ms;
-  telemetry.osqp_wall_update_ms = result.wall_update_time_ms;
-  telemetry.osqp_wall_solve_ms = result.wall_solve_time_ms;
-  telemetry.qp_complete_phase_ms = result.wall_complete_qp_phase_time_ms;
-  telemetry.osqp_wall_qp_phase_ms = result.wall_qp_phase_time_ms;
-  telemetry.primal_residual = result.primal_residual;
-  telemetry.dual_residual = result.dual_residual;
-  telemetry.hard_constraint_margin =
-      qp_solver_settings_.max_hard_constraint_violation -
-      std::max(result.hard_constraint_maximum_violation,
-               audit.actual_hard_constraint_maximum_violation);
-  telemetry.slack_maximum = std::max(result.slack_maximum,
-                                     audit.actual_slack_maximum);
-  telemetry.candidate_feasible = audit.feasible;
-  const char *reason = audit.rejection_reason.empty() ? "none" :
-                       audit.rejection_reason.c_str();
-  std::snprintf(telemetry.rejection_reason.data(),
-                telemetry.rejection_reason.size(), "%s", reason);
-  telemetry.collision_gate = safety.collision_free;
-  telemetry.map_gate = safety.map_fresh;
-  if (candidate.valid && !candidate.controls.empty()) {
-    const Control &qp = candidate.controls.front();
-    for (int axis = 0; axis < 3; ++axis) {
-      const std::size_t index = static_cast<std::size_t>(axis);
-      telemetry.qp_first_control[index] = qp(axis);
-      telemetry.first_control_delta[index] = qp(axis) - telemetry.ilqr_first_control[index];
-    }
-  }
-}
-
-/**
  * @brief 完成本控制周期的性能记录并按明确预算累积根因计数。
- * @details OSQP update/solve 各自以 `qp_time_limit_ms` 复核；iLQR、LTV 构造、candidate
+ * @details OSQP update/solve 各自以 `qp_time_limit_ms` 复核；LTV 构造、candidate
  *          audit、telemetry、日志与完整 callback 都以运行时 `control_period_ms` 复核。
  *          同一个周期可有多个根因，因此总数只能作为 root-cause events，绝不能替代分布。
  */
@@ -1650,14 +2428,17 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
     RCLCPP_INFO(
         get_logger(),
         "控制周期遥测 序号=%llu 模式=%s 频率=%.1fHz 周期=%.3fms "
-        "qp_status=%s iter=%d qp_wall(update/solve/backend/complete)=%.3f/%.3f/%.3f/%.3fms "
+        "qp_status=%s iter=%d prim=%.2e dual=%.2e slack=%.3f "
+        "qp_wall(update/solve/backend/complete)=%.3f/%.3f/%.3f/%.3fms "
         "callback_p50/p95/p99=%.3f/%.3f/%.3fms "
         "qp_backend_p50/p95/p99=%.3f/%.3f/%.3fms "
         "qp_complete_p50/p95/p99=%.3f/%.3f/%.3fms "
         "same_snapshot=%s feasible=%s reject=%s",
         static_cast<unsigned long long>(telemetry.cycle_sequence), solver_mode_.c_str(),
         control_rate_hz_, control_period_ms, ltvQpSolverStatusName(telemetry.status),
-        telemetry.iterations, telemetry.osqp_wall_update_ms, telemetry.osqp_wall_solve_ms,
+        telemetry.iterations, telemetry.primal_residual, telemetry.dual_residual,
+        telemetry.slack_maximum, telemetry.osqp_wall_update_ms,
+        telemetry.osqp_wall_solve_ms,
         telemetry.osqp_wall_qp_phase_ms, telemetry.qp_complete_phase_ms,
         callback_distribution.p50_ms, callback_distribution.p95_ms,
         callback_distribution.p99_ms, qp_backend_phase_distribution.p50_ms,
@@ -1700,12 +2481,12 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
   if (!control_telemetry_.push(telemetry, cycle_start)) {
     return;
   }
-  if (telemetry.qp_shadow_attempted &&
+  if (telemetry.qp_attempted &&
       telemetry.status == LtvQpSolverStatus::kTimeLimit) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kOsqpTimeLimitStatus);
   }
-  if (telemetry.qp_shadow_attempted && exceeded(
+  if (telemetry.qp_attempted && exceeded(
           ControlCycleTimingStage::kOsqpSolve, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kOsqpSolveBudgetOverrun);
@@ -1714,31 +2495,27 @@ void AtsSwerveMpcNode::finalizeControlTelemetry(
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kCallbackPeriodOverrun);
   }
-  if (exceeded(ControlCycleTimingStage::kIlqrSolve, control_period_ms)) {
-    control_telemetry_.incrementDeadlineCause(
-        ControlCycleDeadlineCause::kIlqrSolveBudgetOverrun);
-  }
-  if (telemetry.qp_shadow_attempted && exceeded(
+  if (telemetry.qp_attempted && exceeded(
           ControlCycleTimingStage::kQpProblemBuild, control_period_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpProblemBuildBudgetOverrun);
   }
-  if (telemetry.qp_shadow_attempted && exceeded(
+  if (telemetry.qp_attempted && exceeded(
           ControlCycleTimingStage::kOsqpNumericUpdate, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpUpdateBudgetOverrun);
   }
-  if (telemetry.qp_shadow_attempted && exceeded(
+  if (telemetry.qp_attempted && exceeded(
           ControlCycleTimingStage::kQpBackendPhase, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpPhaseBudgetOverrun);
   }
-  if (telemetry.qp_shadow_attempted && exceeded(
+  if (telemetry.qp_attempted && exceeded(
           ControlCycleTimingStage::kQpCompletePhase, qp_solver_settings_.time_limit_ms)) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpCompletePhaseBudgetOverrun);
   }
-  if (telemetry.qp_shadow_attempted && candidate_audit_overrun) {
+  if (telemetry.qp_attempted && candidate_audit_overrun) {
     control_telemetry_.incrementDeadlineCause(
         ControlCycleDeadlineCause::kQpCandidateAuditBudgetOverrun);
   }
@@ -1797,6 +2574,14 @@ void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
   last_control_.setZero();
   last_control_update_stamp_.reset();
   last_control_update_steady_.reset();
+  qp_warm_start_valid_ = false;
+  if (qp_solver_) {
+    qp_solver_->resetWarmStart();
+  }
+  {
+    std::lock_guard<std::mutex> history_lock(command_history_mutex_);
+    command_delay_history_.clear();
+  }
   publishCommand(last_control_);
   controller_->reset();
   if (reason_zh != nullptr) {
@@ -1969,6 +2754,14 @@ void AtsSwerveMpcNode::engageFailStop(
       last_stop_command_ = stop_command;
     }
     controller_->reset();
+    qp_warm_start_valid_ = false;
+    if (qp_solver_) {
+      qp_solver_->resetWarmStart();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> history_lock(command_history_mutex_);
+    command_delay_history_.clear();
   }
   last_control_.setZero();
   last_control_update_stamp_.reset();
@@ -1978,6 +2771,25 @@ void AtsSwerveMpcNode::engageFailStop(
 
 /** @brief 将内部车体系 Control 映射到唯一 `geometry_msgs::msg::Twist` 发布通道。 */
 void AtsSwerveMpcNode::publishCommand(const Control &command) {
+  const double stamp_sec =
+      get_clock()->ros_time_is_active()
+          ? now().seconds()
+          : std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+  {
+    std::lock_guard<std::mutex> history_lock(command_history_mutex_);
+    if (!command_delay_history_.empty() &&
+        stamp_sec < command_delay_history_.back().stamp_sec) {
+      command_delay_history_.clear();
+    }
+    command_delay_history_.push_back(CommandHistorySample{stamp_sec, command});
+    while (command_delay_history_.size() > 64U ||
+           (command_delay_history_.size() > 2U &&
+            stamp_sec - command_delay_history_.front().stamp_sec > 0.5)) {
+      command_delay_history_.pop_front();
+    }
+  }
   geometry_msgs::msg::Twist message;
   message.linear.x = command(0);
   message.linear.y = command(1);

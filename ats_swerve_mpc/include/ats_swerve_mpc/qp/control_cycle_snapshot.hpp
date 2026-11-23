@@ -13,12 +13,7 @@
 namespace ats_swerve_mpc {
 
 /**
- * @brief 单个 iLQR/QP shadow 控制周期共享的不可变输入快照。
- *
- * @details 控制定时器在调用 iLQR 前复制当前状态、reference、上一控制和执行授权身份。
- *          iLQR 只能读取此副本求解，随后 qp_shadow 也只能读取同一副本，禁止在二者之间
- *          重新读取 ROS 状态、tracker 或 ExecutionCommand。该类型没有可发布 Twist，因而
- *          不能改变 `/cmd_vel/autonomy_raw` 的 iLQR 唯一所有权。
+ * @brief 单个 OSQP SQP-RTI 控制周期冻结的不可变输入快照。
  */
 struct ControlCycleSnapshot {
   std::uint64_t cycle_sequence = 0;
@@ -28,9 +23,8 @@ struct ControlCycleSnapshot {
   Control last_control_before_solve = Control::Zero();
   // 本控制周期相对上一控制指令的实际时间步长 [s]，供首步增量约束复用。
   double first_step_dt = 0.0;
-  Se2MpcResult ilqr_result;
 
-  // ExecutionCommand 的单调身份字段；它们是审计输入，不是 QP 可以修改的控制权限。
+  // ExecutionCommand 的单调身份字段；用于跨阶段一致性审计。
   std::uint64_t manager_incarnation = 0;
   std::uint64_t command_sequence = 0;
   std::uint64_t goal_id = 0;
@@ -45,12 +39,9 @@ struct ControlCycleSnapshot {
   bool localization_fresh = false;
   bool gimbal_valid = false;
   bool execution_lease_valid = false;
-  // Twist-only 节点尚无独立 map/footprint 健康 producer；接入真实 snapshot 前必须
-  // 保持 false，令 qp_shadow candidate 以 fail-closed 方式拒绝。
   bool map_fresh = false;
 
-  // iLQR 求解前计算。shadow 记录前以同一 canonical 规则重算并逐值比对；有效位与摘要
-  // 数值分离，避免把任意合法的 64 位哈希值误当成“输入含非有限数”。
+  // 求解前计算 canonical digest，确保输入在 SQP-RTI 阶段未被篡改。
   std::uint64_t identity_digest = 0;
   bool identity_digest_valid = false;
 };

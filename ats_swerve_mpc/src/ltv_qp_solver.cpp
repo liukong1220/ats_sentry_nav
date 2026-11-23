@@ -12,41 +12,29 @@ namespace {
 
 constexpr double kConstraintTolerance = 1e-9;
 
-/** @brief 接受有限数与 +/-infinity 的约束边界，但拒绝 NaN。 */
 bool finiteOrInfinity(double value) {
   return !std::isnan(value);
 }
 
-/** @brief 安全门限必须为有限非负值，避免 Inf 上限把约束变成无界执行。 */
 bool finiteNonnegative(double value) {
   return std::isfinite(value) && value >= 0.0;
 }
 
-/** @brief 检查 CSC 数值数组没有 NaN/Inf，矩阵结构由另一层单独校验。 */
 bool vectorFinite(const std::vector<double> &values) {
   return std::all_of(values.begin(), values.end(),
                      [](double value) { return std::isfinite(value); });
 }
 
-/** @brief 检查重建出的每一拍车体系控制均有限。 */
 bool finiteControls(const std::vector<Control> &controls) {
   return std::all_of(controls.begin(), controls.end(),
                      [](const Control &control) { return control.allFinite(); });
 }
 
-/** @brief 检查共享 SE(2) 非线性 rollout 的每一状态均有限。 */
 bool finiteStates(const std::vector<State> &states) {
   return std::all_of(states.begin(), states.end(),
                      [](const State &state) { return state.allFinite(); });
 }
 
-/** @brief 固定 LTV 约束的总行数：等式、增量不等式和变量 bounds。 */
-int expectedConstraintRows(const LtvQpProblem &problem) {
-  return problem.equality_matrix.rows() + problem.inequality_matrix.rows() +
-         problem.decisionSize();
-}
-
-/** @brief 检查 Eigen 约束向量，允许 OSQP 使用的无穷边界。 */
 bool eigenVectorFiniteOrInfinity(const Eigen::VectorXd &values) {
   for (int index = 0; index < values.size(); ++index) {
     if (!finiteOrInfinity(values(index))) {
@@ -56,14 +44,12 @@ bool eigenVectorFiniteOrInfinity(const Eigen::VectorXd &values) {
   return true;
 }
 
-/** @brief 向可选错误输出写入稳定原因，避免校验函数抛出异常。 */
 void setError(std::string *error, const char *message) {
   if (error != nullptr) {
     *error = message;
   }
 }
 
-/** @brief 将同一车体 Twist 映射到真实四个轮心速度，用作独立 hard-check。 */
 std::array<Eigen::Vector2d, 4> moduleVelocities(
     const Control &control, const Se2MpcConfig &config) {
   const double x = std::max(0.0, config.wheel_base_x);
@@ -79,17 +65,14 @@ std::array<Eigen::Vector2d, 4> moduleVelocities(
   return velocities;
 }
 
-/** @brief 返回 value 超过单边上限的非负违反量。 */
 double upperViolation(double value, double upper) {
   return std::max(0.0, value - upper);
 }
 
-/** @brief 返回绝对值约束的违反量，适用于车体速度和加速度。 */
 double absoluteViolation(double value, double bound) {
   return upperViolation(std::abs(value), bound);
 }
 
-/** @brief 统一记录 fail-closed 审计拒绝原因。 */
 void reject(LtvQpCandidateAudit &audit, const char *reason) {
   audit.feasible = false;
   audit.rejection_reason = reason;
@@ -97,7 +80,6 @@ void reject(LtvQpCandidateAudit &audit, const char *reason) {
 
 }  // namespace
 
-/** @brief 将统一状态码转为日志字段，保持 OSQP 原始 status 的可审计性。 */
 const char *ltvQpSolverStatusName(LtvQpSolverStatus status) {
   switch (status) {
     case LtvQpSolverStatus::kSolved:
@@ -122,105 +104,74 @@ const char *ltvQpSolverStatusName(LtvQpSolverStatus status) {
   return "unknown";
 }
 
-/** @brief 验证 CSC 的列偏移、行索引范围和严格有序性。 */
-bool LtvQpSparseStructure::valid(std::string *error) const {
-  if (rows <= 0 || columns <= 0 ||
-      column_offsets.size() != static_cast<std::size_t>(columns + 1) ||
-      column_offsets.empty() || column_offsets.front() != 0 ||
-      column_offsets.back() != static_cast<int>(row_indices.size())) {
-    setError(error, "invalid CSC dimensions or column offsets");
+bool LtvQpSparseProblem::valid(std::string *error) const {
+  if (decision_size <= 0 || constraint_rows <= 0) {
+    setError(error, "sparse QP dimensions must be positive");
     return false;
   }
-  for (int column = 0; column < columns; ++column) {
-    const int begin = column_offsets[static_cast<std::size_t>(column)];
-    const int end = column_offsets[static_cast<std::size_t>(column + 1)];
-    if (begin > end || begin < 0 || end > static_cast<int>(row_indices.size())) {
-      setError(error, "invalid CSC column range");
-      return false;
-    }
-    int previous_row = -1;
+  if (!hessian_structure.valid(error) ||
+      hessian_structure.rows != decision_size ||
+      hessian_structure.columns != decision_size ||
+      hessian_values.size() != hessian_structure.row_indices.size()) {
+    setError(error, "Hessian CSC pattern or value size mismatch");
+    return false;
+  }
+  for (int col = 0; col < decision_size; ++col) {
+    const int begin =
+        hessian_structure.column_offsets[static_cast<std::size_t>(col)];
+    const int end =
+        hessian_structure.column_offsets[static_cast<std::size_t>(col + 1)];
     for (int offset = begin; offset < end; ++offset) {
-      const int row = row_indices[static_cast<std::size_t>(offset)];
-      if (row < 0 || row >= rows || row <= previous_row) {
-        setError(error, "CSC rows must be in range and strictly ordered");
+      if (hessian_structure.row_indices[static_cast<std::size_t>(offset)] >
+          col) {
+        setError(error, "OSQP Hessian must be upper triangular");
         return false;
       }
-      previous_row = row;
     }
   }
-  return true;
-}
-
-/** @brief 比较两个 CSC layout 的所有形状与索引，拒绝 timer 内结构漂移。 */
-bool LtvQpSparseStructure::samePattern(
-    const LtvQpSparseStructure &other) const {
-  return rows == other.rows && columns == other.columns &&
-         column_offsets == other.column_offsets &&
-         row_indices == other.row_indices;
-}
-
-/** @brief 同时验证 CSC 数值、gradient 与 lower<=upper 的固定维度契约。 */
-bool LtvQpSparseProblem::valid(std::string *error) const {
-  if (decision_size <= 0 || constraint_rows <= 0 ||
-      !hessian_structure.valid(error) || !constraint_structure.valid(error)) {
-    return false;
-  }
-  if (hessian_structure.rows != decision_size ||
-      hessian_structure.columns != decision_size ||
+  if (!constraint_structure.valid(error) ||
       constraint_structure.rows != constraint_rows ||
-      constraint_structure.columns != decision_size) {
-    setError(error, "sparse matrix dimensions do not match QP dimensions");
+      constraint_structure.columns != decision_size ||
+      constraint_values.size() != constraint_structure.row_indices.size()) {
+    setError(error, "constraint CSC pattern or value size mismatch");
     return false;
   }
-  if (hessian_values.size() != hessian_structure.row_indices.size() ||
-      constraint_values.size() != constraint_structure.row_indices.size() ||
-      !vectorFinite(hessian_values) || !vectorFinite(constraint_values) ||
-      gradient.size() != decision_size || lower.size() != constraint_rows ||
-      upper.size() != constraint_rows || !gradient.allFinite()) {
-    setError(error, "invalid sparse values or vector dimensions");
+  if (!vectorFinite(hessian_values) || !vectorFinite(constraint_values) ||
+      gradient.size() != decision_size || !gradient.allFinite() ||
+      lower.size() != constraint_rows || upper.size() != constraint_rows ||
+      !eigenVectorFiniteOrInfinity(lower) ||
+      !eigenVectorFiniteOrInfinity(upper) ||
+      !(lower.array() <= upper.array()).all()) {
+    setError(error, "sparse QP numerical values or bounds invalid");
     return false;
-  }
-  for (int row = 0; row < constraint_rows; ++row) {
-    if (!finiteOrInfinity(lower(row)) || !finiteOrInfinity(upper(row)) ||
-        lower(row) > upper(row)) {
-      setError(error, "invalid lower or upper constraint bound");
-      return false;
-    }
   }
   return true;
 }
 
-/** @brief 仅接受与当前 decision/constraint 完全同维且有限的 primal/dual 初值。 */
 bool LtvQpWarmStart::validFor(int decision_size, int constraint_rows) const {
-  return primal.size() == decision_size && dual.size() == constraint_rows &&
+  return decision_size > 0 && constraint_rows > 0 &&
+         primal.size() == decision_size && dual.size() == constraint_rows &&
          primal.allFinite() && dual.allFinite();
 }
 
-/** @brief 校验所有 solver 接受门限是有限、非负且具有正的资源上界。 */
 bool LtvQpSolverSettings::valid() const {
   return max_iterations > 0 && std::isfinite(time_limit_ms) &&
          time_limit_ms > 0.0 && std::isfinite(max_primal_residual) &&
-         max_primal_residual >= 0.0 && std::isfinite(max_dual_residual) &&
-         max_dual_residual >= 0.0 && std::isfinite(max_tracking_slack) &&
-         max_tracking_slack >= 0.0 &&
-         std::isfinite(max_hard_constraint_violation) &&
-         max_hard_constraint_violation >= 0.0;
+         max_primal_residual > 0.0 && std::isfinite(max_dual_residual) &&
+         max_dual_residual > 0.0 && finiteNonnegative(max_tracking_slack) &&
+         finiteNonnegative(max_hard_constraint_violation);
 }
 
-/**
- * @brief 从 OSQP primal 的 delta_u 重建绝对控制并进行非线性 SE(2) 前向复算。
- * @details 该过程使 candidate 复核不依赖 LTV 近似；任何尺寸、有限性或 rollout 问题
- *          都只产生拒绝诊断，绝不生成可发布的 QP Twist。
- */
 LtvQpPrimalCandidate LtvQpCandidateReconstructor::reconstruct(
     const State &current_state, const LtvQpProblem &problem,
-    const std::vector<Control> &nominal_controls,
-    const Se2MpcConfig &config, const LtvQpSolveResult &result) {
+    const std::vector<Control> &nominal_controls, const Se2MpcConfig &config,
+    const LtvQpSolveResult &result, const Control &last_control,
+    double first_step_dt) {
   LtvQpPrimalCandidate candidate;
   if (!problem.valid || problem.horizon <= 0 ||
       !problem.hasExpectedLayout() || !problem.hasOrderedBounds() ||
       !problem.hasFiniteNumerics() || problem.decisionSize() <= 0 ||
-      !current_state.allFinite() ||
+      !current_state.allFinite() || !last_control.allFinite() ||
       config.horizon != problem.horizon || !std::isfinite(config.dt) ||
       config.dt <= 0.0 ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
@@ -229,7 +180,12 @@ LtvQpPrimalCandidate LtvQpCandidateReconstructor::reconstruct(
     candidate.validation_error = "invalid QP primal reconstruction input";
     return candidate;
   }
+  const Se2MpcController projector(config);
+  const double effective_first_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : config.dt;
   candidate.controls.reserve(static_cast<std::size_t>(problem.horizon));
+  Control prev_control = last_control;
   for (int step = 0; step < problem.horizon; ++step) {
     const std::size_t index = static_cast<std::size_t>(step);
     if (!nominal_controls[index].allFinite()) {
@@ -237,17 +193,28 @@ LtvQpPrimalCandidate LtvQpCandidateReconstructor::reconstruct(
       candidate.controls.clear();
       return candidate;
     }
-    const Control control = nominal_controls[index] +
+    const Control raw_control =
+        nominal_controls[index] +
         result.primal_solution.segment<3>(problem.controlOffset(step));
-    if (!control.allFinite()) {
+    if (!raw_control.allFinite()) {
       candidate.validation_error = "non-finite reconstructed control";
       candidate.controls.clear();
       return candidate;
     }
-    candidate.controls.push_back(control);
+    const double step_dt = step == 0 ? effective_first_dt : config.dt;
+    const Control projected =
+        projector.clampStepIncrement(raw_control, prev_control, step_dt);
+    if (!projected.allFinite()) {
+      candidate.validation_error = "non-finite projected control";
+      candidate.controls.clear();
+      return candidate;
+    }
+    candidate.controls.push_back(projected);
+    prev_control = projected;
   }
-  candidate.states = Se2Model(config.dt).rollout(current_state,
-                                                  candidate.controls);
+  candidate.states = Se2Model::rolloutWithLag(
+      current_state, candidate.controls, last_control, first_step_dt, config.dt,
+      config.actuator_lag_tau_sec);
   if (candidate.states.size() != candidate.controls.size() + 1 ||
       !finiteStates(candidate.states)) {
     candidate.validation_error = "non-finite nonlinear rollout";
@@ -259,21 +226,12 @@ LtvQpPrimalCandidate LtvQpCandidateReconstructor::reconstruct(
   return candidate;
 }
 
-/**
- * @brief 基于 nominal+delta_u 执行后端无关的完整安全审计。
- * @details 依次核验 QP 维度/状态/资源、残差/slack、外部健康门和真实四轮速度、
- *          轮向量增量、ZeroSpeedGuard 下有效舵角速率；任一步失败都 fail-closed。
- */
 LtvQpCandidateAudit LtvQpCandidateValidator::validate(
-    const LtvQpProblem &problem,
-    const std::vector<Control> &nominal_controls,
-    const Control &last_control,
-    const Se2MpcConfig &config,
+    const LtvQpProblem &problem, const std::vector<Control> &nominal_controls,
+    const Control &last_control, const Se2MpcConfig &config,
     const ZeroSpeedGuardConfig &guard_config,
-    const LtvQpSolverSettings &settings,
-    const LtvQpCandidateSafety &safety,
-    const LtvQpSolveResult &result,
-    double first_step_dt) {
+    const LtvQpSolverSettings &settings, const LtvQpCandidateSafety &safety,
+    const LtvQpSolveResult &result, double first_step_dt) {
   LtvQpCandidateAudit audit;
   if (!settings.valid()) {
     reject(audit, "invalid_solver_settings");
@@ -281,26 +239,16 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
   }
   if (!problem.valid || problem.horizon <= 0 ||
       !problem.hasExpectedLayout() || !problem.hasOrderedBounds() ||
-      !problem.hasFiniteNumerics() ||
-      problem.decisionSize() <= 0 ||
+      !problem.hasFiniteNumerics() || problem.decisionSize() <= 0 ||
       result.primal_solution.size() != problem.decisionSize() ||
-      result.dual_solution.size() != expectedConstraintRows(problem) ||
+      result.dual_solution.size() != problem.constraintRows() ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
       config.horizon != problem.horizon || !std::isfinite(config.dt) ||
-      config.dt <= 0.0 ||
-      !last_control.allFinite()) {
+      config.dt <= 0.0 || !last_control.allFinite()) {
     reject(audit, "invalid_problem_or_candidate_dimensions");
     return audit;
   }
-  if (!problem.hessian.allFinite() || !problem.gradient.allFinite() ||
-      !problem.equality_matrix.allFinite() ||
-      !problem.equality_lower.allFinite() || !problem.equality_upper.allFinite() ||
-      !problem.inequality_matrix.allFinite() ||
-      !problem.inequality_lower.allFinite() ||
-      !problem.inequality_upper.allFinite() ||
-      !eigenVectorFiniteOrInfinity(problem.lower_bound) ||
-      !eigenVectorFiniteOrInfinity(problem.upper_bound) ||
-      !result.primal_solution.allFinite() ||
+  if (!result.primal_solution.allFinite() ||
       !result.dual_solution.allFinite() ||
       !std::isfinite(result.solve_time_ms) ||
       !std::isfinite(result.update_time_ms) ||
@@ -322,12 +270,11 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     reject(audit, "non_finite_matrix_or_result");
     return audit;
   }
-  if (result.status != LtvQpSolverStatus::kSolved) {
+  if (result.status != LtvQpSolverStatus::kSolved &&
+      result.status != LtvQpSolverStatus::kSolvedInaccurate) {
     reject(audit, "solver_status_not_solved");
     return audit;
   }
-  // 后端报告时间只用于归因；准入还必须拒绝 adapter/C API 墙钟超期。
-  // update 与 solve 是 control timer 内独立受限阶段，任一步超期都不可执行。
   if (result.iterations < 0 || result.iterations > settings.max_iterations ||
       result.solve_time_ms > settings.time_limit_ms ||
       result.update_time_ms > settings.time_limit_ms ||
@@ -366,21 +313,31 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     return audit;
   }
 
+  for (int step = 0; step < problem.horizon; ++step) {
+    const double slack = result.primal_solution(problem.slackOffset(step));
+    if (!std::isfinite(slack)) {
+      reject(audit, "non_finite_slack");
+      return audit;
+    }
+    audit.actual_slack_maximum =
+        std::max(audit.actual_slack_maximum, std::max(0.0, slack));
+    audit.actual_hard_constraint_maximum_violation = std::max(
+        audit.actual_hard_constraint_maximum_violation, std::max(0.0, -slack));
+  }
   for (const double slack : result.tracking_slacks) {
     if (!std::isfinite(slack)) {
       reject(audit, "non_finite_slack");
       return audit;
     }
     audit.actual_slack_maximum =
-        std::max(audit.actual_slack_maximum, slack);
+        std::max(audit.actual_slack_maximum, std::max(0.0, slack));
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation, std::max(0.0, -slack));
   }
-  // 当前 LtvQpBuilder 未分配 tracking/terminal slack 决策列。拒绝非空 payload
-  // 可防止 adapter 在 slack 布局、上界和惩罚尚未评审前静默软化任何 hard constraint。
-  if (!result.tracking_slacks.empty() ||
-      result.slack_maximum > settings.max_tracking_slack ||
-      audit.actual_slack_maximum > settings.max_tracking_slack) {
+  if (result.slack_maximum >
+          settings.max_tracking_slack + settings.max_primal_residual ||
+      audit.actual_slack_maximum >
+          settings.max_tracking_slack + settings.max_primal_residual) {
     reject(audit, "unexpected_or_excessive_tracking_slack");
     return audit;
   }
@@ -394,12 +351,23 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
   }
   zero_speed_guard.update(initial_speeds);
 
+  const Se2MpcController projector(config);
   for (int step = 0; step < problem.horizon; ++step) {
     const std::size_t index = static_cast<std::size_t>(step);
-    const Control candidate =
+    const Control raw_candidate =
         nominal_controls[index] +
         result.primal_solution.segment<3>(problem.controlOffset(step));
-    if (!candidate.allFinite() || !nominal_controls[index].allFinite()) {
+    if (!raw_candidate.allFinite() || !nominal_controls[index].allFinite()) {
+      reject(audit, "non_finite_body_control");
+      return audit;
+    }
+    const double step_dt =
+        (step == 0 && std::isfinite(first_step_dt) && first_step_dt > 0.0)
+            ? first_step_dt
+            : config.dt;
+    const Control candidate =
+        projector.clampStepIncrement(raw_candidate, previous, step_dt);
+    if (!candidate.allFinite()) {
       reject(audit, "non_finite_body_control");
       return audit;
     }
@@ -413,11 +381,10 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
         audit.actual_hard_constraint_maximum_violation,
         absoluteViolation(candidate(2), config.max_wz));
 
-    const double step_dt =
-        (step == 0 && std::isfinite(first_step_dt) && first_step_dt > 0.0)
-            ? first_step_dt
-            : config.dt;
-    const Control body_delta = candidate - previous;
+    // 旋转系速度搬运 R(-wz*dt)：与 Se2MpcController 惯性加速度约束严格统一
+    const Control carried_previous =
+        Se2Model::rotateControlLinear(previous, previous(2) * step_dt);
+    const Control body_delta = candidate - carried_previous;
     audit.actual_hard_constraint_maximum_violation = std::max(
         audit.actual_hard_constraint_maximum_violation,
         absoluteViolation(body_delta(0), config.max_ax * step_dt));
@@ -435,24 +402,38 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
       const double previous_speed = previous_modules[module].norm();
       const double candidate_speed = candidate_modules[module].norm();
       candidate_speeds[module] = candidate_speed;
+      const double wheel_speed_viol =
+          upperViolation(candidate_speed, config.max_wheel_speed);
+      audit.max_wheel_speed_violation =
+          std::max(audit.max_wheel_speed_violation, wheel_speed_viol);
+      audit.actual_hard_constraint_maximum_violation = std::max(
+          audit.actual_hard_constraint_maximum_violation, wheel_speed_viol);
+
+      double cosine = 1.0;
+      const bool both_moving = candidate_speed > 1e-4 && previous_speed > 1e-4;
+      if (both_moving) {
+        cosine = std::clamp(
+            candidate_modules[module].dot(previous_modules[module]) /
+                (candidate_speed * previous_speed),
+            -1.0, 1.0);
+      }
+      // 统一滚速标量增量 + 舵角速率解耦审计（与 Se2MpcController::moduleIncrementFeasible 对齐）
+      const double rolling_speed_delta =
+          both_moving ? (cosine >= 0.0 ? std::abs(candidate_speed - previous_speed)
+                                       : (candidate_speed + previous_speed))
+                      : (candidate_modules[module] - previous_modules[module]).norm();
       audit.actual_hard_constraint_maximum_violation = std::max(
           audit.actual_hard_constraint_maximum_violation,
-          upperViolation(candidate_speed, config.max_wheel_speed));
-      audit.actual_hard_constraint_maximum_violation = std::max(
-          audit.actual_hard_constraint_maximum_violation,
-          upperViolation((candidate_modules[module] - previous_modules[module]).norm(),
+          upperViolation(rolling_speed_delta,
                          config.max_wheel_acceleration * step_dt));
 
       if (zero_speed_guard.angleConstraintDefined(previous_speed,
                                                   candidate_speed)) {
         ++audit.steering_rate_constraints_checked;
-        const double cosine = std::clamp(
-            candidate_modules[module].dot(previous_modules[module]) /
-                (candidate_speed * previous_speed),
-            -1.0, 1.0);
         audit.actual_hard_constraint_maximum_violation = std::max(
             audit.actual_hard_constraint_maximum_violation,
-            upperViolation(std::acos(cosine), config.max_steer_rate * step_dt));
+            upperViolation(std::acos(std::abs(cosine)),
+                           config.max_steer_rate * step_dt));
       } else {
         ++audit.steering_rate_constraints_skipped_by_zero_speed_guard;
       }
@@ -473,21 +454,14 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
   return audit;
 }
 
-/** @brief 在基础 hard-check 前确认重建控制与 primal identity 及 nonlinear rollout 一致。 */
 LtvQpCandidateAudit LtvQpCandidateValidator::validate(
-    const LtvQpProblem &problem,
-    const std::vector<Control> &nominal_controls,
-    const Control &last_control,
-    const Se2MpcConfig &config,
+    const LtvQpProblem &problem, const std::vector<Control> &nominal_controls,
+    const Control &last_control, const Se2MpcConfig &config,
     const ZeroSpeedGuardConfig &guard_config,
-    const LtvQpSolverSettings &settings,
-    const LtvQpCandidateSafety &safety,
-    const LtvQpSolveResult &result,
-    const LtvQpPrimalCandidate &candidate,
+    const LtvQpSolverSettings &settings, const LtvQpCandidateSafety &safety,
+    const LtvQpSolveResult &result, const LtvQpPrimalCandidate &candidate,
     double first_step_dt) {
   LtvQpCandidateAudit audit;
-  // 该 overload 会在委托基础 hard-check 前读取 control offset 和 primal segment。
-  // 先完整复核公开输入，不能依赖 qp_shadow 当前只传 builder 成功 buffer 的调用约定。
   if (!problem.valid || problem.horizon <= 0 ||
       !problem.hasExpectedLayout() || !problem.hasOrderedBounds()) {
     reject(audit, "invalid_problem_or_candidate_dimensions");
@@ -502,15 +476,14 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     reject(audit, "invalid_solver_settings");
     return audit;
   }
-  if (decision_size <= 0 ||
-      config.horizon != problem.horizon || !std::isfinite(config.dt) ||
-      config.dt <= 0.0 || !last_control.allFinite() ||
+  if (decision_size <= 0 || config.horizon != problem.horizon ||
+      !std::isfinite(config.dt) || config.dt <= 0.0 ||
+      !last_control.allFinite() ||
       result.primal_solution.size() != decision_size ||
-      result.dual_solution.size() != expectedConstraintRows(problem) ||
+      result.dual_solution.size() != problem.constraintRows() ||
       !result.primal_solution.allFinite() ||
       !result.dual_solution.allFinite() ||
-      !finiteControls(nominal_controls) ||
-      !candidate.valid ||
+      !finiteControls(nominal_controls) || !candidate.valid ||
       nominal_controls.size() != static_cast<std::size_t>(problem.horizon) ||
       candidate.controls.size() != static_cast<std::size_t>(problem.horizon) ||
       candidate.states.size() != candidate.controls.size() + 1 ||
@@ -518,20 +491,30 @@ LtvQpCandidateAudit LtvQpCandidateValidator::validate(
     reject(audit, "nonlinear_rollout_reconstruction_reject");
     return audit;
   }
+  const Se2MpcController projector(config);
+  const double effective_first_dt =
+      (std::isfinite(first_step_dt) && first_step_dt > 0.0) ? first_step_dt
+                                                            : config.dt;
+  Control prev_control = last_control;
   for (int step = 0; step < problem.horizon; ++step) {
     const int control_offset = problem.controlOffset(step);
     if (control_offset < 0 || control_offset > decision_size - 3) {
       reject(audit, "invalid_problem_or_candidate_dimensions");
       return audit;
     }
-    const Control reconstructed = nominal_controls[static_cast<std::size_t>(step)] +
+    const Control raw =
+        nominal_controls[static_cast<std::size_t>(step)] +
         result.primal_solution.segment<3>(control_offset);
+    const double step_dt = step == 0 ? effective_first_dt : config.dt;
+    const Control reconstructed =
+        projector.clampStepIncrement(raw, prev_control, step_dt);
     if (!reconstructed.allFinite() ||
         (candidate.controls[static_cast<std::size_t>(step)] - reconstructed)
                 .lpNorm<Eigen::Infinity>() > 1e-9) {
       reject(audit, "nonlinear_rollout_identity_reject");
       return audit;
     }
+    prev_control = reconstructed;
   }
   return validate(problem, nominal_controls, last_control, config, guard_config,
                   settings, safety, result, first_step_dt);

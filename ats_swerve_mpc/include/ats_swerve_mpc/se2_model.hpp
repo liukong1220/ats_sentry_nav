@@ -53,6 +53,39 @@ public:
   std::vector<State> rollout(const State &initial,
                              const std::vector<Control> &controls) const;
 
+  /** @brief 将车体系线速度搬运到旋转 +yaw_delta 后的新车体系 R(-yaw_delta)*[vx,vy]。 */
+  static Control rotateControlLinear(const Control &control, double yaw_delta);
+  /** @brief 计算 rotateControlLinear(u, u_z * step_dt) 对控制向量 u 的 3x3 解析 Jacobian。 */
+  static Eigen::Matrix3d rotateControlLinearJacobian(const Control &control,
+                                                     double step_dt);
+  /** @brief 计算一阶执行器滞后在步长 dt 内的平均作用权重 gamma in (0, 1]（tau<=0 返回 1）。 */
+  static double actuatorLagGamma(double dt, double lag_tau_sec);
+  /** @brief 计算考虑一阶执行器滞后与旋转系搬运后的等效车体系控制。 */
+  static Control effectiveControlWithLag(const Control &control,
+                                         const Control &previous_control,
+                                         double previous_carry_dt,
+                                         double step_dt,
+                                         double lag_tau_sec);
+  /** @brief 带一阶执行器滞后的单步 SE(2) 指数映射离散动力学（tau<=0 退化为精确无滞后模型）。 */
+  static State dynamicsWithLag(const State &state, const Control &control,
+                               const Control &previous_control,
+                               double previous_carry_dt, double dt,
+                               double lag_tau_sec);
+  /** @brief 带一阶执行器滞后的解析 Jacobian：返回 A = df/dx, B_curr = df/du_k, B_prev = df/du_{k-1}。 */
+  static void jacobiansWithLag(const State &state, const Control &control,
+                               const Control &previous_control,
+                               double previous_carry_dt, double dt,
+                               double lag_tau_sec,
+                               Eigen::Matrix3d &state_jacobian,
+                               Eigen::Matrix3d &current_control_jacobian,
+                               Eigen::Matrix3d &previous_control_jacobian);
+  /** @brief 带一阶执行器滞后的共享模型完整状态 rollout。 */
+  static std::vector<State> rolloutWithLag(const State &initial,
+                                           const std::vector<Control> &controls,
+                                           const Control &last_control,
+                                           double first_step_dt, double dt,
+                                           double lag_tau_sec);
+
   /** @brief 将任意航向角映射到 [-pi,pi]，保证跨边界比较连续。 */
   static double normalizeAngle(double angle);
   /** @brief 计算 SE(2) 状态差，并对 yaw 使用最短角差。 */
