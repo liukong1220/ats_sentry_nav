@@ -189,6 +189,32 @@ public:
       declare_parameter<double>("directional_fusion.weak_yaw_damping", 0.2), 0.0, 1.0);
     directional_fusion_config_.max_strong_nis = std::max(
       0.0, declare_parameter<double>("directional_fusion.max_strong_nis", 36.0));
+    tracking_filter_config_.enable =
+      declare_parameter<bool>("tracking_filter.enable", true);
+    tracking_filter_config_.deadband_translation = std::max(
+      0.0, declare_parameter<double>("tracking_filter.deadband_translation", 0.04));
+    tracking_filter_config_.deadband_yaw = std::max(
+      0.0, declare_parameter<double>("tracking_filter.deadband_yaw", 0.03));
+    tracking_filter_config_.lpf_alpha_translation = std::clamp(
+      declare_parameter<double>("tracking_filter.lpf_alpha_translation", 0.25), 0.01, 1.0);
+    tracking_filter_config_.lpf_alpha_yaw = std::clamp(
+      declare_parameter<double>("tracking_filter.lpf_alpha_yaw", 0.20), 0.01, 1.0);
+    tracking_filter_config_.settle_translation_tolerance = std::max(
+      1e-4, declare_parameter<double>("tracking_filter.settle_translation_tolerance", 0.001));
+    tracking_filter_config_.settle_yaw_tolerance = std::max(
+      1e-4, declare_parameter<double>("tracking_filter.settle_yaw_tolerance", 0.002));
+    tracking_filter_config_.motion_consistency_base_m = std::max(
+      0.0, declare_parameter<double>("tracking_filter.motion_consistency_base_m", 0.12));
+    tracking_filter_config_.motion_consistency_ratio = std::max(
+      0.0, declare_parameter<double>("tracking_filter.motion_consistency_ratio", 0.05));
+    tracking_filter_config_.motion_consistency_base_yaw = std::max(
+      0.0, declare_parameter<double>("tracking_filter.motion_consistency_base_yaw", 0.08));
+    tracking_filter_config_.motion_jump_confirm_count = static_cast<int>(std::max<std::int64_t>(
+      1, declare_parameter<std::int64_t>("tracking_filter.motion_jump_confirm_count", 3)));
+    tracking_filter_config_.motion_jump_confirm_tolerance_m = std::max(
+      0.005, declare_parameter<double>("tracking_filter.motion_jump_confirm_tolerance_m", 0.04));
+    tracking_filter_config_.motion_jump_confirm_tolerance_yaw = std::max(
+      0.005, declare_parameter<double>("tracking_filter.motion_jump_confirm_tolerance_yaw", 0.04));
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     localization_pub_ =
@@ -334,6 +360,10 @@ private:
         observation_clock_start_.reset();
         has_map_to_odom_ = false;
         has_accepted_observation_ = false;
+        last_accepted_odom_to_base_.reset();
+        tracking_lpf_settling_ = false;
+        pending_jump_candidate_.reset();
+        pending_jump_count_ = 0;
         ++epoch_;
         enterLostLocked("odometry source instance changed");
         publishStatusLocked();
@@ -555,15 +585,14 @@ private:
     }
     const std::optional<tf2::Transform> current_map_to_odom =
       has_map_to_odom_ ? std::optional<tf2::Transform>(map_to_odom_) : std::nullopt;
-    const CorrectionUpdate correction = selectCorrectionUpdate(
-      candidate_map_to_odom, current_map_to_odom, epoch_translation_threshold_,
-      epoch_yaw_threshold_, continuous_correction_max_translation_,
-      continuous_correction_max_yaw_);
+    const CorrectionDelta raw_delta = current_map_to_odom
+      ? correctionDelta(candidate_map_to_odom, *current_map_to_odom)
+      : CorrectionDelta{};
     {
       const bool lost = lost_latched_;
       const double max_xy = lost ? lost_max_correction_translation_ : max_correction_translation_;
       const double max_yaw = lost ? lost_max_correction_yaw_ : max_correction_yaw_;
-      if (has_map_to_odom_ && !correctionWithinLimits(correction.delta, max_xy, max_yaw)) {
+      if (has_map_to_odom_ && !correctionWithinLimits(raw_delta, max_xy, max_yaw)) {
         recordRejectionLocked(
           lost ? "LOST relocalization correction exceeded lost plausibility gate"
                : "relocalization correction exceeded plausibility gate",
@@ -573,12 +602,114 @@ private:
       }
     }
 
+    const bool in_steady_tracking =
+      has_map_to_odom_ && has_accepted_observation_ && !lost_latched_ &&
+      status_ == LocalizationStatus::STATE_TRACKING && tracking_filter_config_.enable;
+    if (in_steady_tracking && tracking_filter_config_.motion_consistency_base_m > 0.0) {
+      double odom_travel = 0.0;
+      double odom_rot = 0.0;
+      if (last_accepted_odom_to_base_) {
+        const CorrectionDelta odom_step =
+          correctionDelta(*odom_to_base, *last_accepted_odom_to_base_);
+        odom_travel = odom_step.translation;
+        odom_rot = odom_step.yaw;
+      }
+      const double allowed_trans =
+        tracking_filter_config_.motion_consistency_base_m +
+        tracking_filter_config_.motion_consistency_ratio * odom_travel;
+      const double allowed_yaw =
+        tracking_filter_config_.motion_consistency_base_yaw +
+        tracking_filter_config_.motion_consistency_ratio * odom_rot;
+      if (raw_delta.translation > allowed_trans || raw_delta.yaw > allowed_yaw) {
+        if (pending_jump_candidate_) {
+          const CorrectionDelta jump_diff =
+            correctionDelta(candidate_map_to_odom, *pending_jump_candidate_);
+          if (jump_diff.translation <= tracking_filter_config_.motion_jump_confirm_tolerance_m &&
+            jump_diff.yaw <= tracking_filter_config_.motion_jump_confirm_tolerance_yaw)
+          {
+            ++pending_jump_count_;
+            pending_jump_candidate_ = candidate_map_to_odom;
+          } else {
+            pending_jump_candidate_ = candidate_map_to_odom;
+            pending_jump_count_ = 1;
+          }
+        } else {
+          pending_jump_candidate_ = candidate_map_to_odom;
+          pending_jump_count_ = 1;
+        }
+        if (pending_jump_count_ < tracking_filter_config_.motion_jump_confirm_count) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "【运动一致性门控】跟踪期异常跳变 待确认=%d/%d delta=(%.3f m, %.3f rad) "
+            "allowed=(%.3f m, %.3f rad) odom_travel=%.2f m，暂不改写 map->odom。",
+            pending_jump_count_, tracking_filter_config_.motion_jump_confirm_count,
+            raw_delta.translation, raw_delta.yaw, allowed_trans, allowed_yaw, odom_travel);
+          publishStatusLocked();
+          return;
+        }
+      }
+      pending_jump_candidate_.reset();
+      pending_jump_count_ = 0;
+    } else {
+      pending_jump_candidate_.reset();
+      pending_jump_count_ = 0;
+    }
+
+    CorrectionUpdate correction = selectCorrectionUpdate(
+      candidate_map_to_odom, current_map_to_odom, epoch_translation_threshold_,
+      epoch_yaw_threshold_, continuous_correction_max_translation_,
+      continuous_correction_max_yaw_);
+    bool damped_applied = false;
+    const bool continuous_band_enabled =
+      continuous_correction_max_translation_ > 0.0 && continuous_correction_max_yaw_ > 0.0;
+    const bool within_continuous_band =
+      continuous_band_enabled &&
+      raw_delta.translation <= continuous_correction_max_translation_ &&
+      raw_delta.yaw <= continuous_correction_max_yaw_;
+    if (in_steady_tracking && within_continuous_band) {
+      const bool beyond_deadband =
+        (raw_delta.translation > 0.0 &&
+         raw_delta.translation >= tracking_filter_config_.deadband_translation) ||
+        (raw_delta.yaw > 0.0 &&
+         raw_delta.yaw >= tracking_filter_config_.deadband_yaw);
+      if (beyond_deadband) {
+        tracking_lpf_settling_ = true;
+      }
+      if (tracking_lpf_settling_) {
+        tf2::Transform filtered = interpolateTransform(
+          map_to_odom_, candidate_map_to_odom,
+          tracking_filter_config_.lpf_alpha_translation,
+          tracking_filter_config_.lpf_alpha_yaw);
+        const CorrectionDelta remaining = correctionDelta(candidate_map_to_odom, filtered);
+        if (remaining.translation <= tracking_filter_config_.settle_translation_tolerance &&
+          remaining.yaw <= tracking_filter_config_.settle_yaw_tolerance)
+        {
+          filtered = candidate_map_to_odom;
+          tracking_lpf_settling_ = false;
+        }
+        correction.map_to_odom = filtered;
+        correction.delta = correctionDelta(filtered, map_to_odom_);
+        correction.apply = true;
+        correction.continuous = true;
+        correction.advance_epoch = false;
+        damped_applied = true;
+      } else {
+        correction.map_to_odom = map_to_odom_;
+        correction.apply = false;
+        correction.continuous = false;
+        correction.advance_epoch = false;
+      }
+    } else if (correction.advance_epoch) {
+      tracking_lpf_settling_ = false;
+    }
+
     const bool requires_hold = correction.advance_epoch ||
       status_ != LocalizationStatus::STATE_TRACKING;
-    // 阈值内观测只刷新健康状态，不改 TF；一旦改 TF 就必须同步推进 epoch。
+    // 死区内观测只刷新健康状态不改 TF；连续带内采用指数低通阻尼吸收；超界跳变推进 epoch。
     map_to_odom_ = correction.map_to_odom;
     has_map_to_odom_ = true;
     has_accepted_observation_ = true;
+    last_accepted_odom_to_base_ = *odom_to_base;
     lost_latched_ = false;
     recovery_episode_closed_ = false;
     recovery_until_.reset();
@@ -593,8 +724,10 @@ private:
     } else if (correction.continuous) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "【连续修正】map->odom 修正 平移=%.3f m 航向=%.3f rad，未超过连续上界，epoch=%llu 保持。",
+        "【连续%s修正】map->odom 步进=(%.3f m, %.3f rad) 原始新息=(%.3f m, %.3f rad)，epoch=%llu 保持。",
+        damped_applied ? "阻尼" : "",
         correction.delta.translation, correction.delta.yaw,
+        raw_delta.translation, raw_delta.yaw,
         static_cast<unsigned long long>(epoch_));
     }
     if (requires_hold && (!relocalizing_until_ || correction.advance_epoch)) {
@@ -728,6 +861,9 @@ private:
       recovery_observation_floor_ = now();
     }
     lost_latched_ = true;
+    tracking_lpf_settling_ = false;
+    pending_jump_candidate_.reset();
+    pending_jump_count_ = 0;
     recovery_until_.reset();
     relocalizing_until_.reset();
     status_ = LocalizationStatus::STATE_LOST;
@@ -846,8 +982,13 @@ private:
   double status_publish_rate_hz_{10.0};
   bool degrade_on_out_of_order_odom_{false};
   DirectionalFusionConfig directional_fusion_config_;
+  TrackingFilterConfig tracking_filter_config_;
 
   std::mutex mutex_;
+  std::optional<tf2::Transform> last_accepted_odom_to_base_;
+  bool tracking_lpf_settling_{false};
+  std::optional<tf2::Transform> pending_jump_candidate_;
+  int pending_jump_count_{0};
   OdomInstanceTracker odom_instance_tracker_;
   builtin_interfaces::msg::Time odom_epoch_start_stamp_;
   double identity_future_tolerance_s_{5.0};

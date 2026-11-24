@@ -208,6 +208,9 @@ void SensorScanGenerationNode::laserCloudAndOdometryHandler(
   if (!has_robot_base_pose_ && !get_parameter("use_identified_odometry").as_bool()) {
     odometryHandler(odometry_msg);
   }
+  if (!pub_laser_cloud_ || pub_laser_cloud_->get_subscription_count() == 0U) {
+    return;
+  }
   tf2::fromMsg(odometry_msg->pose.pose, tf_odom_to_lidar);
 
   // 以 unique_ptr 发布：开 intra-process 时 publish(const T &) 会整帧深拷贝一次。

@@ -189,6 +189,41 @@ inline CorrectionUpdate selectCorrectionUpdate(
   return update;
 }
 
+struct TrackingFilterConfig
+{
+  bool enable{true};
+  // 死区：小于该值的跟踪期抖动只刷新健康心跳、不改写 map->odom（非 settling 状态）。
+  double deadband_translation{0.04};
+  double deadband_yaw{0.03};
+  // 指数低通阻尼系数 alpha in (0, 1]：每次接受观测仅吸收一部分残差，消除阶跃跳变。
+  double lpf_alpha_translation{0.25};
+  double lpf_alpha_yaw{0.20};
+  // 进入平滑吸收后收敛到该残差内即贴齐并退出 settling，保证稳态无残差。
+  double settle_translation_tolerance{0.001};
+  double settle_yaw_tolerance{0.002};
+  // 相对 Point-LIO 帧间运动一致性门控：单次跳变超限时需连续一致确认才放行。
+  double motion_consistency_base_m{0.12};
+  double motion_consistency_ratio{0.05};
+  double motion_consistency_base_yaw{0.08};
+  int motion_jump_confirm_count{3};
+  double motion_jump_confirm_tolerance_m{0.04};
+  double motion_jump_confirm_tolerance_yaw{0.04};
+};
+
+inline tf2::Transform interpolateTransform(
+  const tf2::Transform & from, const tf2::Transform & to,
+  double alpha_translation, double alpha_yaw)
+{
+  const double at = std::clamp(alpha_translation, 0.0, 1.0);
+  const double ay = std::clamp(alpha_yaw, 0.0, 1.0);
+  tf2::Transform out;
+  out.setOrigin(from.getOrigin().lerp(to.getOrigin(), at));
+  tf2::Quaternion q = from.getRotation().slerp(to.getRotation(), ay);
+  q.normalize();
+  out.setRotation(q);
+  return out;
+}
+
 struct DirectionalFusionConfig
 {
   bool enable{true};

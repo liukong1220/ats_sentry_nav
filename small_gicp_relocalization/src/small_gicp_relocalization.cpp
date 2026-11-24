@@ -230,6 +230,12 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter(
     "degeneracy.weak_translation_eigenvalue", weak_translation_eigenvalue_threshold_);
   this->declare_parameter("degeneracy.weak_yaw_eigenvalue", weak_yaw_eigenvalue_threshold_);
+  this->declare_parameter(
+    "degeneracy.max_translation_condition_ratio", max_translation_condition_ratio_);
+  this->declare_parameter(
+    "degeneracy.weak_translation_per_inlier", weak_translation_per_inlier_threshold_);
+  this->declare_parameter("tracking_max_motion_residual", tracking_max_motion_residual_);
+  this->declare_parameter("tracking_max_prior_deviation", tracking_max_prior_deviation_);
   this->declare_parameter("scan_context.enable", scan_context_enable_);
   this->declare_parameter("scan_context.grid_step_xy", 2.0);
   this->declare_parameter("scan_context.max_radius_m", 15.0);
@@ -397,6 +403,16 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   weak_translation_eigenvalue_threshold_ = std::max(0.0, weak_translation_eigenvalue_threshold_);
   this->get_parameter("degeneracy.weak_yaw_eigenvalue", weak_yaw_eigenvalue_threshold_);
   weak_yaw_eigenvalue_threshold_ = std::max(0.0, weak_yaw_eigenvalue_threshold_);
+  this->get_parameter(
+    "degeneracy.max_translation_condition_ratio", max_translation_condition_ratio_);
+  max_translation_condition_ratio_ = std::max(0.0, max_translation_condition_ratio_);
+  this->get_parameter(
+    "degeneracy.weak_translation_per_inlier", weak_translation_per_inlier_threshold_);
+  weak_translation_per_inlier_threshold_ = std::max(0.0, weak_translation_per_inlier_threshold_);
+  this->get_parameter("tracking_max_motion_residual", tracking_max_motion_residual_);
+  tracking_max_motion_residual_ = std::max(0.0, tracking_max_motion_residual_);
+  this->get_parameter("tracking_max_prior_deviation", tracking_max_prior_deviation_);
+  tracking_max_prior_deviation_ = std::max(0.0, tracking_max_prior_deviation_);
 
   ScanContextConfig sc_cfg;
   this->get_parameter("scan_context.enable", scan_context_enable_);
@@ -1940,6 +1956,32 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
 
 
   const Eigen::Isometry3d candidate = attempt.transform;
+  if (has_accepted_alignment_ && follow_localization_status_ && !isRecoveringLocalization() &&
+      localization_state_ == ats_navigation_interfaces::msg::LocalizationStatus::STATE_TRACKING &&
+      !pending_confirmation_ && attempt.stage == "fine_only")
+  {
+    const bool motion_jump = tracking_max_motion_residual_ > 0.0 &&
+      std::isfinite(attempt.motion_residual) &&
+      attempt.motion_residual > tracking_max_motion_residual_;
+    const bool prior_jump = tracking_max_prior_deviation_ > 0.0 &&
+      std::isfinite(attempt.prior_deviation) &&
+      attempt.prior_deviation > tracking_max_prior_deviation_;
+    if (motion_jump || prior_jump) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), log_throttle_ms_,
+        "【GICP跟踪跳变拒绝】阶段=%s motion=%.3f(限%.3f) prior=%.3f(限%.3f) inliers=%zu cond=%.3g，保持当前锚点。",
+        attempt.stage.c_str(), attempt.motion_residual, tracking_max_motion_residual_,
+        attempt.prior_deviation, tracking_max_prior_deviation_, attempt.num_inliers,
+        attempt.information_condition_number);
+      publishObservation(
+        scan_time, false,
+        ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_REJECTED,
+        "tracking fine_only jump exceeded motion/prior gate", attempt.num_inliers,
+        attempt.registration_error, source_points, Eigen::Isometry3d::Identity(), covariance);
+      return;
+    }
+  }
+
   ConfirmationSample sample;
   sample.map_to_odom = candidate;
   sample.odom_to_base = *odom_to_robot_base;
@@ -2089,7 +2131,20 @@ void SmallGicpRelocalizationNode::handleRegistrationAttempt(
 
   const Se2DirectionalInformation se2_info = computeSe2SchurInformation(
     attempt.information, result_t_, *odom_to_robot_base,
-    weak_translation_eigenvalue_threshold_, weak_yaw_eigenvalue_threshold_);
+    weak_translation_eigenvalue_threshold_, weak_yaw_eigenvalue_threshold_,
+    attempt.num_inliers, max_translation_condition_ratio_,
+    weak_translation_per_inlier_threshold_);
+  if (log_registration_details_ || se2_info.degeneracy_mask != 0U) {
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), log_throttle_ms_,
+      "【SE2退化评估】inliers=%zu lam_min=%.1f lam_max=%.1f cond_xy=%.2f per_inlier=%.3f "
+      "yaw_info=%.1f mask=%u weak_dir=(%.2f,%.2f)",
+      attempt.num_inliers, se2_info.min_translation_eigenvalue,
+      se2_info.max_translation_eigenvalue, se2_info.translation_condition_ratio,
+      se2_info.min_translation_per_inlier, se2_info.yaw_marginal_information,
+      static_cast<unsigned>(se2_info.degeneracy_mask),
+      se2_info.weak_direction_x, se2_info.weak_direction_y);
+  }
   publishObservation(
     scan_time, true, ats_navigation_interfaces::msg::RelocalizationObservation::STATUS_ACCEPTED,
     "accepted:" + attempt.stage, attempt.num_inliers, attempt.registration_error, source_points,
@@ -2309,6 +2364,21 @@ void SmallGicpRelocalizationNode::localizationStatusCallback(
         (committed.translation() - growing_pending_transform_.translation()).norm());
       result_t_ = previous_result_t_ = committed;
       growing_pending_source_.clear();
+    }
+  }
+  if (!mapping_mode_ && has_accepted_alignment_ && !pending_confirmation_ && !odom_identity_latched_ &&
+    msg->observation_sequence > 0U &&
+    (msg->state == LS::STATE_TRACKING || msg->state == LS::STATE_CONFIRMED) &&
+    msg->map_to_odom_valid && msg->map_to_odom.header.frame_id == map_frame_ &&
+    msg->map_to_odom.child_frame_id == odom_frame_)
+  {
+    const auto & rotation = msg->map_to_odom.transform.rotation;
+    const Eigen::Quaterniond quaternion(rotation.w, rotation.x, rotation.y, rotation.z);
+    const auto committed = tf2::transformToEigen(msg->map_to_odom.transform);
+    if (committed.matrix().allFinite() && std::isfinite(quaternion.norm()) &&
+      std::abs(quaternion.norm() - 1.0) < 1e-6)
+    {
+      result_t_ = previous_result_t_ = committed;
     }
   }
   const std::uint8_t previous = localization_state_;

@@ -399,6 +399,10 @@ private:
   std::shared_ptr<PointKdTree> submap_target_tree_;
   double weak_translation_eigenvalue_threshold_{25.0};
   double weak_yaw_eigenvalue_threshold_{15.0};
+  double max_translation_condition_ratio_{8.0};
+  double weak_translation_per_inlier_threshold_{0.35};
+  double tracking_max_motion_residual_{0.25};
+  double tracking_max_prior_deviation_{0.25};
 
   // O5c: STATE_LOST 轻量 Scan Context 描述子召回。
   bool scan_context_enable_{true};

@@ -639,6 +639,9 @@ struct Se2DirectionalInformation
   std::array<double, 9> se2_information{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
   double min_se2_eigenvalue{0.0};
   double min_translation_eigenvalue{0.0};
+  double max_translation_eigenvalue{0.0};
+  double translation_condition_ratio{1.0};
+  double min_translation_per_inlier{0.0};
   double yaw_marginal_information{0.0};
   double weak_direction_x{1.0};
   double weak_direction_y{0.0};
@@ -648,12 +651,17 @@ struct Se2DirectionalInformation
 /// 将 small_gicp 在 odom 原点处的右扰动 6x6 Hessian [rx, ry, rz, tx, ty, tz]
 /// 精确换算到机器人底盘中心、map 系下的 [dx_b, dy_b, dz_b, dphi_x, dphi_y, dpsi_z]，
 /// 消除 odom 原点长力臂耦合，再对高度/横滚/俯仰做 Schur 补得到平面 SE(2) [x, y, yaw] 信息矩阵。
+/// O5b 双判据：除绝对特征值下限外，同时校验 SE(2) 平移块各向异性条件数比 (lambda_max / lambda_min)
+/// 与单位内点归一化信息 (lambda_min / num_inliers)，防止高内点数退化走廊绕过绝对阈值。
 inline Se2DirectionalInformation computeSe2SchurInformation(
   const Eigen::Matrix<double, 6, 6> & information_gicp,
   const Eigen::Isometry3d & map_to_odom,
   const Eigen::Isometry3d & odom_to_base,
   double weak_translation_threshold = 25.0,
-  double weak_yaw_threshold = 15.0)
+  double weak_yaw_threshold = 15.0,
+  std::size_t num_inliers = 0U,
+  double max_translation_condition_ratio = 8.0,
+  double weak_translation_per_inlier_threshold = 0.35)
 {
   Se2DirectionalInformation out;
   if (!information_gicp.allFinite() || !map_to_odom.matrix().allFinite() ||
@@ -718,15 +726,28 @@ inline Se2DirectionalInformation computeSe2SchurInformation(
   lambda_xy = 0.5 * (lambda_xy + lambda_xy.transpose());
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> xy_solver(lambda_xy);
   if (xy_solver.info() == Eigen::Success && xy_solver.eigenvalues().allFinite()) {
-    out.min_translation_eigenvalue = std::max(0.0, xy_solver.eigenvalues()(0));
+    const double lambda_min = std::max(0.0, xy_solver.eigenvalues()(0));
+    const double lambda_max = std::max(lambda_min, xy_solver.eigenvalues()(1));
+    out.min_translation_eigenvalue = lambda_min;
+    out.max_translation_eigenvalue = lambda_max;
+    out.translation_condition_ratio =
+      lambda_min > 1e-9 ? (lambda_max / lambda_min) : std::numeric_limits<double>::infinity();
+    out.min_translation_per_inlier =
+      num_inliers > 0U ? (lambda_min / static_cast<double>(num_inliers)) : lambda_min;
     const Eigen::Vector2d v_min = xy_solver.eigenvectors().col(0).normalized();
     if (v_min.allFinite()) {
       out.weak_direction_x = v_min.x();
       out.weak_direction_y = v_min.y();
     }
-    if (weak_translation_threshold > 0.0 &&
-      out.min_translation_eigenvalue < weak_translation_threshold)
-    {
+    const bool weak_abs =
+      weak_translation_threshold > 0.0 && lambda_min < weak_translation_threshold;
+    const bool weak_aniso =
+      max_translation_condition_ratio > 1.0 &&
+      !(out.translation_condition_ratio < max_translation_condition_ratio);
+    const bool weak_per_inlier =
+      num_inliers > 0U && weak_translation_per_inlier_threshold > 0.0 &&
+      out.min_translation_per_inlier < weak_translation_per_inlier_threshold;
+    if (weak_abs || weak_aniso || weak_per_inlier) {
       out.degeneracy_mask |= 1U;
     }
   }

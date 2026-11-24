@@ -478,7 +478,9 @@ int main(int argc, char ** argv)
 
         if (init_feats_world->size() >= init_map_size) {
           ivox_->AddPoints(init_feats_world->points);
-          publish_init_map(pub_laser_cloud_map);
+          if (pub_laser_cloud_map && pub_laser_cloud_map->get_subscription_count() > 0U) {
+            publish_init_map(pub_laser_cloud_map);
+          }
           init_feats_world.reset(new PointCloudXYZI());
           init_map = true;
         } else {
