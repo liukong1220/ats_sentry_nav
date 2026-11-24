@@ -45,7 +45,7 @@ void MincoTimeAllocator::setParams(const MincoTimeAllocatorParams & params)
 
 MincoTimeAllocation MincoTimeAllocator::allocate(
   const std::vector<Eigen::Vector2d> & waypoints, double initial_speed,
-  double terminal_speed) const
+  double terminal_speed, const std::vector<double> * waypoint_speed_caps) const
 {
   MincoTimeAllocation result;
   if (waypoints.size() < 2U) {
@@ -72,6 +72,14 @@ MincoTimeAllocation MincoTimeAllocator::allocate(
       waypoints[index - 1U], waypoints[index], waypoints[index + 1U]);
   }
   result.waypoint_speeds.assign(count, std::min(reference_speed, max_velocity));
+  if (waypoint_speed_caps != nullptr && waypoint_speed_caps->size() == count) {
+    for (std::size_t index = 0; index < count; ++index) {
+      const double cap = (*waypoint_speed_caps)[index];
+      if (std::isfinite(cap) && cap > 0.0) {
+        result.waypoint_speeds[index] = std::min(result.waypoint_speeds[index], cap);
+      }
+    }
+  }
   for (std::size_t index = 1; index + 1U < count; ++index) {
     const double curvature = std::abs(result.signed_curvatures[index]);
     if (curvature > 1e-9) {

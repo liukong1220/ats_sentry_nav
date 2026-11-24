@@ -294,6 +294,30 @@ std::vector<TunnelSegment> detectTunnelSegments(
       segment.coherence = std::max(
         segment.coherence, pca_coherence_sum / static_cast<double>(pca_count));
     }
+    // 对齐前按弧长平滑 2 阶轴向，消除 PCA 开关跳变或洞口梯度切换引入的单步角度阶跃。
+    if (count >= 3U) {
+      const double axis_smooth_window = std::max(0.45, smooth_window);
+      std::vector<double> smoothed_axis(count, 0.0);
+      for (std::size_t k = begin; k <= end; ++k) {
+        const std::size_t idx = k - begin;
+        const double center_s = trajectory.points[k].s;
+        double sum_c2 = 0.0;
+        double sum_s2 = 0.0;
+        for (std::size_t m = begin; m <= end; ++m) {
+          const double ds = std::abs(trajectory.points[m].s - center_s);
+          if (ds <= axis_smooth_window) {
+            const double w = 1.0 - 0.5 * (ds / axis_smooth_window);
+            const double a = segment.axis_yaw[m - begin];
+            sum_c2 += w * std::cos(2.0 * a);
+            sum_s2 += w * std::sin(2.0 * a);
+          }
+        }
+        smoothed_axis[idx] = std::hypot(sum_c2, sum_s2) > 1e-6 ?
+          normalize(0.5 * std::atan2(sum_s2, sum_c2)) :
+          segment.axis_yaw[idx];
+      }
+      segment.axis_yaw = std::move(smoothed_axis);
+    }
     const double start_s = trajectory.points.front().s;
     const bool approaching_from_outside =
       (trajectory.points[begin].s - start_s) > params.front_extent + 1e-6;
@@ -302,7 +326,8 @@ std::vector<TunnelSegment> detectTunnelSegments(
     if (segment.forward_alignment) {
       for (std::size_t k = begin; k <= end; ++k) {
         const std::size_t idx = k - begin;
-        segment.axis_yaw[idx] = tunnelAlignedYaw(segment.axis_yaw[idx], 0.0, tangent_yaws[idx]);
+        const double branch_ref = idx == 0U ? tangent_yaws[idx] : segment.axis_yaw[idx - 1U];
+        segment.axis_yaw[idx] = tunnelAlignedYaw(segment.axis_yaw[idx], 0.0, branch_ref);
       }
     }
     segments.push_back(std::move(segment));

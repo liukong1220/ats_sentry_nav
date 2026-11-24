@@ -364,8 +364,8 @@ void YawSplinePlanner::applyClearanceAware(
   }
   // 窄通道可能延续到最终位置。此时保留通道内的切线 yaw，再追加原地、
   // 限速的目标朝向过渡，避免 Navigate action 在位置到达后永久 tracking。
-  // 对于非最终目标的滚动局部子目标（且末点速度非零），不追加原地转向停顿。
-  if (is_final_goal || std::hypot(trajectory.points.back().vx, trajectory.points.back().vy) <= 0.05) {
+  // 对于非最终目标的滚动局部子目标，绝不追加原地转向停顿。
+  if (is_final_goal) {
     appendTerminalGoalYawTransition(trajectory, goal_yaw);
   }
 }

@@ -385,9 +385,25 @@ bool buildSidestepTerminalYawTurnaround(
     result.points.back().yaw_rate = 0.0;
   }
 
-  // Phase 3: hold goal_yaw while sliding back to exact terminal position.
-  const ReferencePoint & goal_point = input.points.back();
-  appendStraightSegment(goal_point.x, goal_point.y, goal_yaw);
+  // Phase 3: hold goal_yaw while returning to the path and finishing to the exact terminal position.
+  const std::size_t tail = terminalCoincidentTailStart(input);
+  if (anchor_index < tail) {
+    const ReferencePoint & anchor_point = input.points[anchor_index];
+    appendStraightSegment(anchor_point.x, anchor_point.y, goal_yaw);
+    const double dt_offset = result.points.back().t - anchor_point.t;
+    const double ds_offset = result.points.back().s - anchor_point.s;
+    for (std::size_t i = anchor_index + 1U; i <= tail; ++i) {
+      ReferencePoint point = input.points[i];
+      point.t += dt_offset;
+      point.s += ds_offset;
+      point.yaw = normalizeAngle(goal_yaw);
+      point.yaw_rate = 0.0;
+      result.points.push_back(point);
+    }
+  } else {
+    const ReferencePoint & goal_point = input.points.back();
+    appendStraightSegment(goal_point.x, goal_point.y, goal_yaw);
+  }
 
   freezeMotion(result.points.back());
   result.points.back().yaw = normalizeAngle(goal_yaw);

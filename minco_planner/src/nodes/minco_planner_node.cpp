@@ -435,6 +435,7 @@ void MincoPlannerNode::declareAndLoadParams()
     "reference_window_from_robot_progress", reference_window_from_robot_progress_);
   declare_parameter<double>("reference_window_backward_sec", reference_window_backward_sec_);
   declare_parameter<bool>("replan_advisory_enabled", replan_advisory_enabled_);
+  declare_parameter<int>("far_conflict_confirm_snapshots", far_conflict_confirm_snapshots_);
   declare_parameter<double>("plan_lead", replan_start_params_.plan_lead_sec);
   declare_parameter<double>("deviation_max", replan_start_params_.deviation_max_m);
   declare_parameter<double>("body_yaw_follow_clearance", body_yaw_follow_clearance_);
@@ -777,6 +778,8 @@ void MincoPlannerNode::declareAndLoadParams()
   get_parameter("retain_reference_horizon_sec", retain_reference_horizon_sec_);
   get_parameter("reference_window_from_robot_progress", reference_window_from_robot_progress_);
   get_parameter("replan_advisory_enabled", replan_advisory_enabled_);
+  get_parameter("far_conflict_confirm_snapshots", far_conflict_confirm_snapshots_);
+  far_conflict_confirm_snapshots_ = std::max(1, far_conflict_confirm_snapshots_);
   get_parameter("plan_lead", replan_start_params_.plan_lead_sec);
   replan_start_params_.plan_lead_sec = std::isfinite(replan_start_params_.plan_lead_sec) ?
     std::max(0.0, replan_start_params_.plan_lead_sec) : 0.0;
@@ -1206,6 +1209,10 @@ void MincoPlannerNode::declareAndLoadParams()
     optimizer_params.reference_speed;
   optimizer_params_cached_max_accel_ = optimizer_params.max_acceleration;
   optimizer_params_cached_lat_accel_ = optimizer_params.max_lateral_acceleration;
+  optimizer_params.clearance_speed_min = wheel_speed_time_scaling_params_.clearance_speed_min;
+  optimizer_params.clearance_speed_low = wheel_speed_time_scaling_params_.clearance_speed_low;
+  optimizer_params.clearance_speed_high = wheel_speed_time_scaling_params_.clearance_speed_high;
+  wheel_speed_time_scaling_params_.clearance_speed_max = optimizer_params_cached_speed_;
   optimizer_.setParams(optimizer_params);
   // 4 阶对称（切线 ±pi/2 等价）只对正方形足迹成立；非正方形时 ±pi/2 会把长边横进
   // 通道，这里回退到 2 阶，fail-closed。
@@ -1625,13 +1632,15 @@ void MincoPlannerNode::ingestMapSnapshot(
   std::string retain_reason;
   geometry_msgs::msg::PoseStamped progress_pose;
   std::optional<geometry_msgs::msg::Point> reference_conflict;
+  std::size_t far_collision_count = 0;
   // map->odom 在同一定位 epoch 内的连续修正不作废参考，检查按当前 TF 重新表达的参考。
   const ReferenceTrajectory retain_aligned = retain_candidate ?
     alignedToCurrentTf(*retain_candidate) : ReferenceTrajectory();
   const bool retain_verdict = retain_candidate &&
     retain_candidate->trajectory.header.frame_id == snapshot->grid.header.frame_id &&
     remainingReferenceSafeOn(
-      retain_aligned, snapshot->grid, &retain_reason, &progress_pose, &reference_conflict);
+      retain_aligned, snapshot->grid, &retain_reason, &progress_pose, &reference_conflict,
+      &far_collision_count);
   bool guide_blocked = false;
   if (replan_advisory_enabled_ && retain_verdict && retain_candidate->guide &&
     retain_candidate->guide_snapshot)
@@ -1646,8 +1655,9 @@ void MincoPlannerNode::ingestMapSnapshot(
     }
   }
   // 远端冲突、近端安全：继续执行并建议重规划，交给 10 Hz 运行期复检兜底近端。
-  const bool advise_replan = replan_advisory_enabled_ && retain_candidate &&
+  const bool far_conflict_raw = replan_advisory_enabled_ && retain_candidate &&
     (guide_blocked || (!retain_verdict && runtimeWindowSafeOn(retain_aligned, snapshot->grid)));
+  const bool far_conflict_severe = !retain_verdict && far_collision_count >= 4U;
   std::optional<ActiveSafetyReference> advised_reference;
   bool retained_reference = false;
   std::uint64_t retained_reference_goal = 0;
@@ -1678,7 +1688,7 @@ void MincoPlannerNode::ingestMapSnapshot(
           retain_candidate->goal_id, retain_candidate->localization_epoch,
           snapshot->generation, *reference_conflict};
       }
-      retained_reference = (retain_verdict || advise_replan) && replaces_existing_snapshot &&
+      retained_reference = (retain_verdict || far_conflict_raw) && replaces_existing_snapshot &&
         active_safety_reference_ && safety_state_.plan_safe &&
         safety_state_.mapSnapshotUsable(snapshot->generation) &&
         active_safety_reference_->goal_id == retain_candidate->goal_id &&
@@ -1691,14 +1701,30 @@ void MincoPlannerNode::ingestMapSnapshot(
       if (retained_reference) {
         active_safety_reference_->map_generation = snapshot->generation;
         retained_reference_goal = active_safety_reference_->goal_id;
-        if (advise_replan && (!replan_advised_reference_stamp_ ||
-          *replan_advised_reference_stamp_ != active_safety_reference_->trajectory.header.stamp))
-        {
-          replan_advised_reference_stamp_ = active_safety_reference_->trajectory.header.stamp;
-          advised_reference = active_safety_reference_;
+        if (far_conflict_raw) {
+          if (!far_conflict_reference_stamp_ ||
+            *far_conflict_reference_stamp_ != active_safety_reference_->trajectory.header.stamp)
+          {
+            far_conflict_reference_stamp_ = active_safety_reference_->trajectory.header.stamp;
+            far_conflict_streak_ = 0;
+          }
+          ++far_conflict_streak_;
+          const bool far_conflict_confirmed =
+            far_conflict_severe || far_conflict_streak_ >= far_conflict_confirm_snapshots_;
+          if (far_conflict_confirmed && (!replan_advised_reference_stamp_ ||
+            *replan_advised_reference_stamp_ != active_safety_reference_->trajectory.header.stamp))
+          {
+            replan_advised_reference_stamp_ = active_safety_reference_->trajectory.header.stamp;
+            advised_reference = active_safety_reference_;
+          }
+        } else {
+          far_conflict_streak_ = 0;
+          far_conflict_reference_stamp_.reset();
         }
       } else {
         active_safety_reference_.reset();
+        far_conflict_streak_ = 0;
+        far_conflict_reference_stamp_.reset();
       }
       next_map_generation_ = snapshot->generation;
       latest_map_snapshot_ = snapshot;
@@ -1817,8 +1843,12 @@ void MincoPlannerNode::onMapReadyWatchdog()
 bool MincoPlannerNode::remainingReferenceSafeOn(
   const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
   std::string * reason, geometry_msgs::msg::PoseStamped * progress_pose,
-  std::optional<geometry_msgs::msg::Point> * conflict)
+  std::optional<geometry_msgs::msg::Point> * conflict,
+  std::size_t * collision_count)
 {
+  if (collision_count) {
+    *collision_count = 0;
+  }
   if (trajectory.points.size() < 2) {
     if (reason) {
       *reason = "参考点不足";
@@ -1861,6 +1891,9 @@ bool MincoPlannerNode::remainingReferenceSafeOn(
   const bool shallow = escapePrefixContactAdmitted(
     remaining, escape, footprint_params_, grid, escape_prefix_params_);
   if (!shallow && !safety.collisions.empty()) {
+    if (collision_count) {
+      *collision_count = safety.collisions.size();
+    }
     const CollisionSample & first = safety.collisions.front();
     const ReferencePoint & center =
       remaining.points[std::min(first.trajectory_index, remaining.points.size() - 1U)];
@@ -2408,7 +2441,7 @@ void MincoPlannerNode::planGoal(
   // These are diagnostic-only products. They deliberately publish before the
   // candidate gate so a fail-closed rejection can still be attributed to a
   // geometry, ESDF, time-allocation, or dynamic-limit stage.
-  if (raw_path_pub_) {
+  if (raw_path_pub_ && raw_path_pub_->get_subscription_count() > 0) {
     raw_path_pub_->publish(search_result.path);
   }
   const double start_yaw = tf2::getYaw(start.pose.orientation);
@@ -2454,17 +2487,7 @@ void MincoPlannerNode::planGoal(
       const auto t0 = std::chrono::steady_clock::now();
       ReferenceTrajectory out = optimizer_.optimize(
         guide_path, esdf_ptr, yaw_ref, seed_ptr, &planning_grid, &safety_checker_,
-        out_trace, tail_ptr);
-      minco_wall_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t0).count();
-      return out;
-    };
-  const auto runContinuation = [&](
-    const nav_msgs::msg::Path & tail_path,
-    const InitialKinematicState & junction_state) {
-      const auto t0 = std::chrono::steady_clock::now();
-      ReferenceTrajectory out = optimizer_.buildContinuationTail(
-        tail_path, junction_state, &planning_grid, &safety_checker_);
+        out_trace, tail_ptr, map_snapshot->blocked_squared_cells.get());
       minco_wall_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
       return out;
@@ -2480,37 +2503,67 @@ void MincoPlannerNode::planGoal(
     };
 
   bool has_spliced_tail = false;
+  bool used_old_trajectory_splice = false;
+  nav_msgs::msg::Path active_guide_path = search_result.path;
+  double active_goal_yaw = goal_yaw;
+  bool active_is_final_goal = !search_result.partial;
   MincoOptimizationTrace selected_trace;
   ReferenceTrajectory center_reference;
 
-  // O2 局部滚动窗口 + C2 定时参考拼接：
-  // 当路径总长 > rolling_horizon_length_m + rolling_min_tail_length_m 时，优先对近端局部窗口
-  // 做完整 ESDF/足迹联合优化（允许非零末端速度/加速度），并 C2 无缝拼接至：
-  //   (A) 已提交安全参考轨迹的对应后段，或
-  //   (B) 轻量代数续接段（最终目标仍严格零速零加速度确定性停车）。
-  // 若拼接点落在窄隧道附近或拼接候选未过全路径矩形足迹门禁，自动回退至整条轨迹优化。
+  // O2 真局部滚动地平线 + C2 复用拼接：
+  // 当路径总长 > rolling_horizon_length_m + rolling_min_tail_length_m 时：
+  //   (A) 若已提交安全参考直达同一终点且后段仍安全，优先 C2 拼接至旧参考后段；
+  //   (B) 否则在隧道外且足迹可停的滚动地平线处截断为局部窗口（约 8~12 m，零速确定性停车），
+  //       仅对局部窗口跑完整 ESDF/足迹联合优化（~8-12 段，< 15 ms），同时保留全局引导供绕障
+  //       检测，由 GoalManager 在进入制动尾段前无停车滚动刷新下一窗口。
   const double total_guide_length = pathArcLength(search_result.path);
   if (rolling_horizon_enabled_ &&
     total_guide_length > rolling_horizon_length_m_ + rolling_min_tail_length_m_)
   {
-    double candidate_split_s = rolling_horizon_length_m_;
-    for (const auto & tunnel : guide_tunnels) {
-      if (tunnel.end < traced_guide.points.size()) {
-        const double entry_s = traced_guide.points[tunnel.begin].s - 1.5;
-        const double exit_s = traced_guide.points[tunnel.end].s + 1.5;
-        if (candidate_split_s >= entry_s && candidate_split_s <= exit_s) {
-          if (exit_s + rolling_min_tail_length_m_ < total_guide_length) {
-            candidate_split_s = exit_s;
-          } else if (entry_s > 2.5) {
-            candidate_split_s = entry_s;
+    auto avoidTunnels = [&](double split_s) {
+        for (const auto & tunnel : guide_tunnels) {
+          if (tunnel.end < traced_guide.points.size()) {
+            const double entry_s = traced_guide.points[tunnel.begin].s - 1.5;
+            const double exit_s = traced_guide.points[tunnel.end].s + 1.5;
+            if (split_s >= entry_s && split_s <= exit_s) {
+              if (exit_s + rolling_min_tail_length_m_ < total_guide_length &&
+                exit_s <= rolling_horizon_length_m_ + 4.0)
+              {
+                split_s = exit_s;
+              } else if (entry_s >= 4.0) {
+                split_s = entry_s;
+              } else if (exit_s + rolling_min_tail_length_m_ < total_guide_length) {
+                split_s = exit_s;
+              }
+            }
           }
         }
+        return split_s;
+      };
+    const double base_split_s = avoidTunnels(rolling_horizon_length_m_);
+    SplitGuideResult split;
+    const double offsets[] = {0.0, -0.5, 0.5, -1.0, 1.0, -1.5, 1.5};
+    for (const double delta : offsets) {
+      const double try_s = avoidTunnels(base_split_s + delta);
+      if (try_s < 3.5 || try_s + rolling_min_tail_length_m_ >= total_guide_length) {
+        continue;
+      }
+      SplitGuideResult cand = splitPathAtArcLength(
+        search_result.path, try_s, rolling_min_tail_length_m_);
+      if (!cand.valid) {
+        continue;
+      }
+      const double cand_yaw = std::atan2(cand.junction_tangent.y(), cand.junction_tangent.x());
+      if (goalPoseFootprintFree(
+          cand.junction_pos.x(), cand.junction_pos.y(), cand_yaw,
+          planning_grid, footprint_params_))
+      {
+        split = std::move(cand);
+        break;
       }
     }
-    SplitGuideResult split = splitPathAtArcLength(
-      search_result.path, candidate_split_s, rolling_min_tail_length_m_);
     if (split.valid) {
-      // (A) 优先尝试直接 C2 拼接到仍在执行且后段安全的旧参考轨迹。
+      // (A) 优先尝试直接 C2 拼接到仍在执行且直达最终目标的安全旧参考轨迹。
       if (committed_for_start && replan_frame_matches &&
         committed_for_start->trajectory.valid() &&
         !search_result.path.poses.empty())
@@ -2556,6 +2609,7 @@ void MincoPlannerNode::planGoal(
                     center_reference = std::move(spliced);
                     selected_trace = std::move(splice_trace);
                     has_spliced_tail = true;
+                    used_old_trajectory_splice = true;
                   }
                 }
               }
@@ -2563,58 +2617,13 @@ void MincoPlannerNode::planGoal(
           }
         }
       }
-      // (B) 无可复用旧参考后段时，用非零局部尾速度 + 快速代数续接段 C2 拼接至终点停车。
+      // (B) 真局部滚动窗口：仅对近端局部窗口跑完整 ESDF/足迹优化（末端安全零速停车），
+      // 保留完整全局引导用于远端绕障，由 GoalManager 在进入制动区前无停车滚动推进。
       if (!center_reference.valid()) {
-        const double remaining_after = std::max(0.0, split.total_length - split.split_s);
-        const double brake_accel = 0.70 * std::max(0.5, optimizer_params_cached_max_accel_);
-        const double brake_cap = std::sqrt(
-          std::max(0.0, 2.0 * brake_accel * std::max(0.0, remaining_after - 0.50)));
-        double junction_speed = std::min(
-          0.85 * std::max(0.1, optimizer_params_cached_speed_), brake_cap);
-        if (split.junction_turn_rad > 0.15) {
-          const double approx_kappa = split.junction_turn_rad / 1.2;
-          junction_speed = std::min(
-            junction_speed,
-            std::sqrt(std::max(0.2, optimizer_params_cached_lat_accel_) / approx_kappa));
-        }
-        if (clearance_esdf && clearance_esdf->available()) {
-          const double d_j = clearance_esdf->getDistance(
-            split.junction_pos.x(), split.junction_pos.y());
-          junction_speed = std::min(
-            junction_speed, clearanceSpeedLimit(d_j, wheel_speed_time_scaling_params_));
-          if (std::isfinite(d_j) && d_j < 0.65) {
-            junction_speed = std::min(junction_speed, 1.2);
-          }
-        }
-        TerminalKinematicState subgoal_tail;
-        subgoal_tail.valid = junction_speed > 0.05;
-        subgoal_tail.velocity = junction_speed * split.junction_tangent;
-        subgoal_tail.acceleration.setZero();
-        MincoOptimizationTrace prefix_trace;
-        ReferenceTrajectory local_prefix = runOptimize(
-          split.prefix, clearance_esdf.get(), nullptr, &prefix_trace,
-          subgoal_tail.valid ? &subgoal_tail : nullptr);
-        if (local_prefix.valid()) {
-          const ReferencePoint & end_pt = local_prefix.points.back();
-          InitialKinematicState junction_head;
-          junction_head.valid = true;
-          junction_head.velocity = Eigen::Vector2d(end_pt.vx, end_pt.vy);
-          junction_head.acceleration = Eigen::Vector2d(end_pt.ax, end_pt.ay);
-          ReferenceTrajectory alg_tail = runContinuation(split.suffix, junction_head);
-          if (alg_tail.valid()) {
-            ReferenceTrajectory spliced = spliceReferenceTrajectories(
-              local_prefix, alg_tail, local_prefix.totalTime());
-            if (spliced.valid()) {
-              spliced.header.stamp = now();
-              planYaw(spliced, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
-              if (safety_checker_.check(spliced, planning_grid, clearance_esdf.get()).safe) {
-                center_reference = std::move(spliced);
-                selected_trace = std::move(prefix_trace);
-                has_spliced_tail = true;
-              }
-            }
-          }
-        }
+        active_guide_path = std::move(split.prefix);
+        active_goal_yaw = std::atan2(split.junction_tangent.y(), split.junction_tangent.x());
+        active_is_final_goal = false;
+        has_spliced_tail = true;
       }
     }
   }
@@ -2624,12 +2633,25 @@ void MincoPlannerNode::planGoal(
     center_safety.safe = true;
   } else {
     center_reference = runOptimize(
-      search_result.path, clearance_esdf.get(), nullptr, &selected_trace, nullptr);
+      active_guide_path, clearance_esdf.get(), nullptr, &selected_trace, nullptr);
+    if (!center_reference.valid() && has_spliced_tail && !used_old_trajectory_splice) {
+      // 局部窗口求解失败时回退至整条路径一次，保证不因局部裁剪引入额外失败。
+      has_spliced_tail = false;
+      active_guide_path = search_result.path;
+      active_goal_yaw = goal_yaw;
+      active_is_final_goal = !search_result.partial;
+      center_reference = runOptimize(
+        active_guide_path, clearance_esdf.get(), nullptr, &selected_trace, nullptr);
+    }
   }
-  if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
+  if (preprocessed_guide_pub_ && preprocessed_guide_pub_->get_subscription_count() > 0 &&
+    !selected_trace.preprocessed_guide.poses.empty())
+  {
     preprocessed_guide_pub_->publish(selected_trace.preprocessed_guide);
   }
-  if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
+  if (esdf_refined_guide_pub_ && esdf_refined_guide_pub_->get_subscription_count() > 0 &&
+    !selected_trace.esdf_refined_guide.poses.empty())
+  {
     esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
   }
   if (!center_reference.valid()) {
@@ -2662,9 +2684,9 @@ void MincoPlannerNode::planGoal(
       map_snapshot->generation);
     return;
   }
-  if (!has_spliced_tail) {
+  if (!used_old_trajectory_splice) {
     center_reference.header.stamp = now();
-    planYaw(center_reference, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
+    planYaw(center_reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal);
     center_safety = safety_checker_.check(
       center_reference, planning_grid, clearance_esdf.get());
   }
@@ -2688,7 +2710,7 @@ void MincoPlannerNode::planGoal(
           return;
         }
         refined.header.stamp = now();
-        planYaw(refined, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
+        planYaw(refined, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal);
         FootprintSafetyResult refined_safety = safety_checker_.check(
           refined, planning_grid, clearance_esdf.get());
         if (refined_safety.collisions.size() > candidate_safety.collisions.size()) {
@@ -2703,18 +2725,19 @@ void MincoPlannerNode::planGoal(
   const bool need_footprint_refinement = !center_safety.safe ||
     center_min_clearance < footprint_refinement_skip_clearance_m_;
   if (optimizer_.esdfFootprintOptimizationEnabled() && need_footprint_refinement &&
-    !has_spliced_tail && !rollingBudgetExceeded())
+    !used_old_trajectory_splice && !rollingBudgetExceeded())
   {
     MincoOptimizationTrace footprint_trace;
     ReferenceTrajectory footprint_reference = runOptimize(
-      search_result.path, clearance_esdf.get(), &center_reference, &footprint_trace, nullptr);
+      active_guide_path, clearance_esdf.get(), &center_reference, &footprint_trace, nullptr);
     if (footprint_reference.valid()) {
       footprint_reference.header.stamp = now();
-      planYaw(footprint_reference, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
+      planYaw(
+        footprint_reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal);
       FootprintSafetyResult footprint_safety = safety_checker_.check(
         footprint_reference, planning_grid, clearance_esdf.get());
       refineFootprintYaw(
-        search_result.path, footprint_reference, footprint_safety, footprint_trace);
+        active_guide_path, footprint_reference, footprint_safety, footprint_trace);
       if (footprint_safety.safe || !center_safety.safe) {
         reference = std::move(footprint_reference);
         safety = std::move(footprint_safety);
@@ -2732,10 +2755,10 @@ void MincoPlannerNode::planGoal(
     // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
     MincoOptimizationTrace fallback_trace;
     ReferenceTrajectory fallback_reference = runOptimize(
-      search_result.path, nullptr, nullptr, &fallback_trace, nullptr);
+      active_guide_path, nullptr, nullptr, &fallback_trace, nullptr);
     if (fallback_reference.valid()) {
       fallback_reference.header.stamp = now();
-      planYaw(fallback_reference, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
+      planYaw(fallback_reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal);
       const FootprintSafetyResult fallback_safety = safety_checker_.check(
         fallback_reference, planning_grid, clearance_esdf.get());
       if (fallback_safety.safe) {
@@ -2795,7 +2818,7 @@ void MincoPlannerNode::planGoal(
       const nav_msgs::msg::Path repair_guide = toPath(reference);
       reference = std::move(repaired);
       reference.header.stamp = now();
-      planYaw(reference, *map_snapshot, start_yaw, goal_yaw, !search_result.partial);
+      planYaw(reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal);
       safety = safety_checker_.check(reference, planning_grid, clearance_esdf.get());
       refineFootprintYaw(repair_guide, reference, safety, repair_trace);
       selected_trace = std::move(repair_trace);
@@ -2813,7 +2836,7 @@ void MincoPlannerNode::planGoal(
     collisionsConfinedToTerminalApproach(
       reference, safety, terminal_yaw_relocation_params_.terminal_window_length) ||
     (relocation_tail_start == 0U && reference.points.size() >= 2U));
-  const bool tight_terminal_rotation = safety.safe &&
+  const bool tight_terminal_rotation = active_is_final_goal && safety.safe &&
     hasTightInPlaceTerminalRotation(
       reference, terminal_rotation_tight_yaw_span_rad_, comfortable_rotation_clearance_m);
   if (terminal_yaw_relocation_enabled_ &&
@@ -2893,8 +2916,8 @@ void MincoPlannerNode::planGoal(
         auto candidate_tunnels = detectTunnelSegments(
           candidate_center, *clearance_esdf, tunnel_yaw_params_);
         resolveTerminalTunnelGoalAlignment(
-          candidate_tunnels, candidate_center, goal_yaw,
-          !search_result.partial, tunnel_yaw_params_);
+          candidate_tunnels, candidate_center, active_goal_yaw,
+          active_is_final_goal, tunnel_yaw_params_);
         if (!forwardTunnelEntriesAligned(candidate, candidate_tunnels, tunnel_yaw_params_)) {
           rejected << label << ":tunnel_align;";
           return false;
@@ -2907,7 +2930,7 @@ void MincoPlannerNode::planGoal(
     for (const std::size_t rotation_index : candidates) {
       ReferenceTrajectory candidate;
       if (!relocateTerminalYawRotation(
-          reference, goal_yaw, rotation_index, terminal_yaw_relocation_params_, &candidate))
+          reference, active_goal_yaw, rotation_index, terminal_yaw_relocation_params_, &candidate))
       {
         rejected << rotation_index << ":build_failed;";
         continue;
@@ -2933,17 +2956,32 @@ void MincoPlannerNode::planGoal(
     }
 
     // 沿路径重定位全部失败或净空仍不足 comfortable_rotation_clearance_m 时，搜索附近开阔 ESDF 点进行全向侧移掉头。
+    // 若终点位于窄通道内（如贴壁掉头或进洞反转），额外尝试在起点静止/低速附近（anchor=0）先侧移掉头再沿原安全轨迹进洞。
     if ((!best_candidate || best_clearance < comfortable_rotation_clearance_m) &&
         clearance_esdf && clearance_esdf->available() && !reference.points.empty())
     {
-      const std::size_t anchor_index =
-        (reference.points[tail_start].s <= 0.60 && reference.points.front().v <= 0.15) ?
-        0U : tail_start;
-      const ReferencePoint & pivot = reference.points[anchor_index];
-      const ReferencePoint & goal_pt = reference.points.back();
-      const double yaw_diff = std::abs(std::atan2(
-        std::sin(goal_yaw - pivot.yaw), std::cos(goal_yaw - pivot.yaw)));
-      if (yaw_diff > 0.25 || !safety.safe) {
+      std::vector<std::size_t> anchor_indices;
+      if (tail_start == 0U ||
+          (reference.points[tail_start].s <= 0.60 && reference.points.front().v <= 0.15))
+      {
+        anchor_indices.push_back(0U);
+      } else {
+        anchor_indices.push_back(tail_start);
+        if (reference.points.front().v <= 0.25) {
+          anchor_indices.push_back(0U);
+        }
+      }
+      for (const std::size_t anchor_index : anchor_indices) {
+        if (best_candidate && best_clearance >= sidestep_accept_clearance_m_) {
+          break;
+        }
+        const ReferencePoint & pivot = reference.points[anchor_index];
+        const ReferencePoint & goal_pt = reference.points.back();
+        const double yaw_diff = std::abs(std::atan2(
+          std::sin(active_goal_yaw - pivot.yaw), std::cos(active_goal_yaw - pivot.yaw)));
+        if (yaw_diff <= 0.25 && safety.safe) {
+          continue;
+        }
         const double half_l = 0.5 * std::max(0.0, footprint_length_) + footprint_safety_margin_;
         const double half_w = 0.5 * std::max(0.0, footprint_width_) + footprint_safety_margin_;
         const double circumradius = std::hypot(half_l, half_w);
@@ -2992,8 +3030,10 @@ void MincoPlannerNode::planGoal(
               continue;
             }
             const double detour =
-              std::hypot(tx - pivot.x, ty - pivot.y) +
-              std::hypot(goal_pt.x - tx, goal_pt.y - ty);
+              anchor_index == 0U
+                ? (2.0 * std::hypot(tx - pivot.x, ty - pivot.y))
+                : (std::hypot(tx - pivot.x, ty - pivot.y) +
+                   std::hypot(goal_pt.x - tx, goal_pt.y - ty));
             spots.push_back({tx, ty, dist, detour, dist >= desired_esdf});
           }
         }
@@ -3014,17 +3054,17 @@ void MincoPlannerNode::planGoal(
           const auto & spot = spots[s_idx];
           ReferenceTrajectory candidate;
           if (!buildSidestepTerminalYawTurnaround(
-              reference, goal_yaw, anchor_index, spot.x, spot.y,
+              reference, active_goal_yaw, anchor_index, spot.x, spot.y,
               terminal_yaw_relocation_params_, &candidate))
           {
-            rejected << "sidestep" << s_idx << ":build_failed;";
+            rejected << "sidestep" << anchor_index << "_" << s_idx << ":build_failed;";
             continue;
           }
           ++built;
           FootprintSafetyResult candidate_safety;
           double candidate_clearance = -std::numeric_limits<double>::infinity();
           if (!evaluateCandidate(
-              candidate, "sidestep" + std::to_string(s_idx),
+              candidate, "sidestep" + std::to_string(anchor_index) + "_" + std::to_string(s_idx),
               candidate_safety, candidate_clearance))
           {
             continue;
@@ -3075,10 +3115,14 @@ void MincoPlannerNode::planGoal(
     }
   }
 
-  if (preprocessed_guide_pub_ && !selected_trace.preprocessed_guide.poses.empty()) {
+  if (preprocessed_guide_pub_ && preprocessed_guide_pub_->get_subscription_count() > 0 &&
+    !selected_trace.preprocessed_guide.poses.empty())
+  {
     preprocessed_guide_pub_->publish(selected_trace.preprocessed_guide);
   }
-  if (esdf_refined_guide_pub_ && !selected_trace.esdf_refined_guide.poses.empty()) {
+  if (esdf_refined_guide_pub_ && esdf_refined_guide_pub_->get_subscription_count() > 0 &&
+    !selected_trace.esdf_refined_guide.poses.empty())
+  {
     esdf_refined_guide_pub_->publish(selected_trace.esdf_refined_guide);
   }
   if (!reference.valid()) {
@@ -3239,15 +3283,34 @@ void MincoPlannerNode::planGoal(
           if (!tail_search.success || tail_search.path.poses.size() < 2U) {
             continue;
           }
+          nav_msgs::msg::Path tail_guide_path = tail_search.path;
+          double tail_goal_yaw = goal_yaw;
+          bool tail_is_final = !tail_search.partial;
+          bool tail_spliced = false;
+          if (rolling_horizon_enabled_ &&
+            pathArcLength(tail_guide_path) >
+              rolling_horizon_length_m_ + rolling_min_tail_length_m_)
+          {
+            SplitGuideResult tail_split = splitPathAtArcLength(
+              tail_guide_path, rolling_horizon_length_m_, rolling_min_tail_length_m_);
+            if (tail_split.valid) {
+              tail_guide_path = std::move(tail_split.prefix);
+              tail_goal_yaw = std::atan2(
+                tail_split.junction_tangent.y(), tail_split.junction_tangent.x());
+              tail_is_final = false;
+              tail_spliced = true;
+            }
+          }
           MincoOptimizationTrace tail_trace;
           ReferenceTrajectory tail_traj = optimizer_.optimize(
-            tail_search.path, clearance_esdf.get(), nullptr, nullptr,
-            &planning_grid, &safety_checker_, &tail_trace, nullptr);
+            tail_guide_path, clearance_esdf.get(), nullptr, nullptr,
+            &planning_grid, &safety_checker_, &tail_trace, nullptr,
+            map_snapshot->blocked_squared_cells.get());
           if (!tail_traj.valid()) {
             continue;
           }
           tail_traj.header.stamp = now();
-          planYaw(tail_traj, *map_snapshot, start_yaw, goal_yaw, !tail_search.partial);
+          planYaw(tail_traj, *map_snapshot, start_yaw, tail_goal_yaw, tail_is_final);
           ReferenceTrajectory combined = spliceReferenceTrajectories(
             backoff, tail_traj, backoff.totalTime());
           if (!combined.valid()) {
@@ -3265,6 +3328,11 @@ void MincoPlannerNode::planGoal(
             ax, ay, dist, start_d, ad, combined.points.size());
           reference = std::move(combined);
           safety = combined_safety;
+          if (tail_spliced) {
+            has_spliced_tail = true;
+            active_goal_yaw = tail_goal_yaw;
+            active_is_final_goal = false;
+          }
           selected_trace = std::move(tail_trace);
           escaped = true;
           break;
@@ -3390,7 +3458,7 @@ void MincoPlannerNode::planGoal(
     annotatePositionClearance(center, *map_snapshot);
     forward_tunnels = detectTunnelSegments(center, *clearance_esdf, tunnel_yaw_params_);
     resolveTerminalTunnelGoalAlignment(
-      forward_tunnels, center, goal_yaw, !search_result.partial, tunnel_yaw_params_);
+      forward_tunnels, center, active_goal_yaw, active_is_final_goal, tunnel_yaw_params_);
   }
   if (!forwardTunnelEntriesAligned(reference, forward_tunnels, tunnel_yaw_params_)) {
     std::size_t bad_index = 0U;
@@ -3467,16 +3535,17 @@ void MincoPlannerNode::planGoal(
       forward_tunnels.empty() ? nullptr : &forward_tunnels,
       &tunnel_yaw_params_);
     const bool attempted = spin_ok;
+    FootprintSafetyResult spun_safety;
     if (spin_ok) {
       applyWheelSpeedTimeScaling(spun, wheel_speed_time_scaling_params_);
       annotateClearance(spun, *map_snapshot);
-      spin_ok = spun.valid() &&
-        safety_checker_.check(spun, planning_grid, clearance_esdf.get()).safe &&
+      spun_safety = safety_checker_.check(spun, planning_grid, clearance_esdf.get());
+      spin_ok = spun.valid() && spun_safety.safe &&
         forwardTunnelEntriesAligned(spun, forward_tunnels, tunnel_yaw_params_);
     }
     if (spin_ok) {
       reference = std::move(spun);
-      safety = safety_checker_.check(reference, planning_grid, clearance_esdf.get());
+      safety = std::move(spun_safety);
       quality = quality_evaluator_.evaluate(
         reference, clearance_esdf.get(), footprintSamples(planning_grid),
         selected_trace.segment_durations);
@@ -3642,7 +3711,7 @@ void MincoPlannerNode::planGoal(
       tf2::getYaw(start.pose.orientation), start_gap, replan_start.vx, replan_start.vy,
       replan_start.ax, replan_start.ay, plan_ms, plan_wall_ms);
   }
-  if (marker_pub_) {
+  if (marker_pub_ && marker_pub_->get_subscription_count() > 0) {
     // Marker publication follows the immutable-snapshot commit, so the red
     // curve is exactly the safety-validated reference handed to MPC.
     marker_pub_->publish(visualizer_.buildMarkers(
@@ -3724,6 +3793,9 @@ void MincoPlannerNode::planYaw(
   // 窄通道判据必须用与 yaw 无关的位置净空:yaw 正是这一步要决定的量,拿 yaw 相关的
   // footprint 净空当输入构成循环依赖,而 annotateClearance 恰好是 yaw 相关的。
   annotatePositionClearance(trajectory, snapshot);
+  // 净空限速只依赖与 yaw 无关的中心净空，放在 yaw 规划之前执行：这样弯窄通道内已具备真实降速后的
+  // 时间步长 dt，避免高速时间网格下角加速度受限导致洞口/弯隧道内 yaw 跟踪滞后。
+  applyClearanceSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   std::vector<TunnelSegment> tunnel_segments;
   if (tunnel_yaw_params_.enabled && snapshot.clearance_esdf) {
     tunnel_segments = detectTunnelSegments(
@@ -3784,8 +3856,6 @@ void MincoPlannerNode::planYaw(
   applyWheelSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 窄通道边平移边转向时再放慢，压低 MPC 横向/yaw 跟踪误差；同样只改时间。
   applyNarrowTurnTimeScaling(trajectory, wheel_speed_time_scaling_params_);
-  // 离墙越近走得越慢（按中心净空），同样只改时间。
-  applyClearanceSpeedTimeScaling(trajectory, wheel_speed_time_scaling_params_);
   // 下游(yaw authority、轨迹质量评估、planned 记录)读的是 yaw 相关的 footprint 净空,
   // 所以 yaw 定下来之后再覆盖回 footprint 净空,对外语义不变。
   annotateClearance(trajectory, snapshot);
@@ -3811,15 +3881,24 @@ std::vector<Eigen::Vector2d> MincoPlannerNode::footprintSamples(
   const double resolution = std::max(0.02, static_cast<double>(grid.info.resolution));
   const int samples_x = std::max(2, static_cast<int>(std::ceil((2.0 * half_length) / resolution)));
   const int samples_y = std::max(2, static_cast<int>(std::ceil((2.0 * half_width) / resolution)));
+  // ESDF 对外部障碍的极小值落在矩形边界上，内部辅以中心及四象限采样点兼顾孤立内部障碍。
   std::vector<Eigen::Vector2d> samples;
-  samples.reserve(static_cast<std::size_t>((samples_x + 1) * (samples_y + 1)));
+  samples.reserve(static_cast<std::size_t>(2 * (samples_x + samples_y) + 5));
   for (int ix = 0; ix <= samples_x; ++ix) {
     const double x = -half_length + 2.0 * half_length * ix / static_cast<double>(samples_x);
-    for (int iy = 0; iy <= samples_y; ++iy) {
-      const double y = -half_width + 2.0 * half_width * iy / static_cast<double>(samples_y);
-      samples.emplace_back(x, y);
-    }
+    samples.emplace_back(x, -half_width);
+    samples.emplace_back(x, half_width);
   }
+  for (int iy = 1; iy < samples_y; ++iy) {
+    const double y = -half_width + 2.0 * half_width * iy / static_cast<double>(samples_y);
+    samples.emplace_back(-half_length, y);
+    samples.emplace_back(half_length, y);
+  }
+  samples.emplace_back(0.0, 0.0);
+  samples.emplace_back(-0.5 * half_length, -0.5 * half_width);
+  samples.emplace_back(-0.5 * half_length, 0.5 * half_width);
+  samples.emplace_back(0.5 * half_length, -0.5 * half_width);
+  samples.emplace_back(0.5 * half_length, 0.5 * half_width);
   return samples;
 }
 
@@ -4046,6 +4125,8 @@ void MincoPlannerNode::invalidatePlannerStatusLocked(
 
 void MincoPlannerNode::invalidateMapLocked() {
   reference_conflict_.reset();
+  far_conflict_streak_ = 0;
+  far_conflict_reference_stamp_.reset();
   ++map_health_epoch_;
   latest_map_snapshot_.reset();
   active_safety_reference_.reset();
@@ -4135,6 +4216,8 @@ bool MincoPlannerNode::publishReferenceIfCurrent(
     active_reference.control_reference = committed_reference;
   }
   active_safety_reference_ = std::move(active_reference);
+  far_conflict_streak_ = 0;
+  far_conflict_reference_stamp_.reset();
   if (planner_manages_emergency_stop_) {
     // Preserve the P2 stop-clear/reference ordering inside the same map lock.
     publishEmergencyStop(false);

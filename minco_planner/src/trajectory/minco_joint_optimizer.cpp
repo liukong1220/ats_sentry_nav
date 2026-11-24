@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "minco_planner/trajectory/minco_s3.hpp"
+#include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
 
 namespace minco_planner
 {
@@ -170,8 +171,12 @@ std::vector<Eigen::Vector2d> MincoJointOptimizer::resampleByArcLength(
     arc[index] = arc[index - 1U] + (polyline[index] - polyline[index - 1U]).norm();
   }
   const double length = arc.back();
+  // Paths >= 0.30 m need at least 2 pieces (>= 1 free interior waypoint) so MINCO
+  // L-BFGS can bend around corner/tunnel-mouth obstacles instead of being locked to
+  // a rigid 1-piece straight segment when length < 1.5 * spacing.
+  const int min_pieces = (length >= 0.30) ? 2 : 1;
   const int pieces = (spacing > 1e-6 && length > 1e-9) ?
-    std::max(1, static_cast<int>(std::lround(length / spacing))) : 1;
+    std::max(min_pieces, static_cast<int>(std::lround(length / spacing))) : 1;
 
   std::vector<Point> result;
   result.reserve(static_cast<std::size_t>(pieces + 1));
@@ -253,7 +258,6 @@ double MincoJointOptimizer::evaluate(
   const bool footprint_enabled = obstacle_enabled && static_cast<bool>(problem.yaw);
   const bool smooth_l1 = params_.obstacle_smooth_l1_weight > 0.0 &&
     params_.obstacle_smooth_l1_mu > 0.0;
-  const double max_speed_squared = params_.max_velocity * params_.max_velocity;
   const double max_acceleration_squared = params_.max_acceleration * params_.max_acceleration;
   const int samples = params_.samples_per_piece;
   const int guide_segments = static_cast<int>(problem.guide.size()) - 1;
@@ -307,13 +311,17 @@ double MincoJointOptimizer::evaluate(
           }
         };
 
+      bool has_center_distance = false;
+      double center_distance = 0.0;
+      Point center_distance_gradient = Point::Zero();
       if (center_enabled) {
-        double distance = 0.0;
-        Point distance_gradient = Point::Zero();
-        if (problem.distance(position, distance, distance_gradient) && std::isfinite(distance)) {
-          const double violation = params_.center_clearance - distance;
+        if (problem.distance(position, center_distance, center_distance_gradient) &&
+          std::isfinite(center_distance))
+        {
+          has_center_distance = true;
+          const double violation = params_.center_clearance - center_distance;
           if (violation > 0.0) {
-            addObstacle(violation, distance_gradient);
+            addObstacle(violation, center_distance_gradient);
             local.max_center_violation = std::max(local.max_center_violation, violation);
           }
         }
@@ -358,12 +366,27 @@ double MincoJointOptimizer::evaluate(
       }
 
       if (params_.max_velocity > 0.0) {
-        const double violation = velocity.squaredNorm() - max_speed_squared;
+        double local_v_max = params_.max_velocity;
+        double dv_max_dd = 0.0;
+        if (has_center_distance && params_.clearance_speed_min > 0.0 &&
+          params_.clearance_speed_high > params_.clearance_speed_low)
+        {
+          local_v_max = clearanceSpeedLimitAndDerivative(
+            center_distance, params_.clearance_speed_min,
+            params_.clearance_speed_low, params_.clearance_speed_high,
+            params_.max_velocity, &dv_max_dd);
+        }
+        const double local_v_max_sq = local_v_max * local_v_max;
+        const double violation = velocity.squaredNorm() - local_v_max_sq;
         if (violation > 0.0) {
           dynamics_penalty += params_.velocity_weight * cube(violation);
           grad_velocity += 6.0 * params_.velocity_weight * violation * violation * velocity;
+          if (dv_max_dd > 0.0) {
+            grad_position -= 6.0 * params_.velocity_weight * violation * violation *
+              local_v_max * dv_max_dd * center_distance_gradient;
+          }
           local.max_velocity_excess = std::max(
-            local.max_velocity_excess, velocity.norm() - params_.max_velocity);
+            local.max_velocity_excess, velocity.norm() - local_v_max);
         }
       }
       if (params_.max_acceleration > 0.0) {

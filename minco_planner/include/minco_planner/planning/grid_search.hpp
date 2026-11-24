@@ -100,8 +100,17 @@ private:
     bool uniform_neighborhood = false;
   };
 
+  struct OpenNode
+  {
+    int x = 0;
+    int y = 0;
+    double f = 0.0;
+    double g = 0.0;
+  };
+
   GridSearchParams params_;
   std::vector<Cell> cells_;
+  std::vector<OpenNode> open_buffer_;
   std::uint32_t generation_ = 0;
   int width_ = 0;
   int height_ = 0;

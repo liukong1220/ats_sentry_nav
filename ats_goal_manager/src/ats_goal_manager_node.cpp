@@ -230,6 +230,21 @@ public:
   }
 
 private:
+  enum class ReplanTriggerReason {
+    kFarObstacleConflict,
+    kEndpointRetarget,
+    kRollingReplan,
+  };
+
+  struct ReplanTriggerInfo {
+    ReplanTriggerReason reason{ReplanTriggerReason::kFarObstacleConflict};
+    double drift_m{0.0};
+    double threshold_m{0.0};
+    double distance_to_goal_m{0.0};
+    double advanced_m{0.0};
+    double dist_to_subgoal_m{0.0};
+  };
+
   struct ActiveGoal {
     std::uint64_t id{0};
     geometry_msgs::msg::PoseStamped target;
@@ -250,6 +265,9 @@ private:
     std::optional<geometry_msgs::msg::PoseStamped> committed_planning_target{std::nullopt};
     // 无停车重规划进行中：旧参考继续执行，expected_plan_request_sequence 指向新请求。
     bool replacement_pending{false};
+    ReplanTriggerReason pending_replan_reason{ReplanTriggerReason::kFarObstacleConflict};
+    std::optional<std::chrono::steady_clock::time_point> last_non_urgent_replan_time{std::nullopt};
+    std::optional<std::chrono::steady_clock::time_point> last_rolling_replan_fail_time{std::nullopt};
     double requested_position_tolerance{0.0};
     std::optional<geometry_msgs::msg::Point> last_rolling_commit_pos{std::nullopt};
     std::optional<rclcpp::Time> last_rolling_commit_time{std::nullopt};
@@ -297,6 +315,16 @@ private:
     require_accepted_localization_ = declare_parameter<bool>("require_accepted_localization", false);
     planner_start_in_planning_frame_ = declare_parameter<bool>("planner_start_in_planning_frame", false);
     retarget_threshold_ = std::max(0.0, declare_parameter<double>("retarget_threshold", 0.03));
+    retarget_cruise_threshold_ = std::max(
+        retarget_threshold_,
+        declare_parameter<double>("retarget_cruise_threshold", 0.20));
+    retarget_terminal_distance_m_ = std::max(
+        0.1, declare_parameter<double>("retarget_terminal_distance_m", 1.5));
+    retarget_cruise_distance_m_ = std::max(
+        retarget_terminal_distance_m_ + 0.1,
+        declare_parameter<double>("retarget_cruise_distance_m", 2.0));
+    replan_advised_cooldown_sec_ = std::max(
+        0.0, declare_parameter<double>("replan_advised_cooldown_sec", 1.5));
     map_transform_timeout_sec_ = std::max(0.1,
       declare_parameter<double>("map_transform_timeout_sec", 1.0));
     require_map_status_ = declare_parameter<bool>("require_map_status", true);
@@ -715,7 +743,9 @@ private:
     }
     if (message->state == PlannerStatus::STATE_ACCEPTED &&
         message->failure_reason == PlannerStatus::FAILURE_REPLAN_ADVISED) {
-      onReplanAdvised(*message);
+      ReplanTriggerInfo info;
+      info.reason = ReplanTriggerReason::kFarObstacleConflict;
+      onReplanAdvised(*message, info);
       return;
     }
     if (message->state == PlannerStatus::STATE_ACCEPTED &&
@@ -738,13 +768,19 @@ private:
         return;
       }
       // 无停车重规划的替换请求失败（规划器以 ACCEPTED 报告，旧参考仍受守护）：
-      // 清除替换标记继续执行，等待下一次建议。
+      // 清除替换标记并记录冷却时间，避免高频失败死循环。
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_ && active_goal_->replacement_pending &&
           active_goal_->id == message->goal_id &&
           active_goal_->localization_epoch == message->localization_epoch &&
           active_goal_->expected_plan_request_sequence == message->plan_request_sequence) {
         active_goal_->replacement_pending = false;
+        const auto failed_at = std::chrono::steady_clock::now();
+        if (active_goal_->pending_replan_reason == ReplanTriggerReason::kRollingReplan) {
+          active_goal_->last_rolling_replan_fail_time = failed_at;
+        } else {
+          active_goal_->last_non_urgent_replan_time = failed_at;
+        }
         RCLCPP_WARN(
           get_logger(),
           "【无停车重规划失败】目标=%llu 请求=%llu 原因=%u，继续执行当前参考。",
@@ -793,7 +829,26 @@ private:
     tryCommitReference();
   }
 
+  double effectiveRetargetThreshold(double distance_to_goal) const {
+    if (!std::isfinite(distance_to_goal) || distance_to_goal <= retarget_terminal_distance_m_) {
+      return retarget_threshold_;
+    }
+    if (distance_to_goal >= retarget_cruise_distance_m_) {
+      return retarget_cruise_threshold_;
+    }
+    const double ratio =
+      (distance_to_goal - retarget_terminal_distance_m_) /
+      std::max(1e-6, retarget_cruise_distance_m_ - retarget_terminal_distance_m_);
+    return retarget_threshold_ + ratio * (retarget_cruise_threshold_ - retarget_threshold_);
+  }
+
   void onReplanAdvised(const PlannerStatus & message) {
+    onReplanAdvised(message, ReplanTriggerInfo{});
+  }
+
+  void onReplanAdvised(
+      const PlannerStatus & message,
+      const ReplanTriggerInfo & trigger) {
     std::optional<geometry_msgs::msg::PoseStamped> target;
     std::uint64_t localization_epoch = 0;
     {
@@ -807,14 +862,58 @@ private:
           active_goal_->committed_plan_request_sequence != message.plan_request_sequence) {
         return;
       }
+      const auto steady_now = std::chrono::steady_clock::now();
+      if (trigger.reason == ReplanTriggerReason::kRollingReplan) {
+        if (active_goal_->last_rolling_replan_fail_time &&
+            steady_now - *active_goal_->last_rolling_replan_fail_time <
+            secondsToDuration(0.5)) {
+          return;
+        }
+      } else {
+        const bool terminal_retarget =
+          trigger.reason == ReplanTriggerReason::kEndpointRetarget &&
+          std::isfinite(trigger.distance_to_goal_m) &&
+          trigger.distance_to_goal_m <= retarget_terminal_distance_m_;
+        const double cooldown_sec = terminal_retarget
+          ? std::min(replan_advised_cooldown_sec_, 0.4)
+          : replan_advised_cooldown_sec_;
+        if (cooldown_sec > 0.0 && active_goal_->last_non_urgent_replan_time &&
+            steady_now - *active_goal_->last_non_urgent_replan_time <
+            secondsToDuration(cooldown_sec)) {
+          return;
+        }
+        active_goal_->last_non_urgent_replan_time = steady_now;
+      }
       active_goal_->replacement_pending = true;
+      active_goal_->pending_replan_reason = trigger.reason;
       target = active_goal_->target;
       localization_epoch = active_goal_->localization_epoch;
     }
-    RCLCPP_WARN(
-      get_logger(),
-      "【无停车重规划】目标=%llu 参考远端冲突，继续执行当前参考并从当前位姿重规划。",
-      static_cast<unsigned long long>(message.goal_id));
+    switch (trigger.reason) {
+      case ReplanTriggerReason::kEndpointRetarget:
+        RCLCPP_INFO(
+          get_logger(),
+          "【无停车重规划-目标重投影】目标=%llu 目标重投影偏移=%.3f m (阈值=%.3f m, 距目标=%.2f m)，"
+          "继续执行当前参考并重规划。",
+          static_cast<unsigned long long>(message.goal_id),
+          trigger.drift_m, trigger.threshold_m, trigger.distance_to_goal_m);
+        break;
+      case ReplanTriggerReason::kRollingReplan:
+        RCLCPP_INFO(
+          get_logger(),
+          "【无停车重规划-滚动推进】目标=%llu 已推进=%.2f m (距子目标=%.2f m, 距终点=%.2f m)，"
+          "继续执行当前参考并滚动重规划。",
+          static_cast<unsigned long long>(message.goal_id),
+          trigger.advanced_m, trigger.dist_to_subgoal_m, trigger.distance_to_goal_m);
+        break;
+      case ReplanTriggerReason::kFarObstacleConflict:
+      default:
+        RCLCPP_WARN(
+          get_logger(),
+          "【无停车重规划-远端障碍冲突】目标=%llu 参考远端冲突，继续执行当前参考并从当前位姿重规划。",
+          static_cast<unsigned long long>(message.goal_id));
+        break;
+    }
     if (!publishPlannerGoal(message.goal_id, localization_epoch, *target)) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_goal_ && active_goal_->id == message.goal_id) {
@@ -1427,6 +1526,7 @@ private:
       return;
     }
     std::optional<PlannerStatus> endpoint_retarget;
+    ReplanTriggerInfo endpoint_retarget_info;
     std::optional<ActiveGoal> snapshot;
     bool dispatch = false;
     bool cancel = false;
@@ -1618,15 +1718,28 @@ private:
             const auto & requested = active_goal_->committed_planning_target->pose.position;
             const double drift = std::hypot(requested.x - latest_target.pose.position.x,
               requested.y - latest_target.pose.position.y);
-            if (drift > retarget_threshold_) {
+            const double retarget_threshold = effectiveRetargetThreshold(distance);
+            const auto tick_steady_now = std::chrono::steady_clock::now();
+            const double retarget_cooldown = distance <= retarget_terminal_distance_m_
+              ? std::min(replan_advised_cooldown_sec_, 0.4)
+              : replan_advised_cooldown_sec_;
+            const bool retarget_cooldown_ok = retarget_cooldown <= 0.0 ||
+              !active_goal_->last_non_urgent_replan_time ||
+              (tick_steady_now - *active_goal_->last_non_urgent_replan_time) >=
+                secondsToDuration(retarget_cooldown);
+            if (drift > retarget_threshold && retarget_cooldown_ok) {
               endpoint_retarget = PlannerStatus();
               endpoint_retarget->goal_id = active_goal_->id;
               endpoint_retarget->localization_epoch = active_goal_->localization_epoch;
               endpoint_retarget->plan_request_sequence = active_goal_->committed_plan_request_sequence;
+              endpoint_retarget_info.reason = ReplanTriggerReason::kEndpointRetarget;
+              endpoint_retarget_info.drift_m = drift;
+              endpoint_retarget_info.threshold_m = retarget_threshold;
+              endpoint_retarget_info.distance_to_goal_m = distance;
               terminal_converged_since_.reset();
               reached = false;
               RCLCPP_INFO(get_logger(), "S3 endpoint retarget drift=%.4f threshold=%.4f goal=%llu map_tf_stamp_ns=%lld",
-                drift, retarget_threshold_, static_cast<unsigned long long>(active_goal_->id),
+                drift, retarget_threshold, static_cast<unsigned long long>(active_goal_->id),
                 static_cast<long long>(rclcpp::Time(latest_target.header.stamp).nanoseconds()));
             } else if (rolling_replan_enabled_ &&
               (active_execution_command_->is_partial_subgoal ||
@@ -1654,15 +1767,21 @@ private:
                 ((dist_to_subgoal <= subgoal_lookahead_m && advanced_m >= 0.35) ||
                  (latest_pub > active_goal_->last_rolling_publication_sequence &&
                   (advanced_m >= 0.4 * rolling_replan_advance_m_ || dist_to_subgoal <= 0.60)));
+              const double spliced_refresh_dist_m = std::max(4.5, rolling_replan_advance_m_ + 2.0);
               const bool spliced_trigger = !active_execution_command_->is_partial_subgoal &&
                 active_execution_command_->has_spliced_tail &&
-                advanced_m >= rolling_replan_advance_m_;
+                (advanced_m >= rolling_replan_advance_m_ ||
+                 dist_to_subgoal <= spliced_refresh_dist_m);
               if (period_ready && (partial_trigger || spliced_trigger)) {
                 endpoint_retarget = PlannerStatus();
                 endpoint_retarget->goal_id = active_goal_->id;
                 endpoint_retarget->localization_epoch = active_goal_->localization_epoch;
                 endpoint_retarget->plan_request_sequence =
                   active_goal_->committed_plan_request_sequence;
+                endpoint_retarget_info.reason = ReplanTriggerReason::kRollingReplan;
+                endpoint_retarget_info.distance_to_goal_m = distance;
+                endpoint_retarget_info.advanced_m = advanced_m;
+                endpoint_retarget_info.dist_to_subgoal_m = dist_to_subgoal;
                 terminal_converged_since_.reset();
                 reached = false;
               }
@@ -1873,7 +1992,7 @@ private:
       }
     }
     if (endpoint_retarget && !progress_replan && !progress_suspend_goal_id && !gimbal_recovery_goal_id) {
-      onReplanAdvised(*endpoint_retarget);
+      onReplanAdvised(*endpoint_retarget, endpoint_retarget_info);
     }
     if (progress_replan) {
       publishEmergencyStop(true);
@@ -2519,6 +2638,10 @@ private:
   bool planner_start_in_planning_frame_{false};
   bool has_accepted_localization_{false};
   double retarget_threshold_{0.03};
+  double retarget_cruise_threshold_{0.20};
+  double retarget_terminal_distance_m_{1.5};
+  double retarget_cruise_distance_m_{2.0};
+  double replan_advised_cooldown_sec_{1.5};
   double map_transform_timeout_sec_{1.0};
   bool require_map_status_{true};
   bool require_gimbal_status_{true};

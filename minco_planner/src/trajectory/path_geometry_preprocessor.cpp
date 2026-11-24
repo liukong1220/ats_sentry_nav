@@ -39,7 +39,8 @@ void PathGeometryPreprocessor::setParams(const PathGeometryPreprocessorParams & 
 PathGeometryResult PathGeometryPreprocessor::preprocess(
   const nav_msgs::msg::Path & raw_path,
   const nav_msgs::msg::OccupancyGrid * planning_grid,
-  const FootprintSafetyChecker * safety_checker) const
+  const FootprintSafetyChecker * safety_checker,
+  const std::vector<double> * precomputed_blocked_squared) const
 {
   PathGeometryResult result;
   std::vector<Eigen::Vector2d> unique;
@@ -60,15 +61,25 @@ PathGeometryResult PathGeometryPreprocessor::preprocess(
     return result;
   }
 
-  std::vector<double> blocked_squared;
+  std::vector<double> owned_blocked_squared;
+  const std::vector<double> * blocked_squared_ptr = nullptr;
   if (params_.shortcut_min_clearance > 0.0 && planning_grid && !planning_grid->data.empty() &&
     planning_grid->info.resolution > 0.0 && safety_checker)
   {
-    GridOccupancyPolicy policy;
-    policy.obstacle_value_threshold = safety_checker->params().obstacle_value_threshold;
-    policy.unknown_is_obstacle = safety_checker->params().unknown_is_obstacle;
-    blocked_squared = computeBlockedSquaredDistanceCells(*planning_grid, policy);
+    if (precomputed_blocked_squared != nullptr &&
+      precomputed_blocked_squared->size() == planning_grid->data.size())
+    {
+      blocked_squared_ptr = precomputed_blocked_squared;
+    } else {
+      GridOccupancyPolicy policy;
+      policy.obstacle_value_threshold = safety_checker->params().obstacle_value_threshold;
+      policy.unknown_is_obstacle = safety_checker->params().unknown_is_obstacle;
+      owned_blocked_squared = computeBlockedSquaredDistanceCells(*planning_grid, policy);
+      blocked_squared_ptr = &owned_blocked_squared;
+    }
   }
+  const std::vector<double> & blocked_squared =
+    blocked_squared_ptr != nullptr ? *blocked_squared_ptr : owned_blocked_squared;
 
   std::vector<Eigen::Vector2d> simplified;
   simplified.reserve(unique.size());

@@ -31,11 +31,12 @@ struct WheelSpeedTimeScalingParams
   double narrow_turn_yaw_rate_threshold = 0.2;
   // 按中心净空限速（m/s）；clearance_speed_min <= 0 关闭。中心净空 <= clearance_speed_low
   // 时平移速度不超过 clearance_speed_min，在 clearance_speed_low..clearance_speed_high
-  // 之间线性放开，>= clearance_speed_high 不限。离墙越近 MPC 横向误差越要小，而横向
-  // 误差随速度增大；这一项让余量小的位置走得慢。
+  // 之间光滑放开，>= clearance_speed_high 不限（或按 clearance_speed_max 上限）。
   double clearance_speed_min = 0.0;
   double clearance_speed_low = 0.0;
   double clearance_speed_high = 0.0;
+  // > 0 时使用与 MINCO 上游一致的 C1 光滑曲线衔接至 clearance_speed_max；<= 0 保持原 min/(1-u)。
+  double clearance_speed_max = 0.0;
 };
 
 // 四个舵轮中最大的轮速：轮心速度 = 车体平移速度 + wz x r。vx/vy 为世界系速度。
@@ -102,7 +103,11 @@ inline bool applyNarrowTurnTimeScaling(
   for (std::size_t i = 0; i < count; ++i) {
     const auto & point = trajectory.points[i];
     const double speed = std::hypot(point.vx, point.vy);
+    const double curvature = speed > 0.1 ?
+      std::abs(point.vx * point.ay - point.vy * point.ax) / (speed * speed * speed) : 0.0;
+    const bool tight_or_curving = point.clearance <= 0.45 || curvature >= 0.20;
     if (std::isfinite(point.clearance) && point.clearance <= params.narrow_turn_clearance &&
+      tight_or_curving &&
       std::abs(point.yaw_rate) > params.narrow_turn_yaw_rate_threshold &&
       speed > params.narrow_turn_speed_limit)
     {
@@ -116,6 +121,44 @@ inline bool applyNarrowTurnTimeScaling(
   return applyLocalTimeScaling(trajectory, factors, params.scale_change_rate);
 }
 
+// C1 光滑净空限速及其对净空的解析导数（供 MINCO 上游联合优化与后置限速同源使用）。
+// p(s) = s^3 (4 - 3 s)，在 s=0 与 s=1 处一阶导均为 0，单调递增且全局 C1。
+inline double clearanceSpeedLimitAndDerivative(
+  double clearance, double speed_min, double clearance_low, double clearance_high,
+  double speed_max, double * dlimit_dclearance = nullptr)
+{
+  if (dlimit_dclearance != nullptr) {
+    *dlimit_dclearance = 0.0;
+  }
+  if (speed_min <= 0.0 || !std::isfinite(clearance) || clearance_high <= clearance_low) {
+    return speed_max > 0.0 ? speed_max : std::numeric_limits<double>::infinity();
+  }
+  if (speed_max > 0.0) {
+    const double eff_min = std::min(speed_min, speed_max);
+    if (clearance <= clearance_low) {
+      return eff_min;
+    }
+    if (clearance >= clearance_high) {
+      return speed_max;
+    }
+    const double span = clearance_high - clearance_low;
+    const double s = (clearance - clearance_low) / span;
+    const double p = s * s * s * (4.0 - 3.0 * s);
+    if (dlimit_dclearance != nullptr) {
+      *dlimit_dclearance = (speed_max - eff_min) * (12.0 * s * s * (1.0 - s)) / span;
+    }
+    return eff_min + (speed_max - eff_min) * p;
+  }
+  if (clearance >= clearance_high) {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (clearance <= clearance_low) {
+    return speed_min;
+  }
+  const double u = (clearance - clearance_low) / (clearance_high - clearance_low);
+  return speed_min / std::max(1e-3, 1.0 - u);
+}
+
 // 净空 c 处允许的平移速度上限；关闭或净空未知（NaN）时返回 +inf。
 inline double clearanceSpeedLimit(double clearance, const WheelSpeedTimeScalingParams & params)
 {
@@ -127,13 +170,9 @@ inline double clearanceSpeedLimit(double clearance, const WheelSpeedTimeScalingP
   if (clearance >= params.clearance_speed_high) {
     return std::numeric_limits<double>::infinity();
   }
-  if (clearance <= params.clearance_speed_low) {
-    return params.clearance_speed_min;
-  }
-  // 上限按 min / (1 - u) 增长：u 从 0 到 1 时从 min 单调趋于无穷，在 high 处与"不限速"连续衔接。
-  const double u = (clearance - params.clearance_speed_low) /
-    (params.clearance_speed_high - params.clearance_speed_low);
-  return params.clearance_speed_min / std::max(1e-3, 1.0 - u);
+  return clearanceSpeedLimitAndDerivative(
+    clearance, params.clearance_speed_min, params.clearance_speed_low,
+    params.clearance_speed_high, params.clearance_speed_max);
 }
 
 // 按中心净空的局部放慢：位置与 yaw 序列不变，只改时间参数化。返回是否修改了轨迹。

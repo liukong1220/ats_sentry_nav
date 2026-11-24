@@ -55,7 +55,8 @@ public:
   PathGeometryResult preprocess(
     const nav_msgs::msg::Path & raw_path,
     const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
-    const FootprintSafetyChecker * safety_checker = nullptr) const;
+    const FootprintSafetyChecker * safety_checker = nullptr,
+    const std::vector<double> * precomputed_blocked_squared = nullptr) const;
 
 private:
   bool shortcutSafe(

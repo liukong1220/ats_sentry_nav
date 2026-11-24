@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <queue>
 
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -30,23 +29,6 @@ int sign(int value)
 {
   return (value > 0) - (value < 0);
 }
-
-struct QueueNode
-{
-  Index index;
-  double f;
-  double g;
-};
-
-struct QueueNodeCompare
-{
-  bool prefer_progress;
-
-  bool operator()(const QueueNode & a, const QueueNode & b) const
-  {
-    return prefer_progress && a.f == b.f ? a.g < b.g : a.f > b.f;
-  }
-};
 
 constexpr Index kNeighbors8[] = {
   {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
@@ -246,16 +228,20 @@ GridSearchResult GridSearch::plan(
   first.parent = -1;
   first.g = 0.0;
   first.escape_steps = 0;
-  std::priority_queue<QueueNode, std::vector<QueueNode>, QueueNodeCompare> open(
-    QueueNodeCompare{jump});
-  open.push({start_index, heuristic(start_index), 0.0});
+  open_buffer_.clear();
+  const auto compare_open = [jump](const OpenNode & a, const OpenNode & b) {
+      return jump && a.f == b.f ? a.g < b.g : a.f > b.f;
+    };
+  open_buffer_.push_back({start_index.x, start_index.y, heuristic(start_index), 0.0});
   int best_stop = -1;
   double best_remaining = std::numeric_limits<double>::infinity();
   geometry_msgs::msg::PoseStamped stop_pose;
 
-  while (!open.empty()) {
-    const Index current = open.top().index;
-    open.pop();
+  while (!open_buffer_.empty()) {
+    std::pop_heap(open_buffer_.begin(), open_buffer_.end(), compare_open);
+    const OpenNode top = open_buffer_.back();
+    open_buffer_.pop_back();
+    const Index current{top.x, top.y};
     const int current_id = linear(current);
     auto & cell = cells_[current_id];
     if (cell.closed == generation_) {
@@ -358,7 +344,8 @@ GridSearchResult GridSearch::plan(
       successor.parent = current_id;
       successor.g = tentative_g;
       successor.escape_steps = escape_edge ? cell.escape_steps + 1 : 0;
-      open.push({next, tentative_g + heuristic(next), tentative_g});
+      open_buffer_.push_back({next.x, next.y, tentative_g + heuristic(next), tentative_g});
+      std::push_heap(open_buffer_.begin(), open_buffer_.end(), compare_open);
     }
   }
 

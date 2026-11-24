@@ -14,6 +14,7 @@
 #include "minco_planner/trajectory/consistent_distance_field.hpp"
 #include "minco_planner/trajectory/minco_joint_optimizer.hpp"
 #include "minco_planner/trajectory/minco_s3.hpp"
+#include "minco_planner/trajectory/wheel_speed_time_scaling.hpp"
 #include "ats_rc_esdf/esdf/rc_traversability_esdf_provider.hpp"
 
 namespace minco_planner
@@ -243,11 +244,46 @@ bool queryFootprintEsdf(
   return found;
 }
 
+std::vector<Point> makeBoundaryFootprintSamples(
+  double length,
+  double width,
+  double safety_margin,
+  double spacing)
+{
+  const double half_length = 0.5 * std::max(0.0, length) + std::max(0.0, safety_margin);
+  const double half_width = 0.5 * std::max(0.0, width) + std::max(0.0, safety_margin);
+  const double sample_spacing = std::max(0.02, spacing);
+  const int samples_x = std::max(
+    2, static_cast<int>(std::ceil((2.0 * half_length) / sample_spacing)));
+  const int samples_y = std::max(
+    2, static_cast<int>(std::ceil((2.0 * half_width) / sample_spacing)));
+  std::vector<Point> samples;
+  samples.reserve(static_cast<std::size_t>(2 * (samples_x + samples_y) + 5));
+  for (int ix = 0; ix <= samples_x; ++ix) {
+    const double x = -half_length + 2.0 * half_length * ix / static_cast<double>(samples_x);
+    samples.emplace_back(x, -half_width);
+    samples.emplace_back(x, half_width);
+  }
+  for (int iy = 1; iy < samples_y; ++iy) {
+    const double y = -half_width + 2.0 * half_width * iy / static_cast<double>(samples_y);
+    samples.emplace_back(-half_length, y);
+    samples.emplace_back(half_length, y);
+  }
+  samples.emplace_back(0.0, 0.0);
+  samples.emplace_back(-0.5 * half_length, -0.5 * half_width);
+  samples.emplace_back(-0.5 * half_length, 0.5 * half_width);
+  samples.emplace_back(0.5 * half_length, -0.5 * half_width);
+  samples.emplace_back(0.5 * half_length, 0.5 * half_width);
+  return samples;
+}
+
 double minimumSampleClearance(
   const MincoS3 & minco,
-  double sample_dt,
+  const std::vector<Point> & waypoints,
+  double spatial_spacing,
   const ats_rc_esdf::RcTraversabilityEsdfProvider & esdf,
   bool footprint_aware,
+  double circumradius,
   const ReferenceTrajectory * footprint_orientation,
   const std::vector<Point> & footprint_samples)
 {
@@ -262,19 +298,41 @@ double minimumSampleClearance(
     }());
   for (int piece = 0; piece < minco.pieceCount(); ++piece) {
     const double duration = minco.pieceDuration(piece);
-    const int steps = std::max(2, static_cast<int>(std::ceil(duration / sample_dt)));
+    const double chord = (piece + 1 < static_cast<int>(waypoints.size())) ?
+      (waypoints[static_cast<std::size_t>(piece + 1)] - waypoints[static_cast<std::size_t>(piece)]).norm() :
+      spatial_spacing;
+    const int steps = std::clamp(
+      static_cast<int>(std::ceil(chord / spatial_spacing)), 2, 8);
     for (int step = 0; step <= steps; ++step) {
       const double local_time = duration * static_cast<double>(step) / steps;
       const MincoSample sample = minco.sample(piece, local_time);
-      ats_rc_esdf::EsdfQueryResult query;
-      const bool query_ok = footprint_aware ? queryFootprintEsdf(
-        esdf, sample.position, interpolateReferenceYaw(
-          *footprint_orientation, (elapsed_duration + local_time) / total_duration),
-        footprint_samples, query) : esdf.query(sample.position.x(), sample.position.y(), query);
-      if (!query_ok || !std::isfinite(query.distance)) {
+      const double center_dist = esdf.getDistance(sample.position.x(), sample.position.y());
+      if (!std::isfinite(center_dist)) {
         return -std::numeric_limits<double>::infinity();
       }
-      minimum = std::min(minimum, query.distance);
+      if (!footprint_aware) {
+        minimum = std::min(minimum, center_dist);
+        continue;
+      }
+      // 距离场 1-Lipschitz：若外接圆下界已优于当前最小值，矩形内所有采样点必不更小。
+      if (center_dist - circumradius >= minimum) {
+        continue;
+      }
+      const double yaw = interpolateReferenceYaw(
+        *footprint_orientation, (elapsed_duration + local_time) / total_duration);
+      const double cos_yaw = std::cos(yaw);
+      const double sin_yaw = std::sin(yaw);
+      double pose_min = std::numeric_limits<double>::infinity();
+      for (const Point & offset : footprint_samples) {
+        const double d = esdf.getDistance(
+          sample.position.x() + cos_yaw * offset.x() - sin_yaw * offset.y(),
+          sample.position.y() + sin_yaw * offset.x() + cos_yaw * offset.y());
+        if (!std::isfinite(d)) {
+          return -std::numeric_limits<double>::infinity();
+        }
+        pose_min = std::min(pose_min, d);
+      }
+      minimum = std::min(minimum, pose_min);
     }
     elapsed_duration += duration;
   }
@@ -371,11 +429,13 @@ std::vector<Point> refineWaypointsWithEsdf(
   std::vector<Point> original_waypoints = input_waypoints;
   std::vector<Point> waypoints = original_waypoints;
   bool inserted_clearance_controls = false;
-  const double reference_speed = std::max(0.05, params.reference_speed);
-  const double sample_dt = std::max(0.02, params.sample_spacing * 0.5) / reference_speed;
+  const double spatial_spacing = std::max(0.06, params.sample_spacing);
+  const double circumradius = std::hypot(
+    0.5 * std::max(0.0, params.footprint_length) + std::max(0.0, params.footprint_safety_margin),
+    0.5 * std::max(0.0, params.footprint_width) + std::max(0.0, params.footprint_safety_margin));
   const MincoTimeAllocator time_allocator = makeTimeAllocator(params);
   const std::vector<Point> footprint_samples = footprint_aware ?
-    makeRectangularFootprintSamples(
+    makeBoundaryFootprintSamples(
     params.footprint_length, params.footprint_width, params.footprint_safety_margin,
     params.esdf_footprint_sample_spacing) : std::vector<Point> {};
 
@@ -404,10 +464,20 @@ std::vector<Point> refineWaypointsWithEsdf(
     bool needs_correction = false;
     for (int piece = 0; piece < minco.pieceCount(); ++piece) {
       const double duration = minco.pieceDuration(piece);
-      const int steps = std::max(2, static_cast<int>(std::ceil(duration / sample_dt)));
+      const double chord = (piece + 1 < static_cast<int>(waypoints.size())) ?
+        (waypoints[static_cast<std::size_t>(piece + 1)] - waypoints[static_cast<std::size_t>(piece)]).norm() :
+        spatial_spacing;
+      const int steps = std::clamp(
+        static_cast<int>(std::ceil(chord / spatial_spacing)), 2, 8);
       for (int step = 1; step < steps; ++step) {
         const double fraction = static_cast<double>(step) / steps;
         const MincoSample sample = minco.sample(piece, duration * fraction);
+        if (footprint_aware) {
+          const double center_dist = esdf->getDistance(sample.position.x(), sample.position.y());
+          if (std::isfinite(center_dist) && center_dist - circumradius >= trigger_clearance) {
+            continue;
+          }
+        }
         ats_rc_esdf::EsdfQueryResult query;
         const bool query_ok = footprint_aware ? queryFootprintEsdf(
           *esdf, sample.position,
@@ -499,7 +569,8 @@ std::vector<Point> refineWaypointsWithEsdf(
       break;
     }
     const double current_minimum = minimumSampleClearance(
-      minco, sample_dt, *esdf, footprint_aware, footprint_orientation, footprint_samples);
+      minco, waypoints, spatial_spacing, *esdf, footprint_aware, circumradius,
+      footprint_orientation, footprint_samples);
     bool accepted = false;
     for (int backtrack = 0; backtrack <= std::max(0, params.esdf_obstacle_backtracking_steps);
       ++backtrack)
@@ -518,7 +589,8 @@ std::vector<Point> refineWaypointsWithEsdf(
         continue;
       }
       const double trial_minimum = minimumSampleClearance(
-        trial_minco, sample_dt, *esdf, footprint_aware, footprint_orientation, footprint_samples);
+        trial_minco, trial, spatial_spacing, *esdf, footprint_aware, circumradius,
+        footprint_orientation, footprint_samples);
       if (trial_minimum + 1e-6 >= current_minimum) {
         waypoints = std::move(trial);
         accepted = true;
@@ -609,6 +681,9 @@ MincoJointOptimizerParams makeJointParams(const MincoTrajectoryOptimizerParams &
     std::max(0.05, params.reference_speed);
   joint.max_acceleration = params.max_acceleration;
   joint.max_lateral_acceleration = params.max_lateral_acceleration;
+  joint.clearance_speed_min = params.clearance_speed_min;
+  joint.clearance_speed_low = params.clearance_speed_low;
+  joint.clearance_speed_high = params.clearance_speed_high;
   joint.center_clearance = params.joint_center_clearance;
   joint.footprint_clearance = params.joint_footprint_clearance;
   joint.footprint_length = params.footprint_length;
@@ -651,7 +726,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   const nav_msgs::msg::OccupancyGrid * planning_grid,
   const FootprintSafetyChecker * safety_checker,
   MincoOptimizationTrace * trace,
-  const TerminalKinematicState * terminal_state) const
+  const TerminalKinematicState * terminal_state,
+  const std::vector<double> * precomputed_blocked_squared) const
 {
   ReferenceTrajectory trajectory;
   const auto optimization_started = std::chrono::steady_clock::now();
@@ -684,7 +760,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
     };
   PathGeometryPreprocessor preprocessor(params_.geometry_preprocessor);
   const PathGeometryResult preprocessing = preprocessor.preprocess(
-    raw_path, planning_grid, safety_checker);
+    raw_path, planning_grid, safety_checker, precomputed_blocked_squared);
   std::vector<Point> waypoints = preprocessing.waypoints;
   if (trace) {
     trace->preprocessed_guide = preprocessing.guide_path;
@@ -761,8 +837,27 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimizeOnce(
   waypoints = MincoJointOptimizer::resampleByArcLength(
     waypoints, std::max(0.05, params_.joint_waypoint_spacing));
   const MincoTimeAllocator time_allocator = makeTimeAllocator(params_);
+  std::vector<double> waypoint_speed_caps;
+  const std::vector<double> * speed_caps_ptr = nullptr;
+  if (esdf && esdf->available() && params_.clearance_speed_min > 0.0 &&
+    params_.clearance_speed_high > params_.clearance_speed_low)
+  {
+    const double alloc_v_max = params_.max_velocity > 0.0 ?
+      std::min(params_.max_velocity, std::max(0.05, params_.reference_speed)) :
+      std::max(0.05, params_.reference_speed);
+    waypoint_speed_caps.reserve(waypoints.size());
+    for (const Point & wp : waypoints) {
+      const double dist = esdf->getDistance(wp.x(), wp.y());
+      waypoint_speed_caps.push_back(
+        clearanceSpeedLimitAndDerivative(
+          dist, params_.clearance_speed_min, params_.clearance_speed_low,
+          params_.clearance_speed_high, alloc_v_max));
+    }
+    speed_caps_ptr = &waypoint_speed_caps;
+  }
   const MincoTimeAllocation initial_allocation = time_allocator.allocate(
-    waypoints, head_state.col(1).norm(), has_tail_state ? tail_state.col(1).norm() : 0.0);
+    waypoints, head_state.col(1).norm(), has_tail_state ? tail_state.col(1).norm() : 0.0,
+    speed_caps_ptr);
   if (!initial_allocation.valid) {
     finishTrace("time_allocation_invalid");
     return trajectory;
@@ -1023,7 +1118,8 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
   const nav_msgs::msg::OccupancyGrid * planning_grid,
   const FootprintSafetyChecker * safety_checker,
   MincoOptimizationTrace * trace,
-  const TerminalKinematicState * terminal_state) const
+  const TerminalKinematicState * terminal_state,
+  const std::vector<double> * precomputed_blocked_squared) const
 {
   static constexpr double kSeedLadder[] = {1.0, 0.5, 0.25, 0.0};
   const bool head_seeded = initial_state != nullptr && initial_state->valid &&
@@ -1055,7 +1151,7 @@ ReferenceTrajectory MincoTrajectoryOptimizer::optimize(
     }
     result = optimizeOnce(
       raw_path, esdf, footprint_orientation, head_seed, planning_grid, safety_checker,
-      &attempt_trace, tail_seed);
+      &attempt_trace, tail_seed, precomputed_blocked_squared);
     attempt_trace.seed_scale = kSeedLadder[rung];
     const bool dynamic_failure = attempt_trace.failure_reason == "dynamic_limits_unsatisfied" ||
       attempt_trace.failure_reason == "dynamic_scaling_non_contractive";
@@ -1073,13 +1169,14 @@ ReferenceTrajectory MincoTrajectoryOptimizer::buildContinuationTail(
   const nav_msgs::msg::Path & tail_path,
   const InitialKinematicState & junction_state,
   const nav_msgs::msg::OccupancyGrid * planning_grid,
-  const FootprintSafetyChecker * safety_checker) const
+  const FootprintSafetyChecker * safety_checker,
+  const std::vector<double> * precomputed_blocked_squared) const
 {
   ReferenceTrajectory trajectory;
   trajectory.header = tail_path.header;
   PathGeometryPreprocessor preprocessor(params_.geometry_preprocessor);
   const PathGeometryResult preprocessing = preprocessor.preprocess(
-    tail_path, planning_grid, safety_checker);
+    tail_path, planning_grid, safety_checker, precomputed_blocked_squared);
   std::vector<Point> waypoints = preprocessing.waypoints;
   if (waypoints.size() < 2U) {
     return trajectory;

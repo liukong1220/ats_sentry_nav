@@ -127,6 +127,10 @@ struct MincoTrajectoryOptimizerParams
   // 因此对播种量做保守裁剪：速度上限 [m/s]，加速度上限 [m/s^2]。
   double initial_state_max_speed = 2.0;
   double initial_state_max_acceleration = 2.5;
+  // 上游按中心净空限速（与后置 clearance_speed_* 同源 C1 曲线，<= 0 关闭）。
+  double clearance_speed_min = 0.0;
+  double clearance_speed_low = 0.0;
+  double clearance_speed_high = 0.0;
 };
 
 /**
@@ -229,7 +233,8 @@ public:
     const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
     const FootprintSafetyChecker * safety_checker = nullptr,
     MincoOptimizationTrace * trace = nullptr,
-    const TerminalKinematicState * terminal_state = nullptr) const;
+    const TerminalKinematicState * terminal_state = nullptr,
+    const std::vector<double> * precomputed_blocked_squared = nullptr) const;
 
   /**
    * @brief O2 快速代数续接段生成（带状 LU + 动力学时间缩放，不跑 L-BFGS），用于在局部滚动窗口
@@ -239,7 +244,8 @@ public:
     const nav_msgs::msg::Path & tail_path,
     const InitialKinematicState & junction_state,
     const nav_msgs::msg::OccupancyGrid * planning_grid = nullptr,
-    const FootprintSafetyChecker * safety_checker = nullptr) const;
+    const FootprintSafetyChecker * safety_checker = nullptr,
+    const std::vector<double> * precomputed_blocked_squared = nullptr) const;
 
 private:
   // 单次优化（原 optimize 的全部内容）；optimize 在它外面套首尾种子回退。
@@ -251,7 +257,8 @@ private:
     const nav_msgs::msg::OccupancyGrid * planning_grid,
     const FootprintSafetyChecker * safety_checker,
     MincoOptimizationTrace * trace,
-    const TerminalKinematicState * terminal_state) const;
+    const TerminalKinematicState * terminal_state,
+    const std::vector<double> * precomputed_blocked_squared) const;
 
   MincoTrajectoryOptimizerParams params_;
 };

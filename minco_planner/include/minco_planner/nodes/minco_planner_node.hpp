@@ -162,7 +162,8 @@ private:
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
     std::string * reason = nullptr, geometry_msgs::msg::PoseStamped * progress_pose = nullptr,
-    std::optional<geometry_msgs::msg::Point> * conflict = nullptr);
+    std::optional<geometry_msgs::msg::Point> * conflict = nullptr,
+    std::size_t * collision_count = nullptr);
   // 车当前推进位置起 runtime_safety_horizon_sec 内的参考在 grid 上是否安全（与运行期复检同判据）。
   bool runtimeWindowSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid);
@@ -243,6 +244,10 @@ private:
   bool replan_advisory_enabled_{false};
   // 已发过建议的参考（以参考戳标识），每条参考只建议一次；对应的重规划请求保留旧参考守护。
   std::optional<builtin_interfaces::msg::Time> replan_advised_reference_stamp_;
+  // 远端 1-3 格弱冲突或仅全局引导冲突需连续确认的独立快照数（近端安全窗口仍零延迟急停）。
+  int far_conflict_confirm_snapshots_{2};
+  int far_conflict_streak_{0};
+  std::optional<builtin_interfaces::msg::Time> far_conflict_reference_stamp_;
   // 无停车重规划的新参考起点取自正在执行的已提交轨迹（调研报告附录 A.3），而不是请求时
   // 的实测位姿：规划耗时内车已前行，实测起点落在车后面。plan_lead / deviation_max 见参数。
   ReplanStartParams replan_start_params_{};

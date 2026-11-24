@@ -56,6 +56,10 @@ struct MincoJointOptimizerParams
   double max_velocity = 1.5;
   double max_acceleration = 2.5;
   double max_lateral_acceleration = 1.5;
+  // 净空感知局部速度上限（与后置 clearance_speed_* 同源 C1 曲线；min <= 0 关闭）。
+  double clearance_speed_min = 0.0;
+  double clearance_speed_low = 0.0;
+  double clearance_speed_high = 0.0;
   // 低于该速度不计横向加速度罚（|v×a|/|v| 在 v→0 处无定义）。
   double lateral_min_speed = 0.10;
   // 中心点 ESDF 净空目标 [m]，与 JPS safe_distance 对齐；<= 0 关闭。
