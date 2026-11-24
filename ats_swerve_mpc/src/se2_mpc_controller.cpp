@@ -34,6 +34,72 @@ double maxOctagonEquivalentSpeed(const std::array<Eigen::Vector2d, 4> &velocitie
   return max_equiv;
 }
 
+/**
+ * @brief 计算与 LtvQpCandidateValidator 严格同源的旋转系速度+惯性加速度硬盒 [box_lo, box_hi]。
+ * @details 盒内任意控制均严格满足 |u| <= max_v 且 |u - R(-wz*dt)*u_prev| <= max_a * dt；
+ *          因盒为凸集，盒内任意两点的凸组合必然仍留在盒内。
+ */
+void computeRotatingAccelBox(const Control &previous, double step_dt,
+                             const Se2MpcConfig &config,
+                             Control &carried_previous, Control &box_lo,
+                             Control &box_hi) {
+  const Control max_delta(config.max_ax * step_dt,
+                          config.max_ay * step_dt,
+                          config.max_awz * step_dt);
+  carried_previous = rotateControlLinear(previous, previous(2) * step_dt);
+  const Control max_vel(config.max_vx, config.max_vy, config.max_wz);
+  for (int axis = 0; axis < 3; ++axis) {
+    box_lo(axis) = std::max(-max_vel(axis), carried_previous(axis) - max_delta(axis));
+    box_hi(axis) = std::min(max_vel(axis), carried_previous(axis) + max_delta(axis));
+    if (box_lo(axis) > box_hi(axis)) {
+      const double clamped = std::clamp(carried_previous(axis), -max_vel(axis), max_vel(axis));
+      box_lo(axis) = clamped;
+      box_hi(axis) = clamped;
+    }
+  }
+}
+
+Control clampToBox(const Control &u, const Control &box_lo, const Control &box_hi) {
+  Control out;
+  for (int axis = 0; axis < 3; ++axis) {
+    out(axis) = std::clamp(u(axis), box_lo(axis), box_hi(axis));
+  }
+  return out;
+}
+
+/**
+ * @brief 检查控制量的多步可持续可行性（持久可行域/viability）：
+ *        高速平移同时高速自旋时，四舵轮在惯性直行滑行下的向心滚速加速度
+ *        a_cent = (v_lin * r_max * wz^2) / hypot(v_lin, r_max * |wz|) 不得超过单轮驱动加速度上限，
+ *        且旋转不变轮速上界 v_lin + r_max * |wz| <= max_wheel_speed，
+ *        防止预测时域某一步进入“下一步在旋转系加速度盒内无可行轮速增量”的死胡同。
+ *        纯直线高速（wz=0）与纯原地自旋（v_lin=0）均零受限。
+ */
+bool isPersistentlyViable(const Control &u, const Se2MpcConfig &config) {
+  const double r_max =
+      std::hypot(std::max(0.0, config.wheel_base_x), std::max(0.0, config.wheel_base_y));
+  if (r_max <= 1e-6) {
+    return true;
+  }
+  const double v_lin = std::hypot(u(0), u(1));
+  const double w = std::abs(u(2));
+  if (v_lin <= 1e-6 || w <= 1e-6) {
+    return true;
+  }
+  const double rw = r_max * w;
+  if (config.max_wheel_acceleration > 1e-6) {
+    const double a_cent = (v_lin * rw * w) / std::hypot(v_lin, rw);
+    if (a_cent > 0.90 * config.max_wheel_acceleration) {
+      return false;
+    }
+  }
+  if (config.max_wheel_speed > 1e-6 &&
+      (v_lin + rw) > config.max_wheel_speed + 1e-9) {
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 /** @brief 只把 yaw 前推 yaw_rate * delay / 2；无补偿量时原样返回以保持逐位一致。 */
@@ -170,15 +236,35 @@ std::vector<Control> Se2MpcController::buildNominalControls(
       const double post_oct =
           maxOctagonEquivalentSpeed(moduleVelocities(candidate));
       if (post_oct > config_.max_wheel_speed) {
-        // 沿 previous -> candidate 收缩至八边形内（previous 若已在八边形内则恒可达）。
-        const double prev_oct =
-            maxOctagonEquivalentSpeed(moduleVelocities(previous));
-        if (prev_oct <= config_.max_wheel_speed) {
+        // 在旋转系加速度盒内寻找满足八边形与模块增量的锚点，沿 anchor -> candidate 收缩，
+        // 避免 previous 落在盒外时把名义控制拉出惯性加速度约束盒。
+        Control carried_prev;
+        Control box_lo;
+        Control box_hi;
+        computeRotatingAccelBox(previous, step_dt, config_, carried_prev,
+                                box_lo, box_hi);
+        const std::array<Control, 3> oct_anchors{{
+            clampToBox(previous, box_lo, box_hi),
+            clampToBox(carried_prev, box_lo, box_hi),
+            clampToBox(Control::Zero(), box_lo, box_hi),
+        }};
+        bool found_anchor = false;
+        Control anchor = oct_anchors[0];
+        for (const auto &a : oct_anchors) {
+          if (maxOctagonEquivalentSpeed(moduleVelocities(a)) <=
+                  config_.max_wheel_speed &&
+              moduleIncrementFeasible(a, previous, step_dt)) {
+            anchor = a;
+            found_anchor = true;
+            break;
+          }
+        }
+        if (found_anchor) {
           double lo = 0.0;
           double hi = 1.0;
           for (int it = 0; it < 16; ++it) {
             const double mid = 0.5 * (lo + hi);
-            const Control trial = previous + mid * (candidate - previous);
+            const Control trial = anchor + mid * (candidate - anchor);
             if (maxOctagonEquivalentSpeed(moduleVelocities(trial)) <=
                     config_.max_wheel_speed &&
                 moduleIncrementFeasible(trial, previous, step_dt)) {
@@ -187,9 +273,11 @@ std::vector<Control> Se2MpcController::buildNominalControls(
               hi = mid;
             }
           }
-          candidate = previous + lo * (candidate - previous);
+          candidate = anchor + lo * (candidate - anchor);
         } else {
-          candidate *= (config_.max_wheel_speed * (1.0 - 1e-6)) / post_oct;
+          candidate = clampToBox(
+              candidate * ((config_.max_wheel_speed * (1.0 - 1e-6)) / post_oct),
+              box_lo, box_hi);
         }
       }
       if (step == 0) {
@@ -370,35 +458,188 @@ Control Se2MpcController::clampIncrement(const Control &target,
   const Control max_delta(config_.max_ax * step_dt,
                           config_.max_ay * step_dt,
                           config_.max_awz * step_dt);
-  const Control carried_previous =
-      rotateControlLinear(previous, previous(2) * step_dt);
-  // 同时限制速度幅值和每个 step_dt 内的惯性增量。
-  Control delta = target - carried_previous;
+  Control carried_previous;
+  Control box_lo;
+  Control box_hi;
+  computeRotatingAccelBox(previous, step_dt, config_, carried_previous,
+                          box_lo, box_hi);
+
+  // 记录车体速度上限与单轮速度上限触及诊断（与原语义一致）。
+  Control raw_in_accel = carried_previous;
   for (int axis = 0; axis < 3; ++axis) {
-    delta(axis) = std::clamp(delta(axis), -max_delta(axis), max_delta(axis));
+    raw_in_accel(axis) +=
+        std::clamp(target(axis) - carried_previous(axis), -max_delta(axis), max_delta(axis));
   }
-  const Control limited = clampControl(carried_previous + delta, report);
-  if (moduleIncrementFeasible(limited, previous, step_dt)) {
-    return limited;
+  const Control box_target = clampToBox(target, box_lo, box_hi);
+  if (report != nullptr) {
+    if (std::abs(raw_in_accel(0)) > config_.max_vx + 1e-9 ||
+        std::abs(raw_in_accel(1)) > config_.max_vy + 1e-9 ||
+        std::abs(raw_in_accel(2)) > config_.max_wz + 1e-9) {
+      report->body = true;
+    }
+    if (config_.max_wheel_speed > 1e-6 &&
+        maxModuleSpeed(box_target) > config_.max_wheel_speed + 1e-9) {
+      report->wheel = true;
+    }
   }
+
+  const auto isStrictlyAdmissible = [this, &previous, step_dt](const Control &u) {
+    return moduleIncrementFeasible(u, previous, step_dt) &&
+           isPersistentlyViable(u, config_);
+  };
+
+  // 快速路径：盒内目标直接满足全部模块增量与可持续可行性。
+  if (isStrictlyAdmissible(box_target)) {
+    return box_target;
+  }
+
+  // 若仅因轮速超限未通过，尝试单轮缩放并投影回旋转系加速度盒。
+  if (config_.max_wheel_speed > 1e-6 &&
+      maxModuleSpeed(box_target) > config_.max_wheel_speed + 1e-9) {
+    const Control wheel_clamped =
+        clampToBox(clampControl(box_target, nullptr), box_lo, box_hi);
+    if (isStrictlyAdmissible(wheel_clamped)) {
+      return wheel_clamped;
+    }
+  }
+
   if (increment_limited != nullptr) {
     *increment_limited = true;
   }
 
-  // 沿上一控制到候选控制做保守线搜索，保持四轮速度向量来自同一车体 Twist。
-  double feasible_scale = 0.0;
-  double infeasible_scale = 1.0;
-  const int bisection_iters = std::max(1, config_.clamp_bisection_iterations);
-  for (int iteration = 0; iteration < bisection_iters; ++iteration) {
-    const double scale = 0.5 * (feasible_scale + infeasible_scale);
-    const Control candidate = previous + scale * (limited - previous);
-    if (moduleIncrementFeasible(candidate, previous, step_dt)) {
-      feasible_scale = scale;
-    } else {
-      infeasible_scale = scale;
+  // 计算单点模块级违约量（仅在极罕见回退选优时使用）。
+  const auto previous_velocities = moduleVelocities(previous);
+  const auto moduleViolation = [this, &previous_velocities,
+                                step_dt](const Control &cand) -> double {
+    const auto cand_vel = moduleVelocities(cand);
+    const double max_speed_delta = config_.max_wheel_acceleration * step_dt;
+    const double max_steer_delta = config_.max_steer_rate * step_dt;
+    constexpr double kSteerAngleMinSpeed = 0.01;
+    double viol = 0.0;
+    for (std::size_t i = 0; i < cand_vel.size(); ++i) {
+      const double cs = cand_vel[i].norm();
+      const double ps = previous_velocities[i].norm();
+      if (config_.max_wheel_speed > 1e-6) {
+        viol = std::max(viol, cs - config_.max_wheel_speed);
+      }
+      double cosine = 1.0;
+      const bool both_moving = cs > 1e-4 && ps > 1e-4;
+      if (both_moving) {
+        cosine = std::clamp(cand_vel[i].dot(previous_velocities[i]) / (cs * ps),
+                            -1.0, 1.0);
+        if (config_.max_steer_rate > 1e-6 && cs > kSteerAngleMinSpeed &&
+            ps > kSteerAngleMinSpeed) {
+          viol = std::max(viol, std::acos(std::abs(cosine)) - max_steer_delta);
+        }
+      }
+      if (config_.max_wheel_acceleration > 1e-6) {
+        const double rd = both_moving
+                              ? (cosine >= 0.0 ? std::abs(cs - ps) : (cs + ps))
+                              : (cand_vel[i] - previous_velocities[i]).norm();
+        viol = std::max(viol, rd - max_speed_delta);
+      }
+    }
+    return viol;
+  };
+
+  // 在凸盒 [box_lo, box_hi] 内寻找可行锚点，避免高速转弯时 previous 落于盒外导致
+  // 二分回退破坏旋转系惯性加速度硬约束。
+  const Control p_box = clampToBox(previous, box_lo, box_hi);
+  const Control cp_box = clampToBox(carried_previous, box_lo, box_hi);
+  const Control z_box = clampToBox(Control::Zero(), box_lo, box_hi);
+  const std::array<Control, 8> anchors{{
+      p_box,
+      cp_box,
+      clampToBox(clampControl(p_box, nullptr), box_lo, box_hi),
+      clampToBox(clampControl(cp_box, nullptr), box_lo, box_hi),
+      Control(p_box(0), p_box(1), z_box(2)),
+      Control(cp_box(0), cp_box(1), z_box(2)),
+      Control(z_box(0), z_box(1), p_box(2)),
+      z_box,
+  }};
+
+  bool found_strict_anchor = false;
+  Control anchor = p_box;
+  Control best_mod_cand = p_box;
+  double best_mod_viol = 1e9;
+  for (const auto &c : anchors) {
+    if (isStrictlyAdmissible(c)) {
+      anchor = c;
+      found_strict_anchor = true;
+      break;
+    }
+    const double v = moduleViolation(c);
+    if (v < best_mod_viol) {
+      best_mod_viol = v;
+      best_mod_cand = c;
     }
   }
-  return clampControl(previous + feasible_scale * (limited - previous), report);
+
+  // 极罕见兜底：对盒内 3x3x3 网格做低开销扫描，确保只要可行交集非空必找到盒内锚点。
+  if (!found_strict_anchor) {
+    constexpr std::array<double, 3> kFracs{{0.0, 0.5, 1.0}};
+    for (double fx : kFracs) {
+      const double ux = box_lo(0) + fx * (box_hi(0) - box_lo(0));
+      for (double fy : kFracs) {
+        const double uy = box_lo(1) + fy * (box_hi(1) - box_lo(1));
+        for (double fz : kFracs) {
+          const double uz = box_lo(2) + fz * (box_hi(2) - box_lo(2));
+          const Control c(ux, uy, uz);
+          if (isStrictlyAdmissible(c)) {
+            anchor = c;
+            found_strict_anchor = true;
+            break;
+          }
+          const double v = moduleViolation(c);
+          if (v < best_mod_viol) {
+            best_mod_viol = v;
+            best_mod_cand = c;
+          }
+        }
+        if (found_strict_anchor) {
+          break;
+        }
+      }
+      if (found_strict_anchor) {
+        break;
+      }
+    }
+  }
+
+  const int bisection_iters = std::max(1, config_.clamp_bisection_iterations);
+  if (found_strict_anchor) {
+    // 沿盒内锚点 anchor -> box_target 二分：两端点均在凸盒内，全线段恒满足惯性加速度与速度盒约束。
+    double feasible_scale = 0.0;
+    double infeasible_scale = 1.0;
+    for (int iteration = 0; iteration < bisection_iters; ++iteration) {
+      const double scale = 0.5 * (feasible_scale + infeasible_scale);
+      const Control candidate = anchor + scale * (box_target - anchor);
+      if (isStrictlyAdmissible(candidate)) {
+        feasible_scale = scale;
+      } else {
+        infeasible_scale = scale;
+      }
+    }
+    return anchor + feasible_scale * (box_target - anchor);
+  }
+
+  // 若上一控制本身来自外部非持久可行状态，仍优先保证当拍硬模块约束与盒约束。
+  if (best_mod_viol <= 1e-9) {
+    double feasible_scale = 0.0;
+    double infeasible_scale = 1.0;
+    for (int iteration = 0; iteration < bisection_iters; ++iteration) {
+      const double scale = 0.5 * (feasible_scale + infeasible_scale);
+      const Control candidate =
+          best_mod_cand + scale * (box_target - best_mod_cand);
+      if (moduleIncrementFeasible(candidate, previous, step_dt)) {
+        feasible_scale = scale;
+      } else {
+        infeasible_scale = scale;
+      }
+    }
+    return best_mod_cand + feasible_scale * (box_target - best_mod_cand);
+  }
+  return best_mod_cand;
 }
 
 /**

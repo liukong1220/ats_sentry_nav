@@ -215,6 +215,7 @@ private:
   double rollout_slowdown_clearance_m_ = 0.05;
   double rollout_min_slowdown_scale_ = 0.45;
   double rollout_hard_stop_penetration_m_ = 0.06;
+  double last_rollout_horizon_scale_ = 1.0;
   int qp_rti_iterations_ = 2;
   double qp_rti_second_pass_delta_threshold_ = 0.15;
   std::string command_topic_;

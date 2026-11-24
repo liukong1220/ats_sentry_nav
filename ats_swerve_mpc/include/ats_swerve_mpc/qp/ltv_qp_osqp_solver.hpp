@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -68,7 +69,7 @@ private:
                                   std::vector<OSQPFloat> &upper);
   bool copyLtvNumericalValues(const LtvQpProblem &problem);
   LtvQpSolveResult solvePrepared(
-      int horizon,
+      int horizon, const LtvQpProblem *ltv_problem,
       const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start,
       std::chrono::steady_clock::time_point complete_phase_start);
   static LtvQpSolverStatus mapStatus(OSQPInt status);
@@ -87,6 +88,10 @@ private:
   std::vector<OSQPFloat> gradient_;
   std::vector<OSQPFloat> lower_;
   std::vector<OSQPFloat> upper_;
+  std::vector<std::uint8_t> oct_pruned_;
+  bool any_oct_pruned_ = false;
+  std::vector<OSQPFloat> warm_primal_buf_;
+  std::vector<OSQPFloat> warm_dual_buf_;
   LtvQpSolverSettings applied_settings_{};
   bool has_applied_settings_ = false;
   struct OsqpDeleter {

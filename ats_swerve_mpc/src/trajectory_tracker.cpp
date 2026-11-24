@@ -338,13 +338,18 @@ double TrajectoryTracker::progressScale(double cross_track_error) const
 
 //构建预测参考序列：根据给定时间沿轨迹采样参考状态和控制量，返回采样结果，包括状态和控制量
 std::vector<Se2Reference> TrajectoryTracker::buildHorizon(
-  const TrajectoryProjection & projection, int horizon, double dt) const
+  const TrajectoryProjection & projection, int horizon, double dt,
+  double external_speed_scale) const
 {
   if (!projection.valid || horizon <= 0 || dt <= 0.0) {
     return {};
   }
   // 预测域以最近投影点为起点，而不是盲从 ROS 墙钟时间；延迟补偿也随降速同步缩小。
-  const double scale = progressScale(projection.cross_track_error);
+  // 当外部滚动安全门（kSlowdown/kBrake）减速时同步收缩前瞻步进，防止预测域越过凸角向墙后拉拽形成切角死锁。
+  const double ext = std::isfinite(external_speed_scale)
+                         ? std::clamp(external_speed_scale, config_.min_progress_scale, 1.0)
+                         : 1.0;
+  const double scale = std::min(progressScale(projection.cross_track_error), ext);
   const double start_time = projection.time + config_.command_latency_compensation * scale;
   std::vector<Se2Reference> references;
   references.reserve(static_cast<std::size_t>(horizon + 1));

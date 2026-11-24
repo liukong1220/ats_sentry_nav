@@ -120,9 +120,10 @@ public:
   TrajectoryProjection project(const State & state, double current_wz = 0.0);
   /** @brief 将横向误差转换为 [min_progress_scale,1] 的连续时间缩放。 */
   double progressScale(double cross_track_error) const;
-  /** @brief 从投影时刻采样 horizon+1 个状态和车体系速度参考。 */
+  /** @brief 从投影时刻采样 horizon+1 个状态和车体系速度参考（支持外部安全减速尺度联动收缩前瞻）。 */
   std::vector<Se2Reference> buildHorizon(
-    const TrajectoryProjection & projection, int horizon, double dt) const;
+    const TrajectoryProjection & projection, int horizon, double dt,
+    double external_speed_scale = 1.0) const;
 
 private:
   /** @brief 投影入口的共用实现；按参数决定是否将 yaw 计入距离度量。 */

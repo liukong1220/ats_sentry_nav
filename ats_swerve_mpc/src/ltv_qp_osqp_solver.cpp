@@ -156,6 +156,10 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(int decision_size, int constraint_rows,
                 static_cast<OSQPFloat>(-1.0));
   upper_.assign(static_cast<std::size_t>(constraint_rows_),
                 static_cast<OSQPFloat>(1.0));
+  warm_primal_buf_.assign(static_cast<std::size_t>(decision_size_),
+                          static_cast<OSQPFloat>(0.0));
+  warm_dual_buf_.assign(static_cast<std::size_t>(constraint_rows_),
+                        static_cast<OSQPFloat>(0.0));
 
   // 初始化为正定对角与真实等式/不等式分类（避免首周期 update_rho_vec 重因式分解）
   for (int col = 0; col < decision_size_; ++col) {
@@ -168,17 +172,24 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(int decision_size, int constraint_rows,
   }
   if (ltv_horizon_ > 0) {
     const auto dims = checkedLtvQpDimensions(ltv_horizon_);
+    oct_pruned_.assign(static_cast<std::size_t>(dims.wheel_octagon_rows), 0U);
     for (int r = 0; r < dims.equality_rows; ++r) {
       lower_[static_cast<std::size_t>(r)] = static_cast<OSQPFloat>(0.0);
       upper_[static_cast<std::size_t>(r)] = static_cast<OSQPFloat>(0.0);
     }
-    const int esdf_base = dims.equality_rows + dims.body_accel_rows +
-                          dims.wheel_octagon_rows + dims.wheel_rate_rows;
+    const int oct_base = dims.equality_rows + dims.body_accel_rows;
+    for (int r = 0; r < dims.wheel_octagon_rows; ++r) {
+      lower_[static_cast<std::size_t>(oct_base + r)] =
+          static_cast<OSQPFloat>(-OSQP_INFTY);
+      upper_[static_cast<std::size_t>(oct_base + r)] =
+          static_cast<OSQPFloat>(OSQP_INFTY);
+    }
+    const int esdf_base = oct_base + dims.wheel_octagon_rows + dims.wheel_rate_rows;
     const int slack_bound_base =
         esdf_base + dims.esdf_corridor_rows + 3 * ltv_horizon_;
     for (int s = 0; s < ltv_horizon_; ++s) {
       lower_[static_cast<std::size_t>(esdf_base + s)] =
-          static_cast<OSQPFloat>(-1.0);
+          static_cast<OSQPFloat>(-OSQP_INFTY);
       upper_[static_cast<std::size_t>(esdf_base + s)] =
           static_cast<OSQPFloat>(OSQP_INFTY);
       lower_[static_cast<std::size_t>(slack_bound_base + s)] =
@@ -246,9 +257,11 @@ LtvQpOsqpSolver::LtvQpOsqpSolver(int decision_size, int constraint_rows,
   settings.allocate_solution = 1;
   settings.warm_starting = 1;
   settings.scaling = 10;
-  settings.rho = static_cast<OSQPFloat>(1.0);
-  settings.alpha = static_cast<OSQPFloat>(1.8);
-  settings.adaptive_rho = OSQP_ADAPTIVE_RHO_UPDATE_DISABLED;
+  settings.rho = static_cast<OSQPFloat>(0.2);
+  settings.alpha = static_cast<OSQPFloat>(1.6);
+  settings.adaptive_rho = OSQP_ADAPTIVE_RHO_UPDATE_ITERATIONS;
+  settings.adaptive_rho_interval = 25;
+  settings.adaptive_rho_tolerance = static_cast<OSQPFloat>(2.0);
   settings.check_termination = 5;
   settings.check_dualgap = 0;
   settings.max_iter = static_cast<OSQPInt>(setup_settings.max_iterations);
@@ -308,10 +321,14 @@ bool LtvQpOsqpSolver::copyNumericalValues(
         static_cast<OSQPFloat>(problem.gradient(index));
   }
   for (int index = 0; index < problem.constraint_rows; ++index) {
-    lower[static_cast<std::size_t>(index)] =
-        static_cast<OSQPFloat>(problem.lower(index));
-    upper[static_cast<std::size_t>(index)] =
-        static_cast<OSQPFloat>(problem.upper(index));
+    const double l_val = problem.lower(index);
+    const double u_val = problem.upper(index);
+    lower[static_cast<std::size_t>(index)] = l_val <= -0.99e4
+        ? static_cast<OSQPFloat>(-OSQP_INFTY)
+        : static_cast<OSQPFloat>(l_val);
+    upper[static_cast<std::size_t>(index)] = u_val >= 0.99e4
+        ? static_cast<OSQPFloat>(OSQP_INFTY)
+        : static_cast<OSQPFloat>(u_val);
   }
   return true;
 }
@@ -354,6 +371,7 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
     return result;
   }
   const auto complete_phase_start = std::chrono::steady_clock::now();
+  any_oct_pruned_ = false;
   if (!copyNumericalValues(problem, hessian_values_, constraint_values_,
                            gradient_, lower_, upper_)) {
     result.status = LtvQpSolverStatus::kInvalidProblem;
@@ -363,7 +381,8 @@ LtvQpSolveResult LtvQpOsqpSolver::solve(
                      .count();
     return result;
   }
-  return solvePrepared(ltv_horizon_, settings, warm_start, complete_phase_start);
+  return solvePrepared(ltv_horizon_, nullptr, settings, warm_start,
+                       complete_phase_start);
 }
 
 bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
@@ -387,6 +406,9 @@ bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
     std::memcpy(upper_.data(), problem.upper.data(),
                 upper_.size() * sizeof(double));
     for (int i = 0; i < constraint_rows_; ++i) {
+      if (lower_[static_cast<std::size_t>(i)] <= static_cast<OSQPFloat>(-0.99e4)) {
+        lower_[static_cast<std::size_t>(i)] = static_cast<OSQPFloat>(-OSQP_INFTY);
+      }
       if (upper_[static_cast<std::size_t>(i)] >= static_cast<OSQPFloat>(0.99e4)) {
         upper_[static_cast<std::size_t>(i)] = static_cast<OSQPFloat>(OSQP_INFTY);
       }
@@ -404,12 +426,37 @@ bool LtvQpOsqpSolver::copyLtvNumericalValues(const LtvQpProblem &problem) {
           static_cast<OSQPFloat>(problem.gradient(i));
     }
     for (int i = 0; i < constraint_rows_; ++i) {
-      lower_[static_cast<std::size_t>(i)] =
-          static_cast<OSQPFloat>(problem.lower(i));
+      const double l_val = problem.lower(i);
       const double u_val = problem.upper(i);
+      lower_[static_cast<std::size_t>(i)] = l_val <= -0.99e4
+          ? static_cast<OSQPFloat>(-OSQP_INFTY)
+          : static_cast<OSQPFloat>(l_val);
       upper_[static_cast<std::size_t>(i)] = u_val >= 0.99e4
           ? static_cast<OSQPFloat>(OSQP_INFTY)
           : static_cast<OSQPFloat>(u_val);
+    }
+  }
+  // 惰性八边形活跃集门控：距离轮速边界 >1.5 m/s 的严格内点八边形行先置为无界（OSQP 给 rho=1e-6，
+  // 消除 8 行/步的 4*rho 人工 ADMM 阻尼）；求解后逐行精确校验，若任一行违约则立即恢复并热启重解，
+  // 数学上与全量硬约束 100% 等价。
+  any_oct_pruned_ = false;
+  if (ltv_horizon_ > 0 && problem.horizon == ltv_horizon_) {
+    const auto dims = checkedLtvQpDimensions(ltv_horizon_);
+    const int oct_base = dims.equality_rows + dims.body_accel_rows;
+    constexpr double kLazyOctagonMarginMps = 1.5;
+    for (int r = 0; r < dims.wheel_octagon_rows; ++r) {
+      const int row = oct_base + r;
+      if (problem.lower(row) < -kLazyOctagonMarginMps &&
+          problem.upper(row) > kLazyOctagonMarginMps) {
+        lower_[static_cast<std::size_t>(row)] =
+            static_cast<OSQPFloat>(-OSQP_INFTY);
+        upper_[static_cast<std::size_t>(row)] =
+            static_cast<OSQPFloat>(OSQP_INFTY);
+        oct_pruned_[static_cast<std::size_t>(r)] = 1U;
+        any_oct_pruned_ = true;
+      } else {
+        oct_pruned_[static_cast<std::size_t>(r)] = 0U;
+      }
     }
   }
   return true;
@@ -433,13 +480,13 @@ LtvQpSolveResult LtvQpOsqpSolver::solveLtvProblem(
                      .count();
     return result;
   }
-  return solvePrepared(problem.horizon, settings, warm_start,
+  return solvePrepared(problem.horizon, &problem, settings, warm_start,
                        complete_phase_start);
 }
 
 LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
-    int horizon, const LtvQpSolverSettings &settings,
-    const LtvQpWarmStart *warm_start,
+    int horizon, const LtvQpProblem *ltv_problem,
+    const LtvQpSolverSettings &settings, const LtvQpWarmStart *warm_start,
     std::chrono::steady_clock::time_point complete_phase_start) {
   LtvQpSolveResult result;
   const auto backend_phase_start = std::chrono::steady_clock::now();
@@ -485,6 +532,12 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
 
   const auto update_start = std::chrono::steady_clock::now();
   ++numeric_update_call_count_;
+  // 仅当 rho 极端漂离 [0.005, 10.0] 时才拉回 0.2，保留正常自适应 rho（0.1..5.0）跨周期热启。
+  if (solver_->settings != nullptr &&
+      (solver_->settings->rho > static_cast<OSQPFloat>(10.0) ||
+       solver_->settings->rho < static_cast<OSQPFloat>(0.005))) {
+    osqp_update_rho(solver_.get(), static_cast<OSQPFloat>(0.2));
+  }
   // Update q first so scale_data inside osqp_update_data_mat sees the new cost
   // norm, then update P/A (recomputing Ruiz scaling & KKT), then scale l/u with
   // the new row factors E.
@@ -507,35 +560,119 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
   }
   if (warm_start != nullptr &&
       warm_start->validFor(decision_size_, constraint_rows_)) {
-    if constexpr (sizeof(OSQPFloat) == sizeof(double)) {
-      result.warm_start_used =
-          osqp_warm_start(solver_.get(), warm_start->primal.data(),
-                          warm_start->dual.data()) == 0;
-    } else {
-      std::vector<OSQPFloat> px(static_cast<std::size_t>(decision_size_));
-      std::vector<OSQPFloat> dy(static_cast<std::size_t>(constraint_rows_));
-      for (int i = 0; i < decision_size_; ++i) {
-        px[static_cast<std::size_t>(i)] =
-            static_cast<OSQPFloat>(warm_start->primal(i));
-      }
-      for (int i = 0; i < constraint_rows_; ++i) {
-        dy[static_cast<std::size_t>(i)] =
-            static_cast<OSQPFloat>(warm_start->dual(i));
-      }
-      result.warm_start_used =
-          osqp_warm_start(solver_.get(), px.data(), dy.data()) == 0;
+    for (int i = 0; i < decision_size_; ++i) {
+      warm_primal_buf_[static_cast<std::size_t>(i)] =
+          static_cast<OSQPFloat>(warm_start->primal(i));
     }
+    const OSQPFloat loose_hi = static_cast<OSQPFloat>(0.5 * OSQP_INFTY);
+    const OSQPFloat loose_lo = static_cast<OSQPFloat>(-0.5 * OSQP_INFTY);
+    for (int i = 0; i < constraint_rows_; ++i) {
+      const std::size_t idx = static_cast<std::size_t>(i);
+      warm_dual_buf_[idx] = (lower_[idx] <= loose_lo && upper_[idx] >= loose_hi)
+                                ? static_cast<OSQPFloat>(0.0)
+                                : static_cast<OSQPFloat>(warm_start->dual(i));
+    }
+    result.warm_start_used =
+        osqp_warm_start(solver_.get(), warm_primal_buf_.data(),
+                        warm_dual_buf_.data()) == 0;
   }
-  result.wall_update_time_ms =
+  double total_wall_update_ms =
       1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              update_start)
                    .count();
+  double total_wall_solve_ms = 0.0;
+  int total_iters = 0;
+  int total_rho_updates = 0;
+  double total_osqp_solve_ms = 0.0;
+  double total_osqp_update_ms = 0.0;
+
   const auto solve_start = std::chrono::steady_clock::now();
-  const OSQPInt solve_result = osqp_solve(solver_.get());
-  result.wall_solve_time_ms =
+  OSQPInt solve_result = osqp_solve(solver_.get());
+  total_wall_solve_ms +=
       1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              solve_start)
                    .count();
+  if (solver_->info != nullptr) {
+    total_iters += static_cast<int>(solver_->info->iter);
+    total_rho_updates += static_cast<int>(solver_->info->rho_updates);
+    total_osqp_solve_ms += 1000.0 * static_cast<double>(solver_->info->solve_time);
+    total_osqp_update_ms += 1000.0 * static_cast<double>(solver_->info->update_time);
+  }
+
+  // 惰性八边形行精确后验校验：若任一被剪枝的八边形行在当前解处违约 (>1e-4)，
+  // 立即恢复其精确边界并利用当前热启继续求解（至多 2 轮），保证硬轮速约束零放松。
+  if (solve_result == 0 && ltv_problem != nullptr && any_oct_pruned_ &&
+      horizon > 0 && solver_->solution != nullptr &&
+      solver_->solution->x != nullptr) {
+    const auto dims = checkedLtvQpDimensions(horizon);
+    if (dims.valid && dims.decision_size == decision_size_) {
+      const int oct_base = dims.equality_rows + dims.body_accel_rows;
+      for (int verify_pass = 0; verify_pass < 2; ++verify_pass) {
+        int reactivated = 0;
+        for (int step = 0; step < horizon; ++step) {
+          const auto &cs = ltv_problem->slots.controls[static_cast<std::size_t>(step)];
+          const int u_off = ltv_problem->controlOffset(step);
+          for (int r_idx = 0; r_idx < 8; ++r_idx) {
+            const int r = 8 * step + r_idx;
+            if (oct_pruned_[static_cast<std::size_t>(r)] == 0U) {
+              continue;
+            }
+            double ax = 0.0;
+            for (int c = 0; c < 3; ++c) {
+              ax += ltv_problem->constraint_values[static_cast<std::size_t>(
+                        cs.a_wheel_oct[static_cast<std::size_t>(r_idx)]
+                                      [static_cast<std::size_t>(c)])] *
+                    static_cast<double>(solver_->solution->x[u_off + c]);
+            }
+            const int row = oct_base + r;
+            if (ax < ltv_problem->lower(row) - 1e-4 ||
+                ax > ltv_problem->upper(row) + 1e-4) {
+              lower_[static_cast<std::size_t>(row)] =
+                  static_cast<OSQPFloat>(ltv_problem->lower(row));
+              upper_[static_cast<std::size_t>(row)] =
+                  static_cast<OSQPFloat>(ltv_problem->upper(row));
+              oct_pruned_[static_cast<std::size_t>(r)] = 0U;
+              ++reactivated;
+            }
+          }
+        }
+        if (reactivated == 0) {
+          break;
+        }
+        const auto re_upd_start = std::chrono::steady_clock::now();
+        if (osqp_update_data_vec(solver_.get(), nullptr, lower_.data(),
+                                 upper_.data()) != 0) {
+          solve_result = 1;
+          break;
+        }
+        total_wall_update_ms +=
+            1000.0 * std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - re_upd_start)
+                         .count();
+        const auto re_solve_start = std::chrono::steady_clock::now();
+        solve_result = osqp_solve(solver_.get());
+        total_wall_solve_ms +=
+            1000.0 * std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - re_solve_start)
+                         .count();
+        if (solver_->info != nullptr) {
+          total_iters += static_cast<int>(solver_->info->iter);
+          total_rho_updates += static_cast<int>(solver_->info->rho_updates);
+          total_osqp_solve_ms +=
+              1000.0 * static_cast<double>(solver_->info->solve_time);
+          total_osqp_update_ms +=
+              1000.0 * static_cast<double>(solver_->info->update_time);
+        }
+        if (solve_result != 0 || solver_->solution == nullptr ||
+            solver_->solution->x == nullptr) {
+          break;
+        }
+      }
+    }
+  }
+
+  result.wall_update_time_ms = total_wall_update_ms;
+  result.wall_solve_time_ms = total_wall_solve_ms;
   finalizePhaseTimes();
   if (solver_->info == nullptr) {
     result.status = solve_result == 0 ? LtvQpSolverStatus::kNumericalFailure
@@ -547,15 +684,15 @@ LtvQpSolveResult LtvQpOsqpSolver::solvePrepared(
   if (solve_result != 0 && result.status == LtvQpSolverStatus::kSolved) {
     result.status = LtvQpSolverStatus::kNumericalFailure;
   }
-  result.iterations = static_cast<int>(info.iter);
-  result.solve_time_ms = 1000.0 * static_cast<double>(info.solve_time);
-  result.update_time_ms = 1000.0 * static_cast<double>(info.update_time);
+  result.iterations = total_iters;
+  result.solve_time_ms = total_osqp_solve_ms;
+  result.update_time_ms = total_osqp_update_ms;
   result.primal_residual = static_cast<double>(info.prim_res);
   result.dual_residual = static_cast<double>(info.dual_res);
   result.rho = solver_->settings != nullptr
                    ? static_cast<double>(solver_->settings->rho)
                    : 0.0;
-  result.rho_updates = static_cast<int>(info.rho_updates);
+  result.rho_updates = total_rho_updates;
   result.slack_maximum = 0.0;
   result.hard_constraint_maximum_violation = 0.0;
   if (solver_->solution != nullptr && solver_->solution->x != nullptr &&

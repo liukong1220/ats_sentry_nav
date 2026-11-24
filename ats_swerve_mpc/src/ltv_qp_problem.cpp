@@ -851,7 +851,7 @@ bool LtvQpBuilder::build(
           0.0;
       problem.constraint_values[static_cast<std::size_t>(ss_next.a_esdf_y)] =
           0.0;
-      problem.lower(esdf_row) = -1.0;
+      problem.lower(esdf_row) = -kEsdfUpperBound;
       problem.upper(esdf_row) = kEsdfUpperBound;
     }
 

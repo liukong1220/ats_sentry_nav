@@ -903,6 +903,7 @@ bool AtsSwerveMpcNode::installPath(
   }
   // 任何新轨迹切换均重置 OSQP 对偶热启动，避免旧参考的 active-set 乘子污染新轨迹求解。
   qp_warm_start_valid_ = false;
+  last_rollout_horizon_scale_ = 1.0;
   if (qp_solver_) {
     qp_solver_->resetWarmStart();
   }
@@ -1436,7 +1437,7 @@ std::vector<EsdfCorridorSample> AtsSwerveMpcNode::extractEsdfCorridorSamples(
                  d_ref - qp_esdf_config_.reference_margin_m),
         qp_esdf_config_.min_corridor_clearance_m,
         qp_esdf_config_.corridor_clearance_m);
-    if (d_nom > target + 0.60 || grad_snap.norm() <= 1e-3) {
+    if (d_nom > target + 0.25 || grad_snap.norm() <= 1e-3) {
       continue;
     }
     auto &sample = samples[static_cast<std::size_t>(step)];
@@ -2100,7 +2101,8 @@ void AtsSwerveMpcNode::onControlTimer() {
         trajectory_tracker_.terminalSpeed(terminal_speed_window_sec_);
     projection = trajectory_tracker_.project(current, last_control_(2));
     references = trajectory_tracker_.buildHorizon(
-        projection, controller_->config().horizon, controller_->config().dt);
+        projection, controller_->config().horizon, controller_->config().dt,
+        last_rollout_horizon_scale_);
     trajectory_expired =
         trajectory_deadline_.nanoseconds() > 0 && now() > trajectory_deadline_;
   }
@@ -2302,6 +2304,8 @@ void AtsSwerveMpcNode::onControlTimer() {
   if ((rollout_safety.level == RolloutSafetyLevel::kSlowdown ||
        rollout_safety.level == RolloutSafetyLevel::kBrake) &&
       rollout_safety.speed_scale < 1.0 - 1e-6) {
+    last_rollout_horizon_scale_ =
+        std::clamp(rollout_safety.speed_scale, 0.25, 1.0);
     Control scaled_target = last_control_;
     if (rollout_safety.level == RolloutSafetyLevel::kSlowdown) {
       // kSlowdown 表示预测无碰撞但靠近墙面（如 0.80 m 窄隧道）；仅限制高速接近，
@@ -2325,6 +2329,9 @@ void AtsSwerveMpcNode::onControlTimer() {
       result.controls.front() = last_control_;
       controller_->commitWarmControls(result.controls);
     }
+  } else {
+    last_rollout_horizon_scale_ =
+        std::min(1.0, last_rollout_horizon_scale_ + 0.15);
   }
   // 终点区限速（报告 5.1.10 第 1 项）：MPC 的模型里没有底盘约 0.4 s 的响应滞后，离终点
   // 0.15-0.3 m 时仍给 0.9-1.0 m/s，冲过终点再拉回。终点区内按 |v| <= d / tau 限速，相当于
@@ -2575,6 +2582,7 @@ void AtsSwerveMpcNode::publishZeroCommandForFailure(const char *reason_zh) {
   last_control_update_stamp_.reset();
   last_control_update_steady_.reset();
   qp_warm_start_valid_ = false;
+  last_rollout_horizon_scale_ = 1.0;
   if (qp_solver_) {
     qp_solver_->resetWarmStart();
   }
