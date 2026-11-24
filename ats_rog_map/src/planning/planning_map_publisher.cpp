@@ -78,9 +78,10 @@ public:
     // An empty string disables a view.
     planning_grid_viz_topic_ = declare_parameter<std::string>(
       "planning_grid_viz_topic", "/rog_map_adapter/viz/planning_grid");
-    // 彩色距离点云（占据黑/外接半径内红/黄到绿/未知灰）与两条净空等值线
-    // （内切半宽、外接半径）。
-    esdf_cloud_topic_ = declare_parameter<std::string>("esdf_cloud_topic", "");
+    // 5-field XYZ + distance + intensity ESDF 距离场可视化点云（仅订阅时编码，跳过未知格，
+    // 配合 RViz Intensity Rainbow Flat Squares 呈现无遮挡平滑距离场）与两条净空等值线。
+    esdf_cloud_topic_ = declare_parameter<std::string>(
+      "esdf_cloud_topic", "/rog_map_adapter/viz/esdf_cloud");
     clearance_contour_topic_ = declare_parameter<std::string>(
       "clearance_contour_topic", "/rog_map_adapter/viz/clearance_contours");
     ready_topic_ = declare_parameter<std::string>("ready_topic", "/rog_map_adapter/ready");
@@ -160,6 +161,10 @@ public:
       0.0, declare_parameter<double>("tf_latest_fallback_max_skew_sec", 0.1));
     signed_distance_max_m_ = std::max(
       1e-3, declare_parameter<double>("signed_distance_max_m", 2.0));
+    esdf_viz_max_distance_ = std::max(
+      0.1, declare_parameter<double>("esdf_viz_max_distance", signed_distance_max_m_));
+    esdf_viz_max_points_ = static_cast<std::size_t>(std::max<std::int64_t>(
+      1000, declare_parameter<std::int64_t>("esdf_viz_max_points", 250000)));
     footprint_length_ = std::max(0.0, declare_parameter<double>("footprint_length", 0.58));
     footprint_width_ = std::max(0.0, declare_parameter<double>("footprint_width", 0.58));
     footprint_safety_margin_ = std::max(
@@ -836,7 +841,7 @@ private:
       0.5 * footprint_width_ + footprint_safety_margin_);
     if (esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U) {
       esdf_cloud_pub_->publish(
-        encodeEsdfCloud(fusion.planning_grid, signed_distance, footprint_radius));
+        encodeEsdfCloud(fusion.planning_grid, signed_distance));
     }
     if (clearance_contour_pub_ && clearance_contour_pub_->get_subscription_count() > 0U) {
       const double inscribed_radius =
@@ -844,9 +849,11 @@ private:
       clearance_contour_pub_->publish(encodeClearanceContours(
         fusion.planning_grid, signed_distance, inscribed_radius, footprint_radius));
     }
-    std_msgs::msg::UInt64 generation;
-    generation.data = response.generation;
-    generation_pub_->publish(generation);
+    if (generation_pub_ && generation_pub_->get_subscription_count() > 0U) {
+      std_msgs::msg::UInt64 generation;
+      generation.data = response.generation;
+      generation_pub_->publish(generation);
+    }
     last_rog_generation_ = response.generation;
     planning_snapshot_pub_->publish(planning_snapshot);
     publishMapStatus(true, response.generation, "planning snapshot ready");
@@ -866,40 +873,80 @@ private:
       ms_between(t_pub_start, t_done));
   }
 
-  // 每格一个点，颜色见 distance_viz.hpp：占据黑，外接半径内红，到
-  // kGreenDistanceM 由黄渐变到绿，未知灰。点位按栅格 origin 的 yaw 旋转。
+  // unix_global_esdf 风格 5-field XYZ+distance+intensity 距离场点云：
+  // 1) 跳过未知格（grid.data < 0）与非有限距离，消除场地外大块灰/红实体遮挡；
+  // 2) 二分查找自适应步长控制点数上限 esdf_viz_max_points_；
+  // 3) 保留原始有符号 distance，同时将 clamp(distance, 0, esdf_viz_max_distance_) 写入 intensity
+  //    供 RViz Intensity Rainbow Flat Squares 渲染；z 置于栅格平面下方 0.02 m 避免遮挡路径。
   sensor_msgs::msg::PointCloud2 encodeEsdfCloud(
-    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & distance_field,
-    double footprint_radius) const
+    const nav_msgs::msg::OccupancyGrid & grid, const std::vector<double> & distance_field) const
   {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header = grid.header;
+    const auto & info = grid.info;
+    const std::size_t width = static_cast<std::size_t>(info.width);
+    const std::size_t height = static_cast<std::size_t>(info.height);
+    if (width == 0U || height == 0U || grid.data.size() < width * height ||
+      distance_field.size() < width * height)
+    {
+      return cloud;
+    }
+    const auto gridCount = [&](std::size_t stride) {
+        return ((width - 1U) / stride + 1U) * ((height - 1U) / stride + 1U);
+      };
+    std::size_t low = 1U;
+    std::size_t high = std::max(width, height);
+    while (low < high) {
+      const std::size_t mid = low + (high - low) / 2U;
+      if (gridCount(mid) > esdf_viz_max_points_) {
+        low = mid + 1U;
+      } else {
+        high = mid;
+      }
+    }
+    const std::size_t stride = low;
+
+    std::vector<std::size_t> valid_indices;
+    valid_indices.reserve(gridCount(stride));
+    for (std::size_t row = 0U; row < height; row += stride) {
+      const std::size_t row_offset = row * width;
+      for (std::size_t col = 0U; col < width; col += stride) {
+        const std::size_t idx = row_offset + col;
+        if (grid.data[idx] < 0 || !std::isfinite(distance_field[idx])) {
+          continue;
+        }
+        valid_indices.push_back(idx);
+      }
+    }
+
     sensor_msgs::PointCloud2Modifier modifier(cloud);
-    modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
-    const std::size_t size = std::min(grid.data.size(), distance_field.size());
-    modifier.resize(size);
+    modifier.setPointCloud2Fields(
+      5,
+      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "distance", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "intensity", 1, sensor_msgs::msg::PointField::FLOAT32);
+    modifier.resize(valid_indices.size());
     sensor_msgs::PointCloud2Iterator<float> it_x(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> it_y(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> it_z(cloud, "z");
-    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_r(cloud, "r");
-    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_g(cloud, "g");
-    sensor_msgs::PointCloud2Iterator<std::uint8_t> it_b(cloud, "b");
-    const auto & info = grid.info;
-    for (std::size_t index = 0; index < size; ++index) {
-      const double column = static_cast<double>(index % info.width) + 0.5;
-      const double row = static_cast<double>(index / info.width) + 0.5;
+    sensor_msgs::PointCloud2Iterator<float> it_dist(cloud, "distance");
+    sensor_msgs::PointCloud2Iterator<float> it_int(cloud, "intensity");
+    const float z_plane = static_cast<float>(info.origin.position.z - 0.02);
+    for (const std::size_t idx : valid_indices) {
+      const double column = static_cast<double>(idx % width) + 0.5;
+      const double row = static_cast<double>(idx / width) + 0.5;
       const auto point = cellToFrame(info, column, row);
+      const double d = distance_field[idx];
       *it_x = static_cast<float>(point[0]);
       *it_y = static_cast<float>(point[1]);
-      *it_z = static_cast<float>(info.origin.position.z - 0.02);
-      const auto color = distanceColor(
-        grid.data[index], distance_field[index], fusion_params_.terrain_obstacle_value_threshold,
-        footprint_radius, kGreenDistanceM);
-      *it_r = color.r;
-      *it_g = color.g;
-      *it_b = color.b;
-      ++it_x; ++it_y; ++it_z; ++it_r; ++it_g; ++it_b;
+      *it_z = z_plane;
+      *it_dist = static_cast<float>(d);
+      *it_int = static_cast<float>(std::clamp(d, 0.0, esdf_viz_max_distance_));
+      ++it_x; ++it_y; ++it_z; ++it_dist; ++it_int;
     }
+    cloud.is_dense = true;
     return cloud;
   }
 
@@ -1112,7 +1159,8 @@ private:
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr planning_grid_viz_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr clearance_contour_pub_;
-  static constexpr double kGreenDistanceM = 1.0;
+  double esdf_viz_max_distance_{2.0};
+  std::size_t esdf_viz_max_points_{250000U};
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::

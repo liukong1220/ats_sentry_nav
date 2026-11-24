@@ -480,14 +480,22 @@ void publishTraversabilityGrid(
   publisher->publish(grid);
   publishScalarGrid(slope_publisher, stamp, planarVoxelSlopeDeg,
                     std::max(slopeGridMaxDeg, 1e-3));
-  publishScalarGrid(slope_band_publisher, stamp, planarVoxelSlopeBand, 1.0);
+  if (slope_band_publisher && slope_band_publisher->get_subscription_count() > 0U) {
+    publishScalarGrid(slope_band_publisher, stamp, planarVoxelSlopeBand, 1.0);
+  }
   if (publishTraversabilityDebugGrids) {
-    publishScalarGrid(height_diff_publisher, stamp, planarVoxelHeightDiff,
-                      traversabilityDebugHeightDiffCap);
-    publishScalarGrid(occupancy_ratio_publisher, stamp, planarVoxelOccupancyRatio,
-                      traversabilityDebugOccupancyRatioCap);
-    publishScalarGrid(ground_confidence_publisher, stamp,
-                      planarVoxelGroundConfidence, 1.0);
+    if (height_diff_publisher && height_diff_publisher->get_subscription_count() > 0U) {
+      publishScalarGrid(height_diff_publisher, stamp, planarVoxelHeightDiff,
+                        traversabilityDebugHeightDiffCap);
+    }
+    if (occupancy_ratio_publisher && occupancy_ratio_publisher->get_subscription_count() > 0U) {
+      publishScalarGrid(occupancy_ratio_publisher, stamp, planarVoxelOccupancyRatio,
+                        traversabilityDebugOccupancyRatioCap);
+    }
+    if (ground_confidence_publisher && ground_confidence_publisher->get_subscription_count() > 0U) {
+      publishScalarGrid(ground_confidence_publisher, stamp,
+                        planarVoxelGroundConfidence, 1.0);
+    }
   }
 }
 
@@ -1013,65 +1021,72 @@ int main(int argc, char **argv) {
       // stabilized, so invalid neighbors do not contaminate the gradient.
       computeSlopeGrid();
 
-      // compute terrain map beyond localTerrainMapRadius
-      terrainCloudElev->clear();
-      int terrainCloudElevSize = 0;
-      for (int i = 0; i < terrainCloudSize; i++) {
-        point = terrainCloud->points[i];
-        float dis = sqrt((point.x - vehicleX) * (point.x - vehicleX) +
-                         (point.y - vehicleY) * (point.y - vehicleY));
-        if (point.z - vehicleZ > lowerBoundZ - disRatioZ * dis &&
-            point.z - vehicleZ < upperBoundZ + disRatioZ * dis &&
-            dis > localTerrainMapRadius) {
-          int indX = terrain_analysis_ext::planarVoxelIndex1D(
-              point.x, planarAnchorX, planarVoxelSize, planarVoxelHalfWidth);
-          int indY = terrain_analysis_ext::planarVoxelIndex1D(
-              point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
+      const bool need_terrain_cloud =
+          pubTerrainCloud && pubTerrainCloud->get_subscription_count() > 0U;
+      if (need_terrain_cloud) {
+        // compute terrain map beyond localTerrainMapRadius
+        terrainCloudElev->clear();
+        int terrainCloudElevSize = 0;
+        for (int i = 0; i < terrainCloudSize; i++) {
+          point = terrainCloud->points[i];
+          float dis = sqrt((point.x - vehicleX) * (point.x - vehicleX) +
+                           (point.y - vehicleY) * (point.y - vehicleY));
+          if (point.z - vehicleZ > lowerBoundZ - disRatioZ * dis &&
+              point.z - vehicleZ < upperBoundZ + disRatioZ * dis &&
+              dis > localTerrainMapRadius) {
+            int indX = terrain_analysis_ext::planarVoxelIndex1D(
+                point.x, planarAnchorX, planarVoxelSize, planarVoxelHalfWidth);
+            int indY = terrain_analysis_ext::planarVoxelIndex1D(
+                point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
 
-          if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
-              indY < planarVoxelWidth) {
-            int ind = planarVoxelWidth * indX + indY;
-            float disZ = fabs(point.z - planarVoxelElev[ind]);
-            if (disZ < vehicleHeight &&
-                (planarVoxelConn[ind] == 2 || !checkTerrainConn)) {
-              terrainCloudElev->push_back(point);
-              terrainCloudElev->points[terrainCloudElevSize].x = point.x;
-              terrainCloudElev->points[terrainCloudElevSize].y = point.y;
-              terrainCloudElev->points[terrainCloudElevSize].z = point.z;
-              terrainCloudElev->points[terrainCloudElevSize].intensity = disZ;
+            if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
+                indY < planarVoxelWidth) {
+              int ind = planarVoxelWidth * indX + indY;
+              float disZ = fabs(point.z - planarVoxelElev[ind]);
+              if (disZ < vehicleHeight &&
+                  (planarVoxelConn[ind] == 2 || !checkTerrainConn)) {
+                terrainCloudElev->push_back(point);
+                terrainCloudElev->points[terrainCloudElevSize].x = point.x;
+                terrainCloudElev->points[terrainCloudElevSize].y = point.y;
+                terrainCloudElev->points[terrainCloudElevSize].z = point.z;
+                terrainCloudElev->points[terrainCloudElevSize].intensity = disZ;
 
-              terrainCloudElevSize++;
+                terrainCloudElevSize++;
+              }
             }
           }
         }
-      }
 
-      // merge in local terrain map within localTerrainMapRadius
-      int terrainCloudLocalSize = terrainCloudLocal->points.size();
-      for (int i = 0; i < terrainCloudLocalSize; i++) {
-        point = terrainCloudLocal->points[i];
-        float dis = sqrt((point.x - vehicleX) * (point.x - vehicleX) +
-                         (point.y - vehicleY) * (point.y - vehicleY));
-        if (dis <= localTerrainMapRadius) {
-          terrainCloudElev->push_back(point);
+        // merge in local terrain map within localTerrainMapRadius
+        int terrainCloudLocalSize = terrainCloudLocal->points.size();
+        for (int i = 0; i < terrainCloudLocalSize; i++) {
+          point = terrainCloudLocal->points[i];
+          float dis = sqrt((point.x - vehicleX) * (point.x - vehicleX) +
+                           (point.y - vehicleY) * (point.y - vehicleY));
+          if (dis <= localTerrainMapRadius) {
+            terrainCloudElev->push_back(point);
+          }
         }
       }
 
       clearingCloud = false;
 
-      // publish points with elevation
-      sensor_msgs::msg::PointCloud2 terrainCloud2;
-      pcl::toROSMsg(*terrainCloudElev, terrainCloud2);
-      terrainCloud2.header.stamp = nh->get_clock()->now();
-      terrainCloud2.header.frame_id = "odom";
-      pubTerrainCloud->publish(terrainCloud2);
+      const auto publish_stamp = nh->get_clock()->now();
+      if (need_terrain_cloud) {
+        // publish points with elevation
+        sensor_msgs::msg::PointCloud2 terrainCloud2;
+        pcl::toROSMsg(*terrainCloudElev, terrainCloud2);
+        terrainCloud2.header.stamp = publish_stamp;
+        terrainCloud2.header.frame_id = "odom";
+        pubTerrainCloud->publish(terrainCloud2);
+      }
       publishTraversabilityGrid(pubTraversabilityGrid,
                                 pubTraversabilityHeightDiffGrid,
                                 pubTraversabilityOccupancyRatioGrid,
                                 pubTraversabilityGroundConfidenceGrid,
                                 pubTraversabilitySlopeGrid,
                                 pubTraversabilitySlopeBandGrid,
-                                terrainCloud2.header.stamp);
+                                publish_stamp);
     }
 
     status = rclcpp::ok();

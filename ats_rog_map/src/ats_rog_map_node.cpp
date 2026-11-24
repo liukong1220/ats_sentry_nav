@@ -1133,10 +1133,12 @@ private:
     bool odom_stale = true;
     bool raw_cloud_stale = true;
     getHealthStaleness(map_update_stale, odom_stale, raw_cloud_stale);
-    std_msgs::msg::Bool message;
-    message.data = map_update_stale || odom_stale;
-    stale_pub_->publish(message);
-    if (message.data) {
+    if (stale_pub_ && stale_pub_->get_subscription_count() > 0U) {
+      std_msgs::msg::Bool message;
+      message.data = map_update_stale || odom_stale;
+      stale_pub_->publish(message);
+    }
+    if (map_update_stale || odom_stale) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "ROGMap stale: map_update=%s odom=%s raw_cloud=%s",
