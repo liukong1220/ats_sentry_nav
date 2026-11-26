@@ -49,6 +49,9 @@ find_package(tf2_geometry_msgs REQUIRED)
 
 add_library(${PROJECT_NAME}_lib
   src/ats_swerve_mpc_node.cpp
+  src/ats_swerve_mpc_reference.cpp
+  src/ats_swerve_mpc_solver.cpp
+  src/ats_swerve_mpc_control.cpp
   src/control_cycle_snapshot.cpp
   src/control_cycle_telemetry.cpp
   src/se2_model.cpp
