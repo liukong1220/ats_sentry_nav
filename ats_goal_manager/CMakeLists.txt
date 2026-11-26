@@ -25,7 +25,12 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
-add_executable(ats_goal_manager_node src/ats_goal_manager_node.cpp)
+add_executable(ats_goal_manager_node
+  src/ats_goal_manager_node.cpp
+  src/ats_goal_manager_callbacks.cpp
+  src/ats_goal_manager_tick.cpp
+  src/ats_goal_manager_helpers.cpp
+)
 target_include_directories(ats_goal_manager_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>

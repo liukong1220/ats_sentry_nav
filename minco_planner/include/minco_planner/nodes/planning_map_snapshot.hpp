@@ -139,6 +139,9 @@ struct PlanningMapSnapshot
   // swept-footprint checks are derived.
   std::string safety_content_digest;
   nav_msgs::msg::OccupancyGrid grid;
+  // Optional coarse global occupancy layer (40 x 30 m @ 0.20 m, no global ESDF)
+  // populated atomically in mapless/odom-layer mode for optimistic global guidance.
+  std::optional<nav_msgs::msg::OccupancyGrid> global_grid;
   std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> clearance_esdf;
   // Squared cell distance from each cell centre to the nearest blocked centre (out-of-grid
   // blocked), the field graph search uses. Derived from the same distance field as

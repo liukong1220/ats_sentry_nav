@@ -19,6 +19,12 @@ find_package(Eigen3 REQUIRED)
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/debug/planner_debug_visualizer.cpp
   src/nodes/minco_planner_node.cpp
+  src/nodes/minco_planner_params.cpp
+  src/nodes/minco_planner_search.cpp
+  src/nodes/minco_planner_route.cpp
+  src/nodes/minco_planner_runtime.cpp
+  src/nodes/minco_planner_plan_goal.cpp
+  src/nodes/minco_planner_recovery_commit.cpp
   src/nodes/planning_map_snapshot.cpp
   src/planning/grid_search.cpp
   src/planning/local_route.cpp

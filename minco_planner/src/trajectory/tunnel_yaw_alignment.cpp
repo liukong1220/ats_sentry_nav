@@ -242,7 +242,8 @@ std::vector<TunnelSegment> detectTunnelSegments(
           mean_ly *= inv_n;
           mean_rx *= inv_n;
           mean_ry *= inv_n;
-          double sxx = 0.0, sxy = 0.0, syy = 0.0;
+          double sxx_l = 0.0, sxy_l = 0.0, syy_l = 0.0;
+          double sxx_r = 0.0, sxy_r = 0.0, syy_r = 0.0;
           for (std::size_t m = begin; m <= end; ++m) {
             const auto & ws = wall_samples[m - begin];
             if (ws.valid && std::abs(trajectory.points[m].s - center_s) <= smooth_window) {
@@ -250,17 +251,58 @@ std::vector<TunnelSegment> detectTunnelSegments(
               const double dly = ws.ly - mean_ly;
               const double drx = ws.rx - mean_rx;
               const double dry = ws.ry - mean_ry;
-              sxx += dlx * dlx + drx * drx;
-              sxy += dlx * dly + drx * dry;
-              syy += dly * dly + dry * dry;
+              sxx_l += dlx * dlx;
+              sxy_l += dlx * dly;
+              syy_l += dly * dly;
+              sxx_r += drx * drx;
+              sxy_r += drx * dry;
+              syy_r += dry * dry;
             }
           }
-          const double trace = sxx + syy;
-          if (trace > 1e-5) {
-            const double diff = sxx - syy;
-            const double disc = std::hypot(diff, 2.0 * sxy);
-            const double anisotropy = disc / (trace + 1e-9);
-            const double pca_axis = 0.5 * std::atan2(2.0 * sxy, diff);
+          // Fit left and right walls independently so a step/recess on one wall does not
+          // dominate the pooled covariance and tilt the axis away from the straight opposite wall.
+          const auto fitWallPca = [&](double sxx, double sxy, double syy,
+              double & axis_out, double & aniso_out) -> bool {
+              const double tr = sxx + syy;
+              if (tr <= 1e-5) {return false;}
+              const double df = sxx - syy;
+              const double dc = std::hypot(df, 2.0 * sxy);
+              aniso_out = dc / (tr + 1e-9);
+              axis_out = 0.5 * std::atan2(2.0 * sxy, df);
+              return aniso_out >= params.min_coherence &&
+                std::cos(2.0 * (axis_out - tangent_yaws[idx])) >= params.side_wall_cos2_min;
+            };
+          double axis_l = 0.0, aniso_l = 0.0, axis_r = 0.0, aniso_r = 0.0;
+          const bool ok_l = fitWallPca(sxx_l, sxy_l, syy_l, axis_l, aniso_l);
+          const bool ok_r = fitWallPca(sxx_r, sxy_r, syy_r, axis_r, aniso_r);
+          if (ok_l || ok_r) {
+            double pca_axis = 0.0;
+            double anisotropy = 0.0;
+            if (ok_l && ok_r) {
+              const bool walls_agree = std::cos(2.0 * (axis_l - axis_r)) >= 0.985;
+              if (!walls_agree && std::abs(aniso_l - aniso_r) > 0.015) {
+                if (aniso_l > aniso_r) {
+                  pca_axis = axis_l;
+                  anisotropy = aniso_l;
+                } else {
+                  pca_axis = axis_r;
+                  anisotropy = aniso_r;
+                }
+              } else {
+                const double wl = aniso_l * aniso_l;
+                const double wr = aniso_r * aniso_r;
+                const double c2 = wl * std::cos(2.0 * axis_l) + wr * std::cos(2.0 * axis_r);
+                const double s2 = wl * std::sin(2.0 * axis_l) + wr * std::sin(2.0 * axis_r);
+                pca_axis = 0.5 * std::atan2(s2, c2);
+                anisotropy = (wl * aniso_l + wr * aniso_r) / std::max(1e-9, wl + wr);
+              }
+            } else if (ok_l) {
+              pca_axis = axis_l;
+              anisotropy = aniso_l;
+            } else {
+              pca_axis = axis_r;
+              anisotropy = aniso_r;
+            }
             if (anisotropy >= params.min_coherence &&
               std::cos(2.0 * (pca_axis - tangent_yaws[idx])) >= params.side_wall_cos2_min)
             {
@@ -474,9 +516,27 @@ bool forwardTunnelEntriesAligned(
     }
     const double entry_s = trajectory.points[tunnel.begin].s - params.front_extent;
     // Check every pose once the front reaches the mouth and all poses inside the passage.
-    // Never reject index 0 (initial measured yaw) when the robot starts outside the mouth.
+    // Never reject index 0 (initial measured yaw) when the robot starts outside the mouth,
+    // and do not walk backward across an open-space stationary turnaround (e.g. sidestep
+    // U-turn outside a tunnel mouth) into the pre-turnaround sidestep-out leg.
+    const auto & mouth = trajectory.points[tunnel.begin];
     std::size_t first = tunnel.begin;
     while (first > 1U && trajectory.points[first - 1U].s >= entry_s) {
+      const auto & prev = trajectory.points[first - 1U];
+      const auto & curr = trajectory.points[first];
+      if (prev.v <= 1e-3 && std::abs(prev.yaw_rate) > 0.10) {
+        break;
+      }
+      const double step_x = curr.x - prev.x;
+      const double step_y = curr.y - prev.y;
+      const double step_norm = std::hypot(step_x, step_y);
+      if (step_norm > 1e-5) {
+        const double to_mouth_x = mouth.x - prev.x;
+        const double to_mouth_y = mouth.y - prev.y;
+        if (step_x * to_mouth_x + step_y * to_mouth_y < -1e-6) {
+          break;
+        }
+      }
       --first;
     }
     for (std::size_t i = first; i <= tunnel.end; ++i) {

@@ -51,6 +51,7 @@ struct GridSearchResult
   double cost = 0.0;  // Weighted graph cost in cell units.
   double clearance = 0.0;
   bool partial = false;  // A stoppable segment. Only success denotes the requested goal.
+  bool scan_turn = false;  // Dedicated mapless LiDAR blind-spot scan-turn toward unknown frontier.
 };
 
 struct GridSearchBounds
@@ -67,6 +68,11 @@ struct GridSearchOptions
   double endpoint_minimum = -1.0;
   std::optional<GridSearchBounds> bounds;
   bool strict_endpoints = false;
+  // Optional per-call override of unknown occupancy semantics (e.g. false for
+  // optimistic global guidance on the 40 x 30 m persistent odom layer).
+  std::optional<bool> unknown_is_obstacle_override;
+  // Gentle step-cost penalty (>= 1.0) on unknown cells during optimistic search.
+  double unknown_cost_multiplier = 1.0;
   // Opt in on a known-free grid and validate the directed terminal footprint.
   std::function<bool(const geometry_msgs::msg::PoseStamped &)> can_stop;
 };

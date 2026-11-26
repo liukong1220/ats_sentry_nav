@@ -41,7 +41,8 @@ inline bool validPlanningMapSnapshot(
       static_cast<std::size_t>(snapshot.info.width) * snapshot.info.height;
   if (!snapshot.ready) {
     return snapshot.occupancy.empty() && snapshot.signed_distance_m.empty() &&
-           snapshot.gradient_x.empty() && snapshot.gradient_y.empty();
+           snapshot.gradient_x.empty() && snapshot.gradient_y.empty() &&
+           !snapshot.has_global_layer && snapshot.global_occupancy.empty();
   }
   if (snapshot.header.frame_id.empty() || snapshot.source_generation == 0U ||
       snapshot.publication_sequence == 0U ||
@@ -73,6 +74,24 @@ inline bool validPlanningMapSnapshot(
     if (blocked ? distance > 0.0F : distance < 0.0F) {
       return false;
     }
+  }
+  if (snapshot.has_global_layer) {
+    const auto global_cells =
+        static_cast<std::size_t>(snapshot.global_info.width) *
+        snapshot.global_info.height;
+    if (!finite(snapshot.global_info.resolution) ||
+        snapshot.global_info.resolution <= 0.0F ||
+        !unitQuaternion(snapshot.global_info.origin.orientation) ||
+        global_cells == 0U || snapshot.global_occupancy.size() != global_cells) {
+      return false;
+    }
+    for (const auto occ : snapshot.global_occupancy) {
+      if (occ < -1 || occ > 100) {
+        return false;
+      }
+    }
+  } else if (!snapshot.global_occupancy.empty()) {
+    return false;
   }
   return true;
 }

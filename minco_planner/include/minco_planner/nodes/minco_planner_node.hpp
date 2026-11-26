@@ -97,7 +97,12 @@ private:
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal, const GoalUuid & goal_uuid,
     std::uint64_t goal_id, std::uint64_t localization_epoch,
-    bool goal_pose_footprint_verified, double & used_clearance);
+    bool goal_pose_footprint_verified, double & used_clearance,
+    nav_msgs::msg::Path * global_guide_out = nullptr,
+    std::optional<geometry_msgs::msg::PoseStamped> * local_anchor_out = nullptr);
+  void publishRollingAnchor(
+    const std::optional<geometry_msgs::msg::PoseStamped> & anchor,
+    const std::string & frame_id, const rclcpp::Time & stamp, const char * label);
   // Offline/sandbox input: builds the local snapshot (and its distance fields) from a grid.
   void onGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
   // Production input: the map owner's numeric snapshot; no distance transform runs here.
@@ -122,6 +127,30 @@ private:
                 const InitialKinematicState * initial_state = nullptr,
                 double position_tolerance = 0.0, const GoalUuid & goal_uuid = {},
                 bool preserve_active_reference = false);
+  struct PlanGoalCommitContext;
+  void applyTerminalYawRelocationAndSidestep(
+    const std::shared_ptr<const PlanningMapSnapshot> & map_snapshot,
+    const nav_msgs::msg::OccupancyGrid & planning_grid,
+    const std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> & clearance_esdf,
+    double active_goal_yaw, bool active_is_final_goal,
+    ReferenceTrajectory & reference, FootprintSafetyResult & safety);
+  void tryEscapePrefixAndLocalReverse(
+    const std::shared_ptr<const PlanningMapSnapshot> & map_snapshot,
+    const nav_msgs::msg::OccupancyGrid & planning_grid,
+    const std::shared_ptr<const ats_rc_esdf::RcTraversabilityEsdfProvider> & clearance_esdf,
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal,
+    double start_yaw, double goal_yaw,
+    double & active_goal_yaw, bool & active_is_final_goal,
+    const std::optional<double> & exploration_lidar_fov,
+    const InitialKinematicState * seed_ptr, double used_clearance,
+    bool goal_pose_footprint_verified,
+    const std::function<bool()> & rolling_budget_exceeded,
+    ReferenceTrajectory & reference, FootprintSafetyResult & safety,
+    MincoOptimizationTrace & selected_trace, bool & has_spliced_tail,
+    EscapePrefixDecision & escape_decision);
+  void finalizeAndCommitReference(
+    PlanGoalCommitContext & ctx, const EscapePrefixDecision & escape_decision);
   bool lookupStartPose(
     const nav_msgs::msg::OccupancyGrid & grid, geometry_msgs::msg::PoseStamped & start);
   bool resolveStartPose(
@@ -139,7 +168,9 @@ private:
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
   void planYaw(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot,
-    double start_yaw, double goal_yaw, bool is_final_goal = true) const;
+    double start_yaw, double goal_yaw, bool is_final_goal = true,
+    std::optional<double> preferred_lidar_fov_yaw_offset = std::nullopt,
+    bool force_goal_yaw = false) const;
   void annotateClearance(
     ReferenceTrajectory & trajectory, const PlanningMapSnapshot & snapshot) const;
   std::vector<Eigen::Vector2d> footprintSamples(
@@ -157,7 +188,8 @@ private:
       const PlannerCommitTelemetry & telemetry = PlannerCommitTelemetry(),
       const geometry_msgs::msg::TransformStamped * control_from_grid = nullptr,
       double reference_origin_delay_sec = 0.0,
-      bool preserve_active_reference = false);
+      bool preserve_active_reference = false,
+      bool scan_turn = false);
   void onRuntimeSafetyRecheck();
   bool remainingReferenceSafeOn(
     const ReferenceTrajectory & trajectory, const nav_msgs::msg::OccupancyGrid & grid,
@@ -208,11 +240,13 @@ private:
   std::string candidate_reference_path_topic_;
   std::string preprocessed_guide_topic_ = "/minco/preprocessed_guide";
   std::string esdf_refined_guide_topic_ = "/minco/esdf_refined_guide";
+  std::string rolling_anchor_topic_ = "/minco/rolling_anchor";
   std::string debug_marker_topic_ = "minco/debug_markers";
   std::string map_ready_topic_;
   std::string emergency_stop_topic_ = "/planner/emergency_stop";
   std::string global_frame_ = "map";
   std::string robot_frame_ = "base_link";
+  std::string lidar_frame_ = "front_mid360";
   std::string search_algorithm_ = "hybrid";
   bool publish_unsafe_trajectory_ = false;
   EscapePrefixParams escape_prefix_params_{};
@@ -329,8 +363,32 @@ private:
     geometry_msgs::msg::Pose goal;
     nav_msgs::msg::Path::ConstSharedPtr path;
     double clearance;
+    bool optimistic{false};
   };
   std::optional<GlobalRoute> global_route_;
+  struct FrontierTabooEntry
+  {
+    double x{0.0};
+    double y{0.0};
+    std::chrono::steady_clock::time_point added_at{};
+  };
+  std::uint64_t frontier_taboo_goal_id_{0};
+  std::uint64_t frontier_taboo_epoch_{0};
+  std::vector<FrontierTabooEntry> frontier_taboo_;
+  std::optional<geometry_msgs::msg::Point> last_partial_anchor_;
+  std::optional<geometry_msgs::msg::Point> last_partial_start_;
+  std::optional<geometry_msgs::msg::Point> last_unknown_frontier_;
+  std::optional<geometry_msgs::msg::Point> mapless_stall_origin_;
+  std::optional<geometry_msgs::msg::Point> mapless_long_stall_origin_;
+  double mapless_stall_yaw_{0.0};
+  std::chrono::steady_clock::time_point last_partial_anchor_time_{};
+  std::chrono::steady_clock::time_point mapless_stall_time_{};
+  std::chrono::steady_clock::time_point mapless_long_stall_time_{};
+  int mapless_consecutive_rejects_{0};
+  double optimistic_global_unknown_cost_{1.35};
+  double frontier_taboo_radius_m_{0.70};
+  double frontier_taboo_ttl_sec_{180.0};
+  std::optional<double> resolveLidarFovYawOffsetRad();
   MincoTrajectoryOptimizer optimizer_;
   YawSplinePlanner yaw_planner_;
   /// 同一套航向参数，只多一项 narrow_start_hold_length；planYaw 在两版之间按足迹冲突选。
@@ -373,6 +431,8 @@ private:
     std::optional<nav_msgs::msg::Path> control_reference;
     nav_msgs::msg::Path::ConstSharedPtr guide;
     std::shared_ptr<const PlanningMapSnapshot> guide_snapshot;
+    bool guide_optimistic{false};
+    bool scan_turn{false};
   };
   std::optional<ActiveSafetyReference> active_safety_reference_;
   struct ReferenceConflict
@@ -400,6 +460,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr candidate_reference_path_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr preprocessed_guide_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr esdf_refined_guide_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr rolling_anchor_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlannerStatus>::SharedPtr planner_status_pub_;

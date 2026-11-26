@@ -234,7 +234,8 @@ public:
     const FootprintSafetyChecker * safety_checker = nullptr,
     MincoOptimizationTrace * trace = nullptr,
     const TerminalKinematicState * terminal_state = nullptr,
-    const std::vector<double> * precomputed_blocked_squared = nullptr) const;
+    const std::vector<double> * precomputed_blocked_squared = nullptr,
+    bool allow_shortcut = true) const;
 
   /**
    * @brief O2 快速代数续接段生成（带状 LU + 动力学时间缩放，不跑 L-BFGS），用于在局部滚动窗口
@@ -258,7 +259,8 @@ private:
     const FootprintSafetyChecker * safety_checker,
     MincoOptimizationTrace * trace,
     const TerminalKinematicState * terminal_state,
-    const std::vector<double> * precomputed_blocked_squared) const;
+    const std::vector<double> * precomputed_blocked_squared,
+    bool allow_shortcut) const;
 
   MincoTrajectoryOptimizerParams params_;
 };

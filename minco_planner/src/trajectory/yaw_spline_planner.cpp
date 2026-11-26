@@ -1,6 +1,7 @@
 // Copyright 2026
 
 #include "minco_planner/trajectory/yaw_spline_planner.hpp"
+#include "minco_planner/trajectory/local_time_scaling.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,9 +18,51 @@ void YawSplinePlanner::setParams(const YawSplinePlannerParams & params) { params
 void YawSplinePlanner::apply(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
   const std::vector<TunnelSegment> * tunnels,
-  bool is_final_goal) const
+  bool is_final_goal,
+  std::optional<double> preferred_lidar_fov_yaw_offset,
+  bool force_goal_yaw) const
 {
   if (trajectory.points.empty()) {
+    return;
+  }
+  if (force_goal_yaw) {
+    // Dedicated LiDAR blind-spot scan-turn: smoothly rotate from initial_yaw to goal_yaw
+    // starting immediately at t = 0 so MPC executes nonzero wz right away rather than waiting
+    // for the 1.5 cm terminal position handoff disk.
+    const double start = normalizeAngle(initial_yaw);
+    const double delta = shortestAngularDistance(start, goal_yaw);
+    double required_duration = params_.yaw_rate_limit > 1e-6
+      ? 1.875 * std::abs(delta) / params_.yaw_rate_limit
+      : std::max(1e-3, trajectory.totalTime());
+    if (params_.yaw_acceleration_limit > 0.0) {
+      required_duration = std::max(
+        required_duration,
+        std::sqrt(5.7735 * std::abs(delta) / params_.yaw_acceleration_limit));
+    }
+    const double available = trajectory.totalTime();
+    if (required_duration > available && available > 1e-6) {
+      const double time_scale = required_duration / available;
+      for (auto & point : trajectory.points) {
+        point.t *= time_scale;
+        point.vx /= time_scale;
+        point.vy /= time_scale;
+        point.v /= time_scale;
+        point.ax /= time_scale * time_scale;
+        point.ay /= time_scale * time_scale;
+      }
+    }
+    const double duration = std::max(1e-3, trajectory.totalTime());
+    for (auto & point : trajectory.points) {
+      const double u = std::max(0.0, std::min(1.0, point.t / duration));
+      const double u2 = u * u;
+      const double u3 = u2 * u;
+      const double u4 = u3 * u;
+      const double u5 = u4 * u;
+      const double blend = 10.0 * u3 - 15.0 * u4 + 6.0 * u5;
+      const double blend_rate = (30.0 * u2 - 60.0 * u3 + 30.0 * u4) / duration;
+      point.yaw = normalizeAngle(start + delta * blend);
+      point.yaw_rate = delta * blend_rate;
+    }
     return;
   }
   if (params_.mode == "path_tangent") {
@@ -27,7 +70,9 @@ void YawSplinePlanner::apply(
     return;
   }
   if (params_.mode == "clearance_aware") {
-    applyClearanceAware(trajectory, initial_yaw, goal_yaw, tunnels, is_final_goal);
+    applyClearanceAware(
+      trajectory, initial_yaw, goal_yaw, tunnels, is_final_goal,
+      preferred_lidar_fov_yaw_offset);
     return;
   }
   if (params_.mode == "hold") {
@@ -43,7 +88,8 @@ void YawSplinePlanner::apply(
 void YawSplinePlanner::applyClearanceAware(
   ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
   const std::vector<TunnelSegment> * tunnels,
-  bool is_final_goal) const
+  bool is_final_goal,
+  std::optional<double> preferred_lidar_fov_yaw_offset) const
 {
   if (trajectory.points.size() < 2) {
     applyGoalHeading(trajectory, initial_yaw, goal_yaw);
@@ -118,14 +164,25 @@ void YawSplinePlanner::applyClearanceAware(
           }
         } else {
           const double time_scale = required_time / available_time;
-          const double t0 = start_point.t;
-          for (auto & point : trajectory.points) {
-            point.t = t0 + (point.t - t0) * time_scale;
-            point.vx /= time_scale;
-            point.vy /= time_scale;
-            point.v /= time_scale;
-            point.ax /= time_scale * time_scale;
-            point.ay /= time_scale * time_scale;
+          if (time_scale <= 2.0) {
+            const double t0 = start_point.t;
+            for (auto & point : trajectory.points) {
+              point.t = t0 + (point.t - t0) * time_scale;
+              point.vx /= time_scale;
+              point.vy /= time_scale;
+              point.v /= time_scale;
+              point.ax /= time_scale * time_scale;
+              point.ay /= time_scale * time_scale;
+            }
+          } else {
+            // Only slow down the pre-mouth prefix instead of stretching the entire trajectory
+            // by 8-10x (which would crush cruising speed to ~0.1 m/s and trip progress watchdogs).
+            std::vector<double> factors(trajectory.points.size(), 1.0);
+            const double prefix_factor = std::clamp(available_time / required_time, 0.12, 1.0);
+            for (std::size_t idx = 0; idx <= first_at_mouth && idx < factors.size(); ++idx) {
+              factors[idx] = prefix_factor;
+            }
+            applyLocalTimeScaling(trajectory, std::move(factors), 1.5);
           }
         }
       }
@@ -267,6 +324,17 @@ void YawSplinePlanner::applyClearanceAware(
   }
   trajectory.points.front().yaw = previous_yaw;
   trajectory.points.front().yaw_rate = 0.0;
+  const auto preferred_corridor_yaw = [&](double tangent_yaw, double ref_yaw) -> double {
+      if (preferred_lidar_fov_yaw_offset.has_value()) {
+        // Keep the rectangular footprint aligned with the corridor axis while selecting
+        // the branch whose actual TF-derived LiDAR observation direction points forward
+        // along the exploration tangent (prevents blind backwards entry into unknown corridors).
+        const double lidar_forward_body_yaw = normalizeAngle(
+          tangent_yaw - *preferred_lidar_fov_yaw_offset);
+        return nearest_aligned_yaw(tangent_yaw, lidar_forward_body_yaw, symmetry_order);
+      }
+      return nearest_aligned_yaw(tangent_yaw, ref_yaw, symmetry_order);
+    };
 
   for (std::size_t i = 1; i < point_count; ++i) {
     auto & current = trajectory.points[i];
@@ -296,8 +364,11 @@ void YawSplinePlanner::applyClearanceAware(
               tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset +
               tunnel_locked_branch_offset[j]);
           } else {
+            const double tunnel_ref = preferred_lidar_fov_yaw_offset.has_value()
+              ? normalizeAngle(tunnel.axis_yaw[local_index] - *preferred_lidar_fov_yaw_offset)
+              : previous_yaw;
             desired_yaw = tunnelAlignedYaw(
-              tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, previous_yaw);
+              tunnel.axis_yaw[local_index], params_.tunnel.yaw_offset, tunnel_ref);
           }
           tunnel_alignment = true;
           break;
@@ -317,25 +388,35 @@ void YawSplinePlanner::applyClearanceAware(
           ++tangent_index;
         }
         if (run_end < point_count && tangent_index < point_count) {
-        target = nearest_aligned_yaw(tangent_yaws[tangent_index], previous_yaw, symmetry_order);
+          target = preferred_corridor_yaw(tangent_yaws[tangent_index], previous_yaw);
         }
         open_start_yaw = previous_yaw;
         open_delta = shortestAngularDistance(previous_yaw, target);
         open_t0 = trajectory.points[i - 1].t;
         open_t1 = trajectory.points[std::min(run_end, point_count - 1)].t;
       }
-      const double span = open_t1 - open_t0;
-      const double u = span > 1e-6 ?
-        std::max(0.0, std::min(1.0, (current.t - open_t0) / span)) : 1.0;
-      const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
-      desired_yaw = normalizeAngle(open_start_yaw + open_delta * blend);
+      // During mapless exploration in a pure open-space run (not pre-aligning for an upcoming
+      // narrow corridor on this trajectory), actively steer the TF-derived LiDAR observation
+      // axis toward the local travel / frontier heading immediately (rate+accel limited below)
+      // instead of deferring rotation across a slow quintic blend that rolling replans reset.
+      const bool has_upcoming_narrow = open_t1 < trajectory.points.back().t - 1e-6;
+      if (preferred_lidar_fov_yaw_offset.has_value() && !has_upcoming_narrow) {
+        const double rem_s = trajectory.points.back().s - current.s;
+        if (rem_s <= 0.80 || !std::isfinite(tangent_yaws[i])) {
+          desired_yaw = goal_yaw;
+        } else {
+          desired_yaw = normalizeAngle(tangent_yaws[i] - *preferred_lidar_fov_yaw_offset);
+        }
+      } else {
+        const double span = open_t1 - open_t0;
+        const double u = span > 1e-6 ?
+          std::max(0.0, std::min(1.0, (current.t - open_t0) / span)) : 1.0;
+        const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+        desired_yaw = normalizeAngle(open_start_yaw + open_delta * blend);
+      }
     }
     if (!tunnel_alignment && narrow_flags[i] && std::isfinite(tangent_yaws[i])) {
-      // 窄通道只要求足迹与切线对齐到对称等价：矩形可正向或反向，正方形再加 ±pi/2。
-      // 在所有等价朝向中选与上一时刻转角最小的一个，避免贴墙时做不必要的大角度转向
-      // （正方形车沿 -pi/2 切线进南侧墙尖时，yaw 0 本身已对齐，不应再转 90 度）。
-      // 转角相同时保留靠前的候选（先正向切线），与原先正/反向二选一的行为一致。
-      desired_yaw = nearest_aligned_yaw(tangent_yaws[i], previous_yaw, symmetry_order);
+      desired_yaw = preferred_corridor_yaw(tangent_yaws[i], previous_yaw);
       if (start_in_narrow && current.s - start_s <= narrow_start_hold) {
         desired_yaw = normalizeAngle(initial_yaw);
       }

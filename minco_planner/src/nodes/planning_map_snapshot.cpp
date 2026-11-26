@@ -97,6 +97,14 @@ std::shared_ptr<const PlanningMapSnapshot> PlanningMapSnapshot::fromMessage(
   }
   snapshot->clearance_esdf = std::move(esdf);
   snapshot->blocked_squared_cells = std::move(blocked_squared);
+  if (message.has_global_layer) {
+    nav_msgs::msg::OccupancyGrid global_grid;
+    global_grid.header.frame_id = message.header.frame_id;
+    global_grid.header.stamp = message.source_stamp;
+    global_grid.info = message.global_info;
+    global_grid.data = message.global_occupancy;
+    snapshot->global_grid = std::move(global_grid);
+  }
   return snapshot;
 }
 

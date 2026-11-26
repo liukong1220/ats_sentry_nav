@@ -3,6 +3,7 @@
 #ifndef MINCO_PLANNER__YAW_SPLINE_PLANNER_HPP_
 #define MINCO_PLANNER__YAW_SPLINE_PLANNER_HPP_
 
+#include <optional>
 #include <string>
 
 #include "minco_planner/trajectory/reference_trajectory.hpp"
@@ -52,7 +53,9 @@ public:
   void apply(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
     const std::vector<TunnelSegment> * tunnels = nullptr,
-    bool is_final_goal = true) const;
+    bool is_final_goal = true,
+    std::optional<double> preferred_lidar_fov_yaw_offset = std::nullopt,
+    bool force_goal_yaw = false) const;
 
 private:
   void applyGoalHeading(
@@ -61,7 +64,8 @@ private:
   void applyClearanceAware(
     ReferenceTrajectory & trajectory, double initial_yaw, double goal_yaw,
     const std::vector<TunnelSegment> * tunnels,
-    bool is_final_goal) const;
+    bool is_final_goal,
+    std::optional<double> preferred_lidar_fov_yaw_offset) const;
   void appendTerminalGoalYawTransition(
     ReferenceTrajectory & trajectory, double goal_yaw) const;
   static double normalizeAngle(double angle);

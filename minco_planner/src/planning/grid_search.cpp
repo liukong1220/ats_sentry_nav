@@ -110,7 +110,9 @@ GridSearchResult GridSearch::plan(
   const auto [goal_x, goal_y] = local_coordinates(goal.pose.position);
   const double heuristic_x = std::floor(goal_x);
   const double heuristic_y = std::floor(goal_y);
-  const bool allow_partial = options.can_stop && params_.unknown_is_obstacle &&
+  const bool unknown_is_obstacle =
+    options.unknown_is_obstacle_override.value_or(params_.unknown_is_obstacle);
+  const bool allow_partial = options.can_stop && unknown_is_obstacle &&
     std::isfinite(goal_x) && std::isfinite(goal_y) &&
     grid.data[linear(start_index)] >= 0 &&
     grid.data[linear(start_index)] < params_.obstacle_value_threshold;
@@ -120,7 +122,7 @@ GridSearchResult GridSearch::plan(
     return result;
   }
 
-  const GridOccupancyPolicy policy{params_.obstacle_value_threshold, params_.unknown_is_obstacle};
+  const GridOccupancyPolicy policy{params_.obstacle_value_threshold, unknown_is_obstacle};
   std::vector<double> owned_field;
   if (!blocked_squared || blocked_squared->size() != cell_count) {
     owned_field = computeBlockedSquaredDistanceCells(grid, policy);
@@ -182,15 +184,20 @@ GridSearchResult GridSearch::plan(
   const double range = params_.clearance_cost_distance;
   const double weight = params_.clearance_cost_weight;
   const bool weighted = weight > 0.0 && range > 0.0;
+  const double unknown_penalty = std::max(1.0, options.unknown_cost_multiplier);
   const auto cost_factor = [&](int id) {
+      double factor = 1.0;
       if (weighted) {
         const double distance = std::sqrt(field[id]) * resolution;
         if (distance < range) {
           const double deficit = (range - distance) / range;
-          return 1.0 + weight * deficit * deficit;
+          factor = 1.0 + weight * deficit * deficit;
         }
       }
-      return 1.0;
+      if (unknown_penalty > 1.0 && grid.data[id] < 0) {
+        factor *= unknown_penalty;
+      }
+      return factor;
     };
   const auto uniform = [&](Index index) {
       if (!in_search(index)) {

@@ -55,6 +55,19 @@ bool LocalCollisionRepair::repair(
   const double terminal_x = has_terminal ? trajectory.points.back().x : 0.0;
   const double terminal_y = has_terminal ? trajectory.points.back().y : 0.0;
   const double coincident_eps = 1e-6;
+  const std::size_t n_pts = trajectory.points.size();
+  std::vector<double> orig_x(n_pts, 0.0);
+  std::vector<double> orig_y(n_pts, 0.0);
+  std::vector<double> arc_s(n_pts, 0.0);
+  for (std::size_t i = 0; i < n_pts; ++i) {
+    orig_x[i] = trajectory.points[i].x;
+    orig_y[i] = trajectory.points[i].y;
+    if (i > 0U) {
+      arc_s[i] = arc_s[i - 1U] + std::hypot(
+        orig_x[i] - orig_x[i - 1U], orig_y[i] - orig_y[i - 1U]);
+    }
+  }
+  std::vector<std::uint8_t> repaired_mask(n_pts, 0U);
 
   bool changed = false;
   for (const auto & collision : collisions.collisions) {
@@ -77,15 +90,20 @@ bool LocalCollisionRepair::repair(
     double repaired_x = point.x;
     double repaired_y = point.y;
     bool used_fallback = false;
+    // Require the candidate cell to move strictly farther from the exact obstacle cell
+    // that the rectangular footprint hit (collision.x, collision.y). Otherwise a tunnel-mouth
+    // or narrow-corridor point whose isotropic circular clearance already meets 0.341..0.436 m
+    // gets mapped right back onto itself (negligible_shift) while its rectangular corner still clips.
+    const double min_repulsion_gain = 0.5 * grid.info.resolution;
     bool found = findNearestClearCell(
-      grid, point.x, point.y, params_.required_clearance_m,
-      params_.search_radius, repaired_x, repaired_y);
+      grid, point.x, point.y, collision.x, collision.y, min_repulsion_gain,
+      params_.required_clearance_m, params_.search_radius, repaired_x, repaired_y);
     if (!found && fallback_clearance > 0.0 &&
       fallback_clearance + 1e-9 < params_.required_clearance_m)
     {
       found = findNearestClearCell(
-        grid, point.x, point.y, fallback_clearance,
-        params_.search_radius, repaired_x, repaired_y);
+        grid, point.x, point.y, collision.x, collision.y, min_repulsion_gain,
+        fallback_clearance, params_.search_radius, repaired_x, repaired_y);
       used_fallback = found;
     }
     if (!found) {
@@ -107,12 +125,77 @@ bool LocalCollisionRepair::repair(
     }
     point.x = repaired_x;
     point.y = repaired_y;
+    repaired_mask[collision.trajectory_index] = 1U;
     changed = true;
     if (stats != nullptr) {
       if (used_fallback) {
         ++stats->fallback_repaired;
       } else {
         ++stats->strict_repaired;
+      }
+    }
+  }
+
+  // Blend a smooth C1 cosine-tapered shoulder (+/- 0.65 m along arc length) around
+  // shifted colliding points so MINCO re-optimization does not smooth or resample
+  // across an isolated 10-20 cm spike at a tunnel mouth or narrow corner.
+  if (changed && n_pts > 2U) {
+    constexpr double kShoulderRadiusM = 0.65;
+    const double grid_yaw = std::atan2(
+      2.0 * (grid.info.origin.orientation.w * grid.info.origin.orientation.z +
+        grid.info.origin.orientation.x * grid.info.origin.orientation.y),
+      1.0 - 2.0 * (grid.info.origin.orientation.y * grid.info.origin.orientation.y +
+        grid.info.origin.orientation.z * grid.info.origin.orientation.z));
+    const double cos_y = std::cos(grid_yaw);
+    const double sin_y = std::sin(grid_yaw);
+    std::vector<std::size_t> repaired_indices;
+    repaired_indices.reserve(n_pts);
+    for (std::size_t i = 0; i < n_pts; ++i) {
+      if (repaired_mask[i] != 0U) {
+        repaired_indices.push_back(i);
+      }
+    }
+    for (std::size_t k = 1U; k + 1U < n_pts; ++k) {
+      if (repaired_mask[k] != 0U) {
+        continue;
+      }
+      const bool is_terminal_position =
+        std::abs(orig_x[k] - terminal_x) <= coincident_eps &&
+        std::abs(orig_y[k] - terminal_y) <= coincident_eps;
+      if (is_terminal_position) {
+        continue;
+      }
+      std::size_t nearest_r = repaired_indices.front();
+      double min_ds = std::abs(arc_s[k] - arc_s[nearest_r]);
+      for (std::size_t r : repaired_indices) {
+        const double ds = std::abs(arc_s[k] - arc_s[r]);
+        if (ds < min_ds) {
+          min_ds = ds;
+          nearest_r = r;
+        }
+      }
+      if (min_ds >= kShoulderRadiusM) {
+        continue;
+      }
+      const double w = 0.5 * (1.0 + std::cos(M_PI * min_ds / kShoulderRadiusM));
+      const double shift_x = trajectory.points[nearest_r].x - orig_x[nearest_r];
+      const double shift_y = trajectory.points[nearest_r].y - orig_y[nearest_r];
+      double scale = w;
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        const double cand_x = orig_x[k] + scale * shift_x;
+        const double cand_y = orig_y[k] + scale * shift_y;
+        const double dx0 = cand_x - grid.info.origin.position.x;
+        const double dy0 = cand_y - grid.info.origin.position.y;
+        const double lx = cos_y * dx0 + sin_y * dy0;
+        const double ly = -sin_y * dx0 + cos_y * dy0;
+        const int mx = static_cast<int>(std::floor(lx / grid.info.resolution));
+        const int my = static_cast<int>(std::floor(ly / grid.info.resolution));
+        if (isFree(grid, mx, my)) {
+          trajectory.points[k].x = cand_x;
+          trajectory.points[k].y = cand_y;
+          break;
+        }
+        scale *= 0.5;
       }
     }
   }
@@ -123,6 +206,9 @@ bool LocalCollisionRepair::findNearestClearCell(
   const nav_msgs::msg::OccupancyGrid & grid,
   double x,
   double y,
+  double obs_x,
+  double obs_y,
+  double min_repulsion_gain_m,
   double required_clearance_m,
   double search_radius_m,
   double & repaired_x,
@@ -145,6 +231,9 @@ bool LocalCollisionRepair::findNearestClearCell(
     std::floor(local_y / grid.info.resolution));
   const int radius_cells = std::max(
     1, static_cast<int>(std::ceil(search_radius_m / grid.info.resolution)));
+  const double current_obs_dist = std::hypot(x - obs_x, y - obs_y);
+  const bool enforce_repulsion = std::isfinite(obs_x) && std::isfinite(obs_y) &&
+    min_repulsion_gain_m > 0.0;
 
   double best_distance_sq = std::numeric_limits<double>::infinity();
   bool found = false;
@@ -161,6 +250,11 @@ bool LocalCollisionRepair::findNearestClearCell(
         std::cos(yaw) * cell_local_x - std::sin(yaw) * cell_local_y;
       const double wy = grid.info.origin.position.y +
         std::sin(yaw) * cell_local_x + std::cos(yaw) * cell_local_y;
+      if (enforce_repulsion &&
+        std::hypot(wx - obs_x, wy - obs_y) < current_obs_dist + min_repulsion_gain_m)
+      {
+        continue;
+      }
       const double distance_sq = (wx - x) * (wx - x) + (wy - y) * (wy - y);
       if (distance_sq >= best_distance_sq) {
         continue;
