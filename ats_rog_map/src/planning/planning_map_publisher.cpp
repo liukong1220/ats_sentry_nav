@@ -128,6 +128,10 @@ PlanningMapPublisher::PlanningMapPublisher(GroundProjectionProvider provider, co
     0.1, declare_parameter<double>("esdf_viz_max_distance", signed_distance_max_m_));
   esdf_viz_max_points_ = static_cast<std::size_t>(std::max<std::int64_t>(
     1000, declare_parameter<std::int64_t>("esdf_viz_max_points", 250000)));
+  esdf_viz_use_global_in_mapping_ = declare_parameter<bool>(
+    "esdf_viz_use_global_in_mapping", true);
+  esdf_viz_global_rate_hz_ = std::max(
+    0.2, declare_parameter<double>("esdf_viz_global_rate_hz", 2.0));
   footprint_length_ = std::max(0.0, declare_parameter<double>("footprint_length", 0.58));
   footprint_width_ = std::max(0.0, declare_parameter<double>("footprint_width", 0.58));
   footprint_safety_margin_ = std::max(
@@ -201,6 +205,11 @@ PlanningMapPublisher::PlanningMapPublisher(GroundProjectionProvider provider, co
   planning_snapshot_pub_ = create_publisher<
     ats_navigation_interfaces::msg::PlanningMapSnapshot>(planning_snapshot_topic_, snapshot_qos);
   projection_worker_ = std::thread([this]() {runProjectionWorker();});
+  if (mapping_mode_ && esdf_viz_use_global_in_mapping_ &&
+    (esdf_cloud_pub_ || clearance_contour_pub_))
+  {
+    global_viz_worker_ = std::thread([this]() {runGlobalEsdfVizWorker();});
+  }
   if (mapping_mode_) {
     layer_updated_sub_ = create_subscription<std_msgs::msg::UInt64>(
       "/rog_map/odom_layer_updated", rclcpp::QoS(1).reliable(),
@@ -245,6 +254,14 @@ PlanningMapPublisher::~PlanningMapPublisher()
   worker_cv_.notify_all();
   if (projection_worker_.joinable()) {
     projection_worker_.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(global_viz_mutex_);
+    global_viz_stop_ = true;
+  }
+  global_viz_cv_.notify_all();
+  if (global_viz_worker_.joinable()) {
+    global_viz_worker_.join();
   }
 }
 

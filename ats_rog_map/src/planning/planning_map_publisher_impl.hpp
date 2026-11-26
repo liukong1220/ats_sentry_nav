@@ -76,6 +76,11 @@ private:
   void processProjection(
     const GroundProjection & response,
     std::uint64_t localization_epoch, std::uint64_t request_epoch);
+  void enqueueGlobalEsdfViz(nav_msgs::msg::OccupancyGrid grid);
+  void runGlobalEsdfVizWorker();
+  void publishGlobalEsdfViz(
+    const nav_msgs::msg::OccupancyGrid & global_grid,
+    ats_rc_esdf::RcTraversabilityEsdfProvider & esdf_provider) const;
   sensor_msgs::msg::PointCloud2 encodeEsdfCloud(
     const nav_msgs::msg::OccupancyGrid & grid,
     const std::vector<double> & distance_field) const;
@@ -175,6 +180,8 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr clearance_contour_pub_;
   double esdf_viz_max_distance_{2.0};
   std::size_t esdf_viz_max_points_{250000U};
+  bool esdf_viz_use_global_in_mapping_{true};
+  double esdf_viz_global_rate_hz_{2.0};
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt64>::SharedPtr generation_pub_;
   rclcpp::Publisher<ats_navigation_interfaces::msg::PlanningMapStatus>::
@@ -190,6 +197,14 @@ private:
   bool worker_busy_{false};
   bool worker_stop_{false};
   std::thread projection_worker_;
+
+  std::mutex global_viz_mutex_;
+  std::condition_variable global_viz_cv_;
+  std::optional<nav_msgs::msg::OccupancyGrid> pending_global_viz_grid_;
+  bool global_viz_stop_{false};
+  bool has_published_global_viz_{false};
+  std::chrono::steady_clock::time_point last_global_viz_enqueue_time_{};
+  std::thread global_viz_worker_;
 };
 
 

@@ -424,28 +424,40 @@ void PlanningMapPublisher::processProjection(
     return;
   }
   const auto t_pub_start = std::chrono::steady_clock::now();
+  last_rog_generation_ = response.generation;
+  planning_snapshot_pub_->publish(planning_snapshot);
+  publishMapStatus(true, response.generation, "planning snapshot ready");
   publishPlanningGridViz(fusion.planning_grid);
-  const double footprint_radius = std::hypot(
-    0.5 * footprint_length_ + footprint_safety_margin_,
-    0.5 * footprint_width_ + footprint_safety_margin_);
-  if (esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U) {
-    esdf_cloud_pub_->publish(
-      encodeEsdfCloud(fusion.planning_grid, signed_distance));
-  }
-  if (clearance_contour_pub_ && clearance_contour_pub_->get_subscription_count() > 0U) {
-    const double inscribed_radius =
-      0.5 * std::min(footprint_length_, footprint_width_) + footprint_safety_margin_;
-    clearance_contour_pub_->publish(encodeClearanceContours(
-      fusion.planning_grid, signed_distance, inscribed_radius, footprint_radius));
+  const bool want_esdf_cloud =
+    esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U;
+  const bool want_contours =
+    clearance_contour_pub_ && clearance_contour_pub_->get_subscription_count() > 0U;
+  if (want_esdf_cloud || want_contours) {
+    if (mapping_mode_ && esdf_viz_use_global_in_mapping_ && global_grid.has_value() &&
+      global_viz_worker_.joinable())
+    {
+      enqueueGlobalEsdfViz(std::move(*global_grid));
+    } else {
+      const double footprint_radius = std::hypot(
+        0.5 * footprint_length_ + footprint_safety_margin_,
+        0.5 * footprint_width_ + footprint_safety_margin_);
+      if (want_esdf_cloud) {
+        esdf_cloud_pub_->publish(
+          encodeEsdfCloud(fusion.planning_grid, signed_distance));
+      }
+      if (want_contours) {
+        const double inscribed_radius =
+          0.5 * std::min(footprint_length_, footprint_width_) + footprint_safety_margin_;
+        clearance_contour_pub_->publish(encodeClearanceContours(
+          fusion.planning_grid, signed_distance, inscribed_radius, footprint_radius));
+      }
+    }
   }
   if (generation_pub_ && generation_pub_->get_subscription_count() > 0U) {
     std_msgs::msg::UInt64 generation;
     generation.data = response.generation;
     generation_pub_->publish(generation);
   }
-  last_rog_generation_ = response.generation;
-  planning_snapshot_pub_->publish(planning_snapshot);
-  publishMapStatus(true, response.generation, "planning snapshot ready");
   const auto t_done = std::chrono::steady_clock::now();
   const auto ms_between = [](auto a, auto b) {
     return 1000.0 * std::chrono::duration<double>(b - a).count();
@@ -460,6 +472,144 @@ void PlanningMapPublisher::processProjection(
     ms_between(t_tf_start, t_fuse_start), ms_between(t_fuse_start, t_esdf_start),
     ms_between(t_esdf_start, t_snap_start), ms_between(t_snap_start, t_pub_start),
     ms_between(t_pub_start, t_done));
+}
+
+void PlanningMapPublisher::enqueueGlobalEsdfViz(nav_msgs::msg::OccupancyGrid grid)
+{
+  const auto now_tp = std::chrono::steady_clock::now();
+  const double min_period_s = 1.0 / std::max(0.2, esdf_viz_global_rate_hz_);
+  {
+    std::lock_guard<std::mutex> lock(global_viz_mutex_);
+    if (global_viz_stop_) {
+      return;
+    }
+    if (has_published_global_viz_) {
+      const double elapsed_s = std::chrono::duration<double>(
+        now_tp - last_global_viz_enqueue_time_).count();
+      if (elapsed_s < min_period_s) {
+        return;
+      }
+    }
+    has_published_global_viz_ = true;
+    last_global_viz_enqueue_time_ = now_tp;
+    pending_global_viz_grid_ = std::move(grid);
+  }
+  global_viz_cv_.notify_one();
+}
+
+void PlanningMapPublisher::runGlobalEsdfVizWorker()
+{
+  ats_rc_esdf::RcTraversabilityEsdfProvider global_viz_esdf;
+  while (true) {
+    nav_msgs::msg::OccupancyGrid grid;
+    {
+      std::unique_lock<std::mutex> lock(global_viz_mutex_);
+      global_viz_cv_.wait(
+        lock, [this]() {return global_viz_stop_ || pending_global_viz_grid_.has_value();});
+      if (global_viz_stop_) {
+        return;
+      }
+      grid = std::move(*pending_global_viz_grid_);
+      pending_global_viz_grid_.reset();
+    }
+    try {
+      publishGlobalEsdfViz(grid, global_viz_esdf);
+    } catch (const std::exception & exception) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Global ESDF visualization update failed: %s", exception.what());
+    }
+  }
+}
+
+void PlanningMapPublisher::publishGlobalEsdfViz(
+  const nav_msgs::msg::OccupancyGrid & global_grid,
+  ats_rc_esdf::RcTraversabilityEsdfProvider & esdf_provider) const
+{
+  const bool want_esdf_cloud =
+    esdf_cloud_pub_ && esdf_cloud_pub_->get_subscription_count() > 0U;
+  const bool want_contours =
+    clearance_contour_pub_ && clearance_contour_pub_->get_subscription_count() > 0U;
+  if (!want_esdf_cloud && !want_contours) {
+    return;
+  }
+  const int width = static_cast<int>(global_grid.info.width);
+  const int height = static_cast<int>(global_grid.info.height);
+  if (width <= 0 || height <= 0 ||
+    global_grid.data.size() < static_cast<std::size_t>(width) * static_cast<std::size_t>(height))
+  {
+    return;
+  }
+  int min_x = width;
+  int min_y = height;
+  int max_x = -1;
+  int max_y = -1;
+  for (int y = 0; y < height; ++y) {
+    const std::size_t row = static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
+    for (int x = 0; x < width; ++x) {
+      if (global_grid.data[row + static_cast<std::size_t>(x)] >= 0) {
+        if (x < min_x) {min_x = x;}
+        if (x > max_x) {max_x = x;}
+        if (y < min_y) {min_y = y;}
+        if (y > max_y) {max_y = y;}
+      }
+    }
+  }
+  if (max_x < min_x || max_y < min_y) {
+    return;
+  }
+  // Crop to explored known-cell bounding box (+2-cell unknown border so frontier edges
+  // keep identical ESDF obstacle distance semantics as the local planning window).
+  constexpr int kBorderCells = 2;
+  const int x0 = std::max(0, min_x - kBorderCells);
+  const int y0 = std::max(0, min_y - kBorderCells);
+  const int x1 = std::min(width - 1, max_x + kBorderCells);
+  const int y1 = std::min(height - 1, max_y + kBorderCells);
+  const int cw = x1 - x0 + 1;
+  const int ch = y1 - y0 + 1;
+
+  nav_msgs::msg::OccupancyGrid cropped;
+  cropped.header = global_grid.header;
+  cropped.info = global_grid.info;
+  cropped.info.width = static_cast<std::uint32_t>(cw);
+  cropped.info.height = static_cast<std::uint32_t>(ch);
+  const auto shifted_origin = cellToFrame(
+    global_grid.info, static_cast<double>(x0), static_cast<double>(y0));
+  cropped.info.origin.position.x = shifted_origin[0];
+  cropped.info.origin.position.y = shifted_origin[1];
+  cropped.data.resize(static_cast<std::size_t>(cw) * static_cast<std::size_t>(ch), -1);
+  for (int y = 0; y < ch; ++y) {
+    const std::size_t src_off =
+      static_cast<std::size_t>(y0 + y) * static_cast<std::size_t>(width) +
+      static_cast<std::size_t>(x0);
+    const std::size_t dst_off =
+      static_cast<std::size_t>(y) * static_cast<std::size_t>(cw);
+    std::copy_n(global_grid.data.data() + src_off, static_cast<std::size_t>(cw),
+      cropped.data.data() + dst_off);
+  }
+  OdomLayerStore::fillIsolatedUnknownGaps(
+    cropped.data, cropped.info.width, cropped.info.height, 9, 3,
+    fusion_params_.terrain_obstacle_value_threshold);
+
+  esdf_provider.updateGrid(
+    cropped, fusion_params_.terrain_obstacle_value_threshold,
+    fusion_params_.unknown_is_obstacle, 100, nullptr, nullptr, nullptr, nullptr, false);
+  std::vector<double> global_signed_distance;
+  if (!esdf_provider.copySignedDistanceField(global_signed_distance)) {
+    return;
+  }
+  if (want_esdf_cloud) {
+    esdf_cloud_pub_->publish(encodeEsdfCloud(cropped, global_signed_distance));
+  }
+  if (want_contours) {
+    const double footprint_radius = std::hypot(
+      0.5 * footprint_length_ + footprint_safety_margin_,
+      0.5 * footprint_width_ + footprint_safety_margin_);
+    const double inscribed_radius =
+      0.5 * std::min(footprint_length_, footprint_width_) + footprint_safety_margin_;
+    clearance_contour_pub_->publish(encodeClearanceContours(
+      cropped, global_signed_distance, inscribed_radius, footprint_radius));
+  }
 }
 
 // unix_global_esdf 风格 5-field XYZ+distance+intensity 距离场点云：
