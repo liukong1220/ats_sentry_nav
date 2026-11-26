@@ -30,7 +30,11 @@ ament_auto_find_build_dependencies()
 ###########
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
-  DIRECTORY src
+  src/localization_fusion_node.cpp
+  src/localization_fusion_observation.cpp
+  src/small_gicp_relocalization.cpp
+  src/small_gicp_relocalization_align.cpp
+  src/small_gicp_relocalization_state.cpp
 )
 
 target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
