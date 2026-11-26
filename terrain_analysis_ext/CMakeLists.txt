@@ -38,7 +38,9 @@ find_package(pcl_ros REQUIRED)
 
 include_directories(include)
 
-add_executable(terrainAnalysisExt src/terrainAnalysisExt.cpp)
+add_executable(terrainAnalysisExt
+  src/terrainAnalysisExt.cpp
+  src/terrain_slope_grid.cpp)
 ament_target_dependencies(
   terrainAnalysisExt
   rclcpp

@@ -54,26 +54,50 @@ public:
     }
     for (const auto & p : points) {
       const auto k = key(p, r);
-      if (words_.empty()) {endpoints_.insert(k);}
-      else {
+      bool is_new_endpoint = false;
+      if (words_.empty()) {
+        is_new_endpoint = endpoints_.insert(k).second;
+      } else {
         const auto i = index(k);
-        words_[i / 64U].endpoints |= std::uint64_t{1} << (i % 64U);
+        auto & ep = words_[i / 64U].endpoints;
+        const auto bit = std::uint64_t{1} << (i % 64U);
+        is_new_endpoint = (ep & bit) == 0;
+        ep |= bit;
+      }
+      if (is_new_endpoint) {
+        unique_endpoints_.push_back(p);
       }
     }
   }
 
-  bool clearOnce(const Key & k)
+  const std::vector<Point> & uniqueEndpoints() const {return unique_endpoints_;}
+
+  bool canClear(const Key & k) const
   {
     if (words_.empty()) {
-      if (endpoints_.count(k) || !traversed_.insert(k).second) {return false;}
+      return !endpoints_.count(k) && !traversed_.count(k);
+    }
+    const auto i = index(k);
+    const auto & word = words_[i / 64U];
+    const auto bit = std::uint64_t{1} << (i % 64U);
+    return ((word.endpoints | word.traversed) & bit) == 0;
+  }
+
+  void markCleared(const Key & k)
+  {
+    if (words_.empty()) {
+      traversed_.insert(k);
     } else {
       const auto i = index(k);
-      auto & word = words_[i / 64U];
-      const auto bit = std::uint64_t{1} << (i % 64U);
-      if ((word.endpoints | word.traversed) & bit) {return false;}
-      word.traversed |= bit;
+      words_[i / 64U].traversed |= std::uint64_t{1} << (i % 64U);
     }
     ++visited_;
+  }
+
+  bool clearOnce(const Key & k)
+  {
+    if (!canClear(k)) {return false;}
+    markCleared(k);
     return true;
   }
 
@@ -117,6 +141,7 @@ private:
   std::array<std::size_t, 3> dimensions_{};
   std::vector<Word> words_;
   std::unordered_set<Key, Hash> endpoints_, traversed_;
+  std::vector<Point> unique_endpoints_;
   std::size_t visited_{0};
 };
 
@@ -160,11 +185,25 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   const auto & gc = columns.config();
   const double r = std::min(gc.voxel_resolution, c.cloud_resolution);
   const auto cell_count = static_cast<std::size_t>(c.width) * c.height;
-  std::vector<unsigned char> flags(cell_count, 0);
-  std::vector<double> ground_cache(cell_count, std::numeric_limits<double>::quiet_NaN());
+  thread_local std::vector<unsigned char> flags;
+  thread_local std::vector<double> ground_cache;
+  thread_local std::vector<double> post_ground_cache;
+  thread_local std::vector<unsigned char> post_ground_done;
+  if (flags.size() != cell_count) {
+    flags.assign(cell_count, 0U);
+    ground_cache.assign(cell_count, std::numeric_limits<double>::quiet_NaN());
+    post_ground_cache.assign(cell_count, std::numeric_limits<double>::quiet_NaN());
+    post_ground_done.assign(cell_count, 0U);
+  }
   std::vector<std::size_t> touched;
+  std::vector<std::size_t> dirty_indices;
   touched.reserve(std::min(cell_count, points.size() * 8U));
+  dirty_indices.reserve(std::min(cell_count, points.size() * 8U));
+  const auto mark_dirty = [&](std::size_t i) {
+      if (!(flags[i] & 128U)) {flags[i] |= 128U; dirty_indices.push_back(i);}
+    };
   const auto touch = [&](std::size_t i) {
+      mark_dirty(i);
       if (!(flags[i] & 2U)) {flags[i] |= 2U; touched.push_back(i);}
     };
   std::vector<Point> valid;
@@ -180,7 +219,7 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   for (const auto & k : layer.rayClearCandidates(stamp)) {cloud_mask.addCandidate(k);}
   const auto prepared = std::chrono::steady_clock::now();
   if (sensor_valid) {
-    for (const auto & p : valid) {
+    for (const auto & p : mask.uniqueEndpoints()) {
       const auto clear_cloud = [&](const Key & k) {
           if (!cloud_mask.candidate(k)) {return;}
           const Point center{(k[0] + 0.5) * c.cloud_resolution,
@@ -198,6 +237,7 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         const auto i = layer.index(x, y);
          if (!(flags[i] & 16U)) {
           if (!(flags[i] & 1U)) {
+            mark_dirty(i);
             flags[i] |= 1U;
             if (const auto ground = columns.ground(x, y)) {ground_cache[i] = *ground;}
           }
@@ -211,8 +251,11 @@ OdomLayerFrameStats integrateOdomLayerFrame(
           }
         }
         const Point center{(k[0] + 0.5) * r, (k[1] + 0.5) * r, (k[2] + 0.5) * r};
-        if (!mask.clearOnce(k)) {return;}
-         if (columns.clearVoxel(center, actual)) {
+        if (!mask.canClear(k)) {return;}
+        bool protected_voxel = false;
+        const bool support_changed = columns.clearVoxel(center, actual, &protected_voxel);
+        if (!protected_voxel) {mask.markCleared(k);}
+        if (support_changed) {
            for (int dy = -1; dy <= 1; ++dy) {
              for (int dx = -1; dx <= 1; ++dx) {
                if (layer.validCell(x + dx, y + dy)) {
@@ -235,7 +278,12 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   }
   const auto rays_done = std::chrono::steady_clock::now();
   columns.observe(valid, robot_ground);
+  for (const auto gi : columns.lastUpdatedGroundIndices()) {
+    flags[gi] |= 16U;
+    touch(gi);
+  }
   const auto ground_done = std::chrono::steady_clock::now();
+  std::vector<Point> boundary_back_points;
   for (const auto & p : valid) {
     const int x = static_cast<int>(std::floor((p[0] - c.origin_x) / c.resolution));
     const int y = static_cast<int>(std::floor((p[1] - c.origin_y) / c.resolution));
@@ -254,22 +302,62 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         if (layer.validCell(x + dx, y + dy)) {touch(layer.index(x + dx, y + dy));}
       }
     }
-    const auto ground = columns.ground(x, y);
-    if (ground && p[2] > *ground + gc.surface_max) {flags[i] |= 4U;}
+    const int rough_stride = std::max(1, static_cast<int>(std::lround(0.10 / c.resolution)));
+    if (rough_stride > 1) {
+      const int offs[4][2] = {
+        {-rough_stride, 0}, {rough_stride, 0}, {0, -rough_stride}, {0, rough_stride}};
+      for (const auto & o : offs) {
+        if (layer.validCell(x + o[0], y + o[1])) {touch(layer.index(x + o[0], y + o[1]));}
+      }
+    }
+    if (!post_ground_done[i]) {
+      post_ground_done[i] = 1U;
+      if (const auto ground = columns.ground(x, y)) {post_ground_cache[i] = *ground;}
+    }
+    if (std::isfinite(post_ground_cache[i]) && p[2] > post_ground_cache[i] + gc.surface_max) {
+      flags[i] |= 4U;
+      // A solid obstacle front face lying within 1 cm of a cell boundary (e.g. from LIO
+      // sub-centimeter offset) extends inward along the horizontal ray direction. Observe
+      // a 1 cm inward sample strictly within the robot obstacle height band so the obstacle's
+      // own cell is marked on the first scan while remaining ray-clearable at the same Z.
+      if (p[2] <= post_ground_cache[i] + gc.robot_height + gc.top_margin) {
+        const double rdx = p[0] - sensor[0];
+        const double rdy = p[1] - sensor[1];
+        const double rdxy = std::hypot(rdx, rdy);
+        if (rdxy > 0.10) {
+          const Point p_back{p[0] + 0.01 * (rdx / rdxy), p[1] + 0.01 * (rdy / rdxy), p[2]};
+          const int bx = static_cast<int>(std::floor((p_back[0] - c.origin_x) / c.resolution));
+          const int by = static_cast<int>(std::floor((p_back[1] - c.origin_y) / c.resolution));
+          if ((bx != x || by != y) && layer.validCell(bx, by)) {
+            boundary_back_points.push_back(p_back);
+            const auto bi = layer.index(bx, by);
+            flags[bi] |= 16U | 4U;
+            touch(bi);
+          }
+        }
+      }
+    }
     layer.observePoint(p, stamp, frame_dt);
+  }
+  if (!boundary_back_points.empty()) {
+    columns.observeBoundaryPoints(boundary_back_points);
   }
   for (const auto i : touched) {
     const int x = static_cast<int>(i % c.width), y = static_cast<int>(i / c.width);
     const auto state = columns.state(x, y);
     if (!(flags[i] & 16U)) {
-      if (state != ColumnState::kFree && state != ColumnState::kTunnelFree) {
+      if (state == ColumnState::kTunnelFree) {
+        stats.ray_cleared_cells += layer.observeTunnelFree(x, y, stamp, frame_dt) ? 1U : 0U;
+        ++stats.non_obstacle;
+      } else if (state != ColumnState::kFree) {
         layer.invalidateFree(x, y, stamp);
       }
       continue;
     }
     if (state == ColumnState::kOccupied) {
-      if (flags[i] & 4U) {layer.observeHit(x, y, stamp, frame_dt);}
-      else {
+      if ((flags[i] & 4U) || columns.isDropOffStep(x, y) || columns.isRoughBump(x, y)) {
+        layer.observeHit(x, y, stamp, frame_dt);
+      } else {
         layer.invalidateFree(x, y, stamp);
         layer.observeVisible(x, y, stamp);
       }
@@ -286,6 +374,12 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   }
   stats.ray_voxels = mask.visited();
   layer.tick(stamp);
+  for (const auto i : dirty_indices) {
+    flags[i] = 0U;
+    ground_cache[i] = std::numeric_limits<double>::quiet_NaN();
+    post_ground_cache[i] = std::numeric_limits<double>::quiet_NaN();
+    post_ground_done[i] = 0U;
+  }
   const auto end = std::chrono::steady_clock::now();
   stats.prepare_ms = 1000.0 * std::chrono::duration<double>(prepared - begin).count();
   stats.ray_ms = 1000.0 * std::chrono::duration<double>(rays_done - prepared).count();

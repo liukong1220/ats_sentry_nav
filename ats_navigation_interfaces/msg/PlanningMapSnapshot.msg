@@ -22,3 +22,10 @@ int8[] occupancy
 float32[] signed_distance_m
 float32[] gradient_x
 float32[] gradient_y
+# Optional coarse global occupancy layer (same header.frame_id, source_generation &
+# localization_epoch; no global ESDF). Populated in mapless/odom-layer mode so global
+# search can plan over the full persistent odom layer while local ESDF/MINCO/footprint
+# safety stay strictly inside the local known-free window above.
+bool has_global_layer
+nav_msgs/MapMetaData global_info
+int8[] global_occupancy

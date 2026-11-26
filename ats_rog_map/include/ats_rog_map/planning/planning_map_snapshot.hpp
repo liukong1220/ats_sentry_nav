@@ -69,7 +69,8 @@ inline ats_navigation_interfaces::msg::PlanningMapSnapshot makePlanningMapSnapsh
   const builtin_interfaces::msg::Time & publication_stamp,
   std::uint64_t localization_epoch, std::uint64_t source_generation,
   std::uint64_t publication_sequence, bool unknown_is_obstacle,
-  int occupied_value_threshold)
+  int occupied_value_threshold,
+  const nav_msgs::msg::OccupancyGrid * global_grid = nullptr)
 {
   auto snapshot = makeUnavailablePlanningMapSnapshot(
     grid, publication_stamp, localization_epoch, source_generation,
@@ -135,6 +136,19 @@ inline ats_navigation_interfaces::msg::PlanningMapSnapshot makePlanningMapSnapsh
         std::cos(origin_yaw) * gradient_local_x - std::sin(origin_yaw) * gradient_local_y);
       snapshot.gradient_y[index] = static_cast<float>(
         std::sin(origin_yaw) * gradient_local_x + std::cos(origin_yaw) * gradient_local_y);
+    }
+  }
+  if (global_grid != nullptr && global_grid->header.frame_id == grid.header.frame_id &&
+    global_grid->info.resolution > 0.0F && global_grid->info.width > 0U &&
+    global_grid->info.height > 0U)
+  {
+    const std::size_t global_cells =
+      static_cast<std::size_t>(global_grid->info.width) *
+      static_cast<std::size_t>(global_grid->info.height);
+    if (global_grid->data.size() == global_cells) {
+      snapshot.has_global_layer = true;
+      snapshot.global_info = global_grid->info;
+      snapshot.global_occupancy = global_grid->data;
     }
   }
   return snapshot;

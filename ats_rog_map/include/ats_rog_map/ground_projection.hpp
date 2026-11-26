@@ -34,6 +34,9 @@ struct GroundProjection
 {
   // 0 free, 100 raw occupied, -1 unknown. Downstream owns metric clearance/inflation.
   nav_msgs::msg::OccupancyGrid occupancy_grid;
+  // Optional coarse global occupancy layer (40 x 30 m persistent odom layer, e.g. 0.20 m)
+  // captured atomically with occupancy_grid in mapless/odom-layer mode; no global ESDF.
+  nav_msgs::msg::OccupancyGrid global_occupancy_grid;
   // Optional aligned mask (100 = multi-frame confirmed TUNNEL_FREE column, 0 otherwise).
   nav_msgs::msg::OccupancyGrid tunnel_free_grid;
   std::uint64_t generation{0};

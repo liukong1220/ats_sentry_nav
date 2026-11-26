@@ -83,6 +83,7 @@ public:
     double origin_y, GroundColumnConfig config);
   void observe(const std::vector<std::array<double, 3>> & points,
     const std::array<double, 3> & robot_ground);
+  void observeBoundaryPoints(const std::vector<std::array<double, 3>> & points);
   ColumnState state(int x, int y) const;
   std::optional<double> ground(int x, int y) const;
   void clear();
@@ -91,10 +92,20 @@ public:
   bool clearVoxel(const std::array<double, 3> & point);
   bool clearVoxel(const std::array<double, 3> & point, double ray_z);
   // ray is the sample where the ray crosses the voxel; its XY bounds the slope.
-  bool clearVoxel(const std::array<double, 3> & point, const std::array<double, 3> & ray);
+  // If protected_voxel is non-null, it is set to true only when an existing
+  // ground-band voxel was kept because the ray passed above it.
+  bool clearVoxel(const std::array<double, 3> & point, const std::array<double, 3> & ray,
+    bool * protected_voxel = nullptr);
   void observeRayCell(int x, int y);
   // Diagnostic view of what state() compares against the gate; no new decision.
   std::optional<ColumnHeadroom> ceilingHeadroom(int x, int y) const;
+  bool isDropOffStep(int x, int y) const;
+  bool isRoughBump(int x, int y) const;
+  bool hasOverhead(int x, int y) const;
+  const std::vector<std::size_t> & lastUpdatedGroundIndices() const
+  {
+    return last_updated_ground_indices_;
+  }
   std::size_t outOfRange() const {return out_of_range_;}
   const GroundColumnConfig & config() const {return config_;}
 
@@ -112,8 +123,8 @@ private:
     // keep the height/XY association instead of one whole-cell Cartesian box.
     std::vector<std::pair<int, ReturnExtent>> patches;
   };
-  static void extendExtent(ReturnExtent & target, const ReturnExtent & source);
-  static void extendReturns(VoxelReturns & target, const VoxelReturns & source);
+  static bool extendExtent(ReturnExtent & target, const ReturnExtent & source);
+  static bool extendReturns(VoxelReturns & target, const VoxelReturns & source);
   // Bounds at the query XY, never a neighbouring column's unshifted height.
   // plane_z (optional) receives the fitted plane height at the query, or NaN
   // when no valid plane produced the bounds.
@@ -124,6 +135,7 @@ private:
     double lower;
     double upper;     // conservative: never below any admissible floor
     double estimate;  // plane height (max over the voxel XY extent), else upper
+    bool planar{false};
   };
   // Overhead plane z = c + a (x - x0) + b (y - y0) fitted to the non-floor returns
   // around a column. Valid only for a single flat surface (e.g. a tunnel board).
@@ -154,11 +166,12 @@ private:
     int x, int y, const ReturnExtent & evidence, const std::optional<CeilingPlane> & ceiling) const;
   std::optional<SupportInterval> voxelSupportInterval(int x, int y,
     const ReturnExtent & evidence) const;
-  bool hasOverhead(int x, int y) const;
   bool hasDisconnectedLowerReturn(int x, int y) const;
   ColumnState rawState(int x, int y) const;
   bool valid(int x, int y) const;
   std::size_t index(int x, int y) const;
+  void markFrameTouched(std::size_t i);
+  void invalidateSupportPlanes3x3(int x, int y);
   int width_;
   int height_;
   double resolution_;
@@ -169,10 +182,17 @@ private:
   std::vector<std::optional<VoxelReturns>> ground_;
   std::vector<bool> ray_observed_;
   std::vector<bool> frame_touched_;
+  std::vector<std::size_t> frame_touched_indices_;
+  std::vector<std::size_t> cleared_ground_indices_;
+  std::vector<std::size_t> last_updated_ground_indices_;
+  std::vector<unsigned char> bfs_queued_;
+  std::vector<unsigned char> observed_scratch_;
   std::vector<unsigned int> tunnel_free_observations_;
   // GroundColumnGrid is owned by the serialized odom-layer integration. These
-  // fits are valid only until observe(), clearVoxel() or clear() changes evidence.
+  // caches are incrementally invalidated whenever ground/column evidence changes.
   mutable std::unordered_map<std::size_t, std::vector<SupportPlane>> support_planes_;
+  mutable std::unordered_map<std::size_t, std::optional<CeilingPlane>> floor_planes_;
+  mutable std::unordered_map<std::size_t, ColumnState> raw_state_cache_;
   std::size_t out_of_range_{0};
 };
 }  // namespace ats_rog_map

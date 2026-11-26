@@ -32,18 +32,18 @@ struct OdomLayerConfig
 {
   double origin_x{0.0};
   double origin_y{0.0};
-  double resolution{0.10};
-  // Global mapping layer: 40 m x 30 m at 0.1 m resolution.  The origin is
-  // the lower-left corner of the fixed global array; mapping-start coordinates
+  double resolution{0.05};
+  // Global mapping layer: 40 m x 30 m at 0.05 m resolution (unified with 5 cm planning/prior map).
+  // The origin is the lower-left corner of the fixed global array; mapping-start coordinates
   // are kept at its centre by the default launch configuration.
-  std::uint32_t width{400};
-  std::uint32_t height{300};
+  std::uint32_t width{800};
+  std::uint32_t height{600};
   double static_promotion_seconds{3.0};
   double dynamic_hold_seconds{3.0};
   double max_frame_dt_seconds{0.25};
   double save_persistence_ratio{0.8};
-  double cloud_resolution{0.10};
-  double cloud_clear_ray_radius{0.01};
+  double cloud_resolution{0.05};
+  double cloud_clear_ray_radius{0.03};
   double cloud_clear_endpoint_margin{0.20};
   bool tunnel_free_enabled{true};
   int tunnel_free_confirm_frames{2};
@@ -59,6 +59,7 @@ struct OdomLayerCell
   double observed_time{0.0};
   double last_visible_time{0.0};
   bool cleared_once{false};
+  bool footprint_traversed{false};
   std::uint32_t clear_count{0};
   std::uint16_t tunnel_free_count{0};
 };
@@ -114,6 +115,11 @@ public:
   bool observePoint(const std::array<double, 3> & point, double stamp, double observed_dt);
   bool observeFree(int x, int y, double stamp, double observed_dt);
   bool observeTunnelFree(int x, int y, double stamp, double observed_dt);
+  // Convert kUnknown cells under the robot's physically occupied chassis footprint
+  // to kFree without ever overwriting kOccupied cells (eliminates LiDAR start blind-spot
+  // holes in saved partial maps).
+  void markUnknownFootprintFree(
+    double center_x, double center_y, double half_x, double half_y, double stamp);
   void clearCloudVoxel(const std::array<double, 3> & point, double stamp);
   bool hasRayClearCandidate(const std::array<double, 3> & voxel_location, double stamp) const;
   std::vector<std::array<int, 3>> rayClearCandidates(double stamp) const;
@@ -153,9 +159,26 @@ public:
   bool save(const std::string & output_prefix, const std::string & frame_id,
     const OdomLayerTransform & map_from_odom = {}, OdomLayerSaveStats * stats = nullptr) const;
 
+  // Conservatively fill isolated 1..2 cell unknown scan gaps (8-connected components
+  // with <= max_component_cells and bounding box <= max_bbox_span x max_bbox_span)
+  // that are completely enclosed by known-free cells and touch zero occupied cells.
+  // Never modifies any occupied cell.
+  static std::size_t fillIsolatedUnknownGaps(
+    std::vector<std::int8_t> & data, std::uint32_t width, std::uint32_t height,
+    int max_component_cells = 9, int max_bbox_span = 3, int occupied_threshold = 50);
+
+  // Remove isolated 1..2 cell occupied noise speckles (<= 5x10 cm) whose entire
+  // 8-connected boundary consists strictly of known-free cells (never touching any
+  // wall/obstacle component >= 3 cells or any unknown shadow).
+  static std::size_t filterIsolatedOccupiedSpeckles(
+    std::vector<std::int8_t> & data, std::uint32_t width, std::uint32_t height,
+    int max_component_cells = 2, int occupied_threshold = 50);
+
 private:
   OdomLayerConfig config_;
   std::vector<OdomLayerCell> cells_;
+  std::vector<std::size_t> dynamic_occupied_indices_;
+  std::vector<unsigned char> dynamic_occupied_tracked_;
   struct CloudVoxel
   {
     std::array<double, 3> point;

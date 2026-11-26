@@ -58,7 +58,7 @@ struct GroundProjectionFusionParams
   int terrain_obstacle_value_threshold{50};
   double slope_grid_max_degrees{45.0};
   double slope_obstacle_degrees{28.0};
-  double planning_resolution{0.10};
+  double planning_resolution{0.05};
   bool unknown_is_obstacle{true};
   // Default true keeps the P2 contract (static walls block planning).  O1/S3 may
   // set false only after the odom global layer feeds the planning grid.

@@ -62,18 +62,7 @@ namespace rog_map {
     }
 
 
-    static double computePathLength(const super_utils::vec_E<super_utils::Vec3f>& path) {
-        if (path.size() < 2) {
-            return 0.0;
-        }
-        double len = 0.0;
-        for (size_t i = 0; i < path.size() - 1; i++) {
-            len += (path[i] - path[i + 1]).norm();
-        }
-        return len;
-    }
-
-    static super_utils::Vec3f lineBoxIntersectPoint(const super_utils::Vec3f& pt, const super_utils::Vec3f& pos,
+    inline super_utils::Vec3f lineBoxIntersectPoint(const super_utils::Vec3f& pt, const super_utils::Vec3f& pos,
                                                     const super_utils::Vec3f& box_min,
                                                     const super_utils::Vec3f& box_max) {
         Eigen::Vector3d diff = pt - pos;
@@ -95,46 +84,6 @@ namespace rog_map {
         }
 
         return pos + (min_t - 1e-3) * diff;
-    }
-
-    static bool GetIntersection(float fDst1, float fDst2, super_utils::Vec3f P1, super_utils::Vec3f P2,
-                                super_utils::Vec3f& Hit) {
-        if ((fDst1 * fDst2) >= 0.0f) return false;
-        if (fDst1 == fDst2) return false;
-        Hit = P1 + (P2 - P1) * (-fDst1 / (fDst2 - fDst1));
-        return true;
-    }
-
-    static bool InBox(super_utils::Vec3f Hit, super_utils::Vec3f B1, super_utils::Vec3f B2, const int Axis) {
-        if (Axis == 1 && Hit.z() > B1.z() && Hit.z() < B2.z() && Hit.y() > B1.y() && Hit.y() < B2.y()) return true;
-        if (Axis == 2 && Hit.z() > B1.z() && Hit.z() < B2.z() && Hit.x() > B1.x() && Hit.x() < B2.x()) return true;
-        if (Axis == 3 && Hit.x() > B1.x() && Hit.x() < B2.x() && Hit.y() > B1.y() && Hit.y() < B2.y()) return true;
-        return false;
-    }
-
-    //The box in this article is Axis-Aligned and so can be defined by only two 3D points:
-    // B1 - the smallest values of X, Y, Z
-    //        B2 - the largest values of X, Y, Z
-    // returns true if line (L1, L2) intersects with the box (B1, B2)
-    // returns intersection point in Hit
-    static bool lineIntersectBox(super_utils::Vec3f L1, super_utils::Vec3f L2, super_utils::Vec3f B1,
-                                 super_utils::Vec3f B2, super_utils::Vec3f& Hit) {
-        if (L2.x() < B1.x() && L1.x() < B1.x()) return false;
-        if (L2.x() > B2.x() && L1.x() > B2.x()) return false;
-        if (L2.y() < B1.y() && L1.y() < B1.y()) return false;
-        if (L2.y() > B2.y() && L1.y() > B2.y()) return false;
-        if (L2.z() < B1.z() && L1.z() < B1.z()) return false;
-        if (L2.z() > B2.z() && L1.z() > B2.z()) return false;
-
-        if ((GetIntersection(L1.x() - B1.x(), L2.x() - B1.x(), L1, L2, Hit) && InBox(Hit, B1, B2, 1))
-            || (GetIntersection(L1.y() - B1.y(), L2.y() - B1.y(), L1, L2, Hit) && InBox(Hit, B1, B2, 2))
-            || (GetIntersection(L1.z() - B1.z(), L2.z() - B1.z(), L1, L2, Hit) && InBox(Hit, B1, B2, 3))
-            || (GetIntersection(L1.x() - B2.x(), L2.x() - B2.x(), L1, L2, Hit) && InBox(Hit, B1, B2, 1))
-            || (GetIntersection(L1.y() - B2.y(), L2.y() - B2.y(), L1, L2, Hit) && InBox(Hit, B1, B2, 2))
-            || (GetIntersection(L1.z() - B2.z(), L2.z() - B2.z(), L1, L2, Hit) && InBox(Hit, B1, B2, 3)))
-            return true;
-
-        return false;
     }
 }
 

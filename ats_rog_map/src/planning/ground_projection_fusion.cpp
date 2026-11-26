@@ -199,12 +199,17 @@ void aggregateTransformedFootprint(
     ymin = std::min(ymin, polygon[i].y()); ymax = std::max(ymax, polygon[i].y());
   }
   const double sr = source.info.resolution;
-  const int x0 = std::max(0, static_cast<int>(std::floor(xmin / sr)));
-  const int y0 = std::max(0, static_cast<int>(std::floor(ymin / sr)));
+  // MapMetaData::resolution is float32 (0.05f = 0.050000000745...), which accumulates
+  // ~2e-7..1e-6 m edge drift over 20-30 m. Use a 10-micrometer overlap threshold so
+  // aligned 5 cm grids copy 1:1 instead of dilating every wall into a 2x2 block, while
+  // still capturing any genuine >= 0.01 mm geometric overlap.
+  const double overlap_eps = std::max(1e-5, 1e-4 * std::min(r, sr));
+  const int x0 = std::max(0, static_cast<int>(std::floor((xmin + overlap_eps) / sr)));
+  const int y0 = std::max(0, static_cast<int>(std::floor((ymin + overlap_eps) / sr)));
   const int x1 = std::min(static_cast<int>(source.info.width) - 1,
-      static_cast<int>(std::ceil(xmax / sr)) - 1);
+      static_cast<int>(std::ceil((xmax - overlap_eps) / sr)) - 1);
   const int y1 = std::min(static_cast<int>(source.info.height) - 1,
-      static_cast<int>(std::ceil(ymax / sr)) - 1);
+      static_cast<int>(std::ceil((ymax - overlap_eps) / sr)) - 1);
   for (int y = y0; y <= y1; ++y) {
     for (int x = x0; x <= x1; ++x) {
       bool overlaps = true;
@@ -220,7 +225,8 @@ void aggregateTransformedFootprint(
         }
         const double center = ((x + 0.5) * axis.x() + (y + 0.5) * axis.y()) * sr;
         const double radius = 0.5 * sr * (std::abs(axis.x()) + std::abs(axis.y()));
-        overlaps = std::min(high, center + radius) - std::max(low, center - radius) > 1e-10;
+        overlaps = std::min(high, center + radius) - std::max(low, center - radius) >
+          overlap_eps * axis.length();
       }
       if (!overlaps) {continue;}
       const int sample = source.data[static_cast<std::size_t>(y) * source.info.width + x];
@@ -555,6 +561,23 @@ bool GroundProjectionFusion::fuse(
         {
           known_free = true;
           corridor_static_free = true;
+        } else if (rog_value >= 0) {
+          // Suppress terrain_analysis_ext's <=10 cm overhang bleed at tunnel/overpass mouths
+          // strictly on cells that odom_layer has already verified as known-free (rog_value == 0).
+          const int halo_cells = std::max(
+            1, std::min(2, static_cast<int>(std::lround(0.10 / out_res))));
+          for (int hy = -halo_cells; hy <= halo_cells && !corridor_static_free; ++hy) {
+            for (int hx = -halo_cells; hx <= halo_cells; ++hx) {
+              if (hx == 0 && hy == 0) {continue;}
+              int8_t nb_tf = 0;
+              if (tunnel_free_sampler.sample(
+                  proj_x + hx * out_res, proj_y + hy * out_res, nb_tf) && nb_tf > 0)
+              {
+                corridor_static_free = true;
+                break;
+              }
+            }
+          }
         }
       }
       if (!occupied && known_free && check_override) {

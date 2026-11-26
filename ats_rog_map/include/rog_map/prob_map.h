@@ -216,7 +216,7 @@ namespace rog_map {
 
         void updateProbMap(
                 const PointCloud &cloud, const Pose &sensor_pose,
-                const Vec3f &map_center);
+                const Vec3f &map_center, bool update_esdf = true);
 
         const RaycastDebugStats &getLastRaycastDebugStats() const {
             return last_raycast_debug_stats_;

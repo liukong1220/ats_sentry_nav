@@ -18,7 +18,8 @@ constexpr double kEpsilon = 1e-9;
 
 OdomLayerStore::OdomLayerStore(const OdomLayerConfig & config)
 : config_(config),
-  cells_(static_cast<std::size_t>(config.width) * config.height)
+  cells_(static_cast<std::size_t>(config.width) * config.height),
+  dynamic_occupied_tracked_(static_cast<std::size_t>(config.width) * config.height, 0U)
 {
   config_.resolution = std::max(config_.resolution, kEpsilon);
   config_.static_promotion_seconds = std::max(config_.static_promotion_seconds, 0.0);
@@ -62,8 +63,12 @@ bool OdomLayerStore::observeHit(
   if (value->state == OdomCellState::kOccupied && stamp <= value->last_hit_time) {
     return false;
   }
-  const double bounded_dt = std::clamp(observed_dt, 0.0, config_.max_frame_dt_seconds);
-  if (value->state != OdomCellState::kOccupied) {
+  const bool was_occupied = value->state == OdomCellState::kOccupied;
+  const double raw_dt = (was_occupied && value->last_hit_time > 0.0)
+    ? (stamp - value->last_hit_time)
+    : observed_dt;
+  const double bounded_dt = std::clamp(raw_dt, 0.0, config_.max_frame_dt_seconds);
+  if (!was_occupied) {
     value->first_hit_time = stamp;
     value->hit_time_accum = 0.0;
     // 持久比按本次占据期计算：之前的 free 观测时间不应稀释新出现的障碍。
@@ -76,10 +81,18 @@ bool OdomLayerStore::observeHit(
   value->observed_time += bounded_dt;
   value->state = OdomCellState::kOccupied;
   value->tunnel_free_count = 0U;
-  if (value->layer == OdomCellLayer::kDynamic && !value->cleared_once &&
-    value->hit_time_accum >= config_.static_promotion_seconds)
-  {
+  const double required_promotion = value->cleared_once
+    ? std::max(config_.static_promotion_seconds, 1.5 * config_.static_promotion_seconds)
+    : config_.static_promotion_seconds;
+  if (value->layer == OdomCellLayer::kDynamic && value->hit_time_accum >= required_promotion) {
     value->layer = OdomCellLayer::kStatic;
+    value->cleared_once = false;
+  } else if (value->layer == OdomCellLayer::kDynamic && value->state == OdomCellState::kOccupied) {
+    const auto idx = index(x, y);
+    if (!dynamic_occupied_tracked_[idx]) {
+      dynamic_occupied_tracked_[idx] = 1U;
+      dynamic_occupied_indices_.push_back(idx);
+    }
   }
   return true;
 }
@@ -98,6 +111,7 @@ bool OdomLayerStore::invalidateFree(const int x, const int y, const double stamp
 {
   auto * value = cell(x, y);
   if (value == nullptr || !std::isfinite(stamp) || stamp < value->last_visible_time ||
+    value->footprint_traversed ||
     (value->state != OdomCellState::kFree && value->state != OdomCellState::kTunnelFree))
   {return false;}
   value->state = OdomCellState::kUnknown;
@@ -120,26 +134,36 @@ bool OdomLayerStore::observePoint(
     static_cast<int>(std::floor(point[2] / config_.cloud_resolution))};
   auto & voxel = cloud_voxels_[key];
   auto & evidence = voxel.evidence;
-  if (evidence.state == OdomCellState::kOccupied && stamp <= evidence.last_hit_time) {
+  const bool was_occupied = evidence.state == OdomCellState::kOccupied;
+  if (was_occupied && stamp <= evidence.last_hit_time) {
     return false;
+  }
+  if (!was_occupied) {
+    evidence.first_hit_time = stamp;
+    evidence.hit_time_accum = 0.0;
+    evidence.observed_time = 0.0;
+    evidence.layer = OdomCellLayer::kDynamic;
   }
   voxel.point = point;
   evidence.state = OdomCellState::kOccupied;
-  const double interval = evidence.last_hit_time > 0.0 ?
-    stamp - evidence.last_hit_time : observed_dt;
+  const double interval = (was_occupied && evidence.last_hit_time > 0.0) ?
+    (stamp - evidence.last_hit_time) : observed_dt;
   evidence.last_hit_time = stamp;
-  if (!evidence.cleared_once) {
-    if (voxel.candidate_index == std::numeric_limits<std::size_t>::max()) {
-      ray_candidates_.push_back({key, stamp});
-      voxel.candidate_index = ray_candidates_.size() - 1;
-    } else {
-      ray_candidates_[voxel.candidate_index].last_hit_time = stamp;
-    }
+  if (voxel.candidate_index == std::numeric_limits<std::size_t>::max()) {
+    ray_candidates_.push_back({key, stamp});
+    voxel.candidate_index = ray_candidates_.size() - 1;
+  } else {
+    ray_candidates_[voxel.candidate_index].last_hit_time = stamp;
   }
-  evidence.hit_time_accum += std::clamp(interval, 0.0, config_.max_frame_dt_seconds);
+  const double bounded_dt = std::clamp(interval, 0.0, config_.max_frame_dt_seconds);
+  evidence.hit_time_accum += bounded_dt;
   evidence.observed_time = evidence.hit_time_accum;
-  if (!evidence.cleared_once && evidence.hit_time_accum >= config_.static_promotion_seconds) {
+  const double required_promotion = evidence.cleared_once
+    ? std::max(config_.static_promotion_seconds, 1.5 * config_.static_promotion_seconds)
+    : config_.static_promotion_seconds;
+  if (evidence.layer == OdomCellLayer::kDynamic && evidence.hit_time_accum >= required_promotion) {
     evidence.layer = OdomCellLayer::kStatic;
+    evidence.cleared_once = false;
   }
   return true;
 }
@@ -156,6 +180,8 @@ void OdomLayerStore::clearCloudVoxel(const std::array<double, 3> & point, double
   e.cleared_once = true;
   e.state = OdomCellState::kUnknown;
   e.layer = OdomCellLayer::kDynamic;
+  e.hit_time_accum = 0.0;
+  e.observed_time = 0.0;
   removeRayClearCandidate(found->second);
 }
 
@@ -191,7 +217,8 @@ bool OdomLayerStore::hasRayClearCandidate(
     static_cast<int>(std::floor(location[1] / config_.cloud_resolution)),
     static_cast<int>(std::floor(location[2] / config_.cloud_resolution))};
   const auto found = cloud_voxels_.find(key);
-  return found != cloud_voxels_.end() && !found->second.evidence.cleared_once &&
+  return found != cloud_voxels_.end() &&
+         found->second.evidence.state == OdomCellState::kOccupied &&
          found->second.evidence.last_hit_time < stamp;
 }
 
@@ -204,7 +231,8 @@ void OdomLayerStore::clearCloudVoxelAlongRay(
     static_cast<int>(std::floor(location[1] / config_.cloud_resolution)),
     static_cast<int>(std::floor(location[2] / config_.cloud_resolution))};
   const auto found = cloud_voxels_.find(key);
-  if (found == cloud_voxels_.end() || found->second.evidence.cleared_once ||
+  if (found == cloud_voxels_.end() ||
+    found->second.evidence.state != OdomCellState::kOccupied ||
     found->second.evidence.last_hit_time >= stamp) {return;}
   const auto & point = found->second.point;
   double norm = 0.0, projection = 0.0, distance_squared = 0.0;
@@ -225,6 +253,8 @@ void OdomLayerStore::clearCloudVoxelAlongRay(
   evidence.cleared_once = true;
   evidence.state = OdomCellState::kUnknown;
   evidence.layer = OdomCellLayer::kDynamic;
+  evidence.hit_time_accum = 0.0;
+  evidence.observed_time = 0.0;
   removeRayClearCandidate(found->second);
 }
 
@@ -261,6 +291,42 @@ bool OdomLayerStore::observeTunnelFree(int x, int y, double stamp, double observ
   return cleared;
 }
 
+void OdomLayerStore::markUnknownFootprintFree(
+  const double center_x, const double center_y,
+  const double half_x, const double half_y, const double stamp)
+{
+  if (!std::isfinite(center_x) || !std::isfinite(center_y) ||
+    !std::isfinite(half_x) || !std::isfinite(half_y) || !std::isfinite(stamp) ||
+    half_x <= 0.0 || half_y <= 0.0)
+  {
+    return;
+  }
+  const int x0 = std::max(
+    0, static_cast<int>(std::floor((center_x - half_x - config_.origin_x) / config_.resolution)));
+  const int x1 = std::min(
+    static_cast<int>(config_.width) - 1,
+    static_cast<int>(std::floor((center_x + half_x - config_.origin_x) / config_.resolution)));
+  const int y0 = std::max(
+    0, static_cast<int>(std::floor((center_y - half_y - config_.origin_y) / config_.resolution)));
+  const int y1 = std::min(
+    static_cast<int>(config_.height) - 1,
+    static_cast<int>(std::floor((center_y + half_y - config_.origin_y) / config_.resolution)));
+  for (int y = y0; y <= y1; ++y) {
+    for (int x = x0; x <= x1; ++x) {
+      auto * value = cell(x, y);
+      if (value != nullptr && value->state != OdomCellState::kOccupied) {
+        value->footprint_traversed = true;
+        if (value->state == OdomCellState::kUnknown) {
+          value->state = OdomCellState::kFree;
+          if (stamp > value->last_visible_time) {
+            value->last_visible_time = stamp;
+          }
+        }
+      }
+    }
+  }
+}
+
 std::int8_t OdomLayerStore::sampleFootprint(
   double min_x, double min_y, double max_x, double max_y) const
 {
@@ -270,12 +336,14 @@ std::int8_t OdomLayerStore::sampleFootprint(
       const double value = (coordinate - origin) / config_.resolution;
       if (!std::isfinite(value)) {return value;}
       const double boundary = std::round(value);
-      // Only absorb arithmetic roundoff when expressing the same grid edge in
-      // world coordinates and back. A fixed geometric epsilon on the upper
-      // edge would discard real positive-area overlap with an occupied cell.
-      const double roundoff = 8 * std::numeric_limits<double>::epsilon() *
+      // Only absorb arithmetic / float32 OccupancyGrid::info.resolution roundoff when
+      // expressing the same grid edge in world coordinates and back (float32 0.05f drifts
+      // ~1.5e-8/cell -> ~1e-5 cells over 800 cells, whereas 1e-4 cells = 5 micrometers).
+      const double roundoff = std::max(
+        1e-4,
+        8 * std::numeric_limits<double>::epsilon() *
         std::max(1.0, std::abs(coordinate / config_.resolution) +
-        std::abs(origin / config_.resolution));
+        std::abs(origin / config_.resolution)));
       return std::abs(value - boundary) <= roundoff ? boundary : value;
     };
   const double x0 = lattice(min_x, config_.origin_x), x1 = lattice(max_x, config_.origin_x);
@@ -308,9 +376,11 @@ bool OdomLayerStore::sampleTunnelFree(
       const double value = (coordinate - origin) / config_.resolution;
       if (!std::isfinite(value)) {return value;}
       const double boundary = std::round(value);
-      const double roundoff = 8 * std::numeric_limits<double>::epsilon() *
+      const double roundoff = std::max(
+        1e-4,
+        8 * std::numeric_limits<double>::epsilon() *
         std::max(1.0, std::abs(coordinate / config_.resolution) +
-        std::abs(origin / config_.resolution));
+        std::abs(origin / config_.resolution)));
       return std::abs(value - boundary) <= roundoff ? boundary : value;
     };
   const double x0 = lattice(min_x, config_.origin_x), x1 = lattice(max_x, config_.origin_x);
@@ -344,6 +414,8 @@ bool OdomLayerStore::observeRayClear(
   }
   value->state = OdomCellState::kUnknown;
   value->layer = OdomCellLayer::kDynamic;
+  value->hit_time_accum = 0.0;
+  value->observed_time = 0.0;
   value->cleared_once = true;
   ++value->clear_count;
   value->last_visible_time = stamp;
@@ -355,14 +427,26 @@ void OdomLayerStore::tick(const double stamp)
   if (!std::isfinite(stamp)) {
     return;
   }
-  for (auto & value : cells_) {
-    if (value.layer == OdomCellLayer::kDynamic &&
-      value.state == OdomCellState::kOccupied && value.last_hit_time > 0.0 &&
+  for (std::size_t k = 0; k < dynamic_occupied_indices_.size(); ) {
+    const std::size_t idx = dynamic_occupied_indices_[k];
+    auto & value = cells_[idx];
+    if (value.layer != OdomCellLayer::kDynamic || value.state != OdomCellState::kOccupied) {
+      dynamic_occupied_tracked_[idx] = 0U;
+      dynamic_occupied_indices_[k] = dynamic_occupied_indices_.back();
+      dynamic_occupied_indices_.pop_back();
+      continue;
+    }
+    if (value.last_hit_time > 0.0 &&
       stamp - std::max(value.last_hit_time, value.last_visible_time) >
       config_.dynamic_hold_seconds)
     {
       value.state = OdomCellState::kUnknown;
+      dynamic_occupied_tracked_[idx] = 0U;
+      dynamic_occupied_indices_[k] = dynamic_occupied_indices_.back();
+      dynamic_occupied_indices_.pop_back();
+      continue;
     }
+    ++k;
   }
 }
 
@@ -392,6 +476,15 @@ bool OdomLayerStore::rebase(const OdomLayerTransform & old_from_new)
       const auto & source = old_cells[index(old_x, old_y)];
       auto & destination = cells_[index(new_x, new_y)];
       destination = source;
+      if (destination.layer == OdomCellLayer::kDynamic &&
+        destination.state == OdomCellState::kOccupied)
+      {
+        const auto nidx = index(new_x, new_y);
+        if (!dynamic_occupied_tracked_[nidx]) {
+          dynamic_occupied_tracked_[nidx] = 1U;
+          dynamic_occupied_indices_.push_back(nidx);
+        }
+      }
     }
   }
   return true;
@@ -400,6 +493,8 @@ bool OdomLayerStore::rebase(const OdomLayerTransform & old_from_new)
 void OdomLayerStore::clear()
 {
   cells_.assign(cells_.size(), OdomLayerCell{});
+  dynamic_occupied_indices_.clear();
+  std::fill(dynamic_occupied_tracked_.begin(), dynamic_occupied_tracked_.end(), 0U);
   cloud_voxels_.clear();
   ray_candidates_.clear();
 }
@@ -496,6 +591,27 @@ bool OdomLayerStore::save(
         pixel = 254U;
       }
       pixels[index(x, y)] = pixel;
+    }
+  }
+  {
+    std::vector<std::int8_t> save_grid(cells_.size(), -1);
+    for (std::size_t i = 0; i < cells_.size(); ++i) {
+      if (pixels[i] == 0U) {
+        save_grid[i] = 100;
+      } else if (pixels[i] == 254U) {
+        save_grid[i] = 0;
+      }
+    }
+    const bool changed_speckles =
+      filterIsolatedOccupiedSpeckles(save_grid, config_.width, config_.height) > 0U;
+    const bool changed_gaps =
+      fillIsolatedUnknownGaps(save_grid, config_.width, config_.height) > 0U;
+    if (changed_speckles || changed_gaps) {
+      for (std::size_t i = 0; i < cells_.size(); ++i) {
+        if ((pixels[i] == 205U || pixels[i] == 0U) && save_grid[i] == 0) {
+          pixels[i] = 254U;
+        }
+      }
     }
   }
   auto origin = map_point(config_.origin_x, config_.origin_y, 0.0);
@@ -637,6 +753,214 @@ bool OdomLayerStore::save(
        << "\noccupied_not_saved_other: " << counts.occupied_other << "\n";
   if (stats) {*stats = counts;}
   return write_pcd(pcd_path, points) && pgm.good() && yaml.good();
+}
+
+std::size_t OdomLayerStore::fillIsolatedUnknownGaps(
+  std::vector<std::int8_t> & data, std::uint32_t width, std::uint32_t height,
+  int max_component_cells, int max_bbox_span, int occupied_threshold)
+{
+  const std::size_t cell_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  if (width < 3U || height < 3U || data.size() != cell_count ||
+    max_component_cells <= 0 || max_bbox_span <= 0)
+  {
+    return 0U;
+  }
+  const int w = static_cast<int>(width);
+  const int h = static_cast<int>(height);
+  const auto is_free = [occupied_threshold](std::int8_t v) {
+      return v >= 0 && v < occupied_threshold;
+    };
+  const auto idx = [w](int x, int y) {
+      return static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+    };
+
+  std::size_t total_filled = 0U;
+  std::vector<std::pair<int, int>> component;
+  component.reserve(static_cast<std::size_t>(max_component_cells) + 1U);
+
+  for (int sy = 1; sy < h - 1; ++sy) {
+    const std::size_t row = static_cast<std::size_t>(sy) * static_cast<std::size_t>(w);
+    for (int sx = 1; sx < w - 1; ++sx) {
+      const std::size_t sidx = row + static_cast<std::size_t>(sx);
+      if (data[sidx] >= 0) {
+        continue;
+      }
+      // Only seed from unknown cells adjacent to at least one known-free 4-neighbor.
+      if (!is_free(data[sidx - 1U]) && !is_free(data[sidx + 1U]) &&
+        !is_free(data[sidx - width]) && !is_free(data[sidx + width]))
+      {
+        continue;
+      }
+      component.clear();
+      component.emplace_back(sx, sy);
+      int min_x = sx, max_x = sx, min_y = sy, max_y = sy;
+      bool valid = true;
+      for (std::size_t head = 0U; head < component.size() && valid; ++head) {
+        const auto [cx, cy] = component[head];
+        if (cx <= 0 || cy <= 0 || cx >= w - 1 || cy >= h - 1) {
+          valid = false;
+          break;
+        }
+        for (int dy = -1; dy <= 1 && valid; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+              continue;
+            }
+            const int nx = cx + dx;
+            const int ny = cy + dy;
+            const std::int8_t nv = data[idx(nx, ny)];
+            if (nv >= occupied_threshold) {
+              valid = false;
+              break;
+            }
+            if (nv < 0) {
+              bool already = false;
+              for (const auto & p : component) {
+                if (p.first == nx && p.second == ny) {
+                  already = true;
+                  break;
+                }
+              }
+              if (!already) {
+                if (static_cast<int>(component.size()) >= max_component_cells) {
+                  valid = false;
+                  break;
+                }
+                min_x = std::min(min_x, nx);
+                max_x = std::max(max_x, nx);
+                min_y = std::min(min_y, ny);
+                max_y = std::max(max_y, ny);
+                if (max_x - min_x + 1 > max_bbox_span || max_y - min_y + 1 > max_bbox_span) {
+                  valid = false;
+                  break;
+                }
+                component.emplace_back(nx, ny);
+              }
+            }
+          }
+        }
+      }
+      if (valid) {
+        for (const auto & [fx, fy] : component) {
+          data[idx(fx, fy)] = 0;
+        }
+        total_filled += component.size();
+      }
+    }
+  }
+  // Second pass: bridge thin 1-2 cell (5-10 cm) unknown scan-ring or self-filter slits
+  // strictly bracketed on both opposite sides by known-free cells with zero occupied
+  // cells in their 3x3 neighborhood (never erodes walls or expands into open unknown).
+  if (w >= 5 && h >= 5) {
+    std::vector<std::size_t> slit_cells;
+    for (int sy = 2; sy < h - 2; ++sy) {
+      const std::size_t row = static_cast<std::size_t>(sy) * static_cast<std::size_t>(w);
+      for (int sx = 2; sx < w - 2; ++sx) {
+        const std::size_t sidx = row + static_cast<std::size_t>(sx);
+        if (data[sidx] >= 0) {continue;}
+        bool near_occ = false;
+        for (int dy = -1; dy <= 1 && !near_occ; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (data[idx(sx + dx, sy + dy)] >= occupied_threshold) {
+              near_occ = true;
+              break;
+            }
+          }
+        }
+        if (near_occ) {continue;}
+        const bool horiz_bridge =
+          (is_free(data[idx(sx - 1, sy)]) && is_free(data[idx(sx + 1, sy)])) ||
+          (is_free(data[idx(sx - 1, sy)]) && data[idx(sx + 1, sy)] < 0 && is_free(data[idx(sx + 2, sy)])) ||
+          (is_free(data[idx(sx - 2, sy)]) && data[idx(sx - 1, sy)] < 0 && is_free(data[idx(sx + 1, sy)]));
+        const bool vert_bridge =
+          (is_free(data[idx(sx, sy - 1)]) && is_free(data[idx(sx, sy + 1)])) ||
+          (is_free(data[idx(sx, sy - 1)]) && data[idx(sx, sy + 1)] < 0 && is_free(data[idx(sx, sy + 2)])) ||
+          (is_free(data[idx(sx, sy - 2)]) && data[idx(sx, sy - 1)] < 0 && is_free(data[idx(sx, sy + 1)]));
+        if (horiz_bridge || vert_bridge) {
+          slit_cells.push_back(sidx);
+        }
+      }
+    }
+    for (const std::size_t sidx : slit_cells) {
+      data[sidx] = 0;
+    }
+    total_filled += slit_cells.size();
+  }
+  return total_filled;
+}
+
+std::size_t OdomLayerStore::filterIsolatedOccupiedSpeckles(
+  std::vector<std::int8_t> & data, std::uint32_t width, std::uint32_t height,
+  int max_component_cells, int occupied_threshold)
+{
+  const std::size_t cell_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  if (width < 3U || height < 3U || data.size() != cell_count || max_component_cells <= 0) {
+    return 0U;
+  }
+  const int w = static_cast<int>(width);
+  const int h = static_cast<int>(height);
+  const auto is_free = [occupied_threshold](std::int8_t v) {
+      return v >= 0 && v < occupied_threshold;
+    };
+  const auto idx = [w](int x, int y) {
+      return static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+    };
+  std::size_t total_removed = 0U;
+  std::vector<std::pair<int, int>> component;
+  component.reserve(static_cast<std::size_t>(max_component_cells) + 1U);
+  for (int sy = 1; sy < h - 1; ++sy) {
+    const std::size_t row = static_cast<std::size_t>(sy) * static_cast<std::size_t>(w);
+    for (int sx = 1; sx < w - 1; ++sx) {
+      const std::size_t sidx = row + static_cast<std::size_t>(sx);
+      if (data[sidx] < occupied_threshold) {continue;}
+      component.clear();
+      component.emplace_back(sx, sy);
+      bool isolated = true;
+      for (std::size_t head = 0U; head < component.size() && isolated; ++head) {
+        const auto [cx, cy] = component[head];
+        if (cx <= 0 || cy <= 0 || cx >= w - 1 || cy >= h - 1) {
+          isolated = false;
+          break;
+        }
+        for (int dy = -1; dy <= 1 && isolated; ++dy) {
+          for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {continue;}
+            const int nx = cx + dx;
+            const int ny = cy + dy;
+            const std::int8_t nv = data[idx(nx, ny)];
+            if (nv < 0) {
+              // Touching unknown shadow -> could be the edge of a real obstacle.
+              isolated = false;
+              break;
+            }
+            if (nv >= occupied_threshold) {
+              bool already = false;
+              for (const auto & p : component) {
+                if (p.first == nx && p.second == ny) {already = true; break;}
+              }
+              if (!already) {
+                if (static_cast<int>(component.size()) >= max_component_cells) {
+                  isolated = false;
+                  break;
+                }
+                component.emplace_back(nx, ny);
+              }
+            } else if (!is_free(nv)) {
+              isolated = false;
+              break;
+            }
+          }
+        }
+      }
+      if (isolated) {
+        for (const auto & [fx, fy] : component) {
+          data[idx(fx, fy)] = 0;
+        }
+        total_removed += component.size();
+      }
+    }
+  }
+  return total_removed;
 }
 
 }  // namespace ats_rog_map

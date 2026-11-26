@@ -40,10 +40,12 @@ set(ROG_MAP_CORE_SOURCES
   src/rog_map/esdf_map.cpp
   src/rog_map/inf_map.cpp
   src/rog_map/prob_map.cpp
+  src/rog_map/prob_map_raycast.cpp
   src/rog_map/rog_map.cpp
   src/rog_map/sliding_map.cpp
   src/odom_layer.cpp
   src/ground_column.cpp
+  src/ground_column_planes.cpp
   src/odom_layer_integration.cpp
 )
 
@@ -67,6 +69,7 @@ ament_target_dependencies(${PROJECT_NAME}_core PUBLIC
 add_library(${PROJECT_NAME}_planning
   src/planning/ground_projection_fusion.cpp
   src/planning/planning_map_publisher.cpp
+  src/planning/planning_map_publisher_fuse.cpp
 )
 target_include_directories(${PROJECT_NAME}_planning PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -77,7 +80,10 @@ ament_target_dependencies(${PROJECT_NAME}_planning PUBLIC
   tf2_geometry_msgs tf2_ros ats_rc_esdf visualization_msgs
 )
 
-add_executable(ats_rog_map_node src/ats_rog_map_node.cpp)
+add_executable(ats_rog_map_node
+  src/ats_rog_map_node.cpp
+  src/ats_rog_map_node_projection.cpp
+)
 target_link_libraries(ats_rog_map_node ${PROJECT_NAME}_core ${PROJECT_NAME}_planning)
 ament_target_dependencies(ats_rog_map_node ats_rog_map_interfaces ats_navigation_interfaces ats_rc_esdf visualization_msgs tf2_ros)
 
