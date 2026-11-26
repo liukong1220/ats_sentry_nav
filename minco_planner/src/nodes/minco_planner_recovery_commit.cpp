@@ -688,12 +688,12 @@ void MincoPlannerNode::finalizeAndCommitReference(
     }
   }
   if (robot_in_or_arming_tunnel || search_result.scan_turn || exploration_lidar_fov.has_value()) {
-    // 隧道内（含洞口锁定段与整车退洞段）以及无图主动对准 LiDAR 观测方向/盲区扫描转向段，
-    // 严格禁止小陀螺并采用 BODY_YAW_FOLLOW 授权，确保 MPC 实际跟踪规划航向。
+    // 隧道内（含洞口锁定段与整车退洞段）以及盲区原地扫描段严格采用 BODY_YAW_FOLLOW；
+    // 无图探索段默认先置 BODY_YAW_FOLLOW（面向雷达视野），开阔安全区若小陀螺通过门禁则升为 SPIN。
     yaw_authority = ats_navigation_interfaces::msg::PlannerStatus::YAW_AUTHORITY_BODY_YAW_FOLLOW;
   }
   if (spin_policy_.enabled && !force_body_yaw_follow_ && !robot_in_or_arming_tunnel &&
-    !search_result.scan_turn && !exploration_lidar_fov.has_value())
+    !search_result.scan_turn)
   {
     ReferenceTrajectory spun = reference;
     SpinYawParams spin_params = spin_yaw_params_;
