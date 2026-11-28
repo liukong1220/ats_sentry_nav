@@ -66,7 +66,8 @@ void AtsSwerveMpcNode::onControlTimer() {
   }
   // 2. 获取当前状态（不可用时必须输出确定性零速度，不能静默 return）
   State current = State::Zero();
-  if (!odometryUsable(current)) {
+  Control measured_velocity = Control::Zero();
+  if (!odometryUsable(current, &measured_velocity)) {
     publishZeroCommandForFailure("里程计不可用");
     return;
   }
@@ -77,6 +78,7 @@ void AtsSwerveMpcNode::onControlTimer() {
   bool trajectory_expired = false;
   double rotation_delay = 0.0;
   double reference_terminal_speed = 0.0;
+  double remaining_translation = 0.0;
   // 参考提取（含 trajectory_mutex_ 等待、投影和 horizon 构造）单独计时，
   // 使其不再隐含在 state_trajectory_snapshot 内无法归因。
   const auto reference_extraction_start = std::chrono::steady_clock::now();
@@ -98,6 +100,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     reference_terminal_speed =
         trajectory_tracker_.terminalSpeed(terminal_speed_window_sec_);
     projection = trajectory_tracker_.project(current, last_control_(2));
+    remaining_translation = trajectory_tracker_.remainingTranslation(projection);
     references = trajectory_tracker_.buildHorizon(
         projection, controller_->config().horizon, controller_->config().dt,
         last_rollout_horizon_scale_);
@@ -109,6 +112,10 @@ void AtsSwerveMpcNode::onControlTimer() {
   // 4. 判断是否达到目标或轨迹过期
   const double goal_position_error =
       (goal.head<2>() - current.head<2>()).norm();
+  // 外移掉头回程（terminal_yaw_relocation）在去程可能经过目标点附近，
+  // 用剩余弧长与直线距离的最大值判定终点接近，避免在去程被终点限速锁死。
+  const double terminal_approach_distance =
+      std::max(goal_position_error, remaining_translation);
   const double goal_yaw_error = std::abs(normalizeAngle(goal(2) - current(2)));
   if (trajectory_expired) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -121,6 +128,9 @@ void AtsSwerveMpcNode::onControlTimer() {
   const double max_step_dt = std::max(
       controller_->config().dt, 2.0 * nominal_control_period);
   double actual_step_dt = nominal_control_period;
+  const bool first_active_cycle = get_clock()->ros_time_is_active()
+      ? !last_control_update_stamp_.has_value()
+      : !last_control_update_steady_.has_value();
   if (get_clock()->ros_time_is_active()) {
     const auto update_stamp = now();
     if (last_control_update_stamp_) {
@@ -161,7 +171,7 @@ void AtsSwerveMpcNode::onControlTimer() {
     }
     last_control_update_steady_ = cycle_start;
   }
-  if (goal_position_error <= goal_position_tolerance_ &&
+  if (terminal_approach_distance <= goal_position_tolerance_ &&
       goal_yaw_error <= goal_yaw_tolerance_) {
     publishTerminalDecelerationCommand(actual_step_dt);
     return;
@@ -202,6 +212,15 @@ void AtsSwerveMpcNode::onControlTimer() {
           : std::chrono::duration<double>(cycle_start.time_since_epoch()).count();
   snapshot.current_state = advanceStateThroughCommandDelay(
       current, now_sec_for_delay, rotation_delay);
+  // When resuming active tracking after a brief replanning stop while the chassis
+  // is still rolling (e.g. descending a narrow ramp crest), seed last_control_ from
+  // the measured body velocity so swerve steer angles match the physical rolling
+  // motion instead of snapping sideways from (0, 0, 0).
+  if (first_active_cycle && last_control_.isZero(1e-6) &&
+      measured_velocity.allFinite() &&
+      measured_velocity.head<2>().norm() > 0.05) {
+    last_control_ = controller_->clampBodyAndWheelLimits(measured_velocity);
+  }
   snapshot.references = references;
   snapshot.last_control_before_solve = last_control_;
   snapshot.first_step_dt = actual_step_dt;
@@ -317,8 +336,9 @@ void AtsSwerveMpcNode::onControlTimer() {
         scaled_target.head<2>() *= (target_speed / linear_speed);
       }
     } else {
-      // kBrake 表示预测在制动窗内进入负净空，严格无下限减速。
-      scaled_target.head<2>() *= rollout_safety.speed_scale;
+      // kBrake 表示预测在制动窗内进入负净空，三轴等比减速（含 wz），
+      // 防止线速度刹停而角速度继续旋转把矩形角点扫进弯道内墙。
+      scaled_target *= rollout_safety.speed_scale;
     }
     last_control_ = controller_->clampStepIncrement(
         scaled_target, snapshot.last_control_before_solve,
@@ -335,11 +355,11 @@ void AtsSwerveMpcNode::onControlTimer() {
   // 0.15-0.3 m 时仍给 0.9-1.0 m/s，冲过终点再拉回。终点区内按 |v| <= d / tau 限速，相当于
   // 一阶趋近，tau 大于 e 倍滞后时不过冲。只对终点速度为零的 reference 生效。
   if (terminal_approach_time_constant_ > 0.0 &&
-      goal_position_error <= terminal_approach_radius_ &&
+      terminal_approach_distance <= terminal_approach_radius_ &&
       reference_terminal_speed <= terminal_stop_speed_threshold_) {
     last_control_ = limitTerminalApproachSpeed(
-        last_control_, goal_position_error, terminal_approach_time_constant_);
-    if (goal_position_error <= goal_position_tolerance_) {
+        last_control_, terminal_approach_distance, terminal_approach_time_constant_);
+    if (terminal_approach_distance <= goal_position_tolerance_) {
       // Once translation has reached the endpoint, the physical chassis still
       // needs braking distance for its stationary yaw tail. Waiting until the
       // yaw tolerance is reached can overshoot a footprint-checked terminal

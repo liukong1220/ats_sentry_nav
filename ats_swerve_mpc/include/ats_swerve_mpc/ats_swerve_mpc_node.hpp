@@ -163,7 +163,7 @@ private:
   static Control limitTerminalApproachSpeed(
     const Control & command, double goal_distance, double time_constant);
   /** @brief 校验里程计时效性与位姿跳变；仅返回 true 时状态才可进入本周期求解。 */
-  bool odometryUsable(State & current);
+  bool odometryUsable(State & current, Control * measured_velocity = nullptr);
   /** @brief 检查动力学参数是否落在实车合理区间，并对越界项输出中文 ERROR/WARN。 */
   void validateDynamicsParameters(const Se2MpcConfig & config);
   /** @brief 输出车体/轮级饱和与 OSQP SQP-RTI 求解耗时的分级中文诊断日志。 */
@@ -272,6 +272,7 @@ private:
 
   mutable std::mutex state_mutex_;
   State current_state_ = State::Zero();
+  Control current_velocity_ = Control::Zero();
   bool has_odometry_ = false;
   // 最近一帧里程计的消息时间戳与本地接收时刻，用于超时与跳变检测。
   std::optional<rclcpp::Time> last_odometry_stamp_;

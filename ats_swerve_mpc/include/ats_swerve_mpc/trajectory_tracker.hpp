@@ -118,6 +118,8 @@ public:
   TrajectoryProjection project(const Eigen::Vector2d & position);
   /** @brief 按完整 SE(2) 状态投影，结合 yaw 与当前角速度抑制路径交叉或旋转未刹停时的跳段。 */
   TrajectoryProjection project(const State & state, double current_wz = 0.0);
+  /** @brief 计算从当前投影时刻到轨迹末端的剩余二维平动弧长，避免外移掉头回程轨迹在去程经过目标点时误触终点限速。 */
+  double remainingTranslation(const TrajectoryProjection & projection) const;
   /** @brief 将横向误差转换为 [min_progress_scale,1] 的连续时间缩放。 */
   double progressScale(double cross_track_error) const;
   /** @brief 从投影时刻采样 horizon+1 个状态和车体系速度参考（支持外部安全减速尺度联动收缩前瞻）。 */

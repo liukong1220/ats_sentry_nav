@@ -99,6 +99,42 @@ std::vector<EsdfCorridorSample> AtsSwerveMpcNode::extractEsdfCorridorSamples(
     const double ref_sy = st * ref(0) + ct * ref(1) + snapshot_from_odom(1);
     double d_ref = qp_esdf_config_.corridor_clearance_m;
     sampleSnapshotEsdfBilinear(snapshot, ref_sx, ref_sy, d_ref, nullptr);
+    // Bound d_ref by the clearance at the closest point to nom on the horizon
+    // reference polyline. When nom lags longitudinally behind ref[k] while
+    // exiting a narrow tunnel, ref[k] can already be in wider open space while
+    // nom is still on the centerline inside the tunnel; without this bound,
+    // d_ref > d_nom creates a spurious lateral shove at every tunnel exit.
+    double best_dist_sq = std::numeric_limits<double>::infinity();
+    Eigen::Vector2d proj_odom(ref(0), ref(1));
+    const Eigen::Vector2d nom_xy(nom(0), nom(1));
+    for (int j = 0; j < horizon; ++j) {
+      const Eigen::Vector2d p0(references[static_cast<std::size_t>(j)].state(0),
+                               references[static_cast<std::size_t>(j)].state(1));
+      const Eigen::Vector2d p1(references[static_cast<std::size_t>(j + 1)].state(0),
+                               references[static_cast<std::size_t>(j + 1)].state(1));
+      const Eigen::Vector2d seg = p1 - p0;
+      const double seg_len_sq = seg.squaredNorm();
+      double u = 0.0;
+      if (seg_len_sq > 1e-12) {
+        u = std::clamp((nom_xy - p0).dot(seg) / seg_len_sq, 0.0, 1.0);
+      }
+      const Eigen::Vector2d candidate = p0 + u * seg;
+      const double dist_sq = (nom_xy - candidate).squaredNorm();
+      if (dist_sq < best_dist_sq) {
+        best_dist_sq = dist_sq;
+        proj_odom = candidate;
+      }
+    }
+    if (best_dist_sq <= 0.04 * 0.04) {
+      const double proj_sx =
+          ct * proj_odom(0) - st * proj_odom(1) + snapshot_from_odom(0);
+      const double proj_sy =
+          st * proj_odom(0) + ct * proj_odom(1) + snapshot_from_odom(1);
+      double d_proj = d_ref;
+      if (sampleSnapshotEsdfBilinear(snapshot, proj_sx, proj_sy, d_proj, nullptr)) {
+        d_ref = std::min(d_ref, d_proj);
+      }
+    }
     const double target = std::clamp(
         std::min(qp_esdf_config_.corridor_clearance_m,
                  d_ref - qp_esdf_config_.reference_margin_m),

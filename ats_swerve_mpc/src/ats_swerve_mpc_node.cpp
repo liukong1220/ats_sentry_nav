@@ -374,7 +374,9 @@ Se2MpcConfig AtsSwerveMpcNode::loadConfig() {
 /** @brief 加载路径投影、横向偏差降速和时延补偿参数。 */
 TrajectoryTrackerConfig AtsSwerveMpcNode::loadTrackerConfig() {
   TrajectoryTrackerConfig config;
-  config.terminal_position_tolerance = goal_position_tolerance_;
+  config.terminal_position_tolerance = std::max(
+      goal_position_tolerance_,
+      declare_parameter<double>("terminal_yaw_handoff_tolerance", 0.045));
   config.backward_search_window = declare_parameter<double>(
       "projection_backward_window", config.backward_search_window);
   config.forward_search_window = declare_parameter<double>(
@@ -449,6 +451,11 @@ void AtsSwerveMpcNode::onOdometry(
   }
   previous_odometry_state_ = incoming;
   current_state_ = incoming;
+  Control incoming_vel;
+  incoming_vel(0) = message->twist.twist.linear.x;
+  incoming_vel(1) = message->twist.twist.linear.y;
+  incoming_vel(2) = message->twist.twist.angular.z;
+  current_velocity_ = incoming_vel.allFinite() ? incoming_vel : Control::Zero();
   last_odometry_stamp_ = rclcpp::Time(message->header.stamp);
   last_odometry_signal_ = std::chrono::steady_clock::now();
   has_odometry_ = true;
@@ -460,7 +467,7 @@ void AtsSwerveMpcNode::onOdometry(
  * @return true=状态可用于本周期 MPC 求解；false=必须走零速度兜底。
  * @note 每个控制周期在求解前调用一次。
  */
-bool AtsSwerveMpcNode::odometryUsable(State &current) {
+bool AtsSwerveMpcNode::odometryUsable(State &current, Control *measured_velocity) {
   std::lock_guard<std::mutex> lock(state_mutex_);
   if (!has_odometry_ || !last_odometry_signal_) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -486,6 +493,9 @@ bool AtsSwerveMpcNode::odometryUsable(State &current) {
     return false;
   }
   current = current_state_;
+  if (measured_velocity != nullptr) {
+    *measured_velocity = current_velocity_;
+  }
   return true;
 }
 

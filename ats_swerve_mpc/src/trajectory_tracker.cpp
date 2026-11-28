@@ -422,6 +422,42 @@ bool TrajectoryTracker::sampleReference(double time, Se2Reference & reference) c
   return true;
 }
 
+double TrajectoryTracker::remainingTranslation(
+  const TrajectoryProjection & projection) const
+{
+  if (!projection.valid || trajectory_.size() < 2U) {
+    return 0.0;
+  }
+  const double t = projection.time;
+  if (!std::isfinite(t) || t >= trajectory_.back().time - 1e-9) {
+    return 0.0;
+  }
+  auto upper = std::upper_bound(
+    trajectory_.begin(), trajectory_.end(), t,
+    [](double value, const TimedState & sample) { return value < sample.time; });
+  std::size_t seg = 0U;
+  if (upper == trajectory_.end()) {
+    return 0.0;
+  }
+  if (upper != trajectory_.begin()) {
+    seg = static_cast<std::size_t>(std::distance(trajectory_.begin(), upper) - 1);
+  }
+  seg = std::min(seg, trajectory_.size() - 2U);
+  const auto & first = trajectory_[seg];
+  const auto & second = trajectory_[seg + 1U];
+  const double seg_dt = second.time - first.time;
+  const double ratio = seg_dt > 1e-9
+    ? std::clamp((t - first.time) / seg_dt, 0.0, 1.0)
+    : 1.0;
+  double remaining =
+    (1.0 - ratio) * (second.state.head<2>() - first.state.head<2>()).norm();
+  for (std::size_t i = seg + 1U; i + 1U < trajectory_.size(); ++i) {
+    remaining +=
+      (trajectory_[i + 1U].state.head<2>() - trajectory_[i].state.head<2>()).norm();
+  }
+  return remaining;
+}
+
 //将角度归一化到 [-π, π] 范围内，避免角度跳变问题
 double TrajectoryTracker::normalizeAngle(double angle)
 {

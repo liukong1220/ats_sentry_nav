@@ -169,8 +169,14 @@ Eigen::Matrix3d Se2MpcController::stateCostMatrix(
   const double vw_y =
       sy * reference.control(0) + cy * reference.control(1);
   const double speed = std::hypot(vw_x, vw_y);
-  const double theta_ref =
-      speed > 0.05 ? std::atan2(vw_y, vw_x) : ref_yaw;
+  if (speed <= 0.05) {
+    // 原地转向（含窄洞口 180° 掉头）无沿迹/横迹之分，XY 全向均按高横迹权重锁定转轴，
+    // 防止转至 90° 时沿车体 X 轴退化为低 lag_weight 在坡道底板上侧滑。
+    weight(0, 0) = qc;
+    weight(1, 1) = qc;
+    return weight;
+  }
+  const double theta_ref = std::atan2(vw_y, vw_x);
   const double ct = std::cos(theta_ref);
   const double st = std::sin(theta_ref);
   weight(0, 0) = ql * ct * ct + qc * st * st;

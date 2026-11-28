@@ -152,6 +152,11 @@ public:
                              bool *wheel_saturated = nullptr,
                              bool *increment_limited = nullptr) const;
 
+  /** @brief 施加车体速度和真实四轮速度幅值限制。 */
+  Control clampBodyAndWheelLimits(const Control &control) const {
+    return clampControl(control);
+  }
+
   /** @brief 计算给定车体控制下四轮中的最大轮速 [m/s]。 */
   double computeMaxModuleSpeed(const Control &control) const {
     return maxModuleSpeed(control);
