@@ -1,3 +1,7 @@
+import os
+
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
@@ -6,7 +10,22 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def _load_nav_defaults(pkg_dir):
+    cfg_path = os.path.join(pkg_dir, "config", "launch_defaults.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    merged = {}
+    for section in ("common", "localization", "auto_mapping"):
+        for k, v in (raw.get(section) or {}).items():
+            merged[str(k)] = str(v)
+    return merged, (raw.get("lidar_mount") or {})
+
+
 def generate_launch_description():
+    bringup_dir = get_package_share_directory("ats_nav_bringup")
+    defaults, lidar_mount_cfg = _load_nav_defaults(bringup_dir)
+    chassis_height = lidar_mount_cfg["chassis"]["loam_base_frame_height"]
+    gimbal_height = lidar_mount_cfg["gimbal"]["loam_base_frame_height"]
     namespace = LaunchConfiguration("namespace")
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_identified_odometry = LaunchConfiguration("use_identified_odometry")
@@ -40,7 +59,10 @@ def generate_launch_description():
         gimbal_use_base_footprint_odom, "'.lower() == 'true') else 'gimbal_yaw_odom'",
     ])
     loam_base_frame_height = ParameterValue(
-        PythonExpression(["0.15 if '", lidar_mount_mode, "'.lower() == 'gimbal' else 0.07"]),
+        PythonExpression([
+            f"{gimbal_height} if '", lidar_mount_mode,
+            f"'.lower() == 'gimbal' else {chassis_height}",
+        ]),
         value_type=float,
     )
     sensor_publish_robot_base_tf = ParameterValue(
@@ -66,23 +88,23 @@ def generate_launch_description():
     launch_terrain_analysis = LaunchConfiguration("launch_terrain_analysis")
 
     declarations = [
-        DeclareLaunchArgument("mapping_mode", default_value="false"),
-        DeclareLaunchArgument("mapping_goal_position_tolerance", default_value="0.03"),
-        DeclareLaunchArgument("localization_goal_position_tolerance", default_value="0.08"),
-        DeclareLaunchArgument("mapping_control_position_tolerance", default_value="0.01"),
-        DeclareLaunchArgument("localization_control_position_tolerance", default_value="0.015"),
-        DeclareLaunchArgument("mapping_goal_yaw_tolerance", default_value="0.05"),
-        DeclareLaunchArgument("localization_goal_yaw_tolerance", default_value="0.05"),
-        DeclareLaunchArgument("mapping_goal_admission_position_tolerance", default_value="0.02"),
-        DeclareLaunchArgument("localization_goal_admission_position_tolerance", default_value="0.08"),
-        DeclareLaunchArgument("mapping_goal_admission_position_step", default_value="0.005"),
-        DeclareLaunchArgument("localization_goal_admission_position_step", default_value="0.02"),
-        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
-        DeclareLaunchArgument("namespace", default_value=""),
-        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("mapping_mode", default_value=defaults["mapping_mode"]),
+        DeclareLaunchArgument("mapping_goal_position_tolerance", default_value=defaults["mapping_goal_position_tolerance"]),
+        DeclareLaunchArgument("localization_goal_position_tolerance", default_value=defaults["localization_goal_position_tolerance"]),
+        DeclareLaunchArgument("mapping_control_position_tolerance", default_value=defaults["mapping_control_position_tolerance"]),
+        DeclareLaunchArgument("localization_control_position_tolerance", default_value=defaults["localization_control_position_tolerance"]),
+        DeclareLaunchArgument("mapping_goal_yaw_tolerance", default_value=defaults["mapping_goal_yaw_tolerance"]),
+        DeclareLaunchArgument("localization_goal_yaw_tolerance", default_value=defaults["localization_goal_yaw_tolerance"]),
+        DeclareLaunchArgument("mapping_goal_admission_position_tolerance", default_value=defaults["mapping_goal_admission_position_tolerance"]),
+        DeclareLaunchArgument("localization_goal_admission_position_tolerance", default_value=defaults["localization_goal_admission_position_tolerance"]),
+        DeclareLaunchArgument("mapping_goal_admission_position_step", default_value=defaults["mapping_goal_admission_position_step"]),
+        DeclareLaunchArgument("localization_goal_admission_position_step", default_value=defaults["localization_goal_admission_position_step"]),
+        DeclareLaunchArgument("use_identified_odometry", default_value=defaults["use_identified_odometry"]),
+        DeclareLaunchArgument("namespace", default_value=defaults["namespace"]),
+        DeclareLaunchArgument("use_sim_time", default_value=defaults["use_sim_time"]),
         DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
-        DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
-        DeclareLaunchArgument("use_respawn", default_value="False"),
+        DeclareLaunchArgument("use_robot_state_pub", default_value=defaults["use_robot_state_pub"]),
+        DeclareLaunchArgument("use_respawn", default_value=defaults["use_respawn"]),
         DeclareLaunchArgument(
             "lidar_mount_mode",
             default_value="chassis",
@@ -129,18 +151,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "chassis_vel_output_topic",
-            default_value="/cmd_vel/autonomy",
+            default_value=defaults["chassis_vel_output_topic"],
         ),
-        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value="True"),
+        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value=defaults["launch_cmd_vel_arbiter"]),
         DeclareLaunchArgument(
             "require_serial_link",
             default_value=IfElseSubstitution(use_robot_state_pub, "False", "True"),
         ),
-        DeclareLaunchArgument("require_gimbal_status", default_value="True"),
-        DeclareLaunchArgument("log_level", default_value="info"),
+        DeclareLaunchArgument("require_gimbal_status", default_value=defaults["require_gimbal_status"]),
+        DeclareLaunchArgument("log_level", default_value=defaults["log_level"]),
         DeclareLaunchArgument(
             "launch_terrain_analysis",
-            default_value="False",
+            default_value=defaults["launch_terrain_analysis"],
             description="Start terrain_analysis; only the near field of /terrain_map_ext uses it.",
         ),
     ]

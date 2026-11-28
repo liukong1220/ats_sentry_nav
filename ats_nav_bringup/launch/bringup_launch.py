@@ -1,5 +1,6 @@
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
@@ -7,8 +8,20 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression
 
 
+def _load_nav_defaults(pkg_dir):
+    cfg_path = os.path.join(pkg_dir, "config", "launch_defaults.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    merged = {}
+    for section in ("common", "localization", "auto_mapping"):
+        for k, v in (raw.get(section) or {}).items():
+            merged[str(k)] = str(v)
+    return merged
+
+
 def generate_launch_description():
     bringup_dir = get_package_share_directory("ats_nav_bringup")
+    defaults = _load_nav_defaults(bringup_dir)
     launch_dir = os.path.join(bringup_dir, "launch")
     namespace = LaunchConfiguration("namespace")
     map_yaml_file = LaunchConfiguration("map")
@@ -35,16 +48,16 @@ def generate_launch_description():
     slam = LaunchConfiguration("slam")
 
     declarations = [
-        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
-        DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("use_identified_odometry", default_value=defaults["use_identified_odometry"]),
+        DeclareLaunchArgument("namespace", default_value=defaults["namespace"]),
         DeclareLaunchArgument("map", description="Static map YAML path"),
         DeclareLaunchArgument("prior_pcd_file", default_value=""),
-        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("use_sim_time", default_value=defaults["use_sim_time"]),
         DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
-        DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
-        DeclareLaunchArgument("use_respawn", default_value="False"),
-        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
-        DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
+        DeclareLaunchArgument("use_robot_state_pub", default_value=defaults["use_robot_state_pub"]),
+        DeclareLaunchArgument("use_respawn", default_value=defaults["use_respawn"]),
+        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value=defaults["launch_small_gicp_relocalization"]),
+        DeclareLaunchArgument("launch_localization_fusion", default_value=defaults["launch_localization_fusion"]),
         DeclareLaunchArgument(
             "lidar_mount_mode",
             default_value="chassis",
@@ -82,15 +95,15 @@ def generate_launch_description():
                 launch_fake_vel_transform, "/cmd_vel/autonomy_gimbal", mpc_cmd_vel_topic
             ),
         ),
-        DeclareLaunchArgument("chassis_vel_output_topic", default_value="/cmd_vel/autonomy"),
-        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value="True"),
+        DeclareLaunchArgument("chassis_vel_output_topic", default_value=defaults["chassis_vel_output_topic"]),
+        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value=defaults["launch_cmd_vel_arbiter"]),
         DeclareLaunchArgument(
             "require_serial_link",
             default_value=IfElseSubstitution(use_robot_state_pub, "False", "True"),
         ),
-        DeclareLaunchArgument("require_gimbal_status", default_value="True"),
-        DeclareLaunchArgument("log_level", default_value="info"),
-        DeclareLaunchArgument("slam", default_value="False"),
+        DeclareLaunchArgument("require_gimbal_status", default_value=defaults["require_gimbal_status"]),
+        DeclareLaunchArgument("log_level", default_value=defaults["log_level"]),
+        DeclareLaunchArgument("slam", default_value=defaults["slam"]),
     ]
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "localization_launch.py")),

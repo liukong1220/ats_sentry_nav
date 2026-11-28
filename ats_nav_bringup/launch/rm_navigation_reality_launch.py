@@ -1,5 +1,6 @@
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
@@ -7,6 +8,17 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import IfElseSubstitution, LaunchConfiguration, PythonExpression, TextSubstitution
 from launch_ros.actions import Node
+
+
+def _load_nav_defaults(pkg_dir):
+    cfg_path = os.path.join(pkg_dir, "config", "launch_defaults.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    merged = {}
+    for section in ("common", "localization", "auto_mapping"):
+        for k, v in (raw.get(section) or {}).items():
+            merged[str(k)] = str(v)
+    return merged
 
 
 def _filtered_ld_library_path():
@@ -19,6 +31,7 @@ def _filtered_ld_library_path():
 
 def generate_launch_description():
     bringup_dir = get_package_share_directory("ats_nav_bringup")
+    defaults = _load_nav_defaults(bringup_dir)
     assets_dir = LaunchConfiguration("assets_dir")
     launch_dir = os.path.join(bringup_dir, "launch")
     namespace = LaunchConfiguration("namespace")
@@ -51,10 +64,10 @@ def generate_launch_description():
     slam = LaunchConfiguration("slam")
 
     declarations = [
-        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
-        DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("use_identified_odometry", default_value=defaults["use_identified_odometry"]),
+        DeclareLaunchArgument("namespace", default_value=defaults["namespace"]),
         DeclareLaunchArgument("assets_dir", description="Root-owned maps, PCDs, parameters and RViz assets"),
-        DeclareLaunchArgument("world", default_value="rmuc_2027"),
+        DeclareLaunchArgument("world", default_value=defaults["world"]),
         DeclareLaunchArgument(
             "map",
             default_value=[
@@ -73,22 +86,22 @@ def generate_launch_description():
                 TextSubstitution(text=".pcd"),
             ],
         ),
-        DeclareLaunchArgument("use_sim_time", default_value="False"),
+        DeclareLaunchArgument("use_sim_time", default_value=defaults["use_sim_time"]),
         DeclareLaunchArgument(
             "params_file",
             default_value=[assets_dir, TextSubstitution(text="/params/node_params.yaml")],
         ),
-        DeclareLaunchArgument("use_respawn", default_value="False"),
-        DeclareLaunchArgument("use_robot_state_pub", default_value="False"),
-        DeclareLaunchArgument("use_rviz", default_value="False"),
+        DeclareLaunchArgument("use_respawn", default_value=defaults["use_respawn"]),
+        DeclareLaunchArgument("use_robot_state_pub", default_value=defaults["use_robot_state_pub"]),
+        DeclareLaunchArgument("use_rviz", default_value=defaults["use_rviz"]),
         DeclareLaunchArgument(
             "rviz_config_file",
             default_value=[assets_dir, TextSubstitution(text="/rviz/sentry_default_view.rviz")],
         ),
-        DeclareLaunchArgument("rviz_force_software", default_value="0"),
-        DeclareLaunchArgument("launch_joy_teleop", default_value="False"),
-        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
-        DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
+        DeclareLaunchArgument("rviz_force_software", default_value=defaults["rviz_force_software"]),
+        DeclareLaunchArgument("launch_joy_teleop", default_value=defaults["launch_joy_teleop"]),
+        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value=defaults["launch_small_gicp_relocalization"]),
+        DeclareLaunchArgument("launch_localization_fusion", default_value=defaults["launch_localization_fusion"]),
         DeclareLaunchArgument(
             "lidar_mount_mode",
             default_value="chassis",
@@ -126,15 +139,15 @@ def generate_launch_description():
                 launch_fake_vel_transform, "/cmd_vel/autonomy_gimbal", mpc_cmd_vel_topic
             ),
         ),
-        DeclareLaunchArgument("chassis_vel_output_topic", default_value="/cmd_vel/autonomy"),
-        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value="True"),
+        DeclareLaunchArgument("chassis_vel_output_topic", default_value=defaults["chassis_vel_output_topic"]),
+        DeclareLaunchArgument("launch_cmd_vel_arbiter", default_value=defaults["launch_cmd_vel_arbiter"]),
         DeclareLaunchArgument(
             "require_serial_link",
             default_value=IfElseSubstitution(use_robot_state_pub, "False", "True"),
         ),
-        DeclareLaunchArgument("require_gimbal_status", default_value="True"),
-        DeclareLaunchArgument("log_level", default_value="info"),
-        DeclareLaunchArgument("slam", default_value="False"),
+        DeclareLaunchArgument("require_gimbal_status", default_value=defaults["require_gimbal_status"]),
+        DeclareLaunchArgument("log_level", default_value=defaults["log_level"]),
+        DeclareLaunchArgument("slam", default_value=defaults["slam"]),
     ]
     prior_preflight = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "prior_pcd_preflight.launch.py")),

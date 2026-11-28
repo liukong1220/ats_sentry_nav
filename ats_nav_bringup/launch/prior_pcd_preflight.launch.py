@@ -2,10 +2,25 @@
 
 import os
 
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
+
+
+def _load_preflight_defaults():
+    cfg_path = os.path.join(
+        get_package_share_directory("ats_nav_bringup"), "config", "launch_defaults.yaml"
+    )
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    loc = raw.get("localization") or {}
+    return {
+        "world": str(loc.get("prior_preflight_world", "unspecified")),
+        "launch_small_gicp_relocalization": str(loc.get("launch_small_gicp_relocalization", "True")),
+    }
 
 
 def validate_prior_pcd(context):
@@ -24,9 +39,13 @@ def validate_prior_pcd(context):
 
 
 def generate_launch_description():
+    defaults = _load_preflight_defaults()
     return LaunchDescription([
-        DeclareLaunchArgument("world", default_value="unspecified"),
+        DeclareLaunchArgument("world", default_value=defaults["world"]),
         DeclareLaunchArgument("prior_pcd_file", default_value=""),
-        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
+        DeclareLaunchArgument(
+            "launch_small_gicp_relocalization",
+            default_value=defaults["launch_small_gicp_relocalization"],
+        ),
         OpaqueFunction(function=validate_prior_pcd),
     ])

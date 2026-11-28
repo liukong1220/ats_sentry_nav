@@ -1,0 +1,45 @@
+# ats_nav_bringup 启动默认参数配置（收敛自动建图标志、定位默认值、容差与雷达重力/高度偏置，避免 launch.py 硬编码）。
+# 所有参数均可通过 ros2 launch ... key:=value 在命令行覆写。
+
+common:
+  namespace: ""
+  world: "rmuc_2027"
+  use_sim_time: "False"
+  use_respawn: "False"
+  use_robot_state_pub: "False"
+  use_rviz: "False"
+  rviz_force_software: "0"
+  launch_joy_teleop: "False"
+  launch_cmd_vel_arbiter: "True"
+  require_gimbal_status: "True"
+  launch_terrain_analysis: "False"
+  chassis_vel_output_topic: "/cmd_vel/autonomy"
+  log_level: "info"
+
+localization:
+  use_identified_odometry: "false"
+  launch_small_gicp_relocalization: "True"
+  launch_localization_fusion: "True"
+  prior_preflight_world: "unspecified"
+
+auto_mapping:
+  slam: "False"
+  mapping_mode: "false"
+  mapping_goal_position_tolerance: "0.03"
+  localization_goal_position_tolerance: "0.08"
+  mapping_control_position_tolerance: "0.01"
+  localization_control_position_tolerance: "0.015"
+  mapping_goal_yaw_tolerance: "0.05"
+  localization_goal_yaw_tolerance: "0.05"
+  mapping_goal_admission_position_tolerance: "0.02"
+  localization_goal_admission_position_tolerance: "0.08"
+  mapping_goal_admission_position_step: "0.005"
+  localization_goal_admission_position_step: "0.02"
+
+lidar_mount:
+  chassis:
+    point_lio_gravity: [4.905, 0.0, -8.496]
+    loam_base_frame_height: "0.07"
+  gimbal:
+    point_lio_gravity: [0.0, -9.475732, -2.539015]
+    loam_base_frame_height: "0.15"

@@ -1,5 +1,6 @@
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -16,8 +17,20 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def _load_nav_defaults(pkg_dir):
+    cfg_path = os.path.join(pkg_dir, "config", "launch_defaults.yaml")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    merged = {}
+    for section in ("common", "localization", "auto_mapping"):
+        for k, v in (raw.get(section) or {}).items():
+            merged[str(k)] = str(v)
+    return merged, (raw.get("lidar_mount") or {})
+
+
 def generate_launch_description():
     bringup_dir = get_package_share_directory("ats_nav_bringup")
+    defaults, lidar_mount_cfg = _load_nav_defaults(bringup_dir)
     namespace = LaunchConfiguration("namespace")
     map_yaml_file = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
@@ -40,15 +53,15 @@ def generate_launch_description():
     ])
 
     declarations = [
-        DeclareLaunchArgument("use_identified_odometry", default_value="false"),
-        DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("use_identified_odometry", default_value=defaults["use_identified_odometry"]),
+        DeclareLaunchArgument("namespace", default_value=defaults["namespace"]),
         DeclareLaunchArgument("map", description="Static map YAML path"),
-        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("use_sim_time", default_value=defaults["use_sim_time"]),
         DeclareLaunchArgument("prior_pcd_file", default_value=""),
         DeclareLaunchArgument("params_file", description="Root-owned node parameter YAML path"),
-        DeclareLaunchArgument("use_respawn", default_value="false"),
-        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value="True"),
-        DeclareLaunchArgument("launch_localization_fusion", default_value="True"),
+        DeclareLaunchArgument("use_respawn", default_value=defaults["use_respawn"]),
+        DeclareLaunchArgument("launch_small_gicp_relocalization", default_value=defaults["launch_small_gicp_relocalization"]),
+        DeclareLaunchArgument("launch_localization_fusion", default_value=defaults["launch_localization_fusion"]),
         DeclareLaunchArgument(
             "lidar_mount_mode",
             default_value="chassis",
@@ -59,14 +72,14 @@ def generate_launch_description():
             default_value="True",
             description="In gimbal mode, output odometry/localization in base_footprint (chassis frame).",
         ),
-        DeclareLaunchArgument("log_level", default_value="info"),
-        DeclareLaunchArgument("slam", default_value="False"),
+        DeclareLaunchArgument("log_level", default_value=defaults["log_level"]),
+        DeclareLaunchArgument("slam", default_value=defaults["slam"]),
     ]
 
     prior_preflight = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(bringup_dir, "launch", "prior_pcd_preflight.launch.py")),
         launch_arguments={
-            "world": LaunchConfiguration("world", default="unspecified"),
+            "world": LaunchConfiguration("world", default=defaults["prior_preflight_world"]),
             "prior_pcd_file": prior_pcd_file,
             "launch_small_gicp_relocalization": launch_small_gicp_relocalization,
         }.items(),
@@ -94,11 +107,7 @@ def generate_launch_description():
             raise ValueError(
                 f"lidar_mount_mode must be 'chassis' or 'gimbal', got {mode!r}"
             )
-        gravity = (
-            [0.0, -9.475732, -2.539015]
-            if mode == "gimbal"
-            else [4.905, 0.0, -8.496]
-        )
+        gravity = [float(v) for v in lidar_mount_cfg[mode]["point_lio_gravity"]]
         return [
             Node(
                 package="point_lio",
