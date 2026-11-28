@@ -371,6 +371,7 @@ void AtsRogMapNode::getOdomLayerProjection(
 
     // Export global persistent odom layer (40 x 30 m at unified 5 cm resolution, no global ESDF)
     // atomically with the local window for two-layer optimistic-global + conservative-local planning.
+    // Speckle filtering on the global layer happens once in PlanningMapPublisher after local overlay.
     const double coarse_res = std::max(c.resolution, layer_global_coarse_resolution_);
     const auto coarse_w = static_cast<std::uint32_t>(
       std::ceil((static_cast<double>(c.width) * c.resolution) / coarse_res));
@@ -378,9 +379,6 @@ void AtsRogMapNode::getOdomLayerProjection(
       std::ceil((static_cast<double>(c.height) * c.resolution) / coarse_res));
     response.global_occupancy_grid = sampleLayerBuffer(
       full_cells, c, c.origin_x, c.origin_y, coarse_w, coarse_h, coarse_res);
-    OdomLayerStore::filterIsolatedOccupiedSpeckles(
-      response.global_occupancy_grid.data, response.global_occupancy_grid.info.width,
-      response.global_occupancy_grid.info.height);
 
     if (c.tunnel_free_enabled) {
       response.tunnel_free_grid.header = response.occupancy_grid.header;
@@ -590,18 +588,12 @@ void AtsRogMapNode::getGroundProjection(const GroundProjectionRequest & request_
   map_lock_wait_ms = 1000.0 * std::chrono::duration<double>(
     *map_lock_acquired_at - map_lock_wait_started).count();
   response->generation = map_->generation();
-  const auto esdf_refresh_started = std::chrono::steady_clock::now();
-  response->ready = has_map_data_ && map_->ensureCurrentEsdf();
-  esdf_refresh_ms = 1000.0 * std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - esdf_refresh_started).count();
+  // PlanningMapPublisher computes the authoritative 2D RC-ESDF after static/terrain/slope
+  // fusion; skip throwaway 3D ESDF refresh, 3D ESDF sampling and 2D gradient here so Stage A
+  // projection stays < 15 ms at 5 cm resolution.
+  response->ready = has_map_data_;
+  esdf_refresh_ms = 0.0;
   if (!response->ready) {
-    log_projection_end();
-    return;
-  }
-  rog_map::Vec3f esdf_box_min;
-  rog_map::Vec3f esdf_box_max;
-  if (!map_->getCurrentEsdfBounds(esdf_box_min, esdf_box_max)) {
-    response->ready = false;
     log_projection_end();
     return;
   }
@@ -642,21 +634,14 @@ void AtsRogMapNode::getGroundProjection(const GroundProjectionRequest & request_
   grid.info.origin.orientation.w = 1.0;
   const std::size_t cell_count =
     static_cast<std::size_t>(grid.info.width) * static_cast<std::size_t>(grid.info.height);
-  const float nan = std::numeric_limits<float>::quiet_NaN();
   grid.data.assign(cell_count, -1);
-  response->signed_distance.assign(cell_count, nan);
-  response->gradient_x.assign(cell_count, nan);
-  response->gradient_y.assign(cell_count, nan);
+  response->signed_distance.clear();
+  response->gradient_x.clear();
+  response->gradient_y.clear();
   serialize_ms = 1000.0 * std::chrono::duration<double>(
     std::chrono::steady_clock::now() - serialize_started).count();
 
   const double z_step = std::max(map_->getResolution(), 0.01);
-  const double esdf_distance_limit = (esdf_box_max - esdf_box_min).norm() + resolution;
-  const auto inside_esdf_box = [&esdf_box_min, &esdf_box_max](const rog_map::Vec3f & point) {
-      constexpr double tolerance = 1e-6;
-      return (point.array() >= (esdf_box_min.array() - tolerance)).all() &&
-             (point.array() <= (esdf_box_max.array() + tolerance)).all();
-    };
   const auto sample_started = std::chrono::steady_clock::now();
   const bool use_ground = projection_follow_measured_ground_;
   const bool export_tunnel_free = odom_layer_->config().tunnel_free_enabled;
@@ -699,8 +684,6 @@ void AtsRogMapNode::getGroundProjection(const GroundProjectionRequest & request_
           const int gy = static_cast<int>(std::floor((y - layer_config.origin_y) /
             layer_config.resolution));
           if (const auto ground = ground_columns_->ground(gx, gy)) {
-            // Observed connected support establishes the swept height band. The
-            // numerical map can still block a column with a new return in that band.
             cell_z_min = std::max(static_cast<double>(box_min.z()),
               *ground + column_config.surface_max);
             cell_z_max = std::min(static_cast<double>(box_max.z()),
@@ -716,43 +699,22 @@ void AtsRogMapNode::getGroundProjection(const GroundProjectionRequest & request_
           }
         }
       }
-      double minimum_distance = std::numeric_limits<double>::infinity();
-      for (double z = cell_z_min + 0.5 * z_step; z <= cell_z_max + 1e-6; z += z_step) {
-        const rog_map::Vec3f point(x, y, static_cast<float>(std::min(z, cell_z_max)));
-        // Downstream JPS and footprint gates apply their own metric clearance on this snapshot.
-        // Project raw probability occupancy here to avoid double-inflating the robot start cell.
-        const auto grid_type_started = std::chrono::steady_clock::now();
-        const rog_map::GridType cell_type = map_->getGridType(point);
-        const auto grid_type_finished = std::chrono::steady_clock::now();
-        grid_type_query_ms += 1000.0 * std::chrono::duration<double>(
-          grid_type_finished - grid_type_started).count();
-        ++grid_type_queries;
-        occupied = occupied || cell_type == super_utils::OCCUPIED;
-        known_free = known_free || cell_type == super_utils::KNOWN_FREE;
-        if (inside_esdf_box(point) &&
-          (cell_type == super_utils::OCCUPIED || cell_type == super_utils::KNOWN_FREE))
-        {
-          const auto esdf_query_started = std::chrono::steady_clock::now();
-          const double distance = map_->getESDFDistance(point);
-          esdf_query_ms += 1000.0 * std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - esdf_query_started).count();
-          ++esdf_queries;
-          if (std::isfinite(distance) && std::abs(distance) <= esdf_distance_limit) {
-            minimum_distance = std::min(minimum_distance, std::abs(distance));
+      if (!occupied) {
+        for (double z = cell_z_min + 0.5 * z_step; z <= cell_z_max + 1e-6; z += z_step) {
+          const rog_map::Vec3f point(x, y, static_cast<float>(std::min(z, cell_z_max)));
+          const rog_map::GridType cell_type = map_->getGridType(point);
+          ++grid_type_queries;
+          if (cell_type == super_utils::OCCUPIED) {
+            occupied = true;
+            break;
           }
+          known_free = known_free || cell_type == super_utils::KNOWN_FREE;
         }
       }
       if (occupied) {
         grid.data[index] = 100;
-        if (std::isfinite(minimum_distance)) {
-          response->signed_distance[index] = static_cast<float>(
-            -std::max(0.5 * resolution, minimum_distance));
-        }
       } else if (known_free) {
         grid.data[index] = 0;
-        if (std::isfinite(minimum_distance)) {
-          response->signed_distance[index] = static_cast<float>(minimum_distance);
-        }
       }
     }
   }
@@ -761,46 +723,8 @@ void AtsRogMapNode::getGroundProjection(const GroundProjectionRequest & request_
   }
   sample_ms = 1000.0 * std::chrono::duration<double>(
     std::chrono::steady_clock::now() - sample_started).count();
-
-  const auto index_of = [&grid](std::uint32_t x, std::uint32_t y) {
-      return static_cast<std::size_t>(y) * static_cast<std::size_t>(grid.info.width) + x;
-    };
-  const auto gradient_started = std::chrono::steady_clock::now();
-  for (std::uint32_t my = 0; my < grid.info.height; ++my) {
-    for (std::uint32_t mx = 0; mx < grid.info.width; ++mx) {
-      const std::size_t index = index_of(mx, my);
-      const float center = response->signed_distance[index];
-      if (!std::isfinite(center)) {
-        continue;
-      }
-      const float left = mx > 0 ? response->signed_distance[index_of(mx - 1, my)] : nan;
-      const float right = mx + 1 < grid.info.width ?
-        response->signed_distance[index_of(mx + 1, my)] : nan;
-      const float down = my > 0 ? response->signed_distance[index_of(mx, my - 1)] : nan;
-      const float up = my + 1 < grid.info.height ?
-        response->signed_distance[index_of(mx, my + 1)] : nan;
-      if (std::isfinite(left) && std::isfinite(right)) {
-        response->gradient_x[index] = static_cast<float>((right - left) / (2.0 * resolution));
-      } else if (std::isfinite(right)) {
-        response->gradient_x[index] = static_cast<float>((right - center) / resolution);
-      } else if (std::isfinite(left)) {
-        response->gradient_x[index] = static_cast<float>((center - left) / resolution);
-      } else {
-        response->gradient_x[index] = 0.0F;
-      }
-      if (std::isfinite(down) && std::isfinite(up)) {
-        response->gradient_y[index] = static_cast<float>((up - down) / (2.0 * resolution));
-      } else if (std::isfinite(up)) {
-        response->gradient_y[index] = static_cast<float>((up - center) / resolution);
-      } else if (std::isfinite(down)) {
-        response->gradient_y[index] = static_cast<float>((center - down) / resolution);
-      } else {
-        response->gradient_y[index] = 0.0F;
-      }
-    }
-  }
-  gradient_ms = 1000.0 * std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - gradient_started).count();
+  grid_type_query_ms = sample_ms;
+  gradient_ms = 0.0;
 
   const InputHealth health_at_end = inputHealth();
   response->stale = health_at_end.map_update_stale || health_at_end.odom_stale;

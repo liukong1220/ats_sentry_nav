@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
+#include <vector>
 
 namespace terrain_analysis_ext
 {
@@ -58,6 +60,38 @@ inline float voxelHeightDiff(float min_z, float max_z)
 inline float voxelHeightMetric(float min_z, float max_z, float max_rel_height)
 {
   return std::max(voxelHeightDiff(min_z, max_z), max_rel_height);
+}
+
+// 在已排序的 z 序列中估计地面高程分位数：overhead_height > 0 时剔除相对底部支撑簇
+// 超过 overhead_height 的头顶面/悬空横梁立面点，防止横梁立面将分位数拉高到横梁表面。
+inline float groundBandQuantile(
+  const std::vector<float> & sorted_z, double quantile, double overhead_height)
+{
+  const std::size_t n = sorted_z.size();
+  if (n == 0U) {
+    return 0.0f;
+  }
+  std::size_t anchor = 0U;
+  for (std::size_t k = 0U; k + 1U < n; ++k) {
+    if (sorted_z[k + 1U] - sorted_z[k] <= 0.05f) {
+      anchor = k;
+      break;
+    }
+  }
+  std::size_t hi = n;
+  if (overhead_height > 0.0 && std::isfinite(overhead_height)) {
+    const float limit = static_cast<float>(
+      static_cast<double>(sorted_z[anchor]) + overhead_height);
+    hi = anchor + 1U;
+    while (hi < n && sorted_z[hi] < limit) {
+      ++hi;
+    }
+  }
+  const std::size_t sub_n = hi - anchor;
+  const std::size_t offset = std::min(
+    sub_n - 1U,
+    static_cast<std::size_t>(std::max(0.0, quantile * static_cast<double>(sub_n))));
+  return sorted_z[anchor + offset];
 }
 
 }  // namespace terrain_analysis_ext

@@ -210,15 +210,15 @@ PlanningMapPublisher::PlanningMapPublisher(GroundProjectionProvider provider, co
   {
     global_viz_worker_ = std::thread([this]() {runGlobalEsdfVizWorker();});
   }
-  if (mapping_mode_) {
-    layer_updated_sub_ = create_subscription<std_msgs::msg::UInt64>(
-      "/rog_map/odom_layer_updated", rclcpp::QoS(1).reliable(),
-      [this](std_msgs::msg::UInt64::ConstSharedPtr) {
-        std::lock_guard<std::recursive_mutex> lock(state_mutex_);
-        if (request_pending_) {mapping_update_pending_ = true; return;}
-        requestProjection();
-      });
-  }
+  // Event-driven projection trigger in both Stage A (prior map) and Stage B (mapping):
+  // immediately project on every committed cloud instead of waiting for the next wall-timer tick.
+  layer_updated_sub_ = create_subscription<std_msgs::msg::UInt64>(
+    "/rog_map/odom_layer_updated", rclcpp::QoS(1).reliable(),
+    [this](std_msgs::msg::UInt64::ConstSharedPtr) {
+      std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+      if (request_pending_) {mapping_update_pending_ = true; return;}
+      requestProjection();
+    });
 
   {
     std::lock_guard<std::recursive_mutex> lock(state_mutex_);
@@ -230,10 +230,11 @@ PlanningMapPublisher::PlanningMapPublisher(GroundProjectionProvider provider, co
     std::max(period, std::chrono::milliseconds(1)),
     [this]() {
       std::lock_guard<std::recursive_mutex> lock(state_mutex_);
-      if (mapping_mode_ && last_projection_complete_time_.has_value()) {
+      if (last_projection_complete_time_.has_value()) {
         const double since_last = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - *last_projection_complete_time_).count();
-        if (since_last < 0.20) {
+        const double min_gap = mapping_mode_ ? 0.20 : 0.08;
+        if (since_last < min_gap) {
           return;
         }
       }

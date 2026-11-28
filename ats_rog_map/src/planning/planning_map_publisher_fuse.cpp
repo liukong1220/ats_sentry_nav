@@ -73,14 +73,13 @@ void PlanningMapPublisher::processProjection(
   if (rclcpp::Time(projection_grid.header.stamp).nanoseconds() <= 0) {
     projection_grid.header.stamp = now();
   }
-  const bool projection_ready = response.odom_layer_included
-    ? (response.ready && !response.stale &&
-       response.occupancy_grid.info.resolution > 0.0 &&
-       response.occupancy_grid.info.width > 0U && response.occupancy_grid.info.height > 0U &&
-       response.occupancy_grid.data.size() ==
-         static_cast<std::size_t>(response.occupancy_grid.info.width) *
-         static_cast<std::size_t>(response.occupancy_grid.info.height))
-    : numeric_snapshot.available();
+  const bool projection_ready =
+    response.ready && !response.stale &&
+    response.occupancy_grid.info.resolution > 0.0 &&
+    response.occupancy_grid.info.width > 0U && response.occupancy_grid.info.height > 0U &&
+    response.occupancy_grid.data.size() ==
+      static_cast<std::size_t>(response.occupancy_grid.info.width) *
+      static_cast<std::size_t>(response.occupancy_grid.info.height);
   if (!projection_ready || !projectionFresh(projection_grid)) {
     publishUnavailable("ROGMap projection is unavailable or stale");
     return;

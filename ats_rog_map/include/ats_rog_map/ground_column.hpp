@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <utility>
@@ -40,7 +41,7 @@ struct GroundColumnConfig
   bool ceiling_plane_enabled{true};
   double ceiling_plane_band{0.015};
   int ceiling_plane_radius{2};            // columns, so a 5 x 5 window at 0.1 m
-  int ceiling_plane_min_points{12};
+  int ceiling_plane_min_points{8};
   double ceiling_plane_min_inlier_ratio{0.6};
   double ceiling_plane_min_extent{0.30};  // m, inlier XY extent along both axes
   double ceiling_plane_max_slope{0.2};
@@ -116,6 +117,12 @@ private:
     Point low;
     Point high;
     std::array<double, 4> xy_bounds;  // min x/y, max x/y of every retained return
+    double z_sum{0.0};
+    std::uint32_t count{0U};
+    double meanZ() const
+    {
+      return count > 0U ? z_sum / static_cast<double>(count) : 0.5 * (low[2] + high[2]);
+    }
   };
   struct VoxelReturns : ReturnExtent
   {
@@ -123,8 +130,10 @@ private:
     // keep the height/XY association instead of one whole-cell Cartesian box.
     std::vector<std::pair<int, ReturnExtent>> patches;
   };
-  static bool extendExtent(ReturnExtent & target, const ReturnExtent & source);
-  static bool extendReturns(VoxelReturns & target, const VoxelReturns & source);
+  static bool extendExtent(
+    ReturnExtent & target, const ReturnExtent & source, bool accumulate_stats = true);
+  static bool extendReturns(
+    VoxelReturns & target, const VoxelReturns & source, bool accumulate_stats = true);
   // Bounds at the query XY, never a neighbouring column's unshifted height.
   // plane_z (optional) receives the fitted plane height at the query, or NaN
   // when no valid plane produced the bounds.

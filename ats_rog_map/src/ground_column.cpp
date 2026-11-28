@@ -103,7 +103,8 @@ bool GroundColumnGrid::valid(int x, int y) const
 std::size_t GroundColumnGrid::index(int x, int y) const
 {return static_cast<std::size_t>(y) * width_ + x;}
 
-bool GroundColumnGrid::extendExtent(ReturnExtent & target, const ReturnExtent & source)
+bool GroundColumnGrid::extendExtent(
+  ReturnExtent & target, const ReturnExtent & source, const bool accumulate_stats)
 {
   bool changed = false;
   if (source.low[2] < target.low[2]) {target.low = source.low; changed = true;}
@@ -118,19 +119,28 @@ bool GroundColumnGrid::extendExtent(ReturnExtent & target, const ReturnExtent & 
       changed = true;
     }
   }
+  if (accumulate_stats && source.count > 0U) {
+    if (target.count >= 64U) {
+      target.z_sum *= 0.5;
+      target.count /= 2U;
+    }
+    target.z_sum += source.z_sum;
+    target.count += source.count;
+  }
   return changed;
 }
 
-bool GroundColumnGrid::extendReturns(VoxelReturns & target, const VoxelReturns & source)
+bool GroundColumnGrid::extendReturns(
+  VoxelReturns & target, const VoxelReturns & source, const bool accumulate_stats)
 {
-  bool changed = extendExtent(target, source);
+  bool changed = extendExtent(target, source, accumulate_stats);
   for (const auto & patch : source.patches) {
     const auto found = std::find_if(target.patches.begin(), target.patches.end(),
       [&](const auto & entry) {return entry.first == patch.first;});
     if (found == target.patches.end()) {
       target.patches.push_back(patch);
       changed = true;
-    } else if (extendExtent(found->second, patch.second)) {
+    } else if (extendExtent(found->second, patch.second, accumulate_stats)) {
       changed = true;
     }
   }
@@ -159,7 +169,7 @@ void GroundColumnGrid::observe(
       4 * ((p[0] - origin_x_) / resolution_ - x)), 0, 3);
     const int py = std::clamp(static_cast<int>(
       4 * ((p[1] - origin_y_) / resolution_ - y)), 0, 3);
-    const ReturnExtent extent{p, p, {p[0], p[1], p[0], p[1]}};
+    const ReturnExtent extent{p, p, {p[0], p[1], p[0], p[1]}, p[2], 1U};
     const VoxelReturns observed{extent, {{py * 4 + px, extent}}};
     const auto inserted = column.emplace(bin, observed);
     if (!inserted.second) {extendReturns(inserted.first->second, observed);}
@@ -179,16 +189,47 @@ void GroundColumnGrid::observe(
   const auto merge_support_band = [&](std::size_t i) -> bool {
       bool changed = false;
       const auto anchor = ground_[i]->low;
+      const auto anchor_high = ground_[i]->high;
+      const int anchor_bin = static_cast<int>(std::floor(anchor[2] / config_.voxel_resolution));
       const double top = anchor[2] + config_.surface_max;
+      double z_sum = 0.0;
+      std::uint32_t z_count = 0U;
+      for (auto & tp : ground_[i]->patches) {
+        tp.second.z_sum = 0.0;
+        tp.second.count = 0U;
+      }
       for (const auto & bin : columns_[i]) {
         const auto & observed = bin.second;
         if (observed.high[2] > top + 1e-9) {continue;}
-        if (observed.low[2] < anchor[2] - config_.max_ground_slope *
+        const bool same_or_adjacent_slab =
+          (bin.first == anchor_bin || bin.first + 1 == anchor_bin) &&
+          observed.high[2] >= anchor[2] - config_.max_ground_slope *
+            std::hypot(observed.high[0] - anchor[0], observed.high[1] - anchor[1]) -
+            2.0 * config_.support_noise - 1e-9 &&
+          std::max(anchor_high[2], observed.high[2]) -
+            std::min(anchor[2], observed.low[2]) <= config_.surface_max + 1e-9;
+        if (!same_or_adjacent_slab && observed.low[2] < anchor[2] - config_.max_ground_slope *
           std::hypot(observed.low[0] - anchor[0], observed.low[1] - anchor[1]) -
           config_.support_noise - 1e-9) {continue;}
-        if (extendReturns(*ground_[i], observed)) {
+        z_sum += observed.z_sum;
+        z_count += observed.count;
+        if (extendReturns(*ground_[i], observed, false)) {
           changed = true;
         }
+        // Keep per-patch running stats aligned with current column bins without double counting.
+        for (const auto & sp : observed.patches) {
+          for (auto & tp : ground_[i]->patches) {
+            if (tp.first == sp.first) {
+              tp.second.z_sum += sp.second.z_sum;
+              tp.second.count += sp.second.count;
+              break;
+            }
+          }
+        }
+      }
+      if (z_count > 0U) {
+        ground_[i]->z_sum = z_sum;
+        ground_[i]->count = z_count;
       }
       if (changed) {
         const int gx = static_cast<int>(i % static_cast<std::size_t>(width_));
@@ -211,6 +252,22 @@ void GroundColumnGrid::observe(
   const bool have_robot_ground =
     std::isfinite(robot_ground[0]) && std::isfinite(robot_ground[1]) &&
     std::isfinite(robot_ground[2]);
+  const double clearance_gap = config_.robot_height + config_.top_margin;
+  // A bin with solid returns immediately above it (between surface_max and 0.20 m) belongs
+  // to a vertical wall, obstacle face, or overhang side face — never a drivable surface.
+  // Rejecting it in ground seeding/BFS prevents ground_ from climbing vertical side walls
+  // along ramps and spilling across tunnel overhead beam faces.
+  const auto has_obstacle_above = [&](const std::map<int, VoxelReturns> & col,
+      const VoxelReturns & cand) -> bool {
+      const double min_obs_z = cand.low[2] + config_.surface_max + 1e-9;
+      const double max_obs_z = cand.low[2] + std::min(0.20, clearance_gap - 0.04);
+      for (const auto & entry : col) {
+        if (entry.second.high[2] > min_obs_z && entry.second.low[2] < max_obs_z) {
+          return true;
+        }
+      }
+      return false;
+    };
   // Find the Z-bin in column matching a reference surface point within bounded slope.
   // Checking all bins (not just begin()) allows a robot on an elevated deck with a hollow
   // underside (e.g. a bridge/platform shell seen from below earlier) to connect its true
@@ -221,6 +278,7 @@ void GroundColumnGrid::observe(
       double best_dz = std::numeric_limits<double>::infinity();
       for (const auto & entry : col) {
         const auto & cand = entry.second;
+        if (has_obstacle_above(col, cand)) {continue;}
         const double dz = std::abs(cand.low[2] - ref[2]);
         const double slope_limit = config_.max_ground_slope *
           std::hypot(cand.low[0] - ref[0], cand.low[1] - ref[1]) +
@@ -237,7 +295,6 @@ void GroundColumnGrid::observe(
   // an active upper deck (too tight to be a real navigable lower floor under an overpass) so
   // mesh underside artifacts observed earlier do not poison hasDisconnectedLowerReturn(),
   // while preserving genuine 2-level overpass ramps (>= clearance below the upper bridge).
-  const double clearance_gap = config_.robot_height + config_.top_margin;
   const auto prune_underside_bins = [&](std::size_t i, const VoxelReturns & deck) -> bool {
       auto & col = columns_[i];
       bool pruned = false;
@@ -303,7 +360,10 @@ void GroundColumnGrid::observe(
       for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
           if ((dx == 0 && dy == 0) || !valid(x + dx, y + dy)) {continue;}
-          if (ground_[index(x + dx, y + dy)]) {enqueue(x + dx, y + dy);}
+          const auto nb = index(x + dx, y + dy);
+          if (ground_[nb] && !has_obstacle_above(columns_[nb], *ground_[nb])) {
+            enqueue(x + dx, y + dy);
+          }
         }
       }
     };
@@ -323,6 +383,7 @@ void GroundColumnGrid::observe(
           double best_upper_diff = 0.12;
           for (const auto & entry : columns_[i]) {
             const auto & cand = entry.second;
+            if (has_obstacle_above(columns_[i], cand)) {continue;}
             const double depth = cand.low[2] - ground_[i]->low[2];
             const double diff = std::abs(cand.low[2] - robot_ground[2]);
             if (depth > config_.surface_max + 1e-9 && depth < clearance_gap - 1e-9 &&
@@ -352,9 +413,11 @@ void GroundColumnGrid::observe(
         }
       }
       merge_support_band(i);
-      const int x = static_cast<int>(i % static_cast<std::size_t>(width_));
-      const int y = static_cast<int>(i / static_cast<std::size_t>(width_));
-      enqueue(x, y);
+      if (!has_obstacle_above(columns_[i], *ground_[i])) {
+        const int x = static_cast<int>(i % static_cast<std::size_t>(width_));
+        const int y = static_cast<int>(i / static_cast<std::size_t>(width_));
+        enqueue(x, y);
+      }
     } else {
       seed_from_neighbors(i);
     }
@@ -458,6 +521,10 @@ void GroundColumnGrid::observeBoundaryPoints(
 {
   // Insert obstacle-band boundary samples without wiping cached support_planes_
   // (these points lie strictly above ground + surface_max so they never alter ground_).
+  // Clear raw_state_cache_ when any column changes because neighbor isDropOffStep/isRoughBump
+  // queries read adjacent columns_.
+  if (points.empty()) {return;}
+  bool any_inserted = false;
   for (const auto & p : points) {
     if (!std::all_of(p.begin(), p.end(), [](double v) {return std::isfinite(v);})) {continue;}
     const int x = static_cast<int>(std::floor((p[0] - origin_x_) / resolution_));
@@ -471,14 +538,17 @@ void GroundColumnGrid::observeBoundaryPoints(
       4 * ((p[0] - origin_x_) / resolution_ - x)), 0, 3);
     const int py = std::clamp(static_cast<int>(
       4 * ((p[1] - origin_y_) / resolution_ - y)), 0, 3);
-    const ReturnExtent extent{p, p, {p[0], p[1], p[0], p[1]}};
+    const ReturnExtent extent{p, p, {p[0], p[1], p[0], p[1]}, p[2], 1U};
     const VoxelReturns observed{extent, {{py * 4 + px, extent}}};
     const auto inserted = column.emplace(bin, observed);
     if (!inserted.second) {extendReturns(inserted.first->second, observed);}
     if (!overhead_before && hasOverhead(x, y)) {
       support_planes_.erase(i);
     }
-    raw_state_cache_.erase(i);
+    any_inserted = true;
+  }
+  if (any_inserted) {
+    raw_state_cache_.clear();
   }
 }
 

@@ -116,6 +116,12 @@ std::vector<float> planarVoxelSlopeDeg;
 std::vector<float> planarVoxelSlopeBand;
 std::vector<int> planarVoxelPointCount;
 std::vector<std::vector<float>> planarPointElev;
+std::vector<std::vector<float>> planarCenterPointElev;
+std::vector<double> planarOverheadSlabSum;
+std::vector<int> planarOverheadSlabCount;
+std::vector<float> planarSubOverheadMinZ;
+std::vector<float> planarSubOverheadMaxZ;
+std::vector<int> planarSubOverheadCount;
 std::queue<int> planarVoxelQueue;
 
 // Size every planar buffer from the resolved lattice. Called once before the
@@ -135,6 +141,12 @@ void resizePlanarVoxelBuffers() {
   planarVoxelSlopeBand.assign(planarVoxelNum, 0.0f);
   planarVoxelPointCount.assign(planarVoxelNum, 0);
   planarPointElev.assign(planarVoxelNum, std::vector<float>());
+  planarCenterPointElev.assign(planarVoxelNum, std::vector<float>());
+  planarOverheadSlabSum.assign(planarVoxelNum, 0.0);
+  planarOverheadSlabCount.assign(planarVoxelNum, 0);
+  planarSubOverheadMinZ.assign(planarVoxelNum, std::numeric_limits<float>::infinity());
+  planarSubOverheadMaxZ.assign(planarVoxelNum, -std::numeric_limits<float>::infinity());
+  planarSubOverheadCount.assign(planarVoxelNum, 0);
 }
 
 double laserCloudTime = 0;
@@ -597,6 +609,12 @@ int main(int argc, char **argv) {
         planarVoxelSlopeBand[i] = 0.0f;
         planarVoxelPointCount[i] = 0;
         planarPointElev[i].clear();
+        planarCenterPointElev[i].clear();
+        planarOverheadSlabSum[i] = 0.0;
+        planarOverheadSlabCount[i] = 0;
+        planarSubOverheadMinZ[i] = std::numeric_limits<float>::infinity();
+        planarSubOverheadMaxZ[i] = -std::numeric_limits<float>::infinity();
+        planarSubOverheadCount[i] = 0;
       }
 
       int terrainCloudSize = terrainCloud->points.size();
@@ -611,6 +629,11 @@ int main(int argc, char **argv) {
           int indY = terrain_analysis_ext::planarVoxelIndex1D(
               point.y, planarAnchorY, planarVoxelSize, planarVoxelHalfWidth);
 
+          if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
+              indY < planarVoxelWidth) {
+            planarCenterPointElev[planarVoxelWidth * indX + indY].push_back(
+                point.z);
+          }
           for (int dX = -1; dX <= 1; dX++) {
             for (int dY = -1; dY <= 1; dY++) {
               if (indX + dX >= 0 && indX + dX < planarVoxelWidth &&
@@ -623,21 +646,24 @@ int main(int argc, char **argv) {
         }
       }
 
-      // Estimate ground elevation by a low quantile so sparse obstacle tops do
-      // not easily drag the local ground plane upward.
+      // Estimate ground elevation by a low quantile within the non-overhead band
+      // so dense overhead beam faces and adjacent sidewalls do not drag ground up.
       if (useSorting) {
         for (int i = 0; i < planarVoxelNum; i++) {
-          int planarPointElevSize = planarPointElev[i].size();
-          if (planarPointElevSize > 0) {
+          if (!planarPointElev[i].empty()) {
             sort(planarPointElev[i].begin(), planarPointElev[i].end());
-
-            int quantileID = static_cast<int>(quantileZ * planarPointElevSize);
-            if (quantileID < 0)
-              quantileID = 0;
-            else if (quantileID >= planarPointElevSize)
-              quantileID = planarPointElevSize - 1;
-
-            planarVoxelElev[i] = planarPointElev[i][quantileID];
+            float ground_elev = terrain_analysis_ext::groundBandQuantile(
+                planarPointElev[i], quantileZ, traversabilityOverheadHeight);
+            if (planarCenterPointElev[i].size() >= 2U) {
+              sort(planarCenterPointElev[i].begin(),
+                   planarCenterPointElev[i].end());
+              const float center_elev =
+                  terrain_analysis_ext::groundBandQuantile(
+                      planarCenterPointElev[i], quantileZ,
+                      traversabilityOverheadHeight);
+              ground_elev = std::min(ground_elev, center_elev);
+            }
+            planarVoxelElev[i] = ground_elev;
           }
         }
       } else {
@@ -661,6 +687,14 @@ int main(int argc, char **argv) {
       }
 
       // Revisit raw points and accumulate per-cell vertical extent statistics.
+      // Points in (overhead - 0.03, overhead) are deferred until the local underside
+      // slab mean is evaluated so -1sigma noise on a passable overhead beam does not
+      // trigger false hard obstacles while low beams and 20 mm protrusions stay blocked.
+      const bool use_slab_overhead =
+          traversabilityOverheadHeight > 0.04 &&
+          std::isfinite(traversabilityOverheadHeight);
+      const double body_max_rel = traversabilityOverheadHeight - 0.030;
+      const double slab_top_rel = traversabilityOverheadHeight + 0.045;
       for (int i = 0; i < terrainCloudSize; i++) {
         point = terrainCloud->points[i];
         float dis = sqrt((point.x - vehicleX) * (point.x - vehicleX) +
@@ -675,11 +709,81 @@ int main(int argc, char **argv) {
           if (indX >= 0 && indX < planarVoxelWidth && indY >= 0 &&
               indY < planarVoxelWidth) {
             const int ind = planarVoxelWidth * indX + indY;
-            // Overhead surfaces (a plate the vehicle passes under) are skipped.
-            terrain_analysis_ext::accumulateVoxelPoint(
-                point.z, planarVoxelElev[ind], traversabilityOverheadHeight,
-                planarVoxelMaxRelHeight[ind], planarVoxelMinZ[ind],
-                planarVoxelMaxZ[ind], planarVoxelPointCount[ind]);
+            if (!use_slab_overhead) {
+              terrain_analysis_ext::accumulateVoxelPoint(
+                  point.z, planarVoxelElev[ind], traversabilityOverheadHeight,
+                  planarVoxelMaxRelHeight[ind], planarVoxelMinZ[ind],
+                  planarVoxelMaxZ[ind], planarVoxelPointCount[ind]);
+            } else {
+              const double rel =
+                  static_cast<double>(point.z) -
+                  static_cast<double>(planarVoxelElev[ind]);
+              if (rel <= body_max_rel) {
+                terrain_analysis_ext::accumulateVoxelPoint(
+                    point.z, planarVoxelElev[ind], 0.0,
+                    planarVoxelMaxRelHeight[ind], planarVoxelMinZ[ind],
+                    planarVoxelMaxZ[ind], planarVoxelPointCount[ind]);
+              } else {
+                if (rel <= slab_top_rel) {
+                  planarOverheadSlabSum[ind] += rel;
+                  ++planarOverheadSlabCount[ind];
+                }
+                if (!terrain_analysis_ext::isOverheadPoint(
+                        point.z, planarVoxelElev[ind],
+                        traversabilityOverheadHeight)) {
+                  planarSubOverheadMinZ[ind] =
+                      std::min(planarSubOverheadMinZ[ind], point.z);
+                  planarSubOverheadMaxZ[ind] =
+                      std::max(planarSubOverheadMaxZ[ind], point.z);
+                  ++planarSubOverheadCount[ind];
+                }
+              }
+            }
+          }
+        }
+      }
+      if (use_slab_overhead) {
+        for (int indX = 0; indX < planarVoxelWidth; ++indX) {
+          for (int indY = 0; indY < planarVoxelWidth; ++indY) {
+            const int ind = planarVoxelWidth * indX + indY;
+            if (planarSubOverheadCount[ind] <= 0) {
+              continue;
+            }
+            const int own_cnt = planarOverheadSlabCount[ind];
+            const double own_mean =
+                own_cnt > 0 ? (planarOverheadSlabSum[ind] / own_cnt) : 0.0;
+            bool clears_overhead = false;
+            if (!(own_cnt >= 4 &&
+                  own_mean < traversabilityOverheadHeight - 0.012)) {
+              double sum = planarOverheadSlabSum[ind];
+              int cnt = own_cnt;
+              for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = indX + dx;
+                if (nx < 0 || nx >= planarVoxelWidth) {continue;}
+                for (int dy = -1; dy <= 1; ++dy) {
+                  if (dx == 0 && dy == 0) {continue;}
+                  const int ny = indY + dy;
+                  if (ny < 0 || ny >= planarVoxelWidth) {continue;}
+                  const int nb = planarVoxelWidth * nx + ny;
+                  sum += planarOverheadSlabSum[nb];
+                  cnt += planarOverheadSlabCount[nb];
+                }
+              }
+              clears_overhead =
+                  cnt >= 2 && (sum / cnt) >= traversabilityOverheadHeight;
+            }
+            if (!clears_overhead) {
+              const float rel = planarSubOverheadMaxZ[ind] - planarVoxelElev[ind];
+              if (rel >= 0.0f) {
+                planarVoxelMaxRelHeight[ind] =
+                    std::max(planarVoxelMaxRelHeight[ind], rel);
+              }
+              planarVoxelMinZ[ind] =
+                  std::min(planarVoxelMinZ[ind], planarSubOverheadMinZ[ind]);
+              planarVoxelMaxZ[ind] =
+                  std::max(planarVoxelMaxZ[ind], planarSubOverheadMaxZ[ind]);
+              planarVoxelPointCount[ind] += planarSubOverheadCount[ind];
+            }
           }
         }
       }

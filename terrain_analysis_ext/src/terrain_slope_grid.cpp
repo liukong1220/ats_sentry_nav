@@ -68,20 +68,27 @@ void computeSlopeGrid() {
       const float center_elev = planarVoxelElev[ind];
       const auto sample_continuous_elev = [&](int dx, int dy, float &elev) -> bool {
         // Walk from the center cell to the stride endpoint and reject any ray that
-        // crosses a vertical wall/step discontinuity (> 0.08 m in a single cell or a
-        // flat local cell suddenly jumping > 0.14 m at the stride endpoint). This keeps
-        // genuine continuous ramps (<= 58 deg) intact while preventing vertical tunnel
-        // sidewalls from smearing 0.20 m of false >28 deg slope onto adjacent flat floors.
+        // crosses an empty gap, a vertical obstacle cell (>= safe height), or a
+        // sharp wall/curb discontinuity (> 0.055 m in one cell). This preserves real
+        // continuous ramps (<= 47 deg) while preventing tunnel/ramp sidewalls from
+        // smearing 0.10-0.20 m of false >28 deg slope into adjacent narrow corridors.
         float prev = center_elev;
         const float max_single_step =
-            static_cast<float>(std::max(0.08, 1.2 * resolution));
+            static_cast<float>(std::max(0.055, 1.1 * resolution));
         for (int k = 1; k <= stride; ++k) {
+          const int sx = indX + dx * k;
+          const int sy = indY + dy * k;
           float cur = 0.0f;
-          if (!sample_elev(indX + dx * k, indY + dy * k, cur)) {
-            if (k == stride) {
-              return false;
-            }
-            continue;
+          if (!sample_elev(sx, sy, cur)) {
+            return false;
+          }
+          const int sample_ind = planarVoxelWidth * sx + sy;
+          const double sample_height_metric = static_cast<double>(
+              terrain_analysis_ext::voxelHeightMetric(
+                  planarVoxelMinZ[sample_ind], planarVoxelMaxZ[sample_ind],
+                  planarVoxelMaxRelHeight[sample_ind]));
+          if (sample_height_metric >= traversabilitySafeHeightThre) {
+            return false;
           }
           if (std::fabs(cur - prev) > max_single_step) {
             return false;

@@ -269,6 +269,24 @@ std::optional<GroundColumnGrid::SupportInterval> GroundColumnGrid::voxelSupportI
   }
   lower = std::min(lower, (*centre)[0] - config_.max_ground_slope * diameter * 0.5);
   upper = std::max(upper, (*centre)[1] + config_.max_ground_slope * diameter * 0.5);
+  if (ground_[index(x, y)] && evidence.high[2] - lower > config_.surface_max + 1e-9) {
+    const double clearance = config_.robot_height + config_.top_margin;
+    const double plane_slack =
+      config_.ceiling_plane_band + config_.floor_plane_band + 0.03;
+    if (evidence.low[2] - lower >= clearance - plane_slack - 0.02 &&
+      evidence.low[2] - upper <= clearance + plane_slack + 0.02)
+    {
+      if (const auto floor = floorPlane(x, y)) {
+        double fitted = -std::numeric_limits<double>::infinity();
+        for (const double qx : {evidence.xy_bounds[0], evidence.xy_bounds[2]}) {
+          for (const double qy : {evidence.xy_bounds[1], evidence.xy_bounds[3]}) {
+            fitted = std::max(fitted, floor->at(qx, qy));
+          }
+        }
+        return SupportInterval{lower, upper, std::min(upper, fitted), true};
+      }
+    }
+  }
   return SupportInterval{lower, upper, upper, false};
 }
 
@@ -279,26 +297,74 @@ std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::ceilingPlane(int
   const int plane_radius = std::max(
     config_.ceiling_plane_radius,
     static_cast<int>(std::ceil((config_.ceiling_plane_min_extent + 0.05) / resolution_)));
-  std::vector<Point> points;
+  std::vector<Point> underside_points;
+  std::vector<Point> all_points;
   for (int dy = -plane_radius; dy <= plane_radius; ++dy) {
     for (int dx = -plane_radius; dx <= plane_radius; ++dx) {
       if (!valid(x + dx, y + dy)) {continue;}
-      for (const auto & bin : columns_[index(x + dx, y + dy)]) {
-        const auto support = supportBounds(x + dx, y + dy, bin.second.low[0], bin.second.low[1]);
+      const auto & col = columns_[index(x + dx, y + dy)];
+      for (auto it = col.begin(); it != col.end(); ++it) {
+        const auto & vr = it->second;
+        const auto support = supportBounds(x + dx, y + dy, vr.low[0], vr.low[1]);
         if (!support) {continue;}
-        const double height = bin.second.low[2] - (*support)[1];
-        // Take ONLY the lowest non-floor return per column inside the headroom band
-        // (the tunnel underside). Higher bins or bin.high on a vertical beam front face
-        // would otherwise dilute the horizontal underside RANSAC inlier ratio below 0.6.
+        const double sup_mid = 0.5 * ((*support)[0] + (*support)[1]);
+        const double height = vr.low[2] - sup_mid;
+        // Take ONLY the lowest non-floor return per column inside the overhead headroom band
+        // [clearance - 0.04, clearance + 0.06]. Excluding returns below clearance - 0.04
+        // prevents adjacent narrow-tunnel side walls (0.06..0.20 m) inside the +-0.35 m window
+        // from diluting horizontal underside RANSAC inlier ratio below 0.6.
         if (height <= config_.surface_max + 1e-9) {continue;}
-        if (height <= clearance + 0.08) {
-          points.push_back(bin.second.low);
+        if (height >= clearance - 0.04 && height <= clearance + 0.06) {
+          // A thin horizontal underside stays <= 4.5 cm thick even when Gaussian noise splits it
+          // across an arbitrary 5 cm Z-voxel boundary (e.g. z=0.400 m), and has no continuous
+          // vertical wall returns in (+0.045 m, +0.10 m) above it (even if the top surface of
+          // the same beam is also visible higher up at +0.16 m). Combine only bins within
+          // +0.045 m so meanZ() is unbiased and never polluted by either voxel splits or beam tops.
+          bool vertical_face_above = false;
+          for (auto jt = it; jt != col.end(); ++jt) {
+            if (jt->second.high[2] > vr.low[2] + 0.045 &&
+              jt->second.low[2] < vr.low[2] + 0.10)
+            {
+              vertical_face_above = true;
+              break;
+            }
+          }
+          const bool thin_underside = !vertical_face_above;
+          if (thin_underside) {
+            double z_sum = 0.0;
+            std::uint64_t z_cnt = 0U;
+            double x_lo = vr.xy_bounds[0], x_hi = vr.xy_bounds[2];
+            double y_lo = vr.xy_bounds[1], y_hi = vr.xy_bounds[3];
+            for (auto jt = it; jt != col.end() && jt->second.low[2] <= vr.low[2] + 0.045; ++jt) {
+              z_sum += jt->second.z_sum;
+              z_cnt += jt->second.count;
+              x_lo = std::min(x_lo, jt->second.xy_bounds[0]);
+              x_hi = std::max(x_hi, jt->second.xy_bounds[2]);
+              y_lo = std::min(y_lo, jt->second.xy_bounds[1]);
+              y_hi = std::max(y_hi, jt->second.xy_bounds[3]);
+            }
+            const Point p{
+              0.5 * (x_lo + x_hi),
+              0.5 * (y_lo + y_hi),
+              z_cnt > 0U ? z_sum / static_cast<double>(z_cnt) : vr.meanZ()};
+            underside_points.push_back(p);
+            all_points.push_back(p);
+          } else {
+            all_points.push_back(vr.low);
+          }
         }
         break;
       }
     }
   }
-  return robustPlane(points, config_.ceiling_plane_band, config_.ceiling_plane_max_slope);
+  if (static_cast<int>(underside_points.size()) >= config_.ceiling_plane_min_points) {
+    if (auto fit = robustPlane(
+        underside_points, config_.ceiling_plane_band, config_.ceiling_plane_max_slope))
+    {
+      return fit;
+    }
+  }
+  return robustPlane(all_points, config_.ceiling_plane_band, config_.ceiling_plane_max_slope);
 }
 
 std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::robustPlane(
@@ -413,8 +479,10 @@ std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::floorPlane(int x
       if (!valid(x + dx, y + dy)) {continue;}
       const auto & support = ground_[index(x + dx, y + dy)];
       if (!support) {continue;}
-      points.push_back(support->low);
-      if (support->high[2] > support->low[2]) {points.push_back(support->high);}
+      points.push_back({
+        0.5 * (support->low[0] + support->high[0]),
+        0.5 * (support->low[1] + support->high[1]),
+        support->meanZ()});
     }
   }
   const auto plane = robustPlane(points, config_.floor_plane_band, config_.max_ground_slope);
@@ -424,15 +492,33 @@ std::optional<GroundColumnGrid::CeilingPlane> GroundColumnGrid::floorPlane(int x
     return std::nullopt;
   }
   // A broad fit can reject a real local step as an outlier. It may refine this
-  // column's headroom only if its OWN connected support remains on that plane.
-  // Validate every retained XY patch, not only the two whole-column extrema.
+  // column's headroom only if the column mean and every multi-hit XY patch mean remain
+  // on that plane and all extrema stay within bounded sensor scatter (rejecting real steps).
+  const double mean_tol = std::max(plane->tol, config_.support_noise + 0.003) + 1e-9;
+  const double patch_mean_tol = std::max(mean_tol, config_.floor_plane_band + 1e-9);
+  const double ext_tol = config_.floor_plane_band + 0.018 + 1e-9;
+  const double own_cx = 0.5 * (own_support->xy_bounds[0] + own_support->xy_bounds[2]);
+  const double own_cy = 0.5 * (own_support->xy_bounds[1] + own_support->xy_bounds[3]);
+  const double own_tol =
+    own_support->count >= 3U ? mean_tol : (config_.floor_plane_band + 1e-9);
+  if (std::abs(own_support->meanZ() - plane->at(own_cx, own_cy)) > own_tol) {
+    floor_planes_.emplace(idx, std::nullopt);
+    return std::nullopt;
+  }
   for (const auto & entry : own_support->patches) {
     const auto & patch = entry.second;
+    const double cx = 0.5 * (patch.xy_bounds[0] + patch.xy_bounds[2]);
+    const double cy = 0.5 * (patch.xy_bounds[1] + patch.xy_bounds[3]);
+    const double fitted_c = plane->at(cx, cy);
+    if (patch.count >= 3U && std::abs(patch.meanZ() - fitted_c) > patch_mean_tol) {
+      floor_planes_.emplace(idx, std::nullopt);
+      return std::nullopt;
+    }
     for (const double px : {patch.xy_bounds[0], patch.xy_bounds[2]}) {
       for (const double py : {patch.xy_bounds[1], patch.xy_bounds[3]}) {
         const double fitted = plane->at(px, py);
         if (std::max(std::abs(patch.low[2] - fitted), std::abs(patch.high[2] - fitted)) >
-          plane->tol + 1e-9)
+          ext_tol)
         {
           floor_planes_.emplace(idx, std::nullopt);
           return std::nullopt;
@@ -457,19 +543,44 @@ std::optional<double> GroundColumnGrid::boardClearance(
 {
   if (!ceiling) {return std::nullopt;}
   const double band = config_.ceiling_plane_band;
-  const double tol = std::min(band, ceiling->tol) + 1e-9;
-  const auto on_board = [&](const Point & p) {
-      return std::abs(p[2] - ceiling->at(p[0], p[1])) <= tol;
-    };
-  // The lowest return must lie on the fitted underside board; higher returns in the same
-  // voxel (e.g. vertical beam front-face points above the underside) are strictly safer.
-  if (!on_board(evidence.low) ||
-    evidence.high[2] < ceiling->at(evidence.high[0], evidence.high[1]) - tol)
-  {return std::nullopt;}
-  const auto floor = floorPlane(x, y);
-  if (!floor) {return std::nullopt;}
+  const double tol = std::min(band, std::max(ceiling->tol, config_.support_noise + 0.003)) + 1e-9;
+  const double z_at_low = ceiling->at(evidence.low[0], evidence.low[1]);
   const double cx = 0.5 * (evidence.xy_bounds[0] + evidence.xy_bounds[2]);
   const double cy = 0.5 * (evidence.xy_bounds[1] + evidence.xy_bounds[3]);
+  const double z_at_mid = ceiling->at(cx, cy);
+  const bool low_on_board =
+    std::abs(evidence.low[2] - z_at_low) <= tol &&
+    evidence.high[2] >= ceiling->at(evidence.high[0], evidence.high[1]) - tol;
+  // On high-density vertical beam front faces (or Z-voxel boundary spillover when the true
+  // underside lies 1 mm above a 5 cm bin edge), extreme-value running min of noisy hits can
+  // dip up to band + 3 mm (18 mm) below the fitted board while the column's overhead returns
+  // around the board remain centered on/above z_at_mid. A real low hanging protrusion either
+  // dips below band + 3 mm or pulls the column's near-board mean strictly below z_at_mid - 4 mm.
+  bool mean_on_or_above_board = false;
+  if (!low_on_board &&
+    evidence.low[2] >= z_at_low - (band + 0.003) - 1e-9 &&
+    evidence.low[2] <= z_at_low + tol)
+  {
+    double col_z_sum = 0.0;
+    std::uint64_t col_count = 0U;
+    double col_high = evidence.high[2];
+    for (const auto & bin : columns_[index(x, y)]) {
+      const auto & vr = bin.second;
+      if (vr.high[2] < z_at_mid - (band + 0.010) || vr.low[2] > z_at_mid + 0.035) {continue;}
+      col_z_sum += vr.z_sum;
+      col_count += vr.count;
+      col_high = std::max(col_high, vr.high[2]);
+    }
+    const double col_mean = col_count > 0U
+      ? col_z_sum / static_cast<double>(col_count)
+      : evidence.meanZ();
+    mean_on_or_above_board =
+      col_high >= z_at_mid - tol &&
+      col_mean >= z_at_mid - 0.004 - 1e-9;
+  }
+  if (!low_on_board && !mean_on_or_above_board) {return std::nullopt;}
+  const auto floor = floorPlane(x, y);
+  if (!floor) {return std::nullopt;}
   return ceiling->at(cx, cy) - floor->at(cx, cy);
 }
 
@@ -527,14 +638,112 @@ bool GroundColumnGrid::isDropOffStep(int x, int y) const
   const auto i = index(x, y);
   const bool has_ground = ground_[i].has_value();
   const auto & bins = columns_[i];
-  if (!has_ground && bins.empty()) {return false;}
-  const Point & highest = has_ground ? ground_[i]->high : bins.rbegin()->second.high;
-  // For connected ground adjacent to an elevated deck connected via a separate ramp elsewhere
-  // (e.g. a 0.18 m bridge drop-off), only check immediate 1-cell neighbors so continuous ramps
-  // (<= 3-4 cm per 5 cm cell) are never affected while sheer bridge cliffs are sealed cleanly.
-  const int r_cells = has_ground
-    ? 1
-    : std::max(1, std::min(3, static_cast<int>(std::lround(0.15 / resolution_))));
+  const double max_cliff_drop = config_.robot_height + config_.top_margin;
+  if (!has_ground && bins.empty()) {
+    if (!ray_observed_[i]) {return false;}
+    // Seal sheer drop-off cliffs hidden in LiDAR grazing shadows (< robot_height + top_margin).
+    const int r_shadow = std::max(
+      2, std::min(5, static_cast<int>(std::lround(0.25 / resolution_))));
+    const double shadow_slope = std::min(config_.max_ground_slope, 0.35);
+    const int axes[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+    for (const auto & axis : axes) {
+      int neg_x = -1, neg_y = -1;
+      int pos_x = -1, pos_y = -1;
+      bool neg_is_ground = false, pos_is_ground = false;
+      for (int s = 1; s <= r_shadow; ++s) {
+        const int nx = x - axis[0] * s;
+        const int ny = y - axis[1] * s;
+        if (!valid(nx, ny)) {break;}
+        const auto nidx = index(nx, ny);
+        if (ground_[nidx]) {neg_x = nx; neg_y = ny; neg_is_ground = true; break;}
+        if (!columns_[nidx].empty()) {neg_x = nx; neg_y = ny; break;}
+      }
+      if (neg_x < 0) {continue;}
+      for (int s = 1; s <= r_shadow; ++s) {
+        const int px = x + axis[0] * s;
+        const int py = y + axis[1] * s;
+        if (!valid(px, py)) {break;}
+        const auto pidx = index(px, py);
+        if (ground_[pidx]) {pos_x = px; pos_y = py; pos_is_ground = true; break;}
+        if (!columns_[pidx].empty()) {pos_x = px; pos_y = py; break;}
+      }
+      if (pos_x < 0 || (!neg_is_ground && !pos_is_ground)) {continue;}
+      const auto nidx = index(neg_x, neg_y);
+      const auto pidx = index(pos_x, pos_y);
+      const auto & ng = neg_is_ground ? *ground_[nidx] : columns_[nidx].rbegin()->second;
+      const auto & pg = pos_is_ground ? *ground_[pidx] : columns_[pidx].rbegin()->second;
+      const double horiz = std::hypot(pg.low[0] - ng.low[0], pg.low[1] - ng.low[1]);
+      if (horiz <= 1e-6) {continue;}
+      const bool pos_higher = pg.low[2] > ng.low[2];
+      if (pos_higher ? !pos_is_ground : !neg_is_ground) {continue;}
+      const auto & hi = pos_higher ? pg : ng;
+      const auto & lo = pos_higher ? ng : pg;
+      const auto hi_idx = pos_higher ? pidx : nidx;
+      const int neg_steps = std::max(std::abs(x - neg_x), std::abs(y - neg_y));
+      const int pos_steps = std::max(std::abs(x - pos_x), std::abs(y - pos_y));
+      const int hi_steps = pos_higher ? pos_steps : neg_steps;
+      // Seal ONLY the single cell directly adjacent to the high cliff edge (hi_steps == 1).
+      if (hi_steps > 1) {continue;}
+      const double drop = hi.low[2] - lo.high[2];
+      const double threshold = std::max(
+        config_.surface_max + 0.04,
+        shadow_slope * horiz + config_.support_noise + 0.04);
+      if (drop <= threshold || drop >= max_cliff_drop) {continue;}
+      bool has_continuous_lower = false;
+      for (const auto & bin : columns_[hi_idx]) {
+        const double bhoriz = std::hypot(
+          lo.high[0] - bin.second.low[0], lo.high[1] - bin.second.low[1]);
+        const double blimit = std::max(
+          config_.surface_max,
+          config_.max_ground_slope * bhoriz + config_.support_noise + 1e-6);
+        if (std::abs(bin.second.low[2] - lo.high[2]) <= blimit ||
+          bin.second.low[2] < hi.low[2] - 0.04)
+        {
+          has_continuous_lower = true;
+          break;
+        }
+      }
+      if (!has_continuous_lower) {return true;}
+    }
+    return false;
+  }
+  // Connected ground adjacent to a vertical step/parapet: mark ONLY the higher ledge cell
+  // (never inflating inward onto a narrow lower tunnel floor) unless the lower neighbor already
+  // holds the vertical wall or continuous ramp.
+  if (has_ground) {
+    const Point & low_pt = ground_[i]->low;
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        if ((dx == 0 && dy == 0) || !valid(x + dx, y + dy)) {continue;}
+        const auto nidx = index(x + dx, y + dy);
+        const auto & ng = ground_[nidx];
+        if (!ng) {continue;}
+        const double horiz = std::hypot(low_pt[0] - ng->high[0], low_pt[1] - ng->high[1]);
+        const double drop = low_pt[2] - ng->high[2];
+        if (drop >= max_cliff_drop) {continue;}
+        const double threshold = std::max(
+          config_.surface_max,
+          config_.max_ground_slope * horiz + config_.support_noise + 0.015);
+        if (drop <= threshold) {continue;}
+        bool neighbor_has_wall_or_ramp = false;
+        for (const auto & nbin : columns_[nidx]) {
+          const double nhoriz = std::hypot(
+            low_pt[0] - nbin.second.high[0], low_pt[1] - nbin.second.high[1]);
+          const double nlimit = std::max(
+            config_.surface_max,
+            config_.max_ground_slope * nhoriz + config_.support_noise + 1e-6);
+          if (nbin.second.high[2] >= low_pt[2] - nlimit) {
+            neighbor_has_wall_or_ramp = true;
+            break;
+          }
+        }
+        if (!neighbor_has_wall_or_ramp) {return true;}
+      }
+    }
+    return false;
+  }
+  const Point & highest = bins.rbegin()->second.high;
+  const int r_cells = std::max(1, std::min(3, static_cast<int>(std::lround(0.15 / resolution_))));
   for (int dy = -r_cells; dy <= r_cells; ++dy) {
     for (int dx = -r_cells; dx <= r_cells; ++dx) {
       if ((dx == 0 && dy == 0) || !valid(x + dx, y + dy)) {continue;}
@@ -543,13 +752,11 @@ bool GroundColumnGrid::isDropOffStep(int x, int y) const
       if (!ng) {continue;}
       const double horiz = std::hypot(highest[0] - ng->low[0], highest[1] - ng->low[1]);
       const double drop = ng->low[2] - highest[2];
+      if (drop >= max_cliff_drop) {continue;}
       const double threshold = std::max(
         config_.surface_max + 0.02,
         config_.max_ground_slope * horiz + config_.support_noise + 0.02);
       if (drop > threshold) {
-        // If the neighbor column also contains a surface bin continuous with highest[2]
-        // (e.g. a passable ramp continuing underneath a 2-level overpass deck), this is an
-        // overpass entrance rather than a sheer drop-off cliff.
         bool neighbor_has_wall_or_ramp = false;
         for (const auto & nbin : columns_[nidx]) {
           const double nhoriz = std::hypot(
@@ -558,13 +765,6 @@ bool GroundColumnGrid::isDropOffStep(int x, int y) const
             config_.surface_max,
             config_.max_ground_slope * nhoriz + config_.support_noise + 1e-6);
           if (std::abs(nbin.second.low[2] - highest[2]) <= nlimit) {
-            neighbor_has_wall_or_ramp = true;
-            break;
-          }
-          // When this lower cell is already connected ground and the adjacent higher cell
-          // already contains vertical wall returns below its top, that neighbor cell itself
-          // is already occupied; do not inflate the wall 5 cm inward onto the tunnel floor.
-          if (has_ground && nbin.second.low[2] < ng->low[2] - 0.04) {
             neighbor_has_wall_or_ramp = true;
             break;
           }
@@ -588,25 +788,20 @@ bool GroundColumnGrid::isRoughBump(int x, int y) const
   // Flat floors, constant-slope ramps (even with unevenly spaced missing cells), and
   // monotonic ramp creases produce <= 0 product or zero residual and are unaffected.
   const int max_s = std::max(2, std::min(4, static_cast<int>(std::lround(0.15 / resolution_))));
-  const double z0 = gc->low[2];
+  const double max_bump_jump = config_.robot_height + config_.top_margin - 0.01;
   const auto sampleNearbyZ = [&](int nx, int ny, double & out_z) -> bool {
-      if (!valid(nx, ny)) {return false;}
+      if (!valid(nx, ny) || hasOverhead(nx, ny)) {return false;}
       const auto idx = index(nx, ny);
-      if (ground_[idx]) {
-        out_z = ground_[idx]->low[2];
-        return true;
-      }
-      const auto & col = columns_[idx];
-      if (!col.empty()) {
-        const double z_cand = col.begin()->second.low[2];
-        if (std::abs(z_cand - z0) <= 0.10) {
-          out_z = z_cand;
-          return true;
-        }
-      }
-      return false;
+      // Only compare against connected ground surfaces; never sample non-ground vertical wall
+      // returns (which would falsely flag flat corridor floors 10-15 cm from a wall as bumps).
+      if (!ground_[idx]) {return false;}
+      out_z = ground_[idx]->meanZ();
+      return true;
     };
+  // Use cell meanZ() so single-point LIO outliers on sloped ramps never trigger false bumps,
+  // and ignore neighbors separated by >= max_bump_jump (2-level overpass decks vs underpass).
   const auto checkAxis = [&](int ax, int ay) -> bool {
+      const double z0 = gc->meanZ();
       double zm = 0.0, zp = 0.0;
       int dm_cells = 0, dp_cells = 0;
       const int order[3] = {std::min(2, max_s), max_s, 1};
@@ -619,11 +814,12 @@ bool GroundColumnGrid::isRoughBump(int x, int y) const
       if (dm_cells == 0 || dp_cells == 0) {return false;}
       const double dm = z0 - zm;
       const double dp = z0 - zp;
+      if (std::abs(dm) >= max_bump_jump || std::abs(dp) >= max_bump_jump) {return false;}
       if (dm * dp <= 0.0 || std::min(std::abs(dm), std::abs(dp)) <= 0.018) {return false;}
       const double z_interp =
         (static_cast<double>(dp_cells) * zm + static_cast<double>(dm_cells) * zp) /
         static_cast<double>(dm_cells + dp_cells);
-      return std::abs(z0 - z_interp) > 0.036;
+      return std::abs(z0 - z_interp) > 0.032;
     };
   return checkAxis(1, 0) || checkAxis(0, 1);
 }
@@ -662,7 +858,11 @@ ColumnState GroundColumnGrid::rawState(int x, int y) const
       const double support = interval->estimate;
       double low_z = evidence.low[2];
       double high_z = evidence.high[2];
-      if (evidence.high[2] - lower > config_.surface_max + 1e-9) {
+      const bool own_ground_floor =
+        ground_[index(x, y)].has_value() &&
+        evidence.high[2] - ground_[index(x, y)]->low[2] <= config_.surface_max + 1e-9 &&
+        evidence.high[2] - support <= config_.surface_max + 1e-9;
+      if (!own_ground_floor && evidence.high[2] - lower > config_.surface_max + 1e-9) {
         // Only returns near the robot headroom threshold require 9x9 RANSAC ceiling/floor
         // plane fitting; returns clearly below are guaranteed walls and returns clearly above
         // are guaranteed high overhangs/roofs.
@@ -702,17 +902,49 @@ ColumnState GroundColumnGrid::rawState(int x, int y) const
             headroom = clearance;
             low_z = support + headroom;
             high_z = std::max(high_z, low_z);
+          } else if (!plane && headroom >= clearance - 0.015 - 1e-9 && headroom < clearance) {
+            // Unbiased vertical beam front-face bottom-edge estimator before underside plane fits.
+            if (const auto floor = floorPlane(x, y)) {
+              const auto & col_bins = columns_[index(x, y)];
+              const int b0 = static_cast<int>(
+                std::floor(evidence.low[2] / config_.voxel_resolution));
+              const auto it0 = col_bins.find(b0);
+              const auto it1 = col_bins.find(b0 + 1);
+              if (it0 != col_bins.end() && it1 != col_bins.end() &&
+                it1->second.count >= 8U &&
+                it1->second.high[2] - it1->second.low[2] >= 0.025)
+              {
+                const std::uint64_t total_cnt = it0->second.count + it1->second.count;
+                const double mean_z = total_cnt > 0U ?
+                  (it0->second.z_sum + it1->second.z_sum) / static_cast<double>(total_cnt) :
+                  0.5 * (it0->second.meanZ() + it1->second.meanZ());
+                const double z_top = static_cast<double>(b0 + 2) * config_.voxel_resolution;
+                const double cx = 0.5 * (evidence.xy_bounds[0] + evidence.xy_bounds[2]);
+                const double cy = 0.5 * (evidence.xy_bounds[1] + evidence.xy_bounds[3]);
+                const double edge_hr = (2.0 * mean_z - z_top) - floor->at(cx, cy);
+                if (edge_hr >= board_min_clearance - 1e-9) {
+                  headroom = clearance;
+                  low_z = support + headroom;
+                  high_z = std::max(high_z, low_z);
+                }
+              }
+            }
           }
           if (headroom < clearance - 1e-9) {
-            // When no local floor plane is fitted yet (e.g. viewing a passable 0.25 m tunnel
-            // beam front edge from > 2 m away with sparse floor samples), non-planar Lipschitz
-            // slope-cone inflation can push support up by ~1.3 cm. Likewise, before a horizontal
-            // ceiling plane is observed across the underside, 1-5 mm single-point LiDAR/LIO
-            // noise on a vertical beam front face can dip a true 0.250 m beam just below 0.249 m.
-            // Keep such borderline unverified edges kUnknown (never kFree) until closer scans
-            // establish both floor and ceiling planes for the exact 0.249 m headroom gate.
-            if ((!interval->planar && (low_z - lower >= clearance - 1e-9)) ||
-              (!plane && headroom >= clearance - config_.support_noise - 1e-9))
+            // Keep borderline unverified beam edges kUnknown (never kFree) until closer scans
+            // establish floor/ceiling planes for the exact 0.249 m headroom gate.
+            const bool own_ground_low_headroom =
+              ground_[index(x, y)].has_value() &&
+              (low_z - ground_[index(x, y)]->high[2] <
+                clearance - 2.0 * config_.support_noise - 1e-9);
+            if ((!own_ground_low_headroom && !interval->planar &&
+                (low_z - lower >= clearance - 1e-9)) ||
+              (!plane && headroom >= clearance - 2.0 * config_.support_noise - 1e-9) ||
+              (!ground_[index(x, y)] && plane &&
+                plane->at(evidence.low[0], evidence.low[1]) - lower >= clearance - 1e-9 &&
+                evidence.low[2] >=
+                  plane->at(evidence.low[0], evidence.low[1]) -
+                    (config_.ceiling_plane_band + 0.005)))
             {
               return ColumnState::kUnknown;
             }

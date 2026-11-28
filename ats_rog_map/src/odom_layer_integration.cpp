@@ -278,9 +278,25 @@ OdomLayerFrameStats integrateOdomLayerFrame(
   }
   const auto rays_done = std::chrono::steady_clock::now();
   columns.observe(valid, robot_ground);
+  const int shadow_r = std::max(
+    2, std::min(5, static_cast<int>(std::lround(0.25 / c.resolution))));
   for (const auto gi : columns.lastUpdatedGroundIndices()) {
     flags[gi] |= 16U;
     touch(gi);
+    const int gx = static_cast<int>(gi % c.width);
+    const int gy = static_cast<int>(gi / c.width);
+    const int axes[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+    for (const auto & axis : axes) {
+      for (int dir : {-1, 1}) {
+        for (int s = 1; s <= shadow_r; ++s) {
+          const int nx = gx + axis[0] * dir * s;
+          const int ny = gy + axis[1] * dir * s;
+          if (!layer.validCell(nx, ny)) {break;}
+          if (columns.ground(nx, ny).has_value()) {break;}
+          touch(layer.index(nx, ny));
+        }
+      }
+    }
   }
   const auto ground_done = std::chrono::steady_clock::now();
   std::vector<Point> boundary_back_points;
@@ -302,10 +318,9 @@ OdomLayerFrameStats integrateOdomLayerFrame(
         if (layer.validCell(x + dx, y + dy)) {touch(layer.index(x + dx, y + dy));}
       }
     }
-    const int rough_stride = std::max(1, static_cast<int>(std::lround(0.10 / c.resolution)));
-    if (rough_stride > 1) {
-      const int offs[4][2] = {
-        {-rough_stride, 0}, {rough_stride, 0}, {0, -rough_stride}, {0, rough_stride}};
+    const int rough_stride = std::max(1, static_cast<int>(std::lround(0.15 / c.resolution)));
+    for (int s = 2; s <= rough_stride; ++s) {
+      const int offs[4][2] = {{-s, 0}, {s, 0}, {0, -s}, {0, s}};
       for (const auto & o : offs) {
         if (layer.validCell(x + o[0], y + o[1])) {touch(layer.index(x + o[0], y + o[1]));}
       }
@@ -346,7 +361,11 @@ OdomLayerFrameStats integrateOdomLayerFrame(
     const int x = static_cast<int>(i % c.width), y = static_cast<int>(i / c.width);
     const auto state = columns.state(x, y);
     if (!(flags[i] & 16U)) {
-      if (state == ColumnState::kTunnelFree) {
+      if (state == ColumnState::kOccupied &&
+        (columns.isDropOffStep(x, y) || columns.isRoughBump(x, y)))
+      {
+        layer.observeHit(x, y, stamp, frame_dt);
+      } else if (state == ColumnState::kTunnelFree) {
         stats.ray_cleared_cells += layer.observeTunnelFree(x, y, stamp, frame_dt) ? 1U : 0U;
         ++stats.non_obstacle;
       } else if (state != ColumnState::kFree) {
