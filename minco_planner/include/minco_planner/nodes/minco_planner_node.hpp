@@ -100,6 +100,14 @@ private:
     bool goal_pose_footprint_verified, double & used_clearance,
     nav_msgs::msg::Path * global_guide_out = nullptr,
     std::optional<geometry_msgs::msg::PoseStamped> * local_anchor_out = nullptr);
+  GridSearchResult planMaplessRoute(
+    const std::shared_ptr<const PlanningMapSnapshot> & snapshot,
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal, const GoalUuid & goal_uuid,
+    std::uint64_t goal_id, std::uint64_t localization_epoch,
+    bool goal_pose_footprint_verified, double & used_clearance,
+    nav_msgs::msg::Path * global_guide_out,
+    std::optional<geometry_msgs::msg::PoseStamped> * local_anchor_out);
   void publishRollingAnchor(
     const std::optional<geometry_msgs::msg::PoseStamped> & anchor,
     const std::string & frame_id, const rclcpp::Time & stamp, const char * label);
@@ -364,6 +372,7 @@ private:
     nav_msgs::msg::Path::ConstSharedPtr path;
     double clearance;
     bool optimistic{false};
+    bool known_only{false};
   };
   std::optional<GlobalRoute> global_route_;
   struct FrontierTabooEntry
@@ -374,7 +383,12 @@ private:
   };
   std::uint64_t frontier_taboo_goal_id_{0};
   std::uint64_t frontier_taboo_epoch_{0};
+  std::uint64_t frontier_taboo_version_{0};
   std::vector<FrontierTabooEntry> frontier_taboo_;
+  std::uint64_t cached_global_blocked_pub_seq_{0};
+  std::uint64_t cached_global_blocked_taboo_version_{0};
+  nav_msgs::msg::OccupancyGrid cached_tabooed_global_grid_;
+  std::vector<double> cached_global_blocked_sq_;
   std::optional<geometry_msgs::msg::Point> last_partial_anchor_;
   std::optional<geometry_msgs::msg::Point> last_partial_start_;
   std::optional<geometry_msgs::msg::Point> last_unknown_frontier_;
@@ -385,6 +399,7 @@ private:
   std::chrono::steady_clock::time_point mapless_stall_time_{};
   std::chrono::steady_clock::time_point mapless_long_stall_time_{};
   int mapless_consecutive_rejects_{0};
+  int mapless_optimistic_obstructed_count_{0};
   double optimistic_global_unknown_cost_{1.35};
   double frontier_taboo_radius_m_{0.70};
   double frontier_taboo_ttl_sec_{180.0};

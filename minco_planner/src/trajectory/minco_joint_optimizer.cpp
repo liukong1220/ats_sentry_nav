@@ -254,8 +254,18 @@ double MincoJointOptimizer::evaluate(
   }
 
   const bool obstacle_enabled = static_cast<bool>(problem.distance);
-  const bool center_enabled = obstacle_enabled && params_.center_clearance > 0.0;
   const bool footprint_enabled = obstacle_enabled && static_cast<bool>(problem.yaw);
+  const double inscribed_half = std::min(
+    0.5 * std::max(0.0, params_.footprint_length) + std::max(0.0, params_.footprint_safety_margin),
+    0.5 * std::max(0.0, params_.footprint_width) + std::max(0.0, params_.footprint_safety_margin));
+  // When oriented footprint samples are active, they enforce exact rotated-rectangle clearance
+  // (including corners during turns); cap the isotropic center disk to inscribed_half +
+  // footprint_clearance so straight axially-aligned tunnel paths do not bow laterally across
+  // floor seams chasing sub-cell ESDF peaks once every footprint edge is already safe.
+  const double effective_center_clearance = footprint_enabled
+    ? std::min(params_.center_clearance, inscribed_half + std::max(0.0, params_.footprint_clearance))
+    : params_.center_clearance;
+  const bool center_enabled = obstacle_enabled && effective_center_clearance > 0.0;
   const bool smooth_l1 = params_.obstacle_smooth_l1_weight > 0.0 &&
     params_.obstacle_smooth_l1_mu > 0.0;
   const double max_acceleration_squared = params_.max_acceleration * params_.max_acceleration;
@@ -319,7 +329,7 @@ double MincoJointOptimizer::evaluate(
           std::isfinite(center_distance))
         {
           has_center_distance = true;
-          const double violation = params_.center_clearance - center_distance;
+          const double violation = effective_center_clearance - center_distance;
           if (violation > 0.0) {
             addObstacle(violation, center_distance_gradient);
             local.max_center_violation = std::max(local.max_center_violation, violation);

@@ -486,7 +486,7 @@ void MincoPlannerNode::tryEscapePrefixAndLocalReverse(
           }
           nav_msgs::msg::Path tail_guide_path = tail_search.path;
           double tail_goal_yaw = goal_yaw;
-          bool tail_is_final = !tail_search.partial;
+          bool tail_is_final = active_is_final_goal && !tail_search.partial;
           bool tail_spliced = false;
           if (rolling_horizon_enabled_ &&
             pathArcLength(tail_guide_path) >
@@ -669,6 +669,40 @@ void MincoPlannerNode::finalizeAndCommitReference(
       map_snapshot->generation);
     return;
   }
+  if (keep_active_reference && committed_for_start &&
+    selected_trace.seed_scale < 0.99 && reference.points.size() >= 2U)
+  {
+    const double seed_speed = std::hypot(replan_start.vx, replan_start.vy);
+    const double head_dv = std::hypot(
+      reference.points.front().vx - replan_start.vx,
+      reference.points.front().vy - replan_start.vy);
+    if (seed_speed > 0.50 && head_dv > 0.35) {
+      const auto & p0 = reference.points.front();
+      std::size_t probe = reference.points.size() - 1U;
+      for (std::size_t idx = 1U; idx < reference.points.size(); ++idx) {
+        if (std::hypot(reference.points[idx].x - p0.x, reference.points[idx].y - p0.y) >= 0.30) {
+          probe = idx;
+          break;
+        }
+      }
+      const double dx = reference.points[probe].x - p0.x;
+      const double dy = reference.points[probe].y - p0.y;
+      const double dnorm = std::hypot(dx, dy);
+      const double cos_align = dnorm > 1e-6 ?
+        (replan_start.vx * dx + replan_start.vy * dy) / (seed_speed * dnorm) : 1.0;
+      if (cos_align < -0.25) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), log_throttle_ms_,
+          "【无停车重规划拒绝】高速反向起点速度跳变=%.3f m/s (cos=%.2f, seed_scale=%.2f, "
+          "seed_v=(%.2f,%.2f), ref_v=(%.2f,%.2f))，保留当前安全参考避免高速甩尾。",
+          head_dv, cos_align, selected_trace.seed_scale, replan_start.vx, replan_start.vy,
+          reference.points.front().vx, reference.points.front().vy);
+        fail(ats_navigation_interfaces::msg::PlannerStatus::FAILURE_OPTIMIZER,
+          map_snapshot->generation);
+        return;
+      }
+    }
+  }
   bool robot_in_or_arming_tunnel = false;
   if (tunnel_lock_gimbal_ && !forward_tunnels.empty() && !reference.points.empty()) {
     for (const auto & tunnel : forward_tunnels) {
@@ -696,13 +730,25 @@ void MincoPlannerNode::finalizeAndCommitReference(
     !search_result.scan_turn)
   {
     ReferenceTrajectory spun = reference;
+    if (const auto * bsq = map_snapshot->blocked_squared_cells.get();
+      bsq && bsq->size() == planning_grid.data.size() && planning_grid.info.resolution > 0.0)
+    {
+      const double hw = 0.5 * std::min(footprint_length_, footprint_width_) + footprint_safety_margin_;
+      for (auto & pt : spun.points) {
+        int ix = 0, iy = 0; std::int8_t cell = -1;
+        if (sampleOccupancyGridCell(planning_grid, pt.x, pt.y, cell, &ix, &iy)) {
+          const double kc = std::sqrt((*bsq)[static_cast<std::size_t>(iy) * planning_grid.info.width + ix]) * planning_grid.info.resolution - hw;
+          pt.clearance = std::isfinite(pt.clearance) ? std::min(pt.clearance, kc) : kc;
+        }
+      }
+    }
     SpinYawParams spin_params = spin_yaw_params_;
     spin_params.initial_rate = replan_start.yaw_rate;
     spin_params.stop_before_narrow_m = spin_policy_.align_lookahead_m;
+    // 无图探索段末尾也退出自旋对齐雷达前向，避免在未知前沿/洞口背向盲区停靠。
+    spin_params.align_terminal_yaw = ctx.active_is_final_goal || exploration_lidar_fov.has_value();
     bool spin_ok = applySpinYaw(
-      spun, spin_params,
-      forward_tunnels.empty() ? nullptr : &forward_tunnels,
-      &tunnel_yaw_params_);
+      spun, spin_params, forward_tunnels.empty() ? nullptr : &forward_tunnels, &tunnel_yaw_params_);
     const bool attempted = spin_ok;
     FootprintSafetyResult spun_safety;
     if (spin_ok) {
@@ -768,7 +814,7 @@ void MincoPlannerNode::finalizeAndCommitReference(
   telemetry.content_digest = planning_digest::pathContentDigest(control_reference);
   telemetry.reference_point_count =
     static_cast<std::uint32_t>(reference.points.size());
-  telemetry.is_partial_subgoal = search_result.partial;
+  telemetry.is_partial_subgoal = search_result.partial || !active_is_final_goal;
   telemetry.has_spliced_tail = has_spliced_tail;
   telemetry.search_wall_ms = static_cast<float>(search_wall_ms);
   telemetry.minco_wall_ms = static_cast<float>(minco_wall_ms);

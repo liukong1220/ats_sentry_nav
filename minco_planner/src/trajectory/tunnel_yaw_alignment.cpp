@@ -412,8 +412,19 @@ void resolveTerminalTunnelGoalAlignment(
       continue;
     }
     segment.terminal_goal_axial_override = true;
+    // Allow an in-place turnaround outside the tunnel mouth whenever the start
+    // pose sits just outside the narrow segment (within 1 grid cell of
+    // front_extent) with full circumscribed spin clearance + 1-cell margin.
+    // Do NOT trigger when the robot starts deep inside the mouth margin
+    // (e.g. s_begin - start_s < front_extent - 0.05) where spinning clips walls.
+    const bool start_can_spin_outside =
+      segment.begin > 0U &&
+      (trajectory.points[segment.begin].s - start_s) >= params.front_extent - 0.05 &&
+      std::isfinite(trajectory.points.front().clearance) &&
+      trajectory.points.front().clearance >= params.circumscribed_radius + 0.05;
     const bool approaching_from_outside =
-      (trajectory.points[segment.begin].s - start_s) > params.front_extent + 1e-6;
+      (trajectory.points[segment.begin].s - start_s) > params.front_extent + 1e-6 ||
+      start_can_spin_outside;
     if (approaching_from_outside) {
       segment.forward_alignment = true;
     }

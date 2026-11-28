@@ -100,21 +100,35 @@ void YawSplinePlanner::applyClearanceAware(
   // 静止起步优先在洞外起点插入平滑原地对准段；运动中则等比放长轨迹时间，避免未转到位进洞。
   std::vector<TunnelSegment> adjusted_tunnels;
   const std::vector<TunnelSegment> * active_tunnels = tunnels;
+  std::vector<bool> tunnel_prefix_inserted;
   if (tunnels != nullptr && !tunnels->empty()) {
     adjusted_tunnels = *tunnels;
     active_tunnels = &adjusted_tunnels;
+    tunnel_prefix_inserted.assign(adjusted_tunnels.size(), false);
     const double rate_limit = std::max(1e-3, params_.yaw_rate_limit);
     const double acceleration_limit = std::max(0.0, params_.yaw_acceleration_limit);
-    for (const auto & tunnel : adjusted_tunnels) {
-      if (!tunnel.forward_alignment || tunnel.axis_yaw.empty() ||
-        tunnel.begin >= trajectory.points.size())
-      {
+    for (std::size_t ti = 0; ti < adjusted_tunnels.size(); ++ti) {
+      const auto & tunnel = adjusted_tunnels[ti];
+      if (tunnel.axis_yaw.empty() || tunnel.begin >= trajectory.points.size()) {
         continue;
       }
-      const double target_yaw = normalizeAngle(tunnel.axis_yaw.front() + params_.tunnel.yaw_offset);
+      const double start_to_begin =
+        trajectory.points[tunnel.begin].s - trajectory.points.front().s;
+      const bool in_mouth = start_to_begin <= params_.tunnel.front_extent + 1e-6;
+      const double sym_ref = (!in_mouth && preferred_lidar_fov_yaw_offset.has_value())
+        ? normalizeAngle(tunnel.axis_yaw.front() - *preferred_lidar_fov_yaw_offset)
+        : initial_yaw;
+      const double target_yaw = tunnel.forward_alignment
+        ? normalizeAngle(tunnel.axis_yaw.front() + params_.tunnel.yaw_offset)
+        : tunnelAlignedYaw(tunnel.axis_yaw.front(), params_.tunnel.yaw_offset, sym_ref);
       const double delta = std::abs(shortestAngularDistance(initial_yaw, target_yaw));
-      if (delta <= 0.10) {
+      const double min_delta = tunnel.forward_alignment ? 0.10 : 0.15;
+      if (delta <= min_delta) {
         break;
+      }
+      if (!tunnel.forward_alignment && in_mouth) {
+        // Already inside/at the tunnel mouth: do not inject an in-place spin inside narrow walls.
+        continue;
       }
       const double entry_s = trajectory.points[tunnel.begin].s - params_.tunnel.front_extent;
       std::size_t first_at_mouth = tunnel.begin;
@@ -162,6 +176,7 @@ void YawSplinePlanner::applyClearanceAware(
             segment.begin += static_cast<std::size_t>(sample_count);
             segment.end += static_cast<std::size_t>(sample_count);
           }
+          tunnel_prefix_inserted[ti] = true;
         } else {
           const double time_scale = required_time / available_time;
           if (time_scale <= 2.0) {
@@ -184,6 +199,7 @@ void YawSplinePlanner::applyClearanceAware(
             }
             applyLocalTimeScaling(trajectory, std::move(factors), 1.5);
           }
+          tunnel_prefix_inserted[ti] = true;
         }
       }
       break;
@@ -348,7 +364,10 @@ void YawSplinePlanner::applyClearanceAware(
         }
         const TunnelTraversalPhase phase = classifyTunnelTraversalPhase(
           trajectory, i, tunnel, tunnel_dynamic_pre[j], params_.tunnel);
-        const bool prealign = tunnel.forward_alignment && current.t >= tunnel_turn_start[j] &&
+        const bool prealign =
+          (tunnel.forward_alignment ||
+          (j < tunnel_prefix_inserted.size() && tunnel_prefix_inserted[j])) &&
+          current.t >= tunnel_turn_start[j] &&
           current.s <= trajectory.points[tunnel.end].s + params_.tunnel.front_extent +
             params_.tunnel.post_release_distance;
         if (phase != TunnelTraversalPhase::kOpen || prealign) {
@@ -363,6 +382,15 @@ void YawSplinePlanner::applyClearanceAware(
             desired_yaw = normalizeAngle(
               tunnel.axis_yaw[local_index] + params_.tunnel.yaw_offset +
               tunnel_locked_branch_offset[j]);
+            // 当起步行位于窄洞口/退洞初期且初始航向已与隧道同轴对齐（偏差 <= axis_tolerance）时，
+            // 先沿 initial_yaw 直线平移 narrow_start_hold 距离待后轮完全脱洞后再随出口切线转向，
+            // 避免后轮仍在隧道壁内时被出口弯折切线提前拉偏。
+            if (start_in_narrow && current.s - start_s <= narrow_start_hold &&
+              std::abs(shortestAngularDistance(initial_yaw, desired_yaw)) <=
+                params_.tunnel.axis_tolerance)
+            {
+              desired_yaw = normalizeAngle(initial_yaw);
+            }
           } else {
             const double tunnel_ref = preferred_lidar_fov_yaw_offset.has_value()
               ? normalizeAngle(tunnel.axis_yaw[local_index] - *preferred_lidar_fov_yaw_offset)

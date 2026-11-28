@@ -182,12 +182,13 @@ GridSearchResult GridSearch::plan(
   const bool jump = params_.jump_enabled && params_.allow_diagonal &&
     params_.diagonal_cost > 1.0 && params_.diagonal_cost < 2.0;
   const double range = params_.clearance_cost_distance;
+  const double range_sq = (range > 0.0) ? (range / resolution) * (range / resolution) : 0.0;
   const double weight = params_.clearance_cost_weight;
   const bool weighted = weight > 0.0 && range > 0.0;
   const double unknown_penalty = std::max(1.0, options.unknown_cost_multiplier);
   const auto cost_factor = [&](int id) {
       double factor = 1.0;
-      if (weighted) {
+      if (weighted && field[id] < range_sq) {
         const double distance = std::sqrt(field[id]) * resolution;
         if (distance < range) {
           const double deficit = (range - distance) / range;
@@ -204,16 +205,23 @@ GridSearchResult GridSearch::plan(
         return false;
       }
       const int id = linear(index);
-      return grid.data[id] >= 0 && grid.data[id] < policy.obstacle_value_threshold &&
+      const int8_t val = grid.data[id];
+      const bool cell_free = val < 0
+        ? !policy.unknown_is_obstacle
+        : (val < policy.obstacle_value_threshold);
+      return cell_free &&
              (minimum_squared == 0.0 || field[id] > minimum_squared) &&
-             (!weighted || std::sqrt(field[id]) * resolution >= range);
+             (!weighted || field[id] >= range_sq);
     };
   const auto uniform_neighborhood = [&](Index index) {
-      auto & cell = cells_[linear(index)];
+      const int id = linear(index);
+      auto & cell = cells_[id];
       if (cell.neighborhood_checked != generation_) {
+        const bool is_unk = grid.data[id] < 0;
         cell.uniform_neighborhood = uniform(index) && std::all_of(
           std::begin(kNeighbors8), std::end(kNeighbors8), [&](Index offset) {
-            return uniform({index.x + offset.x, index.y + offset.y});
+            const Index nb{index.x + offset.x, index.y + offset.y};
+            return uniform(nb) && ((grid.data[linear(nb)] < 0) == is_unk);
           });
         cell.neighborhood_checked = generation_;
       }

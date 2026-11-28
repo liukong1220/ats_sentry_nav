@@ -262,13 +262,39 @@ void AtsGoalManagerNode::onTick() {
               dist_to_subgoal <= 0.15 || since_commit_sec >= 0.45;
             const std::uint64_t latest_pub = planning_snapshot_ ?
               planning_snapshot_->publication_sequence : 0U;
-            const double subgoal_lookahead_m = std::max(rolling_replan_advance_m_, 2.5);
+            // Inside a tight corridor/tunnel (center-to-wall signed distance < 0.52 m), avoid
+            // routine non-urgent rolling replans while the current reference still has > 0.75 m
+            // of safe horizon ahead; obstacle conflicts still trigger immediate replan via planner
+            // runtime validation, while skipping mid-tunnel replans prevents reference-origin jump
+            // and yaw-kick Q2 clips inside 0.77 m tunnels.
+            double current_clearance_m = std::numeric_limits<double>::infinity();
+            if (planning_snapshot_ &&
+              planning_snapshot_->header.frame_id == current_planning_pose_.header.frame_id)
+            {
+              int cx = 0;
+              int cy = 0;
+              if (worldToSnapshotCell(
+                  *planning_snapshot_,
+                  current_planning_pose_.pose.position.x,
+                  current_planning_pose_.pose.position.y, cx, cy))
+              {
+                const auto cidx = static_cast<std::size_t>(cy) * planning_snapshot_->info.width +
+                  static_cast<std::size_t>(cx);
+                if (cidx < planning_snapshot_->signed_distance_m.size()) {
+                  current_clearance_m = planning_snapshot_->signed_distance_m[cidx];
+                }
+              }
+            }
+            const bool inside_narrow_corridor_with_horizon =
+              current_clearance_m < 0.52 && dist_to_subgoal > 0.75;
+            const double subgoal_lookahead_m = std::max(rolling_replan_advance_m_, 2.6);
             const bool partial_trigger = active_execution_command_->is_partial_subgoal &&
               !short_turn_in_progress &&
-              ((dist_to_subgoal <= subgoal_lookahead_m && advanced_m >= 0.35) ||
+              !inside_narrow_corridor_with_horizon &&
+              ((dist_to_subgoal <= subgoal_lookahead_m && advanced_m >= 0.65) ||
                (latest_pub > active_goal_->last_rolling_publication_sequence &&
-                (advanced_m >= 0.4 * rolling_replan_advance_m_ ||
-                 (dist_to_subgoal <= 0.60 && short_step_settled))));
+                (advanced_m >= std::max(1.60, rolling_replan_advance_m_) ||
+                 (dist_to_subgoal <= 0.80 && short_step_settled))));
             const double spliced_refresh_dist_m = std::max(4.5, rolling_replan_advance_m_ + 2.0);
             const bool spliced_trigger = !active_execution_command_->is_partial_subgoal &&
               active_execution_command_->has_spliced_tail &&
@@ -356,7 +382,9 @@ void AtsGoalManagerNode::onTick() {
             active_execution_command_->map_generation : 0;
           gate.identity.map_publication_sequence = active_execution_command_ ?
             active_execution_command_->map_publication_sequence : 0;
-          gate.identity.plan_request_sequence = active_goal_->expected_plan_request_sequence;
+          gate.identity.plan_request_sequence = active_execution_command_ ?
+            active_goal_->committed_plan_request_sequence :
+            active_goal_->expected_plan_request_sequence;
           if (active_execution_command_ && planning_snapshot_) {
             // Keep the reference identity stable across adapter refreshes;
             // the current snapshot is a safety gate, not an excuse to reset

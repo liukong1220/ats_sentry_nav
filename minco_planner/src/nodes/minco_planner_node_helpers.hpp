@@ -36,6 +36,14 @@ inline bool finitePose(const geometry_msgs::msg::Pose & pose)
     std::isfinite(pose.orientation.w);
 }
 
+bool isLocalDirectNoPathSealed(
+  const nav_msgs::msg::OccupancyGrid & grid,
+  const std::vector<double> * conservative_squared,
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  double floor_clearance_m,
+  int obstacle_value_threshold);
+
 inline std::string formatCollisionIndices(const std::vector<CollisionSample> & collisions)
 {
   std::ostringstream out;

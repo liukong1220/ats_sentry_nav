@@ -172,6 +172,18 @@ void MincoPlannerNode::planGoal(
       seed_ptr = &frozen_seed;
     }
   }
+  // Cold-start plans (no active trajectory being preserved) run while emergency_stop
+  // holds zero command. Measured Point-LIO twist at standstill carries 0.03-0.20 m/s
+  // IMU jitter; seeding that sideways noise as an exact MINCO head_state velocity
+  // launches narrow-tunnel starts laterally across floor seams.
+  if (!keep_active_reference && seed_ptr != nullptr &&
+    seed_ptr->velocity.norm() <= 0.25 && seed_ptr->acceleration.norm() <= 1e-6)
+  {
+    frozen_seed.valid = false;
+    frozen_seed.velocity.setZero();
+    frozen_seed.acceleration.setZero();
+    seed_ptr = nullptr;
+  }
 
   geometry_msgs::msg::PoseStamped goal = input_goal;
   if (goal.header.frame_id.empty()) {
@@ -581,6 +593,7 @@ void MincoPlannerNode::planGoal(
     };
   const double center_min_clearance = minTrajectoryClearance(center_reference);
   const bool need_footprint_refinement = !center_safety.safe ||
+    !guide_tunnels.empty() ||
     center_min_clearance < footprint_refinement_skip_clearance_m_;
   if (optimizer_.esdfFootprintOptimizationEnabled() && need_footprint_refinement &&
     !used_old_trajectory_splice && !rollingBudgetExceeded())
@@ -611,26 +624,32 @@ void MincoPlannerNode::planGoal(
   }
   bool esdf_fallback_used = false;
   if (!safety.safe && optimizer_.esdfObstacleOptimizationEnabled() && !rollingBudgetExceeded()) {
-    // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO，避免“修正越修越差”。
-    MincoOptimizationTrace fallback_trace;
-    ReferenceTrajectory fallback_reference = runOptimize(
-      active_guide_path, nullptr, nullptr, &fallback_trace, nullptr);
-    if (fallback_reference.valid()) {
-      fallback_reference.header.stamp = now();
-      planYaw(
-        fallback_reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal,
-        exploration_lidar_fov, search_result.scan_turn);
-      const FootprintSafetyResult fallback_safety = safety_checker_.check(
-        fallback_reference, planning_grid, clearance_esdf.get());
-      if (fallback_safety.safe) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), log_throttle_ms_,
-          "【足迹候选回退】RC-ESDF 外层候选有 %zu 个足迹冲突，改用安全的 JPS-MINCO 基线。",
-          safety.collisions.size());
-        esdf_fallback_used = true;
-        reference = std::move(fallback_reference);
-        safety = fallback_safety;
-        selected_trace = std::move(fallback_trace);
+    // 外推候选仍碰撞时回到不做 ESDF 位移的 JPS-MINCO（先常规捷径，若仍在窄道弓出擦墙则关闭捷径贴紧中心线）。
+    for (const bool allow_sc : {true, false}) {
+      if (safety.safe || rollingBudgetExceeded()) {
+        break;
+      }
+      MincoOptimizationTrace fallback_trace;
+      ReferenceTrajectory fallback_reference = runOptimize(
+        active_guide_path, nullptr, nullptr, &fallback_trace, nullptr, allow_sc);
+      if (fallback_reference.valid()) {
+        fallback_reference.header.stamp = now();
+        planYaw(
+          fallback_reference, *map_snapshot, start_yaw, active_goal_yaw, active_is_final_goal,
+          exploration_lidar_fov, search_result.scan_turn);
+        const FootprintSafetyResult fallback_safety = safety_checker_.check(
+          fallback_reference, planning_grid, clearance_esdf.get());
+        if (fallback_safety.safe) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), log_throttle_ms_,
+            "【足迹候选回退】RC-ESDF 外层候选有 %zu 个足迹冲突，改用安全的 JPS-MINCO 基线 (shortcut=%d)。",
+            safety.collisions.size(), allow_sc ? 1 : 0);
+          esdf_fallback_used = true;
+          reference = std::move(fallback_reference);
+          safety = fallback_safety;
+          selected_trace = std::move(fallback_trace);
+          break;
+        }
       }
     }
   }
@@ -716,23 +735,40 @@ void MincoPlannerNode::planGoal(
     }
   }
 
-  // When a mapless partial exploration trajectory is collision-free for a substantial prefix
-  // (>= 0.65 m) and only clips the wall near its far tail (e.g. a narrow-corridor exit kink),
-  // truncate the guide strictly before the first collision instead of discarding the entire
-  // safe prefix with FAILURE_FOOTPRINT. Still verified by the exact same FootprintSafetyChecker.
-  if (!safety.safe && search_result.partial && !search_result.scan_turn &&
-    !safety.collisions.empty() && reference.points.size() >= 2U && !rollingBudgetExceeded())
+  applyTerminalYawRelocationAndSidestep(
+    map_snapshot, planning_grid, clearance_esdf,
+    active_goal_yaw, active_is_final_goal, reference, safety);
+
+  // When a trajectory is collision-free for a substantial prefix (>= 0.45 m on partial subgoals,
+  // or >= 0.80 m on full local goals) and only clips the wall/unknown border far downstream
+  // (e.g. a narrow-corridor entrance or exit kink), truncate the guide strictly before the first
+  // collision and publish it as a partial subgoal (triggering rolling replanning as the robot
+  // advances) instead of discarding the entire safe prefix with FAILURE_FOOTPRINT. Still verified
+  // by the exact same zero-collision FootprintSafetyChecker.
+  const double min_trim_prefix_s =
+    (search_result.partial || !active_is_final_goal) ? 0.45 : 0.80;
+  const bool tail_trim_budget_ok = !keep_active_reference ||
+    rolling_replan_wall_budget_ms_ <= 0.0 ||
+    elapsedWallMs() < rolling_replan_wall_budget_ms_ + 20.0;
+  if (!safety.safe && !search_result.scan_turn &&
+    !safety.collisions.empty() && reference.points.size() >= 2U && tail_trim_budget_ok)
   {
     std::size_t first_col_idx = reference.points.size();
     for (const auto & col : safety.collisions) {
       first_col_idx = std::min(first_col_idx, col.segment_index);
     }
-    if (first_col_idx < reference.points.size() && reference.points[first_col_idx].s >= 0.65) {
+    if (first_col_idx < reference.points.size() &&
+      reference.points[first_col_idx].s >= min_trim_prefix_s)
+    {
       const double first_col_s = reference.points[first_col_idx].s;
-      const double margins[2] = {0.35, 0.65};
+      const double margins[3] = {0.30, 0.55, 0.85};
+      bool trimmed_safe = false;
       for (double margin : margins) {
+        if (trimmed_safe) {
+          break;
+        }
         const double cut_s = first_col_s - margin;
-        if (cut_s < 0.35) {
+        if (cut_s < 0.25) {
           continue;
         }
         nav_msgs::msg::Path short_guide;
@@ -757,7 +793,8 @@ void MincoPlannerNode::planGoal(
         if (short_guide.poses.size() < 2U) {
           continue;
         }
-        // Hold the already-verified collision-free yaw at cut_s instead of a kinky tail yaw.
+        // Hold the already-verified collision-free yaw at cut_s instead of swinging corners
+        // into the unknown frontier border with exploration_lidar_fov.
         double short_goal_yaw = active_goal_yaw;
         for (const auto & pt : reference.points) {
           if (pt.s >= cut_s) {
@@ -765,39 +802,39 @@ void MincoPlannerNode::planGoal(
             break;
           }
         }
-        MincoOptimizationTrace short_trace;
-        ReferenceTrajectory short_ref = runOptimize(
-          short_guide, clearance_esdf.get(), nullptr, &short_trace, nullptr);
-        if (!short_ref.valid()) {
-          continue;
-        }
-        short_ref.header.stamp = now();
-        planYaw(
-          short_ref, *map_snapshot, start_yaw, short_goal_yaw, false,
-          exploration_lidar_fov, false);
-        const FootprintSafetyResult short_safety = safety_checker_.check(
-          short_ref, planning_grid, clearance_esdf.get());
-        if (short_safety.safe) {
-          RCLCPP_INFO_THROTTLE(
-            get_logger(), *get_clock(), log_throttle_ms_,
-            "【部分子目标尾段裁剪】原首冲突在 s=%.2f m，安全裁剪至 s=%.2f m 后零冲突通过。",
-            first_col_s, cut_s);
-          active_guide_path = std::move(short_guide);
-          active_goal_yaw = short_goal_yaw;
-          active_is_final_goal = false;
-          reference = std::move(short_ref);
-          safety = short_safety;
-          selected_trace = std::move(short_trace);
-          break;
+        for (int opt_pass = 0; opt_pass < 2; ++opt_pass) {
+          const bool use_esdf = (opt_pass == 0);
+          MincoOptimizationTrace short_trace;
+          ReferenceTrajectory short_ref = runOptimize(
+            short_guide, use_esdf ? clearance_esdf.get() : nullptr, nullptr, &short_trace,
+            nullptr, /*allow_shortcut=*/use_esdf);
+          if (!short_ref.valid()) {
+            continue;
+          }
+          short_ref.header.stamp = now();
+          planYaw(
+            short_ref, *map_snapshot, start_yaw, short_goal_yaw, false,
+            std::nullopt, false);
+          const FootprintSafetyResult short_safety = safety_checker_.check(
+            short_ref, planning_grid, clearance_esdf.get());
+          if (short_safety.safe) {
+            RCLCPP_INFO_THROTTLE(
+              get_logger(), *get_clock(), log_throttle_ms_,
+              "【部分子目标尾段裁剪】原首冲突在 s=%.2f m，安全裁剪至 s=%.2f m (esdf=%d) 后零冲突通过。",
+              first_col_s, cut_s, use_esdf ? 1 : 0);
+            active_guide_path = std::move(short_guide);
+            active_goal_yaw = short_goal_yaw;
+            active_is_final_goal = false;
+            reference = std::move(short_ref);
+            safety = short_safety;
+            selected_trace = std::move(short_trace);
+            trimmed_safe = true;
+            break;
+          }
         }
       }
     }
   }
-
-
-  applyTerminalYawRelocationAndSidestep(
-    map_snapshot, planning_grid, clearance_esdf,
-    active_goal_yaw, active_is_final_goal, reference, safety);
 
   if (preprocessed_guide_pub_ && preprocessed_guide_pub_->get_subscription_count() > 0 &&
     !selected_trace.preprocessed_guide.poses.empty())
@@ -827,11 +864,17 @@ void MincoPlannerNode::planGoal(
     escape_decision.allowed = false;
   }
 
+  const geometry_msgs::msg::PoseStamped local_escape_goal =
+    (!active_is_final_goal && !active_guide_path.poses.empty()) ?
+    active_guide_path.poses.back() : goal;
+  const double local_escape_goal_yaw = active_is_final_goal ? goal_yaw : active_goal_yaw;
+  const bool local_escape_goal_verified =
+    active_is_final_goal ? goal_pose_footprint_verified : false;
   tryEscapePrefixAndLocalReverse(
-    map_snapshot, planning_grid, clearance_esdf, start, goal,
-    start_yaw, goal_yaw, active_goal_yaw, active_is_final_goal,
+    map_snapshot, planning_grid, clearance_esdf, start, local_escape_goal,
+    start_yaw, local_escape_goal_yaw, active_goal_yaw, active_is_final_goal,
     exploration_lidar_fov, seed_ptr, used_clearance,
-    goal_pose_footprint_verified, rollingBudgetExceeded,
+    local_escape_goal_verified, rollingBudgetExceeded,
     reference, safety, selected_trace, has_spliced_tail, escape_decision);
 
   if (!safety.safe && !publish_unsafe_trajectory_ && escape_decision.allowed) {

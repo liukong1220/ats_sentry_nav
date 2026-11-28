@@ -236,8 +236,13 @@ void MincoPlannerNode::planYaw(
     if (!current_safety.safe) {
       auto forced_tunnels = tunnel_segments;
       auto & first_tunnel = forced_tunnels.front();
+      const double mouth_ref_yaw = preferred_lidar_fov_yaw_offset.has_value()
+        ? std::atan2(
+            std::sin(first_tunnel.axis_yaw.front() - *preferred_lidar_fov_yaw_offset),
+            std::cos(first_tunnel.axis_yaw.front() - *preferred_lidar_fov_yaw_offset))
+        : start_yaw;
       const double nearest_axis = tunnelAlignedYaw(
-        first_tunnel.axis_yaw.front(), tunnel_yaw_params_.yaw_offset, start_yaw);
+        first_tunnel.axis_yaw.front(), tunnel_yaw_params_.yaw_offset, mouth_ref_yaw);
       const double base_target = std::atan2(
         std::sin(first_tunnel.axis_yaw.front() + tunnel_yaw_params_.yaw_offset),
         std::cos(first_tunnel.axis_yaw.front() + tunnel_yaw_params_.yaw_offset));

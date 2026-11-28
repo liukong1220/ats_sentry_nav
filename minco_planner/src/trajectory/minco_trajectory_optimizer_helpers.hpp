@@ -204,7 +204,38 @@ inline double interpolateReferenceYaw(const ReferenceTrajectory & reference, dou
     return reference.points.front().yaw;
   }
 
-  const double target_time = std::max(0.0, std::min(1.0, progress)) * reference.totalTime();
+  const double clamped = std::max(0.0, std::min(1.0, progress));
+  const double total_s = reference.points.back().s;
+  // Index by spatial arc-length whenever the reference translates, so stationary
+  // in-place turns prepended at s == 0 (or appended at s == total_s) never smear
+  // rotated yaw values into the moving tunnel interior during Pass 2 optimization.
+  if (total_s > 1e-4) {
+    const double target_s = clamped * total_s;
+    auto upper = std::lower_bound(
+      reference.points.begin(), reference.points.end(), target_s,
+      [](const ReferencePoint & point, double s) {return point.s < s;});
+    if (clamped <= 1e-9) {
+      while (upper + 1 < reference.points.end() && (upper + 1)->s <= 1e-6) {
+        ++upper;
+      }
+      return upper->yaw;
+    }
+    if (upper == reference.points.begin()) {
+      return upper->yaw;
+    }
+    if (upper == reference.points.end()) {
+      return reference.points.back().yaw;
+    }
+    const ReferencePoint & before = *(upper - 1);
+    const double ds = upper->s - before.s;
+    if (ds <= 1e-6) {
+      return upper->yaw;
+    }
+    const double alpha = std::max(0.0, std::min(1.0, (target_s - before.s) / ds));
+    return normalizeAngle(before.yaw + alpha * normalizeAngle(upper->yaw - before.yaw));
+  }
+
+  const double target_time = clamped * reference.totalTime();
   const auto upper = std::lower_bound(
     reference.points.begin(), reference.points.end(), target_time,
     [](const ReferencePoint & point, double time) {return point.t < time;});

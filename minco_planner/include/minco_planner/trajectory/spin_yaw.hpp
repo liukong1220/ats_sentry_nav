@@ -26,6 +26,8 @@ struct SpinYawParams
   double stop_before_narrow_m = 0.0;   // 非净空点前这么远（弧长）停止自旋并回到规划 yaw。
   double resume_after_narrow_m = 0.0;  // 离开非净空点这么远（弧长）后才重新自旋。
   double sample_period = 0.10;         // 终点停旋/对齐尾段的采样周期 [s]，与 terminal_yaw_sample_period 一致。
+  bool align_terminal_yaw = true;      // 真正终目标需停旋并对齐 goal_yaw；滚动中间 partial 子目标仅平滑降旋不附加原地对角。
+  double stop_before_goal_m = 1.35;    // 终目标前提前开始停旋并对齐目标角（弧长），与减速段重叠而非到点后再原地停旋。
 };
 
 inline double wrapAngle(double angle)
@@ -70,19 +72,21 @@ inline bool appendSpinTerminalGoal(
   {
     return false;
   }
-  const double delta = wrapAngle(goal_yaw - trajectory.points.back().yaw);
-  const double duration = std::max(
-    1.875 * std::abs(delta) / params.blend_rate_limit,
-    std::sqrt((10.0 / std::sqrt(3.0)) * std::abs(delta) / params.angular_accel));
-  if (!append_phase(duration, [delta](auto & point, const auto & start, double span, double u) {
-      const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
-      point.yaw = wrapAngle(start.yaw + delta * blend);
-      point.yaw_rate = delta * 30.0 * u * u * (1.0 - u) * (1.0 - u) / span;
-    }))
-  {
-    return false;
+  if (params.align_terminal_yaw) {
+    const double delta = wrapAngle(goal_yaw - trajectory.points.back().yaw);
+    const double duration = std::max(
+      1.875 * std::abs(delta) / params.blend_rate_limit,
+      std::sqrt((10.0 / std::sqrt(3.0)) * std::abs(delta) / params.angular_accel));
+    if (!append_phase(duration, [delta](auto & point, const auto & start, double span, double u) {
+        const double blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+        point.yaw = wrapAngle(start.yaw + delta * blend);
+        point.yaw_rate = delta * 30.0 * u * u * (1.0 - u) * (1.0 - u) / span;
+      }))
+    {
+      return false;
+    }
+    trajectory.points.back().yaw = wrapAngle(goal_yaw);
   }
-  trajectory.points.back().yaw = wrapAngle(goal_yaw);
   trajectory.points.back().yaw_rate = 0.0;
   if (trajectory.points.back().t < original_end_time) {
     ReferencePoint hold = trajectory.points.back();
@@ -157,6 +161,16 @@ inline bool applySpinYaw(
     }
     if (next_narrow_s - points[k].s <= std::max(0.0, params.stop_before_narrow_m)) {
       spin_ok[k] = 0;
+    }
+  }
+  if (terminal_stop && params.align_terminal_yaw && params.stop_before_goal_m > 0.0 &&
+    travel_distance > params.stop_before_goal_m)
+  {
+    const double goal_stop_s = points[terminal_begin].s - params.stop_before_goal_m;
+    for (std::size_t i = 0; i <= terminal_begin; ++i) {
+      if (points[i].s >= goal_stop_s) {
+        spin_ok[i] = 0;
+      }
     }
   }
   if (tunnels != nullptr && tunnel_params != nullptr && tunnel_params->enabled) {
